@@ -1,0 +1,21 @@
+[package]
+name = "nexus-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "Shared types, error types, and configuration primitives for Nexus SFU"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "sfu", "types", "core"]
+categories = ["multimedia", "network-programming"]
+
+[features]
+default = []
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+getrandom = "0.2"
+
+[dev-dependencies]
+serde_json = "1.0"

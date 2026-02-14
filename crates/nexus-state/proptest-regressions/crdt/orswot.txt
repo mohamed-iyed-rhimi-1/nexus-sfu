@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e3dde2c78c2db3524408e15d25326a4a1b079773881ed264ce67ff9b60865856 # shrinks to adds_a = [(0, Dot { actor_id: 187, clock: 618 })], adds_b = [(1, Dot { actor_id: 187, clock: 618 })]
+cc f0697c7e734a4a02e0eda3feca2f28718fc01ee8d3b7b01786e3fd9faccedc64 # shrinks to ops_a = [(0, Dot { actor_id: 85, clock: 51 })], ops_b = [(1, Dot { actor_id: 85, clock: 51 })]

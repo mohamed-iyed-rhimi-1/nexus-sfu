@@ -1,0 +1,23 @@
+[package]
+name = "nexus-webrtc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "WebRTC transport and SDP parsing for Nexus SFU"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "sdp", "transport"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-transport = { path = "../nexus-transport" }
+nexus-media = { path = "../nexus-media" }
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+rand = "0.8"
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1.4"
+tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros"] }

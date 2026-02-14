@@ -1,0 +1,157 @@
+# Nexus SFU Development Configuration
+# TigerStyle: Explicit development settings for local testing
+#
+# This configuration is optimized for local development with:
+# - All services bound to localhost (127.0.0.1)
+# - Minimal resource allocation (32MB arena, 50 participants, 10 rooms)
+# - Fixed 2 workers without CPU pinning or RT priority
+# - Debug logging enabled
+# - Relaxed BWE thresholds for local network testing
+# - Development JWT secret (minimum 32 characters)
+#
+# Distinct from:
+# - default.toml: Uses auto-detect workers, 64MB arena, 100 participants
+# - production.toml: Uses 1GB arena, 1000 participants, CPU pinning, RT priority
+# for this duration before terminating connections.
+drain_timeout_ms = 1                 # 0 seconds for dev (faster shutdown)
+
+
+[transport]
+media_bind_addr = "0.0.0.0:10000"
+signaling_bind_addr = "0.0.0.0:8080"
+recv_buffer_size_bytes = 4194304        # 4MB (minimal for dev)
+send_buffer_size_bytes = 4194304        # 4MB (minimal for dev)
+batch_size = 16                         # Smaller batches for dev
+batch_flush_interval_us = 2000          # 2ms (relaxed for dev)
+max_webrtc_sessions = 100               # Smaller limit for dev (must be <= 1000)
+tls_cert_path = "./certs/dev-cert.pem"    # Self-signed cert for local QUIC
+tls_key_path = "./certs/dev-key.pem"      # Self-signed key for local QUIC
+stun_servers = ["74.125.250.129:19302", "74.125.250.130:19302"]
+
+[memory]
+arena_size_mb = 32                      # 32MB (minimal for dev, per task spec)
+ring_buffer_size = 256                  # 256 packets per track (smaller for dev)
+
+[worker]
+num_workers = 2                         # Fixed 2 workers for dev (per task spec)
+cpu_affinity = false                    # No CPU pinning in dev (per task spec)
+realtime_priority = false               # No RT priority in dev (per task spec)
+
+[room]
+max_participants_per_room = 50          # 50 max participants (per task spec)
+max_rooms = 10                          # 10 max rooms (per task spec)
+empty_room_timeout_ms = 10000           # 10 seconds (faster cleanup for dev)
+
+[bwe]
+# Relaxed BWE thresholds for local testing (per task spec)
+initial_bandwidth_bps = 500000          # 500 Kbps (lower initial for dev)
+min_bandwidth_bps = 50000               # 50 Kbps (lower minimum for dev)
+max_bandwidth_bps = 5000000             # 5 Mbps (lower max for dev)
+loss_threshold_percent = 10             # 10% (more tolerant for local testing)
+decrease_factor = 0.9                   # 0.9 (gentler decrease for dev)
+increase_bps = 50000                    # 50 Kbps (smaller steps for dev)
+
+[quic]
+bind_addr = "0.0.0.0:8443"
+max_connections = 100
+max_session_tickets = 100
+session_ticket_ttl_secs = 86400
+max_bi_streams = 100
+max_uni_streams = 100
+stream_recv_window_bytes = 1048576
+connection_recv_window_bytes = 8388608
+keep_alive_interval_ms = 5000
+idle_timeout_ms = 30000
+enable_0rtt = true
+cert_path = "./certs/dev-cert.pem"
+key_path = "./certs/dev-key.pem"
+
+[gossip]
+probe_interval_ms = 5000                # 5 seconds (less frequent for dev)
+ping_timeout_ms = 1000                  # 1 second
+suspect_timeout_ms = 10000              # 10 seconds
+fanout = 1                              # Minimal fanout for single-node dev
+max_piggyback_updates = 8               # Smaller piggyback for dev
+
+[cluster]
+# Single-node development mode
+node_id = 0
+
+[actor]
+max_track_actors = 80                   # 80 tracks (fits in 32MB arena with 256 ring buffer)
+max_participant_actors = 50             # 50 participants (matches room limit)
+max_room_actors = 10                    # 10 rooms (per task spec)
+message_queue_size = 512                # Smaller queues for dev
+migration_queue_size = 5                # Smaller migration queue
+supervision_restart_limit = 3
+
+[api]
+bind_addr = "127.0.0.1:8081"
+# JWT secret must be minimum 32 characters (per task spec)
+jwt_secret = "dev-secret-minimum-32-characters-long"
+enabled = true
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+collection_interval_ms = 5000           # 5 seconds (less frequent for dev)
+enable_prometheus = true
+
+[security]
+# Development JWT secret - minimum 32 characters (per task spec)
+# WARNING: Never use this secret in production!
+jwt_secret = "dev-secret-minimum-32-characters-long"
+
+[logging]
+level = "debug"                         # Debug logging enabled (per task spec)
+structured = true
+include_timestamps = true
+include_thread_ids = true
+
+[xdp]
+# XDP kernel bypass disabled for development (per task spec)
+# XDP requires Linux with CAP_NET_ADMIN and libbpf
+enabled = false
+interface = ""
+queue_id = 0
+forward_table_path = "/sys/fs/bpf/nexus/forward_table"
+stats_map_path = "/sys/fs/bpf/nexus/stats_map"
+umem_num_frames = 4096
+umem_frame_size = 4096
+fill_ring_size = 2048
+comp_ring_size = 2048
+rx_ring_size = 2048
+tx_ring_size = 2048
+batch_size = 64
+poll_timeout_ms = 100
+attach_mode = "native"
+fallback_on_failure = true
+
+# ============================================================================
+# ICE Server Configuration (Development)
+# ============================================================================
+# For local development, we use Google's public STUN servers via fallback.
+# No TURN servers are configured by default for development.
+#
+# Google Fallback Behavior:
+# When use_google_fallback = true and stun_servers is empty,
+# the system automatically uses Google's public STUN servers for NAT traversal.
+# This is sufficient for most development scenarios.
+#
+# For testing TURN relay functionality, uncomment the turn_servers section below.
+# ============================================================================
+[ice_servers]
+# Empty = use Google STUN fallback (recommended for development)
+stun_servers = []
+
+# No TURN servers for development (direct connectivity usually works locally)
+turn_servers = []
+
+# Enable Google STUN fallback for development
+use_google_fallback = true
+
+# Example: Local TURN server for testing relay functionality
+# Uncomment to test TURN relay behavior:
+# [[ice_servers.turn_servers]]
+# url = "turn:127.0.0.1:3478"
+# username = "dev-user"
+# credential = "dev-password"

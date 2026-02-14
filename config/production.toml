@@ -1,0 +1,200 @@
+# Nexus SFU Production Configuration
+# TigerStyle: Optimized for performance and reliability
+#
+# Configuration Sections (per architecture document Section 12):
+# - transport: Network I/O and packet processing
+# - memory: Pre-allocated pools (arena, ring buffers)
+# - worker: CPU-pinned media worker threads
+# - room: Room limits and timeouts
+# - bwe: Bandwidth estimation (GCC algorithm)
+# - quic: QUIC signaling server (TLS, 0-RTT)
+# - gossip: SWIM gossip protocol for cluster state sync
+# - actor: Actor system limits and supervision
+# - metrics: Prometheus metrics endpoint
+# - security: JWT authentication
+# - logging: Structured logging configuration
+# - xdp: AF_XDP kernel bypass (Linux only)
+# - api: REST API server
+#
+# Configuration Precedence: CLI > env > file > defaults
+# Environment variables: NEXUS_JWT_SECRET, NEXUS_CONFIG_PATH, etc.
+
+# Graceful drain timeout in milliseconds.
+# When shutdown is initiated, the SFU will continue forwarding packets
+# for this duration before terminating connections.
+# Requirement 10.2: Continue forwarding for drain_timeout period
+drain_timeout_ms = 30000                # 30 seconds for production
+
+[transport]
+media_bind_addr = "0.0.0.0:10000"
+signaling_bind_addr = "0.0.0.0:443"
+recv_buffer_size_bytes = 16777216       # 16MB
+send_buffer_size_bytes = 16777216       # 16MB
+batch_size = 64                         # Larger batches for throughput
+batch_flush_interval_us = 1000          # 1ms
+max_webrtc_sessions = 10000             # Max concurrent WebRTC sessions
+tls_cert_path = "/etc/nexus/tls/cert.pem"
+tls_key_path = "/etc/nexus/tls/key.pem"
+stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
+
+[memory]
+arena_size_mb = 1024                    # 1GB pre-allocated
+ring_buffer_size = 2048                 # 2048 packets per track
+
+[worker]
+num_workers = 0                         # Auto-detect (one per core)
+cpu_affinity = true                     # Pin workers to cores
+realtime_priority = true                # Use SCHED_FIFO (requires CAP_SYS_NICE)
+
+[room]
+max_participants_per_room = 1000
+max_rooms = 10000
+empty_room_timeout_ms = 60000           # 1 minute
+
+[bwe]
+initial_bandwidth_bps = 1000000         # 1 Mbps
+min_bandwidth_bps = 100000              # 100 Kbps
+max_bandwidth_bps = 50000000            # 50 Mbps
+loss_threshold_percent = 5
+decrease_factor = 0.85
+increase_bps = 100000
+
+[quic]
+bind_addr = "0.0.0.0:443"
+max_connections = 10000
+max_session_tickets = 10000
+session_ticket_ttl_secs = 86400
+max_bi_streams = 100
+max_uni_streams = 100
+stream_recv_window_bytes = 1048576
+connection_recv_window_bytes = 8388608
+keep_alive_interval_ms = 30000
+idle_timeout_ms = 60000
+enable_0rtt = true
+cert_path = "/etc/nexus/tls/cert.pem"
+key_path = "/etc/nexus/tls/key.pem"
+
+[gossip]
+# SWIM gossip protocol configuration
+probe_interval_ms = 1000
+ping_timeout_ms = 1000
+suspect_timeout_ms = 10000
+fanout = 3
+max_piggyback_updates = 16
+
+# Seed peers for bootstrapping the cluster.
+# Each entry specifies a known node to contact when joining.
+# Format: { actor_id = <u64>, addr = "<ip>:<port>" }
+# Example with multiple seed peers:
+# seed_peers = [
+#     { actor_id = 2, addr = "192.168.1.2:7946" },
+#     { actor_id = 3, addr = "192.168.1.3:7946" },
+# ]
+seed_peers = []
+
+[cluster]
+# Unique node ID. Set to 0 for auto-generation from hostname+pid+time.
+# In production multi-node clusters, set explicitly per node or use HOSTNAME env var.
+node_id = 0
+
+[actor]
+max_track_actors = 1000000              # 1M tracks
+max_participant_actors = 100000         # 100K participants
+max_room_actors = 10000                 # 10K rooms
+message_queue_size = 4096               # Larger queues
+migration_queue_size = 10
+supervision_restart_limit = 3
+
+[metrics]
+bind_addr = "0.0.0.0:9090"
+collection_interval_ms = 1000
+enable_prometheus = true
+
+[security]
+# MUST set NEXUS_JWT_SECRET environment variable
+jwt_secret = ""                         # Empty = error if not overridden
+
+[logging]
+level = "info"                          # Less verbose in production
+structured = true
+include_timestamps = true
+include_thread_ids = false              # Reduce log size
+
+[xdp]
+# XDP kernel bypass for high-performance packet forwarding (Linux only)
+# Requires: libbpf-dev, clang, CAP_NET_ADMIN capability
+# Set interface to your primary NIC (e.g., "eth0", "ens192")
+enabled = true
+interface = "eth0"                      # MUST override with actual interface
+queue_id = 0
+forward_table_path = "/sys/fs/bpf/nexus/forward_table"
+stats_map_path = "/sys/fs/bpf/nexus/stats_map"
+umem_num_frames = 8192                  # More frames for production
+umem_frame_size = 4096
+fill_ring_size = 4096                   # Larger rings for production
+comp_ring_size = 4096
+rx_ring_size = 4096
+tx_ring_size = 4096
+batch_size = 64
+poll_timeout_ms = 100
+attach_mode = "native"                  # Use native mode for best performance
+fallback_on_failure = true              # Fall back to io_uring if XDP fails
+
+[api]
+bind_addr = "0.0.0.0:8081"
+jwt_secret = ""                         # MUST set NEXUS_JWT_SECRET environment variable
+enabled = true
+
+# ============================================================================
+# ICE Server Configuration (Production)
+# ============================================================================
+# STUN/TURN servers for NAT traversal in WebRTC connections.
+#
+# Production Recommendations:
+# 1. Deploy your own STUN/TURN servers for reliability and privacy
+# 2. Use multiple STUN servers for redundancy
+# 3. Configure TURN servers for clients behind restrictive NATs/firewalls
+# 4. Use TURNS (TLS) for TURN servers in production
+#
+# Google Fallback:
+# When use_google_fallback = true and no stun_servers are configured,
+# Google's public STUN servers are used. This is NOT recommended for
+# production as it introduces external dependencies.
+#
+# URL Formats:
+#   STUN: stun:host:port or stuns:host:port (TLS)
+#   TURN: turn:host:port or turns:host:port (TLS)
+# ============================================================================
+[ice_servers]
+# Primary STUN servers (recommended: deploy your own)
+# Example with your own STUN servers:
+# stun_servers = [
+#     "stun:stun.yourcompany.com:3478",
+#     "stun:stun2.yourcompany.com:3478",
+# ]
+stun_servers = []
+
+# Primary TURN servers (required for clients behind restrictive NATs)
+# TURN credentials should be set via environment variables in production
+turn_servers = []
+
+# Google STUN fallback - set to false in production and use your own servers
+# Setting to true means relying on external Google infrastructure
+use_google_fallback = true
+
+# Example production TURN configuration:
+# [[ice_servers.turn_servers]]
+# url = "turns:turn.yourcompany.com:443"
+# username = "${TURN_USERNAME}"          # Set via environment variable
+# credential = "${TURN_CREDENTIAL}"      # Set via environment variable
+
+# Example with multiple TURN servers for redundancy:
+# [[ice_servers.turn_servers]]
+# url = "turns:turn1.yourcompany.com:443"
+# username = "production-user"
+# credential = "secure-credential-from-env"
+#
+# [[ice_servers.turn_servers]]
+# url = "turns:turn2.yourcompany.com:443"
+# username = "production-user"
+# credential = "secure-credential-from-env"

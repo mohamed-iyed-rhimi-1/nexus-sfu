@@ -1,0 +1,159 @@
+[workspace]
+members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest"]
+resolver = "2"
+
+[package]
+name = "nexus-sfu"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "High-performance WebRTC SFU with batch forwarding and worker sharding"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "sfu", "real-time", "media"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+# Core shared types and primitives
+nexus-core = { path = "crates/nexus-core" }
+# Media processing: RTP/RTCP parsing, codecs, simulcast
+nexus-media = { path = "crates/nexus-media" }
+# Transport layer: UDP, ICE, DTLS, SRTP, arena, ring buffer
+nexus-transport = { path = "crates/nexus-transport" }
+# CRDT state management
+nexus-state = { path = "crates/nexus-state", features = ["serde"] }
+# Actor system for tracks
+nexus-actor = { path = "crates/nexus-actor" }
+# QUIC signaling (required for QUIC-first signaling)
+nexus-signal = { path = "crates/nexus-signal" }
+# Metrics infrastructure
+nexus-metrics = { path = "crates/nexus-metrics" }
+# Bandwidth estimation
+nexus-bwe = { path = "crates/nexus-bwe" }
+# HTTP REST API
+nexus-api = { path = "crates/nexus-api" }
+# WebRTC transport and SDP
+nexus-webrtc = { path = "crates/nexus-webrtc" }
+tokio = { version = "1.44", features = ["full", "rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-util = { version = "0.7" }
+
+# WebSocket signaling
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# Concurrency primitives
+dashmap = "5.5"
+arc-swap = "1.6"
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# CPU affinity for worker pinning
+core_affinity = "0.8"
+num_cpus = "1.16"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+capnp = "0.19"
+prost = "0.13"
+
+# HTTP API server
+axum = { version = "0.7", features = ["json", "macros", "ws"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+http = "1.0"
+hyper = { version = "1.0", features = ["full"] }
+
+# Memory mapping for arena
+memmap2 = "0.9"
+
+# Configuration file parsing
+toml = "0.8"
+notify = "6.1"        # File watching for hot-reload
+
+# System metrics (CPU, memory)
+sysinfo = "0.30"
+
+# Cryptography for TURN authentication (HMAC-SHA1, MD5)
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+rand = "0.8"
+getrandom = "0.2"
+
+# TLS for WebSocket signaling (WSS)
+tokio-rustls = "0.25"
+rustls = { version = "0.22", features = ["ring"] }
+rustls-pemfile = "2.0"
+
+# Lazy initialization
+once_cell = "1.19"
+
+[build-dependencies]
+capnpc = "0.19"
+prost-build = "0.13"
+
+# Linux io_uring support (optional, Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[features]
+# Default features: enable io_uring on Linux for best performance
+default = ["io_uring"]
+io_uring = ["io-uring"]
+capnp = ["nexus-signal/capnp"]
+# XDP/BPF kernel bypass for high-performance packet forwarding (Linux only)
+# Requires: libbpf-dev, clang, CAP_NET_ADMIN capability
+xdp = []
+# Production build guards - enables compile-time checks for production-critical features
+# Ensures sendmmsg is available on Linux, fails compilation on non-Linux platforms
+production = []
+# Simulation mode: enables deterministic testing with no-op I/O and clock abstraction
+sim = ["nexus-transport/sim"]
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio-test = "0.4"
+webrtc = "0.10"
+
+[[example]]
+name = "basic_sfu"
+
+[[bench]]
+name = "forwarding"
+harness = false
+
+[[bench]]
+name = "packet_processing"
+harness = false
+
+[[bench]]
+name = "crdt_sync"
+harness = false
+
+[[bin]]
+name = "nexus-sfu"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

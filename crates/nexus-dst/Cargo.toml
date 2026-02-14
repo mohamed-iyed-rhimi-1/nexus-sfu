@@ -1,0 +1,27 @@
+[package]
+name = "nexus-dst"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "Deterministic Simulation Testing for Nexus SFU"
+
+[[bin]]
+name = "nexus-dst"
+path = "src/main.rs"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-actor = { path = "../nexus-actor" }
+nexus-state = { path = "../nexus-state", features = ["serde"] }
+nexus-bwe = { path = "../nexus-bwe" }
+nexus-media = { path = "../nexus-media" }
+nexus-transport = { path = "../nexus-transport", features = ["sim"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+proptest = "1.4"

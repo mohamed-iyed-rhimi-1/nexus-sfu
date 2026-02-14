@@ -1,0 +1,27 @@
+[package]
+name = "nexus-bwe"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "Bandwidth estimation with delay-based and loss-based algorithms"
+
+[dependencies]
+# Metrics
+nexus-metrics = { path = "../nexus-metrics" }
+
+# Shared types
+nexus-core = { path = "../nexus-core" }
+
+# Atomics and concurrency
+parking_lot = "0.12"
+
+# Error handling
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "delay_estimation"
+harness = false

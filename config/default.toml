@@ -1,0 +1,164 @@
+# Nexus SFU Default Configuration (Development)
+# TigerStyle: All values explicit, no magic numbers
+#
+# Configuration Precedence: CLI > env > file > defaults
+
+# Graceful drain timeout in milliseconds.
+# When shutdown is initiated, the SFU will continue forwarding packets
+# for this duration before terminating connections.
+drain_timeout_ms = 5000                 # 5 seconds for dev (faster shutdown)
+
+[transport]
+media_bind_addr = "127.0.0.1:10000"
+signaling_bind_addr = "127.0.0.1:8080"
+recv_buffer_size_bytes = 8388608        # 8MB (smaller for dev)
+send_buffer_size_bytes = 8388608        # 8MB
+batch_size = 32                         # Smaller batches for dev
+batch_flush_interval_us = 1000          # 1ms
+max_webrtc_sessions = 1000              # Smaller limit for dev
+tls_cert_path = ""                        # Empty = plain WS for development
+tls_key_path = ""                         # Empty = plain WS for development
+stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
+
+[memory]
+arena_size_mb = 64                      # 64MB (smaller for dev)
+ring_buffer_size = 1024                 # 1024 packets per track
+
+[worker]
+num_workers = 0                         # Auto-detect
+cpu_affinity = false                    # Don't pin in dev
+realtime_priority = false               # Don't use RT priority in dev
+
+[room]
+max_participants_per_room = 100         # Smaller limit for dev
+max_rooms = 100
+empty_room_timeout_ms = 30000           # 30 seconds (faster cleanup)
+
+[bwe]
+initial_bandwidth_bps = 1000000         # 1 Mbps
+min_bandwidth_bps = 100000              # 100 Kbps
+max_bandwidth_bps = 10000000            # 10 Mbps (lower for dev)
+loss_threshold_percent = 5
+decrease_factor = 0.85
+increase_bps = 100000
+
+[quic]
+bind_addr = "127.0.0.1:8443"
+max_connections = 1000
+max_session_tickets = 1000
+session_ticket_ttl_secs = 86400
+max_bi_streams = 100
+max_uni_streams = 100
+stream_recv_window_bytes = 1048576
+connection_recv_window_bytes = 8388608
+keep_alive_interval_ms = 5000
+idle_timeout_ms = 30000
+enable_0rtt = true
+cert_path = "./certs/dev-cert.pem"
+key_path = "./certs/dev-key.pem"
+
+[gossip]
+# SWIM gossip protocol configuration
+probe_interval_ms = 1000
+ping_timeout_ms = 500
+suspect_timeout_ms = 5000
+fanout = 3
+max_piggyback_updates = 16
+
+# Seed peers for bootstrapping the cluster.
+# Empty in dev (single node mode)
+seed_peers = []
+
+[actor]
+max_track_actors = 10000
+max_participant_actors = 1000
+max_room_actors = 100
+message_queue_size = 1024
+migration_queue_size = 10
+supervision_restart_limit = 3
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+collection_interval_ms = 1000
+enable_prometheus = true
+
+[security]
+# Override with NEXUS_JWT_SECRET in production
+jwt_secret = "dev-secret-change-in-production"
+
+[logging]
+level = "debug"                         # Verbose in dev
+structured = true
+include_timestamps = true
+include_thread_ids = true
+
+[cluster]
+# Unique node ID. Set to 0 for auto-generation from hostname+pid+time.
+# In production, set explicitly or derive from HOSTNAME.
+node_id = 0
+
+[xdp]
+# XDP kernel bypass disabled in development
+enabled = false
+interface = "lo"
+queue_id = 0
+forward_table_path = "/sys/fs/bpf/nexus/forward_table"
+stats_map_path = "/sys/fs/bpf/nexus/stats_map"
+umem_num_frames = 4096
+umem_frame_size = 4096
+fill_ring_size = 2048
+comp_ring_size = 2048
+rx_ring_size = 2048
+tx_ring_size = 2048
+batch_size = 32
+poll_timeout_ms = 100
+attach_mode = "skb"                     # SKB mode for dev (works without driver support)
+fallback_on_failure = true
+
+# ============================================================================
+# ICE Server Configuration
+# ============================================================================
+# STUN/TURN servers for NAT traversal in WebRTC connections.
+# 
+# STUN servers are used to discover the public IP address and port.
+# TURN servers are used as relays when direct connectivity fails.
+#
+# Google Fallback Behavior:
+# When use_google_fallback = true and no stun_servers are configured,
+# the system automatically uses Google's public STUN servers:
+#   - stun:stun.l.google.com:19302
+#   - stun:stun1.l.google.com:19302
+#   - stun:stun2.l.google.com:19302
+#
+# URL Formats:
+#   STUN: stun:host:port or stuns:host:port (TLS)
+#   TURN: turn:host:port or turns:host:port (TLS)
+# ============================================================================
+[ice_servers]
+# Primary STUN servers (empty = use Google fallback)
+stun_servers = []
+
+# Primary TURN servers (optional, for relay when direct connectivity fails)
+# Each TURN server requires url, username, and credential
+turn_servers = []
+
+# Use Google STUN servers as fallback when no primary STUN servers configured
+# Set to false if you want to use only your own STUN servers
+use_google_fallback = true
+
+# Example TURN server configuration (uncomment to use):
+# [[ice_servers.turn_servers]]
+# url = "turn:turn.example.com:3478"
+# username = "your-username"
+# credential = "your-password"
+
+# Example TURNS (TLS) server configuration:
+# [[ice_servers.turn_servers]]
+# url = "turns:turn.example.com:5349"
+# username = "your-username"
+# credential = "your-password"
+
+[api]
+bind_addr = "127.0.0.1:8081"
+jwt_secret = "dev-secret-change-in-production"
+enabled = true

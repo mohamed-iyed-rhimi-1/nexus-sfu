@@ -1,0 +1,158 @@
+{
+  "dashboard": {
+    "title": "Nexus SFU Metrics",
+    "tags": ["nexus", "sfu", "webrtc"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Packet Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_sfu_packets_received_total[1m])",
+            "legendFormat": "Received"
+          },
+          {
+            "expr": "rate(nexus_sfu_packets_forwarded_total[1m])",
+            "legendFormat": "Forwarded"
+          },
+          {
+            "expr": "rate(nexus_sfu_packets_dropped_total[1m])",
+            "legendFormat": "Dropped"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "packets/sec",
+            "format": "short"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Forwarding Latency",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(nexus_sfu_forwarding_latency_seconds_bucket[1m]))",
+            "legendFormat": "P50"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(nexus_sfu_forwarding_latency_seconds_bucket[1m]))",
+            "legendFormat": "P99"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "latency (ms)",
+            "format": "ms"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Active Entities",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "nexus_sfu_active_tracks",
+            "legendFormat": "Tracks"
+          },
+          {
+            "expr": "nexus_sfu_active_participants",
+            "legendFormat": "Participants"
+          },
+          {
+            "expr": "nexus_sfu_active_rooms",
+            "legendFormat": "Rooms"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Bandwidth Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_sfu_bytes_received_total[1m]) * 8",
+            "legendFormat": "Inbound"
+          },
+          {
+            "expr": "rate(nexus_sfu_bytes_forwarded_total[1m]) * 8",
+            "legendFormat": "Outbound"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "bits/sec",
+            "format": "bps"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Worker CPU Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "nexus_worker_cpu_usage_percent / 100",
+            "legendFormat": "Worker {{worker_id}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "CPU %",
+            "format": "percent",
+            "max": 1
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "CRDT Gossip Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_crdt_gossip_messages_sent_total[1m])",
+            "legendFormat": "Sent"
+          },
+          {
+            "expr": "rate(nexus_crdt_gossip_messages_received_total[1m])",
+            "legendFormat": "Received"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Actor Counts",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "nexus_actor_rooms",
+            "legendFormat": "Rooms"
+          },
+          {
+            "expr": "nexus_actor_participants",
+            "legendFormat": "Participants"
+          },
+          {
+            "expr": "nexus_actor_tracks",
+            "legendFormat": "Tracks"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Actor Message Queue Depth",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "nexus_actor_message_queue_depth",
+            "legendFormat": "Queue Depth"
+          }
+        ]
+      }
+    ]
+  }
+}

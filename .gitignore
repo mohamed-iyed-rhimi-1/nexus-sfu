@@ -1,0 +1,7 @@
+dashboard/node_modules/
+dashboard/dist/
+target
+.kiro/
+
+# Local development certificates
+certs/

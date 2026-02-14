@@ -1,0 +1,15 @@
+[package]
+name = "nexus-actor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+arc-swap = "1.7"
+parking_lot = "0.12"
+nexus-core = { path = "../nexus-core" }
+nexus-state = { path = "../nexus-state" }
+
+[dev-dependencies]
+proptest = "1.4"

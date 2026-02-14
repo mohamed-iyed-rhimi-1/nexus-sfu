@@ -1,0 +1,60 @@
+[package]
+name = "nexus-loadtest"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "CLI-based WebRTC load testing tool for Nexus SFU"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "load-testing", "sfu", "performance"]
+categories = ["development-tools::testing", "network-programming"]
+
+[[bin]]
+name = "nexus-loadtest"
+path = "src/main.rs"
+
+[[bin]]
+name = "nexus-pps-flood"
+path = "src/bin/nexus_pps_flood.rs"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# System
+libc = "0.2"
+
+# WebRTC connectivity
+webrtc = "0.10"
+
+# Async runtime
+tokio = { version = "1.44", features = ["full", "rt-multi-thread", "net", "sync", "time", "macros"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebSocket signaling
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# HTTP server for Prometheus metrics endpoint
+axum = { version = "0.7", features = ["json"] }
+
+# Progress display
+indicatif = "0.17"
+
+# Workspace crates
+nexus-core = { path = "../nexus-core" }
+nexus-signal = { path = "../nexus-signal" }
+
+[dev-dependencies]
+proptest = "1.4"
+tokio-test = "0.4"

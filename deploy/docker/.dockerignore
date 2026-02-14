@@ -1,0 +1,53 @@
+# TigerStyle: minimize build context size
+# Only include what's necessary for the build
+
+# Git metadata
+.git
+.github
+.gitignore
+
+# Build artifacts
+target/
+*.o
+*.so
+*.a
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Test files
+tests/
+benches/
+proptest-regressions/
+
+# Dashboard (not needed for server build)
+dashboard/
+
+# Deployment files (not needed in image)
+deploy/kubernetes/
+deploy/terraform/
+deploy/grafana/
+
+# Scripts
+scripts/
+
+# Examples
+examples/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Config files (except production.toml which is explicitly copied)
+config/default.toml
+config/development.toml

@@ -1,0 +1,459 @@
+// Nexus SFU Metrics Protocol Buffers Schema
+// Detailed metrics message types for Prometheus-compatible export
+//
+// This schema defines comprehensive metrics types matching the nexus-metrics
+// crate exports. It complements the existing Cap'n Proto metrics.capnp schema
+// used for real-time WebSocket metrics streaming.
+
+syntax = "proto3";
+
+package nexus.metrics.v1;
+
+option java_package = "com.nexus.metrics.v1";
+option java_multiple_files = true;
+option go_package = "github.com/nexus-sfu/metrics/v1;metricsv1";
+
+// ============================================================================
+// Top-Level Metrics
+// ============================================================================
+
+// SfuMetrics contains all SFU-level metrics.
+// These metrics are exported to Prometheus and match the nexus-metrics crate.
+message SfuMetrics {
+  // Collection timestamp (nanoseconds since Unix epoch)
+  uint64 timestamp_ns = 1;
+
+  // Packet counters (monotonically increasing)
+  PacketCounters packets = 2;
+
+  // Bandwidth counters (monotonically increasing)
+  BandwidthCounters bandwidth = 3;
+
+  // Latency metrics
+  LatencyMetrics latency = 4;
+
+  // Entity gauges (current values)
+  EntityGauges entities = 5;
+
+  // Per-worker metrics
+  repeated WorkerMetrics workers = 6;
+
+  // Per-room metrics
+  repeated RoomMetrics rooms = 7;
+
+  // Per-track metrics (optional, can be large)
+  repeated TrackMetrics tracks = 8;
+
+  // CRDT synchronization metrics
+  CrdtMetrics crdt = 9;
+
+  // Actor system metrics
+  ActorMetrics actors = 10;
+}
+
+// ============================================================================
+// Packet Metrics
+// ============================================================================
+
+// PacketCounters contains packet-related counters.
+// All counters are monotonically increasing totals.
+message PacketCounters {
+  // Total packets received from publishers
+  uint64 received_total = 1;
+
+  // Total packets forwarded to subscribers
+  uint64 forwarded_total = 2;
+
+  // Total packets dropped (arena exhaustion, parse errors, etc.)
+  uint64 dropped_total = 3;
+
+  // Packets dropped due to arena exhaustion
+  uint64 dropped_arena_exhausted = 4;
+
+  // Packets dropped due to parse errors
+  uint64 dropped_parse_error = 5;
+
+  // Packets dropped due to unknown SSRC
+  uint64 dropped_unknown_ssrc = 6;
+
+  // Packets dropped due to subscriber filtering
+  uint64 dropped_filtered = 7;
+
+  // RTCP packets received
+  uint64 rtcp_received = 8;
+
+  // RTCP packets sent
+  uint64 rtcp_sent = 9;
+}
+
+// ============================================================================
+// Bandwidth Metrics
+// ============================================================================
+
+// BandwidthCounters contains bandwidth-related counters.
+// All values are in bytes, monotonically increasing.
+message BandwidthCounters {
+  // Total bytes received from publishers
+  uint64 received_bytes = 1;
+
+  // Total bytes forwarded to subscribers
+  uint64 forwarded_bytes = 2;
+
+  // Current estimated bandwidth (bits per second)
+  uint64 estimated_bps = 3;
+
+  // Minimum bandwidth estimate seen
+  uint64 min_estimated_bps = 4;
+
+  // Maximum bandwidth estimate seen
+  uint64 max_estimated_bps = 5;
+}
+
+// ============================================================================
+// Latency Metrics
+// ============================================================================
+
+// LatencyMetrics contains forwarding latency statistics.
+// Latency is measured from packet receive to forward completion.
+message LatencyMetrics {
+  // Sum of all latencies (nanoseconds) for average calculation
+  uint64 sum_nanos = 1;
+
+  // Count of latency samples
+  uint64 count = 2;
+
+  // Histogram buckets for latency distribution
+  // Buckets: <1ms, <5ms, <10ms, <50ms, <100ms, <500ms, >500ms
+  LatencyHistogram histogram = 3;
+
+  // Estimated P50 latency (milliseconds)
+  double p50_ms = 4;
+
+  // Estimated P99 latency (milliseconds)
+  double p99_ms = 5;
+
+  // Average latency (milliseconds)
+  double avg_ms = 6;
+}
+
+// LatencyHistogram contains bucket counts for latency distribution.
+// Follows Prometheus histogram conventions.
+message LatencyHistogram {
+  // Packets with latency < 1ms
+  uint64 bucket_1ms = 1;
+
+  // Packets with latency < 5ms
+  uint64 bucket_5ms = 2;
+
+  // Packets with latency < 10ms
+  uint64 bucket_10ms = 3;
+
+  // Packets with latency < 50ms
+  uint64 bucket_50ms = 4;
+
+  // Packets with latency < 100ms
+  uint64 bucket_100ms = 5;
+
+  // Packets with latency < 500ms
+  uint64 bucket_500ms = 6;
+
+  // Packets with latency >= 500ms
+  uint64 bucket_inf = 7;
+}
+
+// ============================================================================
+// Entity Gauges
+// ============================================================================
+
+// EntityGauges contains current counts of active entities.
+// These are point-in-time values, not cumulative counters.
+message EntityGauges {
+  // Number of active rooms
+  uint64 active_rooms = 1;
+
+  // Number of active participants across all rooms
+  uint64 active_participants = 2;
+
+  // Number of active tracks across all rooms
+  uint64 active_tracks = 3;
+
+  // Number of active subscriptions
+  uint64 active_subscriptions = 4;
+
+  // Number of hot subscribers (actively receiving)
+  uint64 hot_subscribers = 5;
+
+  // Number of cold subscribers (inactive)
+  uint64 cold_subscribers = 6;
+
+  // Number of WebSocket connections
+  uint64 websocket_connections = 7;
+
+  // Arena free slots available
+  uint64 arena_free_slots = 8;
+
+  // Arena total capacity (slots)
+  uint64 arena_capacity = 9;
+}
+
+// ============================================================================
+// Worker Metrics
+// ============================================================================
+
+// WorkerMetrics contains per-worker statistics.
+// Each worker is pinned to a CPU core and processes tracks independently.
+message WorkerMetrics {
+  // Worker identifier (0 to num_workers-1)
+  uint32 worker_id = 1;
+
+  // CPU core this worker is pinned to
+  uint32 core_id = 2;
+
+  // CPU usage percentage (0.0 to 100.0)
+  float cpu_usage_percent = 3;
+
+  // Memory usage in bytes
+  uint64 memory_usage_bytes = 4;
+
+  // Number of tracks assigned to this worker
+  uint32 track_count = 5;
+
+  // Current packet queue depth
+  uint32 packet_queue_depth = 6;
+
+  // Total packets processed by this worker
+  uint64 packets_processed_total = 7;
+
+  // Packets dropped by this worker
+  uint64 packets_dropped = 8;
+
+  // Track migrations sent from this worker
+  uint64 migrations_sent = 9;
+
+  // Track migrations received by this worker
+  uint64 migrations_received = 10;
+
+  // Batch sender statistics
+  BatchSenderMetrics batch_sender = 11;
+}
+
+// BatchSenderMetrics contains sendmmsg batch statistics.
+message BatchSenderMetrics {
+  // Total batches sent
+  uint64 batches_sent = 1;
+
+  // Total packets sent via batching
+  uint64 packets_sent = 2;
+
+  // Packets that failed to send
+  uint64 packets_failed = 3;
+
+  // Average batch size
+  float avg_batch_size = 4;
+
+  // Maximum batch size seen
+  uint32 max_batch_size = 5;
+}
+
+// ============================================================================
+// Room Metrics
+// ============================================================================
+
+// RoomMetrics contains per-room statistics.
+message RoomMetrics {
+  // Room identifier
+  uint32 room_id = 1;
+
+  // Room name
+  string room_name = 2;
+
+  // Number of participants in this room
+  uint32 participant_count = 3;
+
+  // Number of tracks in this room
+  uint32 track_count = 4;
+
+  // Packets sent from this room
+  uint64 packets_sent = 5;
+
+  // Packets received in this room
+  uint64 packets_received = 6;
+
+  // Packets dropped in this room
+  uint64 packets_dropped = 7;
+
+  // Bytes sent from this room
+  uint64 bytes_sent = 8;
+
+  // Bytes received in this room
+  uint64 bytes_received = 9;
+
+  // Room creation timestamp (nanoseconds since Unix epoch)
+  uint64 created_at_ns = 10;
+
+  // Last activity timestamp (nanoseconds since Unix epoch)
+  uint64 last_activity_ns = 11;
+}
+
+// ============================================================================
+// Track Metrics
+// ============================================================================
+
+// TrackMetrics contains per-track statistics.
+message TrackMetrics {
+  // Track identifier
+  uint32 track_id = 1;
+
+  // SSRC for this track
+  uint32 ssrc = 2;
+
+  // Room containing this track
+  uint32 room_id = 3;
+
+  // Participant who published this track
+  uint32 publisher_id = 4;
+
+  // Media type (audio or video)
+  MediaType media_type = 5;
+
+  // Number of subscribers to this track
+  uint32 subscriber_count = 6;
+
+  // Number of hot (active) subscribers
+  uint32 hot_subscriber_count = 7;
+
+  // Number of cold (inactive) subscribers
+  uint32 cold_subscriber_count = 8;
+
+  // Packets received on this track
+  uint64 packets_received = 9;
+
+  // Packets forwarded from this track
+  uint64 packets_forwarded = 10;
+
+  // Packets dropped on this track
+  uint64 packets_dropped = 11;
+
+  // Bytes received on this track
+  uint64 bytes_received = 12;
+
+  // Bytes forwarded from this track
+  uint64 bytes_forwarded = 13;
+
+  // Current bitrate (bits per second)
+  uint64 bitrate_bps = 14;
+
+  // Ring buffer statistics
+  RingBufferMetrics ring_buffer = 15;
+}
+
+// MediaType represents the type of media track.
+enum MediaType {
+  MEDIA_TYPE_UNSPECIFIED = 0;
+  MEDIA_TYPE_AUDIO = 1;
+  MEDIA_TYPE_VIDEO = 2;
+}
+
+// RingBufferMetrics contains per-track ring buffer statistics.
+message RingBufferMetrics {
+  // Current number of packets in buffer
+  uint32 current_size = 1;
+
+  // Buffer capacity (max packets)
+  uint32 capacity = 2;
+
+  // Current head sequence number
+  uint32 head_sequence = 3;
+
+  // Current tail sequence number
+  uint32 tail_sequence = 4;
+
+  // Number of overwrites (buffer full)
+  uint64 overwrites = 5;
+}
+
+// ============================================================================
+// CRDT Metrics
+// ============================================================================
+
+// CrdtMetrics contains distributed state synchronization metrics.
+message CrdtMetrics {
+  // Number of CRDT merge operations
+  uint64 merges_total = 1;
+
+  // Number of gossip messages sent
+  uint64 gossip_sent = 2;
+
+  // Number of gossip messages received
+  uint64 gossip_received = 3;
+
+  // Number of state conflicts resolved
+  uint64 conflicts_resolved = 4;
+
+  // Current state version
+  uint64 state_version = 5;
+
+  // Number of cluster nodes known
+  uint32 cluster_size = 6;
+
+  // GCounter metrics
+  GCounterMetrics gcounter = 7;
+
+  // ORSwot metrics
+  OrswotMetrics orswot = 8;
+}
+
+// GCounterMetrics contains grow-only counter statistics.
+message GCounterMetrics {
+  // Number of increment operations
+  uint64 increments = 1;
+
+  // Number of merge operations
+  uint64 merges = 2;
+
+  // Current counter value
+  uint64 value = 3;
+}
+
+// OrswotMetrics contains observed-remove set without tombstones statistics.
+message OrswotMetrics {
+  // Number of add operations
+  uint64 adds = 1;
+
+  // Number of remove operations
+  uint64 removes = 2;
+
+  // Number of merge operations
+  uint64 merges = 3;
+
+  // Current set size
+  uint64 size = 4;
+}
+
+// ============================================================================
+// Actor Metrics
+// ============================================================================
+
+// ActorMetrics contains actor system statistics.
+message ActorMetrics {
+  // Number of active room actors
+  uint32 room_actors = 1;
+
+  // Number of active participant actors
+  uint32 participant_actors = 2;
+
+  // Number of active track actors
+  uint32 track_actors = 3;
+
+  // Total messages processed
+  uint64 messages_processed = 4;
+
+  // Messages currently in queues
+  uint64 messages_queued = 5;
+
+  // Actor restarts due to failures
+  uint64 restarts = 6;
+
+  // Actor supervision events
+  uint64 supervision_events = 7;
+}

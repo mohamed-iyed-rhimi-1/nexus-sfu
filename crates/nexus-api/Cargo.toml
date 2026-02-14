@@ -1,0 +1,43 @@
+[package]
+name = "nexus-api"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "HTTP REST API with JWT authentication, health checks, and room management for Nexus SFU"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "sfu", "api", "rest", "jwt"]
+categories = ["multimedia", "network-programming", "web-programming"]
+
+[dependencies]
+# Shared types and error types
+nexus-core = { path = "../nexus-core" }
+
+# Metrics infrastructure for /metrics endpoint
+nexus-metrics = { path = "../nexus-metrics" }
+
+# Distributed state for room synchronization
+nexus-state = { path = "../nexus-state" }
+
+# HTTP server framework
+axum = { version = "0.7", features = ["json", "macros"] }
+
+# Async runtime
+tokio = { version = "1.35", features = ["sync", "time", "net", "rt"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# JWT authentication
+jsonwebtoken = "9.2"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+axum-test = "14.0"

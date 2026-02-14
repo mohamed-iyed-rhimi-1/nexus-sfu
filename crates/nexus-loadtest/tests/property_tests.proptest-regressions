@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bc0cc8af38eef90ecd9e233a6c531d231b2cc3d03fa7dcbc0c61446822792d55 # shrinks to report = TestReport { scenario: "webinar", sfu_url: "wss://0:0", duration_secs: 1, timestamp: "0000-00-00T00:00:00Z", metrics: SerializableMetrics { latency_p50_ms: 0.0, latency_p95_ms: 0.0, latency_p99_ms: 0.0, packet_loss_rate: 0.0, jitter_avg_ms: 0.0, throughput_pps: 0.0, throughput_bps: 1824460.7603753926, connection_success_rate: 0.0, avg_time_to_first_frame_ms: 0.0, total_clients: 0, successful_clients: 0, failed_clients: 0 }, target_validations: [], passed: false }

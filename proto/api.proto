@@ -1,0 +1,494 @@
+// Nexus SFU gRPC API Service
+// Protocol Buffers schema for SFU management operations
+//
+// This schema defines the gRPC service for managing rooms, participants,
+// and tracks in the Nexus SFU. It complements the existing Cap'n Proto
+// schemas (signaling.capnp, metrics.capnp) used for real-time signaling.
+
+syntax = "proto3";
+
+package nexus.api.v1;
+
+option java_package = "com.nexus.api.v1";
+option java_multiple_files = true;
+option go_package = "github.com/nexus-sfu/api/v1;apiv1";
+
+// NexusSfu is the main gRPC service for SFU management operations.
+// All room management endpoints require JWT authentication.
+// Health and metrics endpoints are public.
+service NexusSfu {
+  // CreateRoom creates a new room with the specified configuration.
+  // Requires: JWT authentication
+  // Returns: The created room with its assigned ID
+  rpc CreateRoom(CreateRoomRequest) returns (CreateRoomResponse);
+
+  // GetRoom retrieves details for a specific room by ID.
+  // Requires: JWT authentication
+  // Returns: Room details or NOT_FOUND error
+  rpc GetRoom(GetRoomRequest) returns (GetRoomResponse);
+
+  // ListRooms returns all active rooms.
+  // Requires: JWT authentication
+  // Returns: List of all rooms with their current state
+  rpc ListRooms(ListRoomsRequest) returns (ListRoomsResponse);
+
+  // DeleteRoom removes a room and disconnects all participants.
+  // Requires: JWT authentication
+  // Returns: Empty response on success
+  rpc DeleteRoom(DeleteRoomRequest) returns (DeleteRoomResponse);
+
+  // GetHealth returns the health status of the SFU.
+  // Public endpoint - no authentication required
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+
+  // GetMetrics returns current SFU metrics.
+  // Public endpoint - no authentication required
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+
+  // GetParticipant retrieves details for a specific participant.
+  // Requires: JWT authentication
+  rpc GetParticipant(GetParticipantRequest) returns (GetParticipantResponse);
+
+  // ListParticipants returns all participants in a room.
+  // Requires: JWT authentication
+  rpc ListParticipants(ListParticipantsRequest) returns (ListParticipantsResponse);
+
+  // RemoveParticipant forcibly removes a participant from a room.
+  // Requires: JWT authentication
+  rpc RemoveParticipant(RemoveParticipantRequest) returns (RemoveParticipantResponse);
+
+  // GetTrack retrieves details for a specific track.
+  // Requires: JWT authentication
+  rpc GetTrack(GetTrackRequest) returns (GetTrackResponse);
+
+  // ListTracks returns all tracks in a room.
+  // Requires: JWT authentication
+  rpc ListTracks(ListTracksRequest) returns (ListTracksResponse);
+}
+
+// ============================================================================
+// Room Messages
+// ============================================================================
+
+// CreateRoomRequest contains parameters for creating a new room.
+message CreateRoomRequest {
+  // Human-readable name for the room (1-256 characters)
+  string name = 1;
+
+  // Maximum number of participants allowed (1-1000, default: 500)
+  uint32 max_participants = 2;
+
+  // Optional metadata for the room (JSON string, max 4KB)
+  string metadata = 3;
+}
+
+// CreateRoomResponse contains the created room details.
+message CreateRoomResponse {
+  // The created room
+  Room room = 1;
+}
+
+// GetRoomRequest identifies a room to retrieve.
+message GetRoomRequest {
+  // Unique room identifier
+  uint32 room_id = 1;
+}
+
+// GetRoomResponse contains the requested room details.
+message GetRoomResponse {
+  // The requested room
+  Room room = 1;
+}
+
+// ListRoomsRequest contains optional filters for listing rooms.
+message ListRoomsRequest {
+  // Maximum number of rooms to return (default: 100, max: 1000)
+  uint32 limit = 1;
+
+  // Offset for pagination
+  uint32 offset = 2;
+}
+
+// ListRoomsResponse contains the list of rooms.
+message ListRoomsResponse {
+  // List of rooms
+  repeated Room rooms = 1;
+
+  // Total number of rooms (for pagination)
+  uint32 total_count = 2;
+}
+
+// DeleteRoomRequest identifies a room to delete.
+message DeleteRoomRequest {
+  // Unique room identifier
+  uint32 room_id = 1;
+
+  // If true, forcibly disconnect all participants
+  bool force = 2;
+}
+
+// DeleteRoomResponse is empty on success.
+message DeleteRoomResponse {}
+
+// Room represents a conference room in the SFU.
+message Room {
+  // Unique room identifier (assigned by server)
+  uint32 id = 1;
+
+  // Human-readable room name
+  string name = 2;
+
+  // Current number of participants
+  uint32 participant_count = 3;
+
+  // Maximum allowed participants
+  uint32 max_participants = 4;
+
+  // Current number of active tracks
+  uint32 track_count = 5;
+
+  // Room creation timestamp (nanoseconds since Unix epoch)
+  uint64 created_at_ns = 6;
+
+  // Last activity timestamp (nanoseconds since Unix epoch)
+  uint64 last_activity_ns = 7;
+
+  // Optional room metadata (JSON string)
+  string metadata = 8;
+}
+
+// ============================================================================
+// Participant Messages
+// ============================================================================
+
+// GetParticipantRequest identifies a participant to retrieve.
+message GetParticipantRequest {
+  // Room containing the participant
+  uint32 room_id = 1;
+
+  // Unique participant identifier
+  uint32 participant_id = 2;
+}
+
+// GetParticipantResponse contains the requested participant details.
+message GetParticipantResponse {
+  // The requested participant
+  Participant participant = 1;
+}
+
+// ListParticipantsRequest identifies a room to list participants from.
+message ListParticipantsRequest {
+  // Room to list participants from
+  uint32 room_id = 1;
+
+  // Maximum number of participants to return (default: 100, max: 1000)
+  uint32 limit = 2;
+
+  // Offset for pagination
+  uint32 offset = 3;
+}
+
+// ListParticipantsResponse contains the list of participants.
+message ListParticipantsResponse {
+  // List of participants
+  repeated Participant participants = 1;
+
+  // Total number of participants in the room
+  uint32 total_count = 2;
+}
+
+// RemoveParticipantRequest identifies a participant to remove.
+message RemoveParticipantRequest {
+  // Room containing the participant
+  uint32 room_id = 1;
+
+  // Participant to remove
+  uint32 participant_id = 2;
+
+  // Reason for removal (sent to participant)
+  string reason = 3;
+}
+
+// RemoveParticipantResponse is empty on success.
+message RemoveParticipantResponse {}
+
+// Participant represents a user in a room.
+message Participant {
+  // Unique participant identifier
+  uint32 id = 1;
+
+  // Human-readable participant name
+  string name = 2;
+
+  // Room the participant is in
+  uint32 room_id = 3;
+
+  // IDs of tracks published by this participant
+  repeated uint32 published_track_ids = 4;
+
+  // IDs of tracks this participant is subscribed to
+  repeated uint32 subscribed_track_ids = 5;
+
+  // Join timestamp (nanoseconds since Unix epoch)
+  uint64 joined_at_ns = 6;
+
+  // Last activity timestamp (nanoseconds since Unix epoch)
+  uint64 last_activity_ns = 7;
+
+  // Connection state
+  ConnectionState connection_state = 8;
+}
+
+// ConnectionState represents the participant's connection status.
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_STATE_CONNECTING = 1;
+  CONNECTION_STATE_CONNECTED = 2;
+  CONNECTION_STATE_RECONNECTING = 3;
+  CONNECTION_STATE_DISCONNECTED = 4;
+}
+
+// ============================================================================
+// Track Messages
+// ============================================================================
+
+// GetTrackRequest identifies a track to retrieve.
+message GetTrackRequest {
+  // Room containing the track
+  uint32 room_id = 1;
+
+  // Unique track identifier
+  uint32 track_id = 2;
+}
+
+// GetTrackResponse contains the requested track details.
+message GetTrackResponse {
+  // The requested track
+  Track track = 1;
+}
+
+// ListTracksRequest identifies a room to list tracks from.
+message ListTracksRequest {
+  // Room to list tracks from
+  uint32 room_id = 1;
+
+  // Optional: filter by participant
+  uint32 participant_id = 2;
+
+  // Optional: filter by media kind
+  MediaKind kind = 3;
+}
+
+// ListTracksResponse contains the list of tracks.
+message ListTracksResponse {
+  // List of tracks
+  repeated Track tracks = 1;
+
+  // Total number of tracks matching the filter
+  uint32 total_count = 2;
+}
+
+// Track represents a media stream (audio or video).
+message Track {
+  // Unique track identifier
+  uint32 id = 1;
+
+  // SSRC (Synchronization Source) for RTP
+  uint32 ssrc = 2;
+
+  // Type of media
+  MediaKind kind = 3;
+
+  // Participant who published this track
+  uint32 publisher_id = 4;
+
+  // Room containing this track
+  uint32 room_id = 5;
+
+  // Number of subscribers to this track
+  uint32 subscriber_count = 6;
+
+  // Track statistics
+  TrackStats stats = 7;
+
+  // Whether the track is currently enabled
+  bool enabled = 8;
+
+  // Whether the track is muted
+  bool muted = 9;
+}
+
+// MediaKind represents the type of media.
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_AUDIO = 1;
+  MEDIA_KIND_VIDEO = 2;
+}
+
+// TrackStats contains statistics for a track.
+message TrackStats {
+  // Total packets received on this track
+  uint64 packets_received = 1;
+
+  // Total packets forwarded from this track
+  uint64 packets_forwarded = 2;
+
+  // Total packets dropped on this track
+  uint64 packets_dropped = 3;
+
+  // Total bytes received
+  uint64 bytes_received = 4;
+
+  // Total bytes forwarded
+  uint64 bytes_forwarded = 5;
+
+  // Current bitrate in bits per second
+  uint64 bitrate_bps = 6;
+}
+
+// ============================================================================
+// Health Messages
+// ============================================================================
+
+// HealthRequest is empty - no parameters needed.
+message HealthRequest {}
+
+// HealthResponse contains the SFU health status.
+message HealthResponse {
+  // Overall health status
+  HealthStatus status = 1;
+
+  // Human-readable status message
+  string message = 2;
+
+  // Server version
+  string version = 3;
+
+  // Server uptime in seconds
+  uint64 uptime_seconds = 4;
+}
+
+// HealthStatus represents the overall health of the SFU.
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_HEALTHY = 1;
+  HEALTH_STATUS_DEGRADED = 2;
+  HEALTH_STATUS_UNHEALTHY = 3;
+}
+
+// ============================================================================
+// Metrics Messages
+// ============================================================================
+
+// MetricsRequest contains optional filters for metrics.
+message MetricsRequest {
+  // If true, include per-worker metrics
+  bool include_workers = 1;
+
+  // If true, include per-room metrics
+  bool include_rooms = 2;
+
+  // If true, include per-track metrics
+  bool include_tracks = 3;
+}
+
+// MetricsResponse contains current SFU metrics.
+// See proto/metrics.proto for detailed metric message types.
+message MetricsResponse {
+  // Timestamp when metrics were collected (nanoseconds since Unix epoch)
+  uint64 timestamp_ns = 1;
+
+  // Global SFU metrics
+  SfuMetricsSummary sfu = 2;
+
+  // Per-worker metrics (if requested)
+  repeated WorkerMetricsSummary workers = 3;
+
+  // Per-room metrics (if requested)
+  repeated RoomMetricsSummary rooms = 4;
+}
+
+// SfuMetricsSummary contains high-level SFU metrics.
+// For detailed metrics, see proto/metrics.proto
+message SfuMetricsSummary {
+  // Total packets received
+  uint64 packets_received = 1;
+
+  // Total packets forwarded
+  uint64 packets_forwarded = 2;
+
+  // Total packets dropped
+  uint64 packets_dropped = 3;
+
+  // Total bytes received
+  uint64 bytes_received = 4;
+
+  // Total bytes forwarded
+  uint64 bytes_forwarded = 5;
+
+  // Number of active rooms
+  uint64 active_rooms = 6;
+
+  // Number of active participants
+  uint64 active_participants = 7;
+
+  // Number of active tracks
+  uint64 active_tracks = 8;
+
+  // Average forwarding latency in milliseconds
+  double avg_latency_ms = 9;
+
+  // P50 forwarding latency in milliseconds
+  double p50_latency_ms = 10;
+
+  // P99 forwarding latency in milliseconds
+  double p99_latency_ms = 11;
+}
+
+// WorkerMetricsSummary contains per-worker metrics.
+message WorkerMetricsSummary {
+  // Worker identifier
+  uint32 worker_id = 1;
+
+  // CPU core this worker is pinned to
+  uint32 core_id = 2;
+
+  // CPU usage percentage (0-100)
+  float cpu_usage_percent = 3;
+
+  // Number of tracks assigned to this worker
+  uint32 track_count = 4;
+
+  // Total packets processed by this worker
+  uint64 packets_processed = 5;
+
+  // Current packet queue depth
+  uint32 queue_depth = 6;
+}
+
+// RoomMetricsSummary contains per-room metrics.
+message RoomMetricsSummary {
+  // Room identifier
+  uint32 room_id = 1;
+
+  // Room name
+  string room_name = 2;
+
+  // Number of participants
+  uint32 participant_count = 3;
+
+  // Number of tracks
+  uint32 track_count = 4;
+
+  // Packets sent from this room
+  uint64 packets_sent = 5;
+
+  // Packets received in this room
+  uint64 packets_received = 6;
+
+  // Bytes sent from this room
+  uint64 bytes_sent = 7;
+
+  // Bytes received in this room
+  uint64 bytes_received = 8;
+}

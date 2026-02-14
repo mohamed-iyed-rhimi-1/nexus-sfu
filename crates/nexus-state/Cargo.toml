@@ -1,0 +1,37 @@
+[package]
+name = "nexus-state"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "CRDT-based distributed state management for Nexus SFU"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["crdt", "distributed", "state", "concurrent", "gossip"]
+categories = ["data-structures", "concurrency", "network-programming"]
+
+[dependencies]
+thiserror = "1.0"
+libc = "0.2"
+nexus-core = { path = "../nexus-core" }
+serde = { version = "1.0", features = ["derive"], optional = true }
+getrandom = "0.2"
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crdt_bench"
+harness = false
+
+[[bench]]
+name = "gossip_bench"
+harness = false
+
+[[bench]]
+name = "distributed_state_bench"
+harness = false

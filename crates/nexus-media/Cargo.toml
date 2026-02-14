@@ -1,0 +1,17 @@
+[package]
+name = "nexus-media"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "RTP/RTCP parsing, codec-specific handlers, and simulcast logic for Nexus SFU"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "sfu", "rtp", "media"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1.4"
