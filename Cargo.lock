@@ -1891,7 +1891,9 @@ dependencies = [
  "jsonwebtoken",
  "nexus-core",
  "nexus-metrics",
+ "nexus-recorder",
  "nexus-state",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1982,6 +1984,18 @@ dependencies = [
  "prometheus",
  "tokio",
  "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "nexus-recorder"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "nexus-core",
+ "parking_lot",
+ "serde",
+ "tempfile",
  "tracing",
 ]
 

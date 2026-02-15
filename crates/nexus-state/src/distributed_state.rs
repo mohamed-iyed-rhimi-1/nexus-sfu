@@ -1264,6 +1264,9 @@ impl DistributedState {
                     Err(e) => Err(e),
                 }
             }
+
+            // Relay events don't modify CRDT state — handled by gossip protocol.
+            StateUpdate::RelaySubscribe { .. } | StateUpdate::RelayUnsubscribe { .. } => Ok(()),
         }
     }
 
@@ -1540,9 +1543,10 @@ mod tests {
         let state = DistributedState::new(config);
 
         let info = TrackInfo {
-            track_type: 1,
+            track_type: 1, content_type: 0,
             codec: 100,
             bitrate_kbps: 2500,
+            owner_node: 0,
         };
 
         // Add track
@@ -1555,9 +1559,10 @@ mod tests {
 
         // Update track
         let new_info = TrackInfo {
-            track_type: 1,
+            track_type: 1, content_type: 0,
             codec: 100,
             bitrate_kbps: 5000,
+            owner_node: 0,
         };
         let ts2 = state.update_track(1, new_info).unwrap();
         assert!(ts2 > ts);

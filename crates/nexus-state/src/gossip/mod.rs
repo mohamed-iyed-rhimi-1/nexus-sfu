@@ -76,7 +76,7 @@ pub mod types;
 pub use config::{GossipConfig, SeedPeer, MAX_SEED_PEERS};
 pub use membership::MembershipList;
 pub use protocol::ProtocolStats;
-pub use protocol::{PendingPing, SwimProtocol};
+pub use protocol::{PendingPing, RelayEvent, SwimProtocol};
 pub use transport::{GossipTransport, TransportStats};
 pub use types::{
     GossipMessage, PeerInfo, PeerState, StateUpdate,

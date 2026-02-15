@@ -1,0 +1,20 @@
+[package]
+name = "nexus-recorder"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+description = "Production-grade room recording for Nexus SFU — zero-alloc hot path, TigerStyle compliant"
+license = "Apache-2.0"
+repository = "https://github.com/nexus/nexus-sfu"
+keywords = ["webrtc", "sfu", "recording", "rtp"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"

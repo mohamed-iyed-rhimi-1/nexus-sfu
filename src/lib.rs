@@ -50,6 +50,7 @@ pub mod error;
 pub mod forward;
 pub mod orchestrator;
 pub mod proto;
+pub mod relay;
 pub mod sfu;
 pub mod signal;
 pub mod spin;

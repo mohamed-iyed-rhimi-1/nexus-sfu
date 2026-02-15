@@ -437,6 +437,22 @@ pub struct MediaWorker {
     last_remb_sent_us: u64,
     /// REMB generator (sender SSRC = 1 for SFU).
     remb_generator: nexus_bwe::RembGenerator,
+    /// Channel for relay output packets (worker → main loop → RelayManager).
+    /// When a subscriber has `is_relay == true`, raw RTP is queued here
+    /// instead of going through SRTP + batch_sender.
+    relay_out_tx: Option<crossbeam::channel::Sender<RelayOutput>>,
+}
+
+/// A packet destined for a relay peer node.
+pub struct RelayOutput {
+    /// Peer node to relay to.
+    pub peer_node: u64,
+    /// Track ID.
+    pub track_id: TrackId,
+    /// Raw RTP data (no SRTP).
+    pub data: [u8; 1500],
+    /// Length of valid data.
+    pub len: u16,
 }
 
 /// State for a TrackActor hosted by a worker.
@@ -452,6 +468,9 @@ struct TrackActorState {
     ssrc: Ssrc,
     /// Media kind.
     kind: MediaKind,
+    /// Content type: 0=camera, 1=screen, 2=audio.
+    /// Screen share (1) bypasses viewport filtering.
+    content_type: u8,
     /// Ring buffer for packet storage.
     ring_buffer: RingBuffer<2048>,
     /// Subscribers for this track.
@@ -514,7 +533,7 @@ struct ActorSubscriber {
     /// Subscriber ID.
     id: u32,
     /// Participant ID.
-    #[allow(dead_code)] // Reserved for participant-level subscriber management
+    #[allow(dead_code)] // Used for viewport filtering context
     participant_id: ParticipantId,
     /// Destination address.
     dest_addr: SocketAddr,
@@ -528,11 +547,22 @@ struct ActorSubscriber {
     /// Maximum layer this subscriber has requested (from signaling).
     /// Allocation will not exceed this even if bandwidth allows.
     max_requested_layer: u8,
+    /// Viewport: sorted source participant IDs visible in subscriber's UI.
+    /// Empty = forward everything (no viewport filtering).
+    viewport_visible: Vec<u32>,
+    /// Viewport: sorted source participant IDs pinned by subscriber.
+    /// Pinned participants always receive video regardless of visible set.
+    viewport_pinned: Vec<u32>,
+    /// If true, this subscriber is a relay to another SFU node.
+    /// Relay subscribers skip SRTP and send via the relay manager.
+    is_relay: bool,
+    /// Peer node ID for relay subscribers (0 if not relay).
+    relay_node: u64,
 }
 
 impl TrackActorState {
     /// Create new actor state.
-    fn new(track_id: TrackId, participant_id: ParticipantId, ssrc: Ssrc, kind: MediaKind) -> Self {
+    fn new(track_id: TrackId, participant_id: ParticipantId, ssrc: Ssrc, kind: MediaKind, content_type: u8) -> Self {
         // Default simulcast layers based on media kind
         let simulcast_layers = if kind == MediaKind::Video {
             vec![
@@ -558,6 +588,7 @@ impl TrackActorState {
             participant_id,
             ssrc,
             kind,
+            content_type,
             ring_buffer: RingBuffer::new(),
             subscribers: Vec::with_capacity(100),
             packets_received: 0,
@@ -593,6 +624,10 @@ impl TrackActorState {
             srtp_context: None,
             target_layer: 2, // Default: highest available layer
             max_requested_layer: 2,
+            viewport_visible: Vec::new(),
+            viewport_pinned: Vec::new(),
+            is_relay: false,
+            relay_node: 0,
         });
     }
 
@@ -737,6 +772,7 @@ impl MediaWorker {
             num_workers: 0,    // Will be set by WorkerPool
             last_remb_sent_us: 0,
             remb_generator: nexus_bwe::RembGenerator::new(1), // SFU sender SSRC
+            relay_out_tx: None,
         })
     }
 
@@ -1056,7 +1092,8 @@ impl MediaWorker {
                 kind,
             } => {
                 // Delegate to spawn_actor for unified track management
-                self.spawn_actor(track_id, 0, ssrc, kind);
+                let ct = if kind == MediaKind::Audio { 2 } else { 0 };
+                self.spawn_actor(track_id, 0, ssrc, kind, ct);
                 true
             }
             WorkerMessage::RemoveTrack { track_id } => {
@@ -1077,8 +1114,9 @@ impl MediaWorker {
                 participant_id,
                 ssrc,
                 kind,
+                content_type,
             } => {
-                self.spawn_actor(track_id, participant_id, ssrc, kind);
+                self.spawn_actor(track_id, participant_id, ssrc, kind, content_type);
                 true
             }
             WorkerMessage::ActorSubscribe {
@@ -1249,6 +1287,82 @@ impl MediaWorker {
                 }
                 true
             }
+            WorkerMessage::UpdateViewport {
+                track_id,
+                subscriber_id,
+                visible,
+                pinned,
+            } => {
+                if let Some(actor) = self.actors.get_mut(&track_id) {
+                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id) {
+                        sub.viewport_visible = visible;
+                        sub.viewport_pinned = pinned;
+                        tracing::debug!(
+                            track_id, subscriber_id,
+                            visible_count = sub.viewport_visible.len(),
+                            pinned_count = sub.viewport_pinned.len(),
+                            "Subscriber viewport updated"
+                        );
+                    }
+                }
+                true
+            }
+            WorkerMessage::SetContentType {
+                track_id,
+                content_type,
+            } => {
+                if let Some(actor) = self.actors.get_mut(&track_id) {
+                    actor.content_type = content_type;
+                }
+                true
+            }
+            WorkerMessage::AddRelaySubscriber {
+                track_id,
+                peer_node,
+                subscriber_id,
+            } => {
+                if let Some(actor) = self.actors.get_mut(&track_id) {
+                    const MAX_SUBSCRIBERS_PER_TRACK: usize = 2000;
+                    if actor.subscribers.len() < MAX_SUBSCRIBERS_PER_TRACK {
+                        actor.subscribers.push(ActorSubscriber {
+                            id: subscriber_id,
+                            participant_id: 0, // Relay — no real participant
+                            dest_addr: "0.0.0.0:0".parse().unwrap(), // Unused for relay
+                            target_layer: 2,
+                            srtp_context: None,
+                            max_requested_layer: 2,
+                            viewport_visible: Vec::new(),
+                            viewport_pinned: Vec::new(),
+                            is_relay: true,
+                            relay_node: peer_node,
+                        });
+                        tracing::info!(
+                            worker_id = self.worker_id,
+                            track_id, peer_node,
+                            "Added relay subscriber"
+                        );
+                    }
+                }
+                true
+            }
+            WorkerMessage::RelayPacket {
+                track_id,
+                data,
+                len,
+            } => {
+                // Inject relay packet as if it was received locally.
+                // Find the track actor and process through the forwarding pipeline.
+                if let Some(actor) = self.actors.get_mut(&track_id) {
+                    if let Some(mut slot) = self.arena.alloc() {
+                        let slot_data = slot.data_mut();
+                        slot_data[..len as usize].copy_from_slice(&data[..len as usize]);
+                        slot.set_len(len);
+                        actor.ring_buffer.push(slot);
+                        actor.packets_received += 1;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -1261,8 +1375,9 @@ impl MediaWorker {
         participant_id: ParticipantId,
         ssrc: Ssrc,
         kind: MediaKind,
+        content_type: u8,
     ) {
-        let actor_state = TrackActorState::new(track_id, participant_id, ssrc, kind);
+        let actor_state = TrackActorState::new(track_id, participant_id, ssrc, kind, content_type);
         self.actors.insert(track_id, actor_state);
         self.track_count.fetch_add(1, Ordering::Relaxed);
         self.actor_messages_processed += 1;
@@ -1354,6 +1469,7 @@ impl MediaWorker {
                     &mut self.dropped_unprotected,
                     &mut self.bytes_copied_fanout,
                     &mut self.arena_alloc_failures_fanout,
+                    &self.relay_out_tx,
                 );
             }
         }
@@ -1567,6 +1683,7 @@ impl MediaWorker {
         dropped_unprotected: &mut u64,
         bytes_copied_fanout: &mut u64,
         arena_alloc_failures_fanout: &mut u64,
+        relay_out_tx: &Option<crossbeam::channel::Sender<RelayOutput>>,
     ) {
         // Precondition assertions (TigerStyle: ≥2 assertions)
         assert!(packet.len() > 0, "packet length must be positive");
@@ -1594,7 +1711,38 @@ impl MediaWorker {
             if actor.kind == MediaKind::Video && packet_layer != subscriber.target_layer {
                 continue;
             }
+
+            // Viewport filtering: skip video if source not in subscriber's viewport.
+            // Empty viewport_visible = no filtering (forward everything).
+            // Audio and screen share are always forwarded regardless of viewport.
+            if actor.kind == MediaKind::Video
+                && actor.content_type != 1 // 1 = screen share — bypass viewport
+                && !subscriber.viewport_visible.is_empty()
+            {
+                let src = actor.participant_id as u32;
+                let in_pinned = subscriber.viewport_pinned.binary_search(&src).is_ok();
+                let in_visible = subscriber.viewport_visible.binary_search(&src).is_ok();
+                if !in_pinned && !in_visible {
+                    continue;
+                }
+            }
             
+            // Relay forwarding: skip SRTP, send raw RTP to peer node.
+            if subscriber.is_relay {
+                if let Some(tx) = relay_out_tx {
+                    let mut out = RelayOutput {
+                        peer_node: subscriber.relay_node,
+                        track_id: actor.track_id,
+                        data: [0u8; 1500],
+                        len: packet_len as u16,
+                    };
+                    out.data[..packet_len].copy_from_slice(packet.data());
+                    let _ = tx.try_send(out); // Drop if full — backpressure
+                }
+                forwarded_count += 1;
+                continue;
+            }
+
             // Under sim feature, skip SRTP entirely — forward plain RTP
             #[cfg(feature = "sim")]
             {
@@ -1766,6 +1914,7 @@ impl MediaWorker {
             0,                // participant_id - not in snapshot
             0,                // ssrc - not in snapshot
             MediaKind::Video, // kind - default to video
+            0,                // content_type - default to camera
         );
 
         // Restore subscribers
@@ -2837,6 +2986,10 @@ impl MediaWorker {
                     target_layer,
                     srtp_context: Some(srtp_context),
                     max_requested_layer: target_layer,
+                    viewport_visible: Vec::new(),
+                    viewport_pinned: Vec::new(),
+                    is_relay: false,
+                    relay_node: 0,
                 });
                 tracing::info!(
                     worker_id = self.worker_id,
@@ -2975,6 +3128,9 @@ pub struct WorkerPool {
     migration_metrics: Arc<MigrationMetrics>,
     /// Last rebalance timestamp (nanos since epoch).
     last_rebalance_time: Arc<AtomicU64>,
+    /// Receiver for relay output packets from workers.
+    /// Drained by the SFU main loop and forwarded to RelayManager.
+    relay_out_rx: crossbeam::channel::Receiver<RelayOutput>,
 }
 
 impl WorkerPool {
@@ -3051,6 +3207,10 @@ impl WorkerPool {
 
         // Get available CPU cores
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+
+        // Relay output channel — all workers share the sender.
+        // SFU main loop drains relay_out_rx → RelayManager.
+        let (relay_out_tx, relay_out_rx) = crossbeam::channel::bounded::<RelayOutput>(8192);
 
         // =========================================================================
         // Phase 1: Create N×(N-1) SPSC channels and distribute handles
@@ -3174,6 +3334,8 @@ impl WorkerPool {
             let spsc_receivers: Vec<Option<super::spsc::SpscReceiver<4096>>> = 
                 std::mem::take(&mut worker_receivers[worker_id as usize]);
 
+            let relay_tx_clone = relay_out_tx.clone();
+
             // Spawn worker thread
             let thread = thread::Builder::new()
                 .name(format!("nexus-worker-{}", worker_id))
@@ -3230,6 +3392,7 @@ impl WorkerPool {
                         Ok(mut worker) => {
                             // Set SPSC channel handles (Requirement 1.3)
                             worker.set_spsc_channels(spsc_receivers, spsc_senders);
+                            worker.relay_out_tx = Some(relay_tx_clone);
                             worker.run()
                         }
                         Err(e) => {
@@ -3343,6 +3506,7 @@ impl WorkerPool {
             migration_event_tx,
             migration_metrics: Arc::new(MigrationMetrics::new()),
             last_rebalance_time: Arc::new(AtomicU64::new(0)),
+            relay_out_rx,
         })
     }
 
@@ -3634,6 +3798,139 @@ impl WorkerPool {
         worker.send(WorkerMessage::RemoveSubscriber {
             track_id,
             subscriber_id,
+        })
+    }
+
+    /// Update viewport filter for a subscriber on a track.
+    ///
+    /// Routes the UpdateViewport message to the correct worker.
+    /// Both `visible` and `pinned` must be sorted for binary_search on the hot path.
+    ///
+    /// # TigerStyle: ≥2 assertions
+    pub fn update_viewport(
+        &self,
+        track_id: TrackId,
+        subscriber_id: u32,
+        mut visible: Vec<u32>,
+        mut pinned: Vec<u32>,
+    ) -> Result<(), WorkerError> {
+        assert!(track_id != 0, "track_id must be non-zero");
+        assert!(subscriber_id != 0, "subscriber_id must be non-zero");
+
+        // Sort for binary_search on hot path.
+        visible.sort_unstable();
+        visible.dedup();
+        pinned.sort_unstable();
+        pinned.dedup();
+
+        let worker_id = match self.track_to_worker.get(&track_id) {
+            Some(&id) => id,
+            None => return Ok(()),
+        };
+
+        let worker = match self.get_worker(worker_id) {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+
+        worker.send(WorkerMessage::UpdateViewport {
+            track_id,
+            subscriber_id,
+            visible,
+            pinned,
+        })
+    }
+
+    /// Set content type on a track (0=camera, 1=screen, 2=audio).
+    /// Screen share tracks bypass viewport filtering.
+    ///
+    /// # TigerStyle: ≥2 assertions
+    pub fn set_content_type(
+        &self,
+        track_id: TrackId,
+        content_type: u8,
+    ) -> Result<(), WorkerError> {
+        assert!(track_id != 0, "track_id must be non-zero");
+        assert!(content_type <= 2, "content_type must be 0, 1, or 2");
+
+        let worker_id = match self.track_to_worker.get(&track_id) {
+            Some(&id) => id,
+            None => return Ok(()),
+        };
+        let worker = match self.get_worker(worker_id) {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        worker.send(WorkerMessage::SetContentType { track_id, content_type })
+    }
+
+    /// Get the relay output receiver. The SFU main loop drains this
+    /// and forwards packets to `RelayManager::relay_packet()`.
+    pub fn relay_output_rx(&self) -> &crossbeam::channel::Receiver<RelayOutput> {
+        &self.relay_out_rx
+    }
+
+    /// Add a relay subscriber to a track (for cascade to a peer node).
+    ///
+    /// # TigerStyle: ≥2 assertions
+    pub fn add_relay_subscriber(
+        &self,
+        track_id: TrackId,
+        peer_node: u64,
+    ) -> Result<(), WorkerError> {
+        assert!(track_id != 0, "track_id must be non-zero");
+        assert!(peer_node != 0, "peer_node must be non-zero");
+
+        let worker_id = match self.track_to_worker.get(&track_id) {
+            Some(&id) => id,
+            None => return Err(WorkerError::InvalidConfig {
+                message: format!("track {} not assigned to worker", track_id),
+            }),
+        };
+
+        let worker = match self.get_worker(worker_id) {
+            Some(w) => w,
+            None => return Err(WorkerError::InvalidConfig {
+                message: format!("worker {} not found", worker_id),
+            }),
+        };
+
+        // Derive subscriber_id from peer_node to ensure uniqueness.
+        let subscriber_id = (peer_node & 0x7FFFFFFF) as u32 | 0x80000000; // High bit set = relay
+
+        worker.send(WorkerMessage::AddRelaySubscriber {
+            track_id,
+            peer_node,
+            subscriber_id,
+        })
+    }
+
+    /// Inject a relay packet from a peer node into the local worker pipeline.
+    ///
+    /// # TigerStyle: ≥2 assertions
+    pub fn inject_relay_packet(
+        &self,
+        track_id: TrackId,
+        data: [u8; 1500],
+        len: u16,
+    ) -> Result<(), WorkerError> {
+        assert!(track_id != 0, "track_id must be non-zero");
+        assert!(len > 0, "len must be positive");
+
+        let worker_id = match self.track_to_worker.get(&track_id) {
+            Some(&id) => id,
+            None => return Ok(()), // Track not on this node — ignore.
+        };
+
+        let worker = match self.get_worker(worker_id) {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+
+        worker.send(WorkerMessage::RelayPacket {
+            track_id,
+            data,
+            len,
         })
     }
 

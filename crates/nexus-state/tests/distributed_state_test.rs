@@ -154,8 +154,9 @@ fn test_add_update_track() {
 
     let info = TrackInfo {
         track_type: 1, // video
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 2500,
+        bitrate_kbps: 2500, owner_node: 0,
     };
 
     // Add track
@@ -170,9 +171,9 @@ fn test_add_update_track() {
 
     // Update track
     let new_info = TrackInfo {
-        track_type: 1,
+        track_type: 1, content_type: 0,
         codec: 100,
-        bitrate_kbps: 5000,
+        bitrate_kbps: 5000, owner_node: 0,
     };
     let ts2 = state.update_track(1, new_info).unwrap();
     assert!(ts2 > ts1);
@@ -372,14 +373,14 @@ fn test_merge_track_updated() {
     let state = DistributedState::new(config);
 
     let info1 = TrackInfo {
-        track_type: 1,
+        track_type: 1, content_type: 0,
         codec: 100,
-        bitrate_kbps: 1000,
+        bitrate_kbps: 1000, owner_node: 0,
     };
     let info2 = TrackInfo {
-        track_type: 1,
+        track_type: 1, content_type: 0,
         codec: 100,
-        bitrate_kbps: 2000,
+        bitrate_kbps: 2000, owner_node: 0,
     };
 
     // Merge with lower timestamp first
@@ -478,14 +479,14 @@ fn test_lww_conflict_resolution() {
 
     // Two updates with same timestamp but different actors
     let info1 = TrackInfo {
-        track_type: 1,
+        track_type: 1, content_type: 0,
         codec: 100,
-        bitrate_kbps: 1000,
+        bitrate_kbps: 1000, owner_node: 0,
     };
     let info2 = TrackInfo {
-        track_type: 1,
+        track_type: 1, content_type: 0,
         codec: 100,
-        bitrate_kbps: 2000,
+        bitrate_kbps: 2000, owner_node: 0,
     };
 
     // Actor 1, timestamp 100
@@ -580,9 +581,10 @@ fn test_concurrent_track_updates() {
         let handle = thread::spawn(move || {
             for i in 0..10 {
                 let info = TrackInfo {
-                    track_type: 1,
+                    track_type: 1, content_type: 0,
                     codec: 100,
                     bitrate_kbps: (thread_id * 1000 + i * 100) as u32,
+                    owner_node: 0,
                 };
                 let _ = state_clone.update_track(1, info);
             }
@@ -631,9 +633,9 @@ fn test_generate_deltas() {
 
     // TrackUpdated
     let info = TrackInfo {
-        track_type: 1,
+        track_type: 1, content_type: 0,
         codec: 100,
-        bitrate_kbps: 2500,
+        bitrate_kbps: 2500, owner_node: 0,
     };
     let delta = DistributedState::generate_track_updated_delta(1, info, 200, 1);
     match delta {

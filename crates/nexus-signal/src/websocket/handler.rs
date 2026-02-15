@@ -232,6 +232,10 @@ pub enum MessageType {
     Subscribe = 8,
     /// Unsubscribe from track
     Unsubscribe = 9,
+    /// Viewport update
+    Viewport = 10,
+    /// Set content type on a track
+    SetContent = 11,
 }
 
 impl MessageType {
@@ -249,6 +253,8 @@ impl MessageType {
             7 => Some(Self::Pong),
             8 => Some(Self::Subscribe),
             9 => Some(Self::Unsubscribe),
+            10 => Some(Self::Viewport),
+            11 => Some(Self::SetContent),
             _ => None,
         }
     }
@@ -1042,7 +1048,9 @@ mod tests {
         assert_eq!(MessageType::from_u8(0), Some(MessageType::Join));
         assert_eq!(MessageType::from_u8(1), Some(MessageType::Leave));
         assert_eq!(MessageType::from_u8(5), Some(MessageType::Stats));
-        assert_eq!(MessageType::from_u8(10), None);
+        assert_eq!(MessageType::from_u8(10), Some(MessageType::Viewport));
+        assert_eq!(MessageType::from_u8(11), Some(MessageType::SetContent));
+        assert_eq!(MessageType::from_u8(12), None);
         assert_eq!(MessageType::from_u8(255), None);
     }
 

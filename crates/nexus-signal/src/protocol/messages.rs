@@ -111,6 +111,8 @@ pub enum SignalMessage {
         publisher_id: u64,
         track_id: u64,
         kind: String,
+        /// Content type: "camera", "screen", or "audio".
+        content: String,
     },
     /// Track unpublished notification.
     TrackUnpublished {
@@ -120,6 +122,31 @@ pub enum SignalMessage {
     ServerShutdown {
         reason: String,
         drain_seconds: u32,
+    },
+    /// Update viewport (visible/pinned participants).
+    /// Client sends this when the UI layout changes.
+    Viewport {
+        /// Participant IDs currently visible in the client's UI.
+        visible: Vec<u64>,
+        /// Participant IDs pinned by the user (always receive video).
+        pinned: Vec<u64>,
+    },
+    /// Viewport update acknowledged.
+    ViewportUpdated {
+        visible_count: u32,
+        pinned_count: u32,
+    },
+    /// Declare content type for a published track.
+    /// Client sends this after publishing to mark a track as screen share.
+    SetContent {
+        track_id: u64,
+        /// "camera", "screen", or "audio".
+        content: String,
+    },
+    /// Content type set acknowledged.
+    ContentSet {
+        track_id: u64,
+        content: String,
     },
 }
 

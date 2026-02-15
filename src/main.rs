@@ -370,7 +370,7 @@ async fn run(config: NexusConfig) -> ExitCode {
     // ========================================================================
     // Create SFU (handles distributed state, gossip, worker pool)
     // ========================================================================
-    let sfu = match Sfu::new(config.clone()).await {
+    let mut sfu = match Sfu::new(config.clone()).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to initialize SFU: {}", e);
@@ -428,6 +428,7 @@ async fn run(config: NexusConfig) -> ExitCode {
     let worker_pool_arc = sfu
         .worker_pool_arc()
         .expect("Worker pool must be initialized");
+    let relay_event_rx = sfu.take_relay_event_rx();
     let mut orchestrator = nexus_sfu::orchestrator::SessionOrchestrator::new(
         sfu.webrtc_transport().clone(),
         sfu.ssrc_router().clone(),
@@ -436,6 +437,9 @@ async fn run(config: NexusConfig) -> ExitCode {
         worker_pool_arc,
         config.transport.media_bind_addr,
     );
+    if let Some(rx) = relay_event_rx {
+        orchestrator.set_relay_event_rx(rx);
+    }
 
     let orchestrator_handle = tokio::spawn(async move {
         orchestrator.run(orchestrator_rx).await;
@@ -484,7 +488,6 @@ async fn run(config: NexusConfig) -> ExitCode {
     };
 
     // Run SFU packet processing loop
-    let mut sfu = sfu;
     let result = sfu.run_with_signals().await;
 
     // Cleanup

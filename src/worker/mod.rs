@@ -91,6 +91,8 @@ pub enum WorkerMessage {
         participant_id: ParticipantId,
         ssrc: Ssrc,
         kind: MediaKind,
+        /// Content type: 0=camera, 1=screen, 2=audio.
+        content_type: u8,
     },
 
     /// Send a message to a TrackActor.
@@ -234,6 +236,40 @@ pub enum WorkerMessage {
         mid_ext_id: u8,
         mid_value: [u8; 4],
         mid_value_len: u8,
+    },
+
+    /// Update viewport filter for a subscriber.
+    /// Sent when a client sends a Viewport signaling message.
+    UpdateViewport {
+        track_id: TrackId,
+        subscriber_id: u32,
+        /// Source participant IDs visible in the subscriber's UI (sorted).
+        visible: Vec<u32>,
+        /// Source participant IDs pinned by the subscriber (sorted).
+        pinned: Vec<u32>,
+    },
+
+    /// Set content type on a track actor (0=camera, 1=screen, 2=audio).
+    /// Screen share tracks bypass viewport filtering.
+    SetContentType {
+        track_id: TrackId,
+        content_type: u8,
+    },
+
+    /// Add a relay subscriber — forwards packets to a peer SFU node.
+    /// No SRTP needed (inter-node traffic on private network).
+    AddRelaySubscriber {
+        track_id: TrackId,
+        peer_node: u64,
+        /// Subscriber ID (derived from peer_node for uniqueness).
+        subscriber_id: u32,
+    },
+
+    /// Inject a relay packet received from a peer node into the local pipeline.
+    RelayPacket {
+        track_id: TrackId,
+        data: [u8; 1500],
+        len: u16,
     },
 }
 

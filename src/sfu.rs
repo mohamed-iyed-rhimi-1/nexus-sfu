@@ -1405,6 +1405,10 @@ pub struct Sfu {
     last_dtls_retransmit: Option<crate::clock::ClockInstant>,
     last_consent_check: Option<crate::clock::ClockInstant>,
     packets_processed: u64,
+    /// Relay manager for inter-node cascade (None if single-node).
+    relay_manager: Option<Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>>,
+    /// Relay event receiver for orchestrator (taken once at startup).
+    relay_event_rx: Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>>,
 }
 
 impl Sfu {
@@ -1657,6 +1661,9 @@ impl Sfu {
         // Create channel for state updates from DistributedState to gossip thread
         let (state_update_tx, state_update_rx) = std::sync::mpsc::channel::<nexus_state::StateUpdate>();
         
+        // Create channel for relay events from gossip thread to orchestrator
+        let (relay_event_tx, relay_event_rx) = mpsc::unbounded_channel::<nexus_state::gossip::RelayEvent>();
+        
         // Set the broadcast sender on distributed state
         distributed_state.set_broadcast_sender(state_update_tx);
         
@@ -1747,6 +1754,11 @@ impl Sfu {
                         warn!("Gossip recv error: {:?}", e);
                     }
                     
+                    // Drain relay events from gossip → orchestrator
+                    for event in swim_protocol.drain_relay_events() {
+                        let _ = relay_event_tx.send(event);
+                    }
+                    
                     // Sleep for probe interval
                     std::thread::sleep(std::time::Duration::from_millis(probe_interval_ms));
                 }
@@ -1807,6 +1819,8 @@ impl Sfu {
             last_dtls_retransmit: None,
             last_consent_check: None,
             packets_processed: 0,
+            relay_manager: None,
+            relay_event_rx: Some(relay_event_rx),
         })
     }
 
@@ -1850,6 +1864,16 @@ impl Sfu {
     #[inline]
     pub fn distributed_state(&self) -> &Arc<DistributedState> {
         &self.distributed_state
+    }
+
+    /// Set the relay manager for inter-node cascade.
+    pub fn set_relay_manager(&mut self, mgr: Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>) {
+        self.relay_manager = Some(mgr);
+    }
+
+    /// Take the relay event receiver (for passing to the orchestrator). Can only be called once.
+    pub fn take_relay_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>> {
+        self.relay_event_rx.take()
     }
 
     /// Get the WebRTC transport.
@@ -2035,6 +2059,7 @@ impl Sfu {
             participant_id,
             ssrc,
             kind,
+            content_type: if kind == crate::types::MediaKind::Audio { 2 } else { 0 },
         }).map_err(|e| format!("Failed to send spawn actor message to worker: {:?}", e))?;
         
         info!(
@@ -2460,6 +2485,36 @@ impl Sfu {
                     self.arena.free_count(),
                     self.arena.capacity()
                 );
+            }
+        }
+
+        // Drain relay output from workers → RelayManager (cascade forwarding).
+        // Also drain relay input from peers → WorkerPool (cascade receiving).
+        if let Some(ref relay_mgr) = self.relay_manager {
+            if let Some(ref pool_arc) = self.worker_pool {
+                if let Ok(pool) = pool_arc.read() {
+                    // Workers → relay peers: drain outbound relay packets
+                    let relay_rx = pool.relay_output_rx();
+                    let mgr = relay_mgr.read();
+                    for _ in 0..256 {
+                        match relay_rx.try_recv() {
+                            Ok(out) => {
+                                mgr.relay_packet(out.peer_node, out.track_id, &out.data[..out.len as usize]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // Relay peers → workers: drain inbound relay packets
+                    let inbound_rx = mgr.packet_rx();
+                    for _ in 0..256 {
+                        match inbound_rx.try_recv() {
+                            Ok(pkt) => {
+                                let _ = pool.inject_relay_packet(pkt.track_id, pkt.data, pkt.len);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
             }
         }
 

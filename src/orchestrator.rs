@@ -154,6 +154,12 @@ pub struct SessionOrchestrator {
     /// RTP/RTCP/STUN/DTLS traffic arrives on the single media socket that
     /// the main packet loop reads from.
     media_bind_addr: SocketAddr,
+    /// Relay manager for inter-node cascade (None if single-node deployment).
+    relay_manager: Option<Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>>,
+    /// Local node ID for cascade routing (0 = not set).
+    local_node_id: u64,
+    /// Relay events from gossip thread (inter-node cascade).
+    relay_event_rx: Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>>,
 }
 
 impl SessionOrchestrator {
@@ -179,7 +185,27 @@ impl SessionOrchestrator {
             ice_gather_rx,
             pending_renegotiations: HashSet::new(),
             media_bind_addr,
+            relay_manager: None,
+            local_node_id: 0,
+            relay_event_rx: None,
         }
+    }
+
+    /// Set the relay manager for inter-node cascade.
+    pub fn set_relay_manager(
+        &mut self,
+        relay_manager: Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>,
+        local_node_id: u64,
+        relay_event_rx: mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>,
+    ) {
+        self.relay_manager = Some(relay_manager);
+        self.local_node_id = local_node_id;
+        self.relay_event_rx = Some(relay_event_rx);
+    }
+
+    /// Set the relay event receiver (from gossip thread) without a full relay manager.
+    pub fn set_relay_event_rx(&mut self, rx: mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>) {
+        self.relay_event_rx = Some(rx);
     }
 
     /// Main event loop — consumes OrchestratorEvents from the WebSocket server.
@@ -197,8 +223,28 @@ impl SessionOrchestrator {
                 Some(ice_event) = self.ice_gather_rx.recv() => {
                     self.dispatch_ice_event(ice_event);
                 }
-                // Both channels closed - exit
+                // Handle relay events from gossip thread (inter-node cascade)
+                Some(relay_event) = async {
+                    match self.relay_event_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.process_relay_events(vec![relay_event]);
+                }
+                // All channels closed - exit
                 else => break,
+            }
+
+            // Drain any queued relay events too (batch processing).
+            if let Some(ref mut rx) = self.relay_event_rx {
+                let mut batch = Vec::new();
+                while let Ok(ev) = rx.try_recv() {
+                    batch.push(ev);
+                }
+                if !batch.is_empty() {
+                    self.process_relay_events(batch);
+                }
             }
 
             // Drain all remaining ready events before firing renegotiations.
@@ -629,6 +675,12 @@ impl SessionOrchestrator {
             }
             SignalMessage::Unsubscribe { track_id } => {
                 self.handle_unsubscribe(participant_id, track_id);
+            }
+            SignalMessage::Viewport { visible, pinned } => {
+                self.handle_viewport(participant_id, &visible, &pinned);
+            }
+            SignalMessage::SetContent { track_id, content } => {
+                self.handle_set_content(participant_id, track_id, &content);
             }
             SignalMessage::Leave => {
                 self.handle_leave(participant_id);
@@ -1254,6 +1306,28 @@ impl SessionOrchestrator {
             }
         };
 
+        // Cascade check: if the track lives on a remote node, request relay.
+        // The remote node will relay RTP packets to our relay receiver socket,
+        // which injects them into the local worker pool for fan-out.
+        if self.local_node_id != 0 {
+            if let Some(track_info) = self.distributed_state.get_track(track_id) {
+                if track_info.owner_node != 0 && track_info.owner_node != self.local_node_id {
+                    // Track is remote — request the owner node to relay it to us via gossip.
+                    self.distributed_state.broadcast_update(
+                        nexus_state::gossip::types::StateUpdate::RelaySubscribe {
+                            track_id,
+                            requester_node: self.local_node_id,
+                        },
+                    );
+                    info!(
+                        "Track {} is on remote node {}, relay requested via gossip",
+                        track_id, track_info.owner_node
+                    );
+                    // Fall through to also add a local subscriber for this participant
+                }
+            }
+        }
+
         let transport_id = match session.transport_id {
             Some(id) => id,
             None => {
@@ -1756,6 +1830,144 @@ impl SessionOrchestrator {
         info!("Participant {} unsubscribed from track {}", participant_id, track_id);
     }
 
+    /// Handle viewport update from a client.
+    ///
+    /// Updates the viewport filter on every track this participant is subscribed to.
+    /// The worker will skip forwarding video from sources not in the visible/pinned set.
+    ///
+    /// # TigerStyle Compliance
+    ///
+    /// - ≥2 assertions validating preconditions
+    /// - Bounded loop (subscribed_tracks.len() bounded by MAX_SUBSCRIPTIONS)
+    /// - Explicit error handling
+    fn handle_viewport(&mut self, participant_id: u64, visible: &[u64], pinned: &[u64]) {
+        assert!(participant_id != 0, "participant_id must be non-zero");
+        assert!(visible.len() <= 1000, "visible list too large");
+
+        let session = match self.sessions.get(&participant_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let subscriber_id = (participant_id & 0xFFFFFFFF) as u32;
+        let subscribed: Vec<u64> = session.subscribed_tracks.clone();
+
+        // Convert u64 participant IDs to u32 for the worker (ParticipantId = u32 internally).
+        let visible_u32: Vec<u32> = visible.iter().map(|&id| id as u32).collect();
+        let pinned_u32: Vec<u32> = pinned.iter().map(|&id| id as u32).collect();
+
+        let pool = match self.worker_pool.read() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("Worker pool lock poisoned during viewport update");
+                return;
+            }
+        };
+
+        // Update viewport on every subscribed track — bounded by subscription limit.
+        for &track_id in &subscribed {
+            if let Err(e) = pool.update_viewport(
+                track_id,
+                subscriber_id,
+                visible_u32.clone(),
+                pinned_u32.clone(),
+            ) {
+                debug!("Failed to update viewport on track {}: {:?}", track_id, e);
+            }
+        }
+
+        self.send_to(participant_id, SignalMessage::ViewportUpdated {
+            visible_count: visible.len() as u32,
+            pinned_count: pinned.len() as u32,
+        });
+
+        debug!(
+            "Participant {} viewport updated: {} visible, {} pinned, {} tracks",
+            participant_id, visible.len(), pinned.len(), subscribed.len()
+        );
+    }
+
+    /// Handle SetContent: mark a published track as screen share (or camera/audio).
+    ///
+    /// Validates the participant owns the track, then sends SetContentType to the worker.
+    /// Screen share tracks bypass viewport filtering so all subscribers receive them.
+    ///
+    /// # TigerStyle: ≥2 assertions, bounded, explicit error handling
+    fn handle_set_content(&mut self, participant_id: u64, track_id: u64, content: &str) {
+        assert!(participant_id != 0, "participant_id must be non-zero");
+        assert!(track_id != 0, "track_id must be non-zero");
+
+        let content_type: u8 = match content {
+            "camera" => 0,
+            "screen" => 1,
+            "audio" => 2,
+            _ => {
+                self.send_to(participant_id, SignalMessage::Error {
+                    code: "INVALID_CONTENT".to_string(),
+                    message: format!("Unknown content type: {}", content),
+                });
+                return;
+            }
+        };
+
+        // Verify participant owns this track
+        let owns_track = match self.sessions.get(&participant_id) {
+            Some(s) => s.published_tracks.contains(&track_id),
+            None => false,
+        };
+        if !owns_track {
+            self.send_to(participant_id, SignalMessage::Error {
+                code: "NOT_OWNER".to_string(),
+                message: "Cannot set content on a track you don't own".to_string(),
+            });
+            return;
+        }
+
+        let pool = match self.worker_pool.read() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if let Err(e) = pool.set_content_type(track_id, content_type) {
+            debug!("Failed to set content type on track {}: {:?}", track_id, e);
+        }
+
+        self.send_to(participant_id, SignalMessage::ContentSet {
+            track_id,
+            content: content.to_string(),
+        });
+
+        info!("Track {} content set to '{}' by participant {}", track_id, content, participant_id);
+    }
+
+    /// Process relay events from gossip. Called by the SFU main loop.
+    ///
+    /// When a remote node sends RelaySubscribe, we add a relay subscriber
+    /// on the local worker pool so the track gets forwarded to that node.
+    pub fn process_relay_events(&mut self, events: Vec<nexus_state::gossip::RelayEvent>) {
+        let pool = match self.worker_pool.read() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        for event in events {
+            match event {
+                nexus_state::gossip::RelayEvent::Subscribe { track_id, requester_node } => {
+                    if let Err(e) = pool.add_relay_subscriber(track_id, requester_node) {
+                        debug!("Failed to add relay subscriber for track {} node {}: {:?}",
+                            track_id, requester_node, e);
+                    } else {
+                        info!("Added relay subscriber: track {} → node {}", track_id, requester_node);
+                    }
+                }
+                nexus_state::gossip::RelayEvent::Unsubscribe { track_id, requester_node } => {
+                    let sub_id = (requester_node & 0x7FFFFFFF) as u32 | 0x80000000;
+                    if let Err(e) = pool.remove_subscriber(track_id, sub_id) {
+                        debug!("Failed to remove relay subscriber: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle participant leave request.
     ///
     /// Cleans up all participant state and notifies other participants.
@@ -1996,10 +2208,15 @@ impl SessionOrchestrator {
                             }
 
                             // Register in distributed state - check return value explicitly
+                            // Detect content type: audio=2, video=0 (camera default).
+                            // Screen share is set later via SetContentType signaling.
+                            let content_type = if kind == MediaKind::Audio { 2 } else { 0 };
                             let track_info = TrackInfo {
                                 track_type: if kind == MediaKind::Audio { 0 } else { 1 },
+                                content_type,
                                 codec: 0,
                                 bitrate_kbps: 0,
+                                owner_node: 0, // Local node — set properly when gossip is initialized
                             };
                             if let Err(e) = self.distributed_state.add_track(track_id, track_info) {
                                 debug!("Failed to add track to distributed state: {:?}", e);
@@ -2020,6 +2237,7 @@ impl SessionOrchestrator {
                                         publisher_id: participant_id,
                                         track_id,
                                         kind: if kind == MediaKind::Audio { "audio".to_string() } else { "video".to_string() },
+                                        content: match content_type { 1 => "screen", 2 => "audio", _ => "camera" }.to_string(),
                                     }));
                                 }
                             }

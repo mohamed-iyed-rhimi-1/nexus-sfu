@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest"]
+members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest", "crates/nexus-recorder"]
 resolver = "2"
 
 [package]

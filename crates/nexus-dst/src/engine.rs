@@ -850,8 +850,9 @@ impl SimulationEngine {
                     track_id,
                     TrackInfo {
                         track_type,
+                        content_type: 0,
                         codec: 0,
-                        bitrate_kbps: 0,
+                        bitrate_kbps: 0, owner_node: 0,
                     },
                 );
 
@@ -1245,8 +1246,9 @@ impl SimulationEngine {
 
             let track_info = TrackInfo {
                 track_type,
+                content_type: 0,
                 codec: 0,
-                bitrate_kbps: 0,
+                bitrate_kbps: 0, owner_node: 0,
             };
 
             for i in 1..self.distributed_states.len() {

@@ -309,43 +309,63 @@ impl PeerInfo {
 /// Information about a media track.
 ///
 /// Used in StateUpdate for track metadata propagation.
+/// Includes `owner_node` for cascade: identifies which SFU node owns this track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackInfo {
     /// Track type (0 = audio, 1 = video)
     pub track_type: u8,
+    /// Content type (0 = camera, 1 = screen, 2 = audio).
+    /// Screen share tracks bypass viewport filtering.
+    pub content_type: u8,
     /// Codec identifier
     pub codec: u32,
     /// Bitrate in kbps
     pub bitrate_kbps: u32,
+    /// Actor ID of the SFU node that owns this track (0 = local/unknown).
+    pub owner_node: u64,
 }
 
+/// Content type constants for `TrackInfo.content_type`.
+pub const CONTENT_CAMERA: u8 = 0;
+pub const CONTENT_SCREEN: u8 = 1;
+pub const CONTENT_AUDIO: u8 = 2;
+
 impl TrackInfo {
-    /// Encode to bytes (9 bytes total)
+    /// Encode to bytes (18 bytes total)
     #[inline]
     pub fn encode(&self, buffer: &mut [u8]) -> usize {
-        assert!(buffer.len() >= 9, "buffer too small for TrackInfo");
+        assert!(buffer.len() >= 18, "buffer too small for TrackInfo");
         buffer[0] = self.track_type;
-        buffer[1..5].copy_from_slice(&self.codec.to_be_bytes());
-        buffer[5..9].copy_from_slice(&self.bitrate_kbps.to_be_bytes());
-        9
+        buffer[1] = self.content_type;
+        buffer[2..6].copy_from_slice(&self.codec.to_be_bytes());
+        buffer[6..10].copy_from_slice(&self.bitrate_kbps.to_be_bytes());
+        buffer[10..18].copy_from_slice(&self.owner_node.to_be_bytes());
+        18
     }
 
     /// Decode from bytes
     #[inline]
     pub fn decode(data: &[u8]) -> Option<(Self, usize)> {
-        if data.len() < 9 {
+        if data.len() < 18 {
             return None;
         }
         let track_type = data[0];
-        let codec = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-        let bitrate_kbps = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+        let content_type = data[1];
+        let codec = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        let bitrate_kbps = u32::from_be_bytes([data[6], data[7], data[8], data[9]]);
+        let owner_node = u64::from_be_bytes([
+            data[10], data[11], data[12], data[13],
+            data[14], data[15], data[16], data[17],
+        ]);
         Some((
             Self {
                 track_type,
+                content_type,
                 codec,
                 bitrate_kbps,
+                owner_node,
             },
-            9,
+            18,
         ))
     }
 }
@@ -354,8 +374,10 @@ impl Default for TrackInfo {
     fn default() -> Self {
         Self {
             track_type: 0,
+            content_type: 0,
             codec: 0,
             bitrate_kbps: 0,
+            owner_node: 0,
         }
     }
 }
@@ -416,6 +438,21 @@ pub enum StateUpdate {
         participant_id: u64,
         /// Dot for unsubscription
         dot: Dot,
+    },
+    /// Request a remote node to relay a track to us.
+    /// Piggybacked on gossip — the owner node starts relaying when it receives this.
+    RelaySubscribe {
+        /// Track to relay.
+        track_id: u64,
+        /// Node requesting the relay (subscriber side).
+        requester_node: u64,
+    },
+    /// Cancel relay of a track.
+    RelayUnsubscribe {
+        /// Track to stop relaying.
+        track_id: u64,
+        /// Node that no longer needs the relay.
+        requester_node: u64,
     },
 }
 
@@ -515,6 +552,32 @@ fn decode_subscription_update(data: &[u8], is_add: bool) -> Option<(StateUpdate,
     };
     
     Some((update, 25))
+}
+
+/// Decode relay subscribe/unsubscribe from bytes.
+/// Wire format: [type:u8][track_id:u64][requester_node:u64] = 17 bytes.
+#[inline]
+fn decode_relay_update(data: &[u8], is_subscribe: bool) -> Option<(StateUpdate, usize)> {
+    if data.len() < 17 {
+        return None;
+    }
+    let track_id = u64::from_be_bytes([
+        data[1], data[2], data[3], data[4],
+        data[5], data[6], data[7], data[8],
+    ]);
+    let requester_node = u64::from_be_bytes([
+        data[9], data[10], data[11], data[12],
+        data[13], data[14], data[15], data[16],
+    ]);
+    assert!(track_id > 0, "track_id must be non-zero");
+    assert!(requester_node > 0, "requester_node must be non-zero");
+
+    let update = if is_subscribe {
+        StateUpdate::RelaySubscribe { track_id, requester_node }
+    } else {
+        StateUpdate::RelayUnsubscribe { track_id, requester_node }
+    };
+    Some((update, 17))
 }
 
 /// Decode track update from bytes.
@@ -632,6 +695,18 @@ impl StateUpdate {
                 buffer[25..33].copy_from_slice(&dot.clock().to_be_bytes());
                 33
             }
+            StateUpdate::RelaySubscribe { track_id, requester_node } => {
+                buffer[0] = 5;
+                buffer[1..9].copy_from_slice(&track_id.to_be_bytes());
+                buffer[9..17].copy_from_slice(&requester_node.to_be_bytes());
+                17
+            }
+            StateUpdate::RelayUnsubscribe { track_id, requester_node } => {
+                buffer[0] = 6;
+                buffer[1..9].copy_from_slice(&track_id.to_be_bytes());
+                buffer[9..17].copy_from_slice(&requester_node.to_be_bytes());
+                17
+            }
         }
     }
 
@@ -659,6 +734,8 @@ impl StateUpdate {
             2 => decode_track_update(data),              // TrackUpdated
             3 => decode_subscription_update(data, true), // SubscriptionAdded
             4 => decode_subscription_update(data, false), // SubscriptionRemoved
+            5 => decode_relay_update(data, true),         // RelaySubscribe
+            6 => decode_relay_update(data, false),        // RelayUnsubscribe
             _ => None,
         }
     }
@@ -1380,19 +1457,23 @@ mod tests {
     fn test_track_info_encode_decode() {
         let info = TrackInfo {
             track_type: 1,
+            content_type: 1,
             codec: 12345,
             bitrate_kbps: 128,
+            owner_node: 0,
         };
 
-        let mut buffer = [0u8; 16];
+        let mut buffer = [0u8; 32];
         let len = info.encode(&mut buffer);
 
         let (decoded, decoded_len) = TrackInfo::decode(&buffer[..len]).unwrap();
 
         assert_eq!(decoded_len, len);
         assert_eq!(decoded.track_type, info.track_type);
+        assert_eq!(decoded.content_type, info.content_type);
         assert_eq!(decoded.codec, info.codec);
         assert_eq!(decoded.bitrate_kbps, info.bitrate_kbps);
+        assert_eq!(decoded.owner_node, info.owner_node);
     }
 
     #[test]
@@ -1419,8 +1500,10 @@ mod tests {
             track_id: 100,
             info: TrackInfo {
                 track_type: 1,
+                content_type: 0,
                 codec: 96,
                 bitrate_kbps: 256,
+                owner_node: 0,
             },
             timestamp: 123456789,
             actor: 7,

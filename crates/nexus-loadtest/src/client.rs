@@ -1023,7 +1023,7 @@ impl HeadlessClient {
                     Ok(Ok(msg)) => {
                         tracing::info!("discover_and_subscribe received signaling message: {:?}", msg);
                         match msg {
-                            SignalMessage::TrackPublished { track_id, kind, publisher_id } => {
+                            SignalMessage::TrackPublished { track_id, kind, publisher_id, .. } => {
                                 tracing::debug!(
                                     "Discovered track {} ({}) from publisher {}",
                                     track_id, kind, publisher_id

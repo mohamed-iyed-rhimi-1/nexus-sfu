@@ -5,3 +5,7 @@ target
 
 # Local development certificates
 certs/
+
+# sdk
+sdk/node_modules/
+sdk/dist/

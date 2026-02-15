@@ -171,6 +171,17 @@ pub struct SwimProtocol {
     stats: ProtocolStats,
     /// Distributed state for applying CRDT updates
     distributed_state: Option<Arc<DistributedState>>,
+    /// Relay events received via gossip — drained by the orchestrator.
+    relay_events: VecDeque<RelayEvent>,
+}
+
+/// A relay event received via gossip piggyback.
+#[derive(Debug, Clone)]
+pub enum RelayEvent {
+    /// A remote node wants us to relay a track to it.
+    Subscribe { track_id: u64, requester_node: u64 },
+    /// A remote node no longer needs relay of a track.
+    Unsubscribe { track_id: u64, requester_node: u64 },
 }
 
 impl SwimProtocol {
@@ -227,6 +238,7 @@ impl SwimProtocol {
             piggyback_queue,
             stats: ProtocolStats::new(),
             distributed_state: None,
+            relay_events: VecDeque::new(),
         })
     }
 
@@ -818,6 +830,11 @@ impl SwimProtocol {
         );
     }
 
+    /// Drain pending relay events. Called by the orchestrator/SFU main loop.
+    pub fn drain_relay_events(&mut self) -> Vec<RelayEvent> {
+        self.relay_events.drain(..).collect()
+    }
+
     /// Get state updates for piggybacking.
     fn get_piggyback_updates(&mut self) -> Vec<StateUpdate> {
         let count = self.piggyback_queue.len().min(self.config.max_piggyback_updates);
@@ -868,6 +885,26 @@ impl SwimProtocol {
 
         // Re-broadcast updates by adding to our queue
         for update in updates {
+            // Queue relay events for the orchestrator to drain.
+            match &update {
+                StateUpdate::RelaySubscribe { track_id, requester_node } => {
+                    if self.relay_events.len() < 1024 {
+                        self.relay_events.push_back(RelayEvent::Subscribe {
+                            track_id: *track_id,
+                            requester_node: *requester_node,
+                        });
+                    }
+                }
+                StateUpdate::RelayUnsubscribe { track_id, requester_node } => {
+                    if self.relay_events.len() < 1024 {
+                        self.relay_events.push_back(RelayEvent::Unsubscribe {
+                            track_id: *track_id,
+                            requester_node: *requester_node,
+                        });
+                    }
+                }
+                _ => {}
+            }
             // Avoid re-adding duplicates (simplified check)
             if self.piggyback_queue.len() < MAX_PIGGYBACK_QUEUE_SIZE {
                 self.piggyback_queue.push_back(update);
@@ -944,6 +981,9 @@ impl SwimProtocol {
             } => {
                 // Remove subscription
                 let _ = state.remove_subscription((*track_id).into(), (*participant_id).into())?;
+            }
+            StateUpdate::RelaySubscribe { .. } | StateUpdate::RelayUnsubscribe { .. } => {
+                // Relay events don't modify CRDT state — handled separately.
             }
         }
 
@@ -1599,9 +1639,10 @@ mod tests {
             StateUpdate::TrackUpdated {
                 track_id: 100,
                 info: TrackInfo {
-                    track_type: 1,
+                    track_type: 1, content_type: 0,
                     codec: 96,
                     bitrate_kbps: 1000,
+                    owner_node: 0,
                 },
                 timestamp: 1,
                 actor: 1,

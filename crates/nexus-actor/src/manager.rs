@@ -532,8 +532,10 @@ impl ActorManager {
                 MediaKind::Audio => 0,
                 MediaKind::Video => 1,
             },
+            content_type: 0,
             codec: 0, // Default codec
             bitrate_kbps: 0, // Default bitrate
+            owner_node: 0, // Set by orchestrator when node ID is known
         };
         if let Err(e) = self.distributed_state.add_track(id as u64, track_info) {
             eprintln!("Warning: Failed to add track to distributed state: {:?}", e);
