@@ -15,6 +15,8 @@
 
 ---
 
+> **⚠️ This project is incomplete and under active development. Performance benchmarks have not been validated yet. Use at your own risk.**
+
 ## Why Nexus?
 
 Most SFUs are written in Go or C++ and rely on garbage collection or manual memory management. Nexus takes a different approach:
