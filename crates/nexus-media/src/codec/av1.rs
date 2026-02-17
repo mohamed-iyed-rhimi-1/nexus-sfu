@@ -2,11 +2,17 @@
 //!
 //! Parses the AV1 RTP payload format as defined in the AV1
 //! RTP specification. The aggregation header precedes one or
-//! more OBUs. Keyframe detection inspects the OBU type and
-//! the frame header's frame_type field.
+//! more OBUs. Keyframe detection uses the N bit (new coded
+//! video sequence) and SequenceHeader OBU type.
 //!
-//! Reference: AV1 RTP payload format
-//!   (https://aomediacodec.github.io/av1-rtp-spec/)
+//! We do NOT attempt bit-level AV1 frame header parsing for
+//! keyframe detection. The AV1 bitstream uses bit-addressed
+//! fields whose positions depend on preceding flags
+//! (show_existing_frame, reduced_still_picture_header, etc.).
+//! Byte-level inspection produces false positives/negatives.
+//! Chrome and Firefox correctly set N=1 on keyframes.
+//!
+//! Reference: https://aomediacodec.github.io/av1-rtp-spec/
 
 use super::{CodecError, LayerInfo};
 
@@ -28,7 +34,6 @@ pub enum ObuType {
 }
 
 impl ObuType {
-    /// Convert raw 4-bit OBU type to enum.
     fn from_raw(raw: u8) -> Self {
         match raw {
             1 => ObuType::SequenceHeader,
@@ -42,10 +47,6 @@ impl ObuType {
 }
 
 /// AV1 RTP payload header.
-///
-/// The first byte is the AV1 aggregation header, followed by
-/// one or more OBUs. We parse the aggregation header and the
-/// first OBU header for keyframe detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Av1PayloadHeader {
     /// Z bit — continuation of previous OBU fragment
@@ -58,7 +59,7 @@ pub struct Av1PayloadHeader {
     pub new_sequence: bool,
     /// Type of the first OBU in the payload
     pub first_obu_type: ObuType,
-    /// True if the first OBU indicates a keyframe
+    /// True if this packet indicates a keyframe
     pub is_key_obu: bool,
     /// Temporal ID from the first OBU extension header
     pub temporal_id: Option<u8>,
@@ -70,15 +71,6 @@ pub struct Av1PayloadHeader {
 
 impl Av1PayloadHeader {
     /// Parse AV1 RTP payload from aggregation header + OBUs.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - RTP payload bytes (after RTP header)
-    ///
-    /// # TigerStyle
-    ///
-    /// Asserts: data.len() >= 1
-    /// Asserts: obu_count <= 3
     pub fn parse(data: &[u8]) -> Result<Self, CodecError> {
         if data.is_empty() {
             return Err(CodecError::TooShort {
@@ -89,8 +81,7 @@ impl Av1PayloadHeader {
 
         let mut offset: usize = 0;
 
-        // --- Aggregation header (1 byte) ---
-        // |Z|Y|W W|N|0 0 0|
+        // Aggregation header: |Z|Y|W W|N|0 0 0|
         let agg = data[0];
         let z_bit = (agg & 0x80) != 0;
         let y_bit = (agg & 0x40) != 0;
@@ -98,8 +89,7 @@ impl Av1PayloadHeader {
         let n_bit = (agg & 0x08) != 0;
         offset += 1;
 
-        // If this is a continuation fragment (Z=1) and not
-        // the start, we cannot determine keyframe status.
+        // Continuation fragment — cannot determine keyframe
         if z_bit {
             return Ok(Av1PayloadHeader {
                 continuation: true,
@@ -114,13 +104,8 @@ impl Av1PayloadHeader {
             });
         }
 
-        // Skip OBU element size (leb128) if W > 0 and
-        // this is not the last element.
-        // For W=1, there is exactly one OBU and no size
-        // prefix. For W>1, each OBU except the last has
-        // a leb128 size prefix.
+        // Skip leb128 OBU element size if W > 1
         if w_field > 1 {
-            // Skip leb128 size of first OBU element
             let max_leb_bytes: usize = 4;
             for _ in 0..max_leb_bytes {
                 if offset >= data.len() {
@@ -131,7 +116,6 @@ impl Av1PayloadHeader {
                 }
                 let byte = data[offset];
                 offset += 1;
-                // leb128: high bit = 0 means last byte
                 if (byte & 0x80) == 0 {
                     break;
                 }
@@ -185,28 +169,12 @@ impl Av1PayloadHeader {
             }
         }
 
-        // Determine keyframe status.
-        // A sequence header or N=1 strongly indicates a
-        // keyframe. For Frame/FrameHeader OBUs, we check
-        // the frame_type field (first 2 bits of payload):
-        //   0 = KEY_FRAME, others = non-key.
+        // Keyframe detection: use N bit and SequenceHeader OBU type.
+        // Do NOT attempt bit-level frame header parsing — AV1 uses
+        // bit-addressed fields whose positions depend on flags we
+        // haven't parsed (show_existing_frame, reduced_still_picture_header).
         let is_key_obu = match obu_type {
             ObuType::SequenceHeader => true,
-            ObuType::Frame | ObuType::FrameHeader => {
-                if offset < data.len() {
-                    // frame_type is in bits 1-0 of the
-                    // show_existing_frame byte. If
-                    // show_existing_frame=0, frame_type
-                    // is in bits 6-5 of the next bits.
-                    // Simplified: check if N bit is set
-                    // or first payload bits indicate key.
-                    n_bit
-                        || (data[offset] & 0x80) == 0
-                            && (data[offset] & 0x60) == 0
-                } else {
-                    n_bit
-                }
-            }
             _ => n_bit,
         };
 
@@ -237,10 +205,6 @@ impl Av1PayloadHeader {
     }
 }
 
-// ---------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,22 +212,17 @@ mod tests {
     #[test]
     fn test_sequence_header_keyframe() {
         // Aggregation: Z=0, Y=0, W=1, N=1 → 0x18
-        // OBU header: type=1 (SeqHdr), no ext, no size
-        //   → 0b0_0001_0_0_0 = 0x08
+        // OBU header: type=1 (SeqHdr), no ext, no size → 0x08
         let data: &[u8] = &[0x18, 0x08];
         let hdr = Av1PayloadHeader::parse(data).unwrap();
         assert!(!hdr.continuation);
         assert!(hdr.new_sequence);
-        assert_eq!(
-            hdr.first_obu_type,
-            ObuType::SequenceHeader
-        );
+        assert_eq!(hdr.first_obu_type, ObuType::SequenceHeader);
         assert!(hdr.is_keyframe());
     }
 
     #[test]
     fn test_continuation_fragment() {
-        // Z=1 → continuation, cannot determine keyframe
         let data: &[u8] = &[0x80, 0x30];
         let hdr = Av1PayloadHeader::parse(data).unwrap();
         assert!(hdr.continuation);
@@ -271,11 +230,34 @@ mod tests {
     }
 
     #[test]
+    fn test_frame_obu_with_n_bit() {
+        // N=1 on a Frame OBU → keyframe
+        // Aggregation: Z=0, Y=0, W=1, N=1 → 0x18
+        // OBU header: type=6 (Frame), no ext, no size → 0x30
+        let data: &[u8] = &[0x18, 0x30, 0x00];
+        let hdr = Av1PayloadHeader::parse(data).unwrap();
+        assert_eq!(hdr.first_obu_type, ObuType::Frame);
+        assert!(hdr.new_sequence);
+        assert!(hdr.is_keyframe());
+    }
+
+    #[test]
+    fn test_frame_obu_without_n_bit() {
+        // N=0 on a Frame OBU → not keyframe
+        // Aggregation: Z=0, Y=0, W=1, N=0 → 0x10
+        // OBU header: type=6 (Frame), no ext, no size → 0x30
+        let data: &[u8] = &[0x10, 0x30, 0x00];
+        let hdr = Av1PayloadHeader::parse(data).unwrap();
+        assert_eq!(hdr.first_obu_type, ObuType::Frame);
+        assert!(!hdr.new_sequence);
+        assert!(!hdr.is_keyframe());
+    }
+
+    #[test]
     fn test_frame_obu_with_extension() {
         // Aggregation: Z=0, Y=0, W=1, N=0 → 0x10
-        // OBU header: type=6 (Frame), ext=1, no size
-        //   → 0b0_0110_1_0_0 = 0x34
-        // Extension: TID=1, SID=0 → 0b001_00_000 = 0x20
+        // OBU header: type=6 (Frame), ext=1, no size → 0x34
+        // Extension: TID=1, SID=0 → 0x20
         let data: &[u8] = &[0x10, 0x34, 0x20, 0x00];
         let hdr = Av1PayloadHeader::parse(data).unwrap();
         assert_eq!(hdr.first_obu_type, ObuType::Frame);

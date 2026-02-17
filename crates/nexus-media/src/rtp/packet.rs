@@ -3,15 +3,11 @@
 //! These methods process multiple RTP packets in a batch, matching
 //! the I/O batch size of 64 packets (from transport batch sender).
 //!
-//! Performance characteristics:
-//! - `parse_batch_optimal()`: Auto-dispatches to CPU-specific impl
-//! - AVX-512: 16-packet chunks with prefetch (~10-15ns/packet)
-//! - AVX2: 8-packet chunks with prefetch (~10-15ns/packet)
-//! - Scalar: Scalar with prefetch optimization (~50-80ns/packet)
+//! All batch methods write into a caller-provided output slice —
+//! zero allocation on the hot path.
 
 use super::header::RtpHeader;
 
-// SIMD intrinsics for prefetch hints
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -19,26 +15,24 @@ impl RtpHeader {
     /// Parse a batch of RTP packets using the optimal
     /// CPU-specific implementation.
     ///
-    /// Automatically dispatches to the fastest available parser:
-    /// - AVX-512: 16 packets per chunk with prefetch
-    /// - AVX2: 8 packets per chunk with prefetch
-    /// - Scalar: Individual packets with prefetch optimization
+    /// Writes results into `out`. Returns the number of entries
+    /// written (always `min(packets.len(), out.len())`).
     #[inline]
     pub fn parse_batch_optimal(
         packets: &[&[u8]],
-    ) -> Vec<Option<Self>> {
+        out: &mut [Option<Self>],
+    ) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512f") {
-                return Self::parse_batch_avx512_impl(packets);
+                return Self::parse_batch_avx512_impl(packets, out);
             }
             if is_x86_feature_detected!("avx2") {
-                return Self::parse_batch_avx2_impl(packets);
+                return Self::parse_batch_avx2_impl(packets, out);
             }
         }
 
-        // Fallback to scalar with prefetch
-        Self::parse_batch_scalar(packets)
+        Self::parse_batch_scalar(packets, out)
     }
 
     /// Parse a batch of RTP packets using scalar parsing with
@@ -46,12 +40,12 @@ impl RtpHeader {
     #[inline]
     pub fn parse_batch_scalar(
         packets: &[&[u8]],
-    ) -> Vec<Option<Self>> {
-        let mut results = Vec::with_capacity(packets.len());
+        out: &mut [Option<Self>],
+    ) -> usize {
+        let count = packets.len().min(out.len());
         let prefetch_distance = 4;
 
-        for i in 0..packets.len() {
-            // Prefetch packets ahead for cache optimization
+        for i in 0..count {
             if i + prefetch_distance < packets.len() {
                 let prefetch_ptr =
                     packets[i + prefetch_distance].as_ptr();
@@ -76,7 +70,6 @@ impl RtpHeader {
                         );
                     }
                 }
-                // On other platforms, prefetch is a no-op
                 #[cfg(not(any(
                     target_arch = "x86_64",
                     target_arch = "aarch64"
@@ -84,44 +77,41 @@ impl RtpHeader {
                 let _ = prefetch_ptr;
             }
 
-            results.push(Self::parse(packets[i]).ok());
+            out[i] = Self::parse(packets[i]).ok();
         }
 
-        results
+        count
     }
 
     /// Parse a batch using AVX2-optimized chunking.
-    ///
-    /// Processes packets in chunks of 8 (optimal for AVX2 256-bit
-    /// registers), prefetching the next chunk while processing the
-    /// current one.
     #[inline]
     pub fn parse_batch_avx2(
         packets: &[&[u8]],
-    ) -> Vec<Option<Self>> {
+        out: &mut [Option<Self>],
+    ) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                return Self::parse_batch_avx2_impl(packets);
+                return Self::parse_batch_avx2_impl(packets, out);
             }
         }
-        Self::parse_batch_scalar(packets)
+        Self::parse_batch_scalar(packets, out)
     }
 
-    /// Internal AVX2 batch parsing implementation (x86_64 only).
     #[cfg(target_arch = "x86_64")]
     #[inline]
     fn parse_batch_avx2_impl(
         packets: &[&[u8]],
-    ) -> Vec<Option<Self>> {
+        out: &mut [Option<Self>],
+    ) -> usize {
         const CHUNK_SIZE: usize = 8;
-        let mut results = Vec::with_capacity(packets.len());
+        let count = packets.len().min(out.len());
+        let mut written = 0;
 
-        let chunks = packets.chunks(CHUNK_SIZE);
+        let chunks = packets[..count].chunks(CHUNK_SIZE);
         let mut chunks_peekable = chunks.peekable();
 
         while let Some(chunk) = chunks_peekable.next() {
-            // Prefetch next chunk if available
             if let Some(next_chunk) = chunks_peekable.peek() {
                 for packet in next_chunk.iter() {
                     unsafe {
@@ -133,47 +123,44 @@ impl RtpHeader {
                 }
             }
 
-            // Process current chunk using SIMD parsing
             for packet in chunk {
-                results.push(Self::parse_simd(packet));
+                out[written] = Self::parse_simd(packet);
+                written += 1;
             }
         }
 
-        results
+        written
     }
 
     /// Parse a batch using AVX-512-optimized chunking.
-    ///
-    /// Processes packets in chunks of 16 (optimal for AVX-512
-    /// 512-bit registers), prefetching the next chunk while
-    /// processing the current one.
     #[inline]
     pub fn parse_batch_avx512(
         packets: &[&[u8]],
-    ) -> Vec<Option<Self>> {
+        out: &mut [Option<Self>],
+    ) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512f") {
-                return Self::parse_batch_avx512_impl(packets);
+                return Self::parse_batch_avx512_impl(packets, out);
             }
         }
-        Self::parse_batch_scalar(packets)
+        Self::parse_batch_scalar(packets, out)
     }
 
-    /// Internal AVX-512 batch parsing implementation (x86_64 only).
     #[cfg(target_arch = "x86_64")]
     #[inline]
     fn parse_batch_avx512_impl(
         packets: &[&[u8]],
-    ) -> Vec<Option<Self>> {
+        out: &mut [Option<Self>],
+    ) -> usize {
         const CHUNK_SIZE: usize = 16;
-        let mut results = Vec::with_capacity(packets.len());
+        let count = packets.len().min(out.len());
+        let mut written = 0;
 
-        let chunks = packets.chunks(CHUNK_SIZE);
+        let chunks = packets[..count].chunks(CHUNK_SIZE);
         let mut chunks_peekable = chunks.peekable();
 
         while let Some(chunk) = chunks_peekable.next() {
-            // Prefetch next chunk if available
             if let Some(next_chunk) = chunks_peekable.peek() {
                 for packet in next_chunk.iter() {
                     unsafe {
@@ -185,12 +172,12 @@ impl RtpHeader {
                 }
             }
 
-            // Process current chunk using SIMD parsing
             for packet in chunk {
-                results.push(Self::parse_simd(packet));
+                out[written] = Self::parse_simd(packet);
+                written += 1;
             }
         }
 
-        results
+        written
     }
 }

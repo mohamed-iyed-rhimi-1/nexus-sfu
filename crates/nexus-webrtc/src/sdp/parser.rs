@@ -20,9 +20,9 @@ impl SdpParser {
     /// - Explicit error handling
     /// - Precondition/postcondition assertions
     pub fn parse(sdp: &str) -> Result<SessionDescription, SdpError> {
-        // Precondition: SDP must not exceed maximum size
-        assert!(sdp.len() <= MAX_SDP_SIZE,
-            "SDP size must be <= MAX_SDP_SIZE");
+        if sdp.is_empty() {
+            return Err(SdpError::InvalidFormat { reason: "empty SDP" });
+        }
         
         if sdp.len() > MAX_SDP_SIZE {
             return Err(SdpError::TooLarge { 
@@ -643,6 +643,144 @@ impl SdpParser {
                 }
             }
             
+            // RTCP feedback (RFC 4585) — critical for NACK/PLI/FIR
+            "rtcp-fb" => {
+                if let Some(v) = attr_value {
+                    if let Some(ref mut media) = current_media {
+                        if let Ok(fb) = super::attributes::RtcpFeedback::parse(v) {
+                            let _ = media.add_rtcp_fb(fb);
+                        }
+                    }
+                }
+            }
+            
+            // SSRC group (RFC 5576) — needed for RTX and simulcast SSRC association
+            "ssrc-group" => {
+                if let Some(v) = attr_value {
+                    if let Some(ref mut media) = current_media {
+                        let parts: Vec<&str> = v.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let mut semantics = [0u8; 16];
+                            let sem_bytes = parts[0].as_bytes();
+                            let sem_len = sem_bytes.len().min(16);
+                            semantics[..sem_len].copy_from_slice(&sem_bytes[..sem_len]);
+                            
+                            let mut ssrcs = [0u32; 8];
+                            let mut ssrc_count = 0u8;
+                            for &p in &parts[1..] {
+                                if ssrc_count as usize >= 8 { break; }
+                                if let Ok(ssrc) = p.parse::<u32>() {
+                                    ssrcs[ssrc_count as usize] = ssrc;
+                                    ssrc_count += 1;
+                                }
+                            }
+                            
+                            let group = super::media::SsrcGroup {
+                                semantics,
+                                semantics_len: sem_len as u8,
+                                ssrcs,
+                                ssrc_count,
+                            };
+                            let _ = media.add_ssrc_group(group);
+                        }
+                    }
+                }
+            }
+            
+            // RID (RFC 8851) — needed for modern simulcast
+            "rid" => {
+                if let Some(v) = attr_value {
+                    if let Some(ref mut media) = current_media {
+                        // Format: id direction [restrictions]
+                        let parts: Vec<&str> = v.splitn(3, ' ').collect();
+                        if parts.len() >= 2 {
+                            let mut id = [0u8; 32];
+                            let id_bytes = parts[0].as_bytes();
+                            let id_len = id_bytes.len().min(32);
+                            id[..id_len].copy_from_slice(&id_bytes[..id_len]);
+                            
+                            let direction = Direction::parse(parts[1])
+                                .unwrap_or(Direction::SendRecv);
+                            
+                            let rid = super::media::Rid {
+                                id,
+                                id_len: id_len as u8,
+                                direction,
+                            };
+                            let _ = media.add_rid(rid);
+                        }
+                    }
+                }
+            }
+            
+            // Simulcast (RFC 8853)
+            "simulcast" => {
+                if let Some(v) = attr_value {
+                    if let Some(ref mut media) = current_media {
+                        let mut value = [0u8; 256];
+                        let bytes = v.as_bytes();
+                        let len = bytes.len().min(256);
+                        value[..len].copy_from_slice(&bytes[..len]);
+                        media.simulcast = Some(super::media::SimulcastAttr {
+                            value,
+                            value_len: len as u16,
+                        });
+                    }
+                }
+            }
+            
+            // Standalone msid (RFC 8830)
+            "msid" => {
+                if let Some(v) = attr_value {
+                    if let Some(ref mut media) = current_media {
+                        let parts: Vec<&str> = v.splitn(2, ' ').collect();
+                        let mut stream_id = [0u8; 128];
+                        let s_bytes = parts[0].as_bytes();
+                        let s_len = s_bytes.len().min(128);
+                        stream_id[..s_len].copy_from_slice(&s_bytes[..s_len]);
+                        
+                        let mut track_id = [0u8; 128];
+                        let t_len = if parts.len() > 1 {
+                            let t_bytes = parts[1].as_bytes();
+                            let len = t_bytes.len().min(128);
+                            track_id[..len].copy_from_slice(&t_bytes[..len]);
+                            len as u8
+                        } else {
+                            0
+                        };
+                        
+                        media.msid = Some(super::media::Msid {
+                            stream_id,
+                            stream_id_len: s_len as u8,
+                            track_id,
+                            track_id_len: t_len,
+                        });
+                    }
+                }
+            }
+            
+            // RTCP-mux-only (RFC 8858)
+            "rtcp-mux-only" => {
+                if let Some(ref mut media) = current_media {
+                    media.rtcp_mux_only = true;
+                    media.rtcp_mux = true; // rtcp-mux-only implies rtcp-mux
+                }
+            }
+            
+            // extmap-allow-mixed (RFC 8285)
+            "extmap-allow-mixed" => {
+                if let Some(ref mut media) = current_media {
+                    media.extmap_allow_mixed = true;
+                }
+            }
+            
+            // end-of-candidates (RFC 8838)
+            "end-of-candidates" => {
+                if let Some(ref mut media) = current_media {
+                    media.end_of_candidates = true;
+                }
+            }
+            
             _ => {
                 // Ignore unknown attributes
             }
@@ -1011,15 +1149,14 @@ m=audio 9 UDP/TLS/RTP/SAVPF 111
     #[test]
     fn test_parse_empty_string() {
         let result = SdpParser::parse("");
-        // Empty SDP currently succeeds with default values (no mandatory field validation)
-        // This is acceptable for WebRTC where validation focuses on ICE/DTLS
-        assert!(result.is_ok());
+        // Empty SDP must be rejected — no valid session can come from nothing
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_whitespace_only() {
         let result = SdpParser::parse("   \n\n   \n");
-        // Whitespace-only SDP is parsed as empty lines
+        // Whitespace-only SDP is parsed as empty lines — still produces a session
         assert!(result.is_ok());
     }
 

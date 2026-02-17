@@ -208,9 +208,9 @@ impl<const N: usize> SpscChannel<N> {
         let len = head.wrapping_sub(tail);
 
         // Postcondition: len is bounded by capacity
-        assert!(len <= N as u32, "len {} must be <= capacity {}", len, N);
+        debug_assert!(len <= N as u32, "len {} must be <= capacity {}", len, N);
         // Postcondition: len is non-negative (wrapping handles this)
-        assert!(len <= u32::MAX / 2, "len must be reasonable (not wrapped negative)");
+        debug_assert!(len <= u32::MAX / 2, "len must be reasonable (not wrapped negative)");
 
         len
     }

@@ -199,10 +199,6 @@ pub struct TurnClient {
     /// Transaction ID counter.
     transaction_counter: u32,
     
-    /// Output buffer for building messages.
-    #[allow(dead_code)] // Reserved for TURN message serialization
-    output_buffer: [u8; 600],
-    
     /// Started timestamp.
     started_at: Option<Instant>,
     
@@ -228,7 +224,6 @@ impl TurnClient {
             config,
             allocation,
             transaction_counter: 0,
-            output_buffer: [0u8; 600],
             started_at: None,
             active_permissions: [None; MAX_ACTIVE_PERMISSIONS],
             active_permission_count: 0,

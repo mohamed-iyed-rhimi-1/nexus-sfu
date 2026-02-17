@@ -59,6 +59,11 @@ impl<const N: usize> Default for RingBuffer<N> {
 
 impl<const N: usize> RingBuffer<N> {
     /// Push a packet, returning the assigned sequence number.
+    ///
+    /// On overflow, silently overwrites the oldest slot. The consumer
+    /// will see a gap, which is correct for media — stale frames are
+    /// useless. The producer never writes the consumer's tail pointer
+    /// (SPSC invariant).
     #[inline(always)]
     pub fn push(&self, packet: PacketSlot) -> u32 {
         assert!(
@@ -66,15 +71,8 @@ impl<const N: usize> RingBuffer<N> {
             "packet.data_len_bytes must be > 0"
         );
         let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
         let seq = self.head_seq.load(Ordering::Acquire);
         let index = (head & Self::mask()) as usize;
-        let count = head.wrapping_sub(tail);
-        if count >= N as u32 {
-            self.tail.store(
-                tail.wrapping_add(1), Ordering::Release,
-            );
-        }
         unsafe {
             let slots = &mut *self.slots.get();
             slots[index] = Some(packet);
@@ -89,6 +87,10 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     /// Pop the oldest packet from the buffer.
+    /// Pop the oldest packet from the buffer.
+    ///
+    /// If the producer has overwritten the slot (head advanced past
+    /// tail + N), the consumer skips forward to the oldest valid slot.
     #[inline(always)]
     pub fn pop(&self) -> Option<PacketSlot> {
         let head = self.head.load(Ordering::Acquire);
@@ -96,13 +98,20 @@ impl<const N: usize> RingBuffer<N> {
         if head == tail {
             return None;
         }
-        let index = (tail & Self::mask()) as usize;
+        // If producer lapped us, skip to oldest valid position
+        let count = head.wrapping_sub(tail);
+        let actual_tail = if count > N as u32 {
+            head.wrapping_sub(N as u32)
+        } else {
+            tail
+        };
+        let index = (actual_tail & Self::mask()) as usize;
         let packet = unsafe {
             let slots = &mut *self.slots.get();
             slots[index].take()
         };
         self.tail.store(
-            tail.wrapping_add(1), Ordering::Release,
+            actual_tail.wrapping_add(1), Ordering::Release,
         );
         packet
     }
@@ -237,10 +246,18 @@ mod tests {
         for i in 0..6 {
             buffer.push(create_test_packet(&arena, i));
         }
-        assert_eq!(buffer.len(), 4);
-        for expected in 2..6 {
-            let popped = buffer.pop().unwrap();
-            assert_eq!(popped.data()[0], expected);
-        }
+        // Producer overwrites oldest slots without advancing tail.
+        // pop() detects the lap and skips forward to the oldest valid slot.
+        // Slots 0,1 were overwritten by 4,5. Valid slots: indices 2,3,0,1
+        // containing values 2,3,4,5.
+        let popped = buffer.pop().unwrap();
+        assert_eq!(popped.data()[0], 2);
+        let popped = buffer.pop().unwrap();
+        assert_eq!(popped.data()[0], 3);
+        let popped = buffer.pop().unwrap();
+        assert_eq!(popped.data()[0], 4);
+        let popped = buffer.pop().unwrap();
+        assert_eq!(popped.data()[0], 5);
+        assert!(buffer.pop().is_none());
     }
 }

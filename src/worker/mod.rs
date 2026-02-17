@@ -101,6 +101,7 @@ pub enum WorkerMessage {
         subscriber_id: u32,
         participant_id: ParticipantId,
         dest_addr: SocketAddr,
+        srtp_context: Option<nexus_transport::srtp::SrtpContext>,
     },
 
     /// Unsubscribe from a TrackActor.
@@ -222,6 +223,12 @@ pub enum WorkerMessage {
         ssrc: Ssrc,
     },
 
+    /// Bind an SSRC to a track actor created without one (unified SSRC binding).
+    SetSsrc {
+        track_id: TrackId,
+        ssrc: Ssrc,
+    },
+
     /// Set target simulcast layer for a subscriber.
     SetSubscriberLayer {
         track_id: TrackId,
@@ -236,6 +243,22 @@ pub enum WorkerMessage {
         mid_ext_id: u8,
         mid_value: [u8; 4],
         mid_value_len: u8,
+    },
+
+    /// Set payload type override for a subscriber's forwarded RTP packets.
+    /// Used when BUNDLE PT uniqueness requires a different PT than the
+    /// publisher's (RFC 8843 §9.2).
+    SetSubscriberPt {
+        track_id: TrackId,
+        subscriber_id: u32,
+        payload_type: u8,
+    },
+
+    /// Set the transport-wide CC RTP header extension ID for a track.
+    /// Enables TWCC feedback generation (RFC 8888) for this publisher.
+    SetTrackTwccExtId {
+        track_id: TrackId,
+        twcc_ext_id: u8,
     },
 
     /// Update viewport filter for a subscriber.

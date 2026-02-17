@@ -5,6 +5,7 @@
 //! - RTP header parsing with SIMD acceleration (SSE4.1, NEON)
 //! - RTCP header and packet type parsing (SR, RR, SDES, BYE,
 //!   feedback)
+//! - Compound RTCP demuxing
 //! - Codec-specific payload parsing (VP8, VP9, H264, AV1, Opus)
 //! - Simulcast layer selection logic
 //!
@@ -17,16 +18,17 @@ pub mod rtcp;
 pub mod codec;
 pub mod simulcast;
 
-// Re-export primary types at crate root for convenience.
-// Re-export primary types at crate root for convenience.
 pub use rtp::RtpHeader;
 pub use rtcp::{
     RtcpHeader, RtcpType,
-    SenderReport, ReceiverReportBlock,
+    SenderReport, ReceiverReportBlock, ReceiverReport,
     PliPacket, NackPacket, RembPacket, TransportCcFeedback,
-    SenderReportGenerator,
-    REMB_PACKET_LENGTH, MAX_NACK_PACKETS,
+    FirPacket, FirEntry,
+    SenderReportGenerator, TwccFeedbackBuilder,
+    demux_compound, CompoundPacket, CompoundEntry,
+    REMB_PACKET_LENGTH, MAX_NACK_PACKETS, MAX_REPORT_BLOCKS,
 };
+pub use codec::{MediaCodec, is_keyframe};
 pub use simulcast::{
     SimulcastLayer, SimulcastLayerConfig,
     LayerSelector, select_layer, standard_layers,

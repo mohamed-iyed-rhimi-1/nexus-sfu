@@ -72,49 +72,49 @@ pub struct OutboundPacket {
 pub struct IceAgent {
     /// Configuration.
     config: IceConfig,
-    
+
     /// ICE role (Controlling or Controlled).
     role: IceRole,
-    
+
     /// Local ICE credentials.
     local_credentials: IceCredentials,
-    
+
     /// Remote ICE credentials (set when remote SDP is received).
     remote_credentials: Option<IceCredentials>,
-    
+
     /// Connection state.
     connection_state: IceConnectionState,
-    
+
     /// Gathering state.
     gathering_state: IceGatheringState,
-    
+
     /// Local candidates.
     local_candidates: [Option<Candidate>; MAX_CANDIDATES],
-    
+
     /// Local candidate count.
     local_candidate_count: u8,
-    
+
     /// Remote candidates.
     remote_candidates: [Option<Candidate>; MAX_CANDIDATES],
-    
+
     /// Remote candidate count.
     remote_candidate_count: u8,
-    
+
     /// Connectivity checklist.
     checklist: Option<Checklist>,
-    
+
     /// STUN server for handling binding requests.
     stun_server: StunServer,
-    
+
     /// Selected candidate pair.
     selected_pair: Option<CandidatePair>,
-    
+
     /// Component ID (1 = RTP, 2 = RTCP).
     component: u8,
-    
+
     /// Last activity timestamp.
     last_activity: Instant,
-    
+
     /// Consent freshness timestamp (RFC 7675).
     last_consent: Instant,
 
@@ -134,18 +134,17 @@ impl IceAgent {
     /// * `role` - ICE role (Controlling or Controlled).
     pub fn new(config: IceConfig, role: IceRole) -> Self {
         // Convert fixed-size arrays to Strings for IceCredentials
-        let local_ufrag = String::from_utf8_lossy(
-            &config.local_ufrag[..config.local_ufrag_len as usize]
-        ).to_string();
-        let local_pwd = String::from_utf8_lossy(
-            &config.local_pwd[..config.local_pwd_len as usize]
-        ).to_string();
-        
+        let local_ufrag =
+            String::from_utf8_lossy(&config.local_ufrag[..config.local_ufrag_len as usize])
+                .to_string();
+        let local_pwd =
+            String::from_utf8_lossy(&config.local_pwd[..config.local_pwd_len as usize]).to_string();
+
         let credentials = IceCredentials {
             local_ufrag,
             local_pwd,
         };
-        
+
         Self {
             config,
             role,
@@ -167,12 +166,12 @@ impl IceAgent {
             outbound_count: 0,
         }
     }
-    
+
     /// Create agent with default configuration.
     pub fn with_defaults(role: IceRole) -> Self {
         Self::new(IceConfig::default(), role)
     }
-    
+
     /// Create agent with IceServerConfig from application configuration.
     ///
     /// This constructor accepts the high-level `IceServerConfig` from the
@@ -188,20 +187,29 @@ impl IceAgent {
     ///
     /// - Precondition assertions for server counts
     /// - Postcondition assertion for STUN server availability
-    pub fn with_server_config(ice_server_config: &super::types::IceServerConfig, role: IceRole) -> Self {
+    pub fn with_server_config(
+        ice_server_config: &super::types::IceServerConfig,
+        role: IceRole,
+    ) -> Self {
         // Precondition: STUN server count must be bounded
-        assert!(ice_server_config.stun_servers.len() <= IceConfig::MAX_STUN_SERVERS,
-            "STUN server count must be <= {}", IceConfig::MAX_STUN_SERVERS);
-        
+        assert!(
+            ice_server_config.stun_servers.len() <= IceConfig::MAX_STUN_SERVERS,
+            "STUN server count must be <= {}",
+            IceConfig::MAX_STUN_SERVERS
+        );
+
         // Precondition: TURN server count must be bounded
-        assert!(ice_server_config.turn_servers.len() <= IceConfig::MAX_TURN_SERVERS,
-            "TURN server count must be <= {}", IceConfig::MAX_TURN_SERVERS);
-        
+        assert!(
+            ice_server_config.turn_servers.len() <= IceConfig::MAX_TURN_SERVERS,
+            "TURN server count must be <= {}",
+            IceConfig::MAX_TURN_SERVERS
+        );
+
         let mut config = IceConfig::new();
-        
+
         // Get effective STUN servers (includes Google fallback if enabled)
         let effective_stun = ice_server_config.effective_stun_servers();
-        
+
         // Add STUN servers
         for stun_url in effective_stun.iter().take(IceConfig::MAX_STUN_SERVERS) {
             // Parse STUN URL (format: stun:host:port or stuns:host:port)
@@ -209,9 +217,13 @@ impl IceAgent {
                 config.add_stun_server(addr);
             }
         }
-        
+
         // Add TURN servers
-        for turn_config in ice_server_config.turn_servers.iter().take(IceConfig::MAX_TURN_SERVERS) {
+        for turn_config in ice_server_config
+            .turn_servers
+            .iter()
+            .take(IceConfig::MAX_TURN_SERVERS)
+        {
             // Parse TURN URL (format: turn:host:port or turns:host:port)
             if let Some(addr) = Self::parse_turn_url(&turn_config.url) {
                 let use_tls = turn_config.url.starts_with("turns:");
@@ -224,17 +236,19 @@ impl IceAgent {
                 config.add_turn_server(turn_server);
             }
         }
-        
+
         // Postcondition: Must have at least one STUN server if fallback enabled
         // (unless explicitly disabled)
         if ice_server_config.use_google_fallback {
-            assert!(config.stun_server_count > 0,
-                "Must have at least one STUN server when fallback is enabled");
+            assert!(
+                config.stun_server_count > 0,
+                "Must have at least one STUN server when fallback is enabled"
+            );
         }
-        
+
         Self::new(config, role)
     }
-    
+
     /// Parse a STUN URL into a SocketAddr.
     ///
     /// Supports formats:
@@ -252,22 +266,22 @@ impl IceAgent {
         if url.is_empty() {
             return None;
         }
-        
+
         let host_port = url
             .strip_prefix("stun:")
             .or_else(|| url.strip_prefix("stuns:"))
             .unwrap_or(url);
-        
+
         // Try direct parse first (for IP:port format)
         if let Ok(addr) = host_port.parse() {
             return Some(addr);
         }
-        
+
         // Try DNS resolution for hostname:port format
         use std::net::ToSocketAddrs;
         host_port.to_socket_addrs().ok()?.next()
     }
-    
+
     /// Parse a TURN URL into a SocketAddr.
     ///
     /// Supports formats:
@@ -283,60 +297,60 @@ impl IceAgent {
         if url.is_empty() {
             return None;
         }
-        
+
         let host_port = url
             .strip_prefix("turn:")
             .or_else(|| url.strip_prefix("turns:"))
             .unwrap_or(url);
-        
+
         // Try direct parse first (for IP:port format)
         if let Ok(addr) = host_port.parse() {
             return Some(addr);
         }
-        
+
         // Try DNS resolution for hostname:port format
         use std::net::ToSocketAddrs;
         host_port.to_socket_addrs().ok()?.next()
     }
-    
+
     /// Set component ID.
     pub fn set_component(&mut self, component: u8) {
         assert!(component >= 1, "component must be >= 1");
         self.component = component;
     }
-    
+
     /// Get local credentials.
     pub fn local_credentials(&self) -> &IceCredentials {
         &self.local_credentials
     }
-    
+
     /// Set remote credentials.
     ///
     /// Must be called before adding remote candidates.
     pub fn set_remote_credentials(&mut self, credentials: IceCredentials) {
         self.remote_credentials = Some(credentials);
     }
-    
+
     /// Get connection state.
     pub const fn connection_state(&self) -> IceConnectionState {
         self.connection_state
     }
-    
+
     /// Get gathering state.
     pub const fn gathering_state(&self) -> IceGatheringState {
         self.gathering_state
     }
-    
+
     /// Get ICE role.
     pub const fn role(&self) -> IceRole {
         self.role
     }
-    
+
     /// Set ICE role (for role conflicts).
     pub fn set_role(&mut self, role: IceRole) {
         self.role = role;
     }
-    
+
     /// Gather local candidates.
     ///
     /// This will enumerate local interfaces, contact STUN servers,
@@ -361,10 +375,7 @@ impl IceAgent {
             (self.local_candidate_count as usize) < MAX_CANDIDATES,
             "Local candidate count must be below MAX_CANDIDATES"
         );
-        assert!(
-            candidate.address.port() > 0,
-            "Candidate port must be > 0"
-        );
+        assert!(candidate.address.port() > 0, "Candidate port must be > 0");
 
         if (self.local_candidate_count as usize) >= MAX_CANDIDATES {
             return Err(IceError::TooManyCandidates {
@@ -406,7 +417,10 @@ impl IceAgent {
     /// - Postcondition: state is Complete
     pub fn set_gathering_complete(&mut self) {
         assert!(
-            matches!(self.gathering_state, IceGatheringState::New | IceGatheringState::Gathering),
+            matches!(
+                self.gathering_state,
+                IceGatheringState::New | IceGatheringState::Gathering
+            ),
             "set_gathering_complete requires New or Gathering state, got {:?}",
             self.gathering_state
         );
@@ -425,33 +439,39 @@ impl IceAgent {
     #[deprecated(note = "Use add_local_candidate + set_gathering_complete instead")]
     pub fn gather_candidates(&mut self) -> Result<(), IceError> {
         // Precondition: state must be New (TigerStyle)
-        assert_eq!(self.gathering_state, IceGatheringState::New,
-            "gather_candidates requires New state");
-        
+        assert_eq!(
+            self.gathering_state,
+            IceGatheringState::New,
+            "gather_candidates requires New state"
+        );
+
         // Precondition: local candidate count must be 0 (TigerStyle)
-        assert_eq!(self.local_candidate_count, 0,
-            "Local candidates must be empty before gathering");
-        
+        assert_eq!(
+            self.local_candidate_count, 0,
+            "Local candidates must be empty before gathering"
+        );
+
         if self.gathering_state != IceGatheringState::New {
             return Err(IceError::InvalidState {
                 expected: "New",
                 actual: "Gathering or Complete",
             });
         }
-        
+
         self.gathering_state = IceGatheringState::Gathering;
-        
+
         // Create a bounded channel for candidate delivery
         let (candidate_tx, mut candidate_rx) = mpsc::channel(MAX_CANDIDATES);
-        let mut gatherer = CandidateGatherer::new(self.config.clone(), self.component, candidate_tx);
-        
+        let mut gatherer =
+            CandidateGatherer::new(self.config.clone(), self.component, candidate_tx);
+
         let gather_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(gatherer.gather())
         });
         let _count = gather_result?;
-        
+
         let count_before = self.local_candidate_count;
-        
+
         // Drain candidates from the channel
         while let Ok(candidate) = candidate_rx.try_recv() {
             if (self.local_candidate_count as usize) < MAX_CANDIDATES {
@@ -459,31 +479,38 @@ impl IceAgent {
                 self.local_candidate_count += 1;
             }
         }
-        
+
         // Postcondition: candidate count must be bounded (TigerStyle)
-        assert!(self.local_candidate_count <= MAX_CANDIDATES as u8,
-            "Local candidate count must be <= MAX_CANDIDATES");
-        
+        assert!(
+            self.local_candidate_count <= MAX_CANDIDATES as u8,
+            "Local candidate count must be <= MAX_CANDIDATES"
+        );
+
         // Postcondition: candidate count must have increased or stayed same (TigerStyle)
-        assert!(self.local_candidate_count >= count_before,
-            "Candidate count must not decrease");
-        
+        assert!(
+            self.local_candidate_count >= count_before,
+            "Candidate count must not decrease"
+        );
+
         self.gathering_state = IceGatheringState::Complete;
-        
+
         // Postcondition: state must be Complete (TigerStyle)
-        assert_eq!(self.gathering_state, IceGatheringState::Complete,
-            "Gathering must transition to Complete");
-        
+        assert_eq!(
+            self.gathering_state,
+            IceGatheringState::Complete,
+            "Gathering must transition to Complete"
+        );
+
         Ok(())
     }
-    
+
     /// Get local candidates.
     pub fn local_candidates(&self) -> impl Iterator<Item = &Candidate> {
         self.local_candidates[..self.local_candidate_count as usize]
             .iter()
             .filter_map(|c| c.as_ref())
     }
-    
+
     /// Add a remote candidate.
     ///
     /// Can be called during ICE negotiation as remote candidates
@@ -498,33 +525,41 @@ impl IceAgent {
         if self.remote_credentials.is_none() {
             return Err(IceError::NoRemoteCredentials);
         }
-        
+
         // Precondition: candidate count must be below maximum (TigerStyle)
-        assert!((self.remote_candidate_count as usize) < MAX_CANDIDATES,
-            "Remote candidate count must be below MAX_CANDIDATES");
-        
+        assert!(
+            (self.remote_candidate_count as usize) < MAX_CANDIDATES,
+            "Remote candidate count must be below MAX_CANDIDATES"
+        );
+
         if (self.remote_candidate_count as usize) >= MAX_CANDIDATES {
             return Err(IceError::TooManyCandidates {
                 count: self.remote_candidate_count as u32,
                 max: MAX_CANDIDATES as u32,
             });
         }
-        
+
         self.remote_candidates[self.remote_candidate_count as usize] = Some(candidate);
         self.remote_candidate_count += 1;
-        
+
         // Postcondition: candidate count bounded (TigerStyle)
-        assert!((self.remote_candidate_count as usize) <= MAX_CANDIDATES,
-            "Remote candidate count must remain bounded");
-        
+        assert!(
+            (self.remote_candidate_count as usize) <= MAX_CANDIDATES,
+            "Remote candidate count must remain bounded"
+        );
+
         // Postcondition: at least one remote candidate now exists (TigerStyle Phase 1.3)
-        assert!(self.remote_candidate_count > 0,
-            "Remote candidate count must be positive after add");
-        
+        assert!(
+            self.remote_candidate_count > 0,
+            "Remote candidate count must be positive after add"
+        );
+
         // Invariant: the slot we just wrote to must contain a candidate (TigerStyle Phase 1.3)
-        assert!(self.remote_candidates[self.remote_candidate_count as usize - 1].is_some(),
-            "Just-added candidate slot must be Some");
-        
+        assert!(
+            self.remote_candidates[self.remote_candidate_count as usize - 1].is_some(),
+            "Just-added candidate slot must be Some"
+        );
+
         // If we're already checking, incrementally add pairs to the checklist
         // This supports trickle ICE where candidates arrive during connectivity checks
         if let Some(ref mut checklist) = self.checklist {
@@ -532,7 +567,7 @@ impl IceAgent {
             let remote = self.remote_candidates[self.remote_candidate_count as usize - 1]
                 .as_ref()
                 .expect("Just-added candidate must exist");
-            
+
             // Form pairs with all existing local candidates
             for i in 0..self.local_candidate_count as usize {
                 if let Some(ref local) = self.local_candidates[i] {
@@ -541,17 +576,17 @@ impl IceAgent {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get remote candidates.
     pub fn remote_candidates(&self) -> impl Iterator<Item = &Candidate> {
         self.remote_candidates[..self.remote_candidate_count as usize]
             .iter()
             .filter_map(|c| c.as_ref())
     }
-    
+
     /// Get the count of local candidates.
     ///
     /// # TigerStyle Compliance
@@ -562,7 +597,7 @@ impl IceAgent {
     pub fn local_candidate_count(&self) -> u8 {
         self.local_candidate_count
     }
-    
+
     /// Get the count of remote candidates.
     ///
     /// # TigerStyle Compliance
@@ -573,7 +608,7 @@ impl IceAgent {
     pub fn remote_candidate_count(&self) -> u8 {
         self.remote_candidate_count
     }
-    
+
     /// Start connectivity checks.
     ///
     /// This should be called after gathering is complete and
@@ -586,61 +621,61 @@ impl IceAgent {
     /// - Postcondition for checklist creation
     pub fn start_checks(&mut self) -> Result<(), IceError> {
         // Precondition: gathering must be complete (TigerStyle Phase 1.4)
-        assert!(self.gathering_state == IceGatheringState::Complete,
-            "start_checks requires GatheringComplete state");
-        
+        assert!(
+            self.gathering_state == IceGatheringState::Complete,
+            "start_checks requires GatheringComplete state"
+        );
+
         if self.gathering_state != IceGatheringState::Complete {
             return Err(IceError::InvalidState {
                 expected: "GatheringComplete",
                 actual: "New or Gathering",
             });
         }
-        
+
         // Validate state transition before changing (TigerStyle Phase 1.4)
         self.validate_state_transition(IceConnectionState::Checking)?;
-        
-        let remote_creds = self.remote_credentials.clone()
+
+        let remote_creds = self
+            .remote_credentials
+            .clone()
             .ok_or(IceError::NoRemoteCredentials)?;
-        
+
         if self.local_candidate_count == 0 {
             return Err(IceError::NoCandidates);
         }
-        
+
         if self.remote_candidate_count == 0 {
             return Err(IceError::NoCandidates);
         }
-        
+
         // Create checklist
-        let mut checklist = Checklist::new(
-            self.local_credentials.clone(),
-            remote_creds,
-            self.role,
-        );
-        
+        let mut checklist = Checklist::new(self.local_credentials.clone(), remote_creds, self.role);
+
         // Collect candidates as slices
-        let local_candidates: Vec<_> = self.local_candidates()
-            .cloned()
-            .collect();
-        let remote_candidates: Vec<_> = self.remote_candidates()
-            .cloned()
-            .collect();
-        
+        let local_candidates: Vec<_> = self.local_candidates().cloned().collect();
+        let remote_candidates: Vec<_> = self.remote_candidates().cloned().collect();
+
         checklist.form_pairs(&local_candidates, &remote_candidates);
-        
+
         self.checklist = Some(checklist);
         self.connection_state = IceConnectionState::Checking;
-        
+
         // Postcondition: checklist must exist (TigerStyle Phase 1.4)
-        assert!(self.checklist.is_some(),
-            "Checklist must be created after start_checks");
-        
+        assert!(
+            self.checklist.is_some(),
+            "Checklist must be created after start_checks"
+        );
+
         // Postcondition: state must be Checking (TigerStyle Phase 1.4)
-        assert!(self.connection_state == IceConnectionState::Checking,
-            "Connection state must be Checking after start_checks");
-        
+        assert!(
+            self.connection_state == IceConnectionState::Checking,
+            "Connection state must be Checking after start_checks"
+        );
+
         Ok(())
     }
-    
+
     /// Validate state transition before applying.
     ///
     /// # TigerStyle Compliance (Phase 1.6)
@@ -655,21 +690,23 @@ impl IceAgent {
                 to: next,
             });
         }
-        
+
         if !self.connection_state.can_transition_to(next) {
             return Err(IceError::InvalidStateTransition {
                 from: self.connection_state,
                 to: next,
             });
         }
-        
+
         // Postcondition: transition is valid
-        assert!(self.connection_state.can_transition_to(next),
-            "State transition validation must succeed");
-        
+        assert!(
+            self.connection_state.can_transition_to(next),
+            "State transition validation must succeed"
+        );
+
         Ok(())
     }
-    
+
     /// Get next check to send.
     ///
     /// Deprecated — use `poll_outbound()` which returns all pending
@@ -677,9 +714,9 @@ impl IceAgent {
     #[deprecated(note = "Use poll_outbound() instead")]
     pub fn next_check(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         let checklist = self.checklist.as_mut()?;
-        
+
         let (_, dest, buf, len) = checklist.next_check()?;
-        
+
         Some((dest, buf[..len].to_vec()))
     }
 
@@ -692,7 +729,11 @@ impl IceAgent {
     /// # TigerStyle
     /// - Bounded buffer: drops with warning if full (NASA Rule 2)
     fn queue_outbound(&mut self, dest: SocketAddr, data: &[u8], len: usize) {
-        assert!(len <= STUN_BUFFER_SIZE, "Outbound packet too large: {}", len);
+        assert!(
+            len <= STUN_BUFFER_SIZE,
+            "Outbound packet too large: {}",
+            len
+        );
 
         if (self.outbound_count as usize) >= MAX_OUTBOUND {
             tracing::warn!(
@@ -784,7 +825,7 @@ impl IceAgent {
 
         result
     }
-    
+
     /// Process incoming packet.
     ///
     /// This handles STUN binding requests/responses and updates
@@ -806,30 +847,30 @@ impl IceAgent {
         from: SocketAddr,
     ) -> Result<Option<Vec<u8>>, IceError> {
         self.last_activity = Instant::now();
-        
+
         if !StunMessage::is_stun(data) {
             // Not STUN - might be application data
             return Ok(None);
         }
-        
+
         // Precondition: data is STUN (TigerStyle Phase 1.7)
-        assert!(StunMessage::is_stun(data),
-            "process_incoming requires STUN data");
-        
+        assert!(
+            StunMessage::is_stun(data),
+            "process_incoming requires STUN data"
+        );
+
         // Delegate to specific handlers based on message class
         let msg = StunMessage::parse(data)?;
-        
+
         tracing::debug!(
             class = ?msg.class,
             transaction_id = ?&msg.transaction_id,
             from = %from,
             "ICE agent processing STUN message"
         );
-        
+
         let result = match msg.class {
-            StunClass::Request => {
-                self.handle_stun_request(&msg, data, from)?
-            }
+            StunClass::Request => self.handle_stun_request(&msg, data, from)?,
             StunClass::SuccessResponse | StunClass::ErrorResponse => {
                 self.handle_stun_response(&msg, data, from)?;
                 None
@@ -840,14 +881,16 @@ impl IceAgent {
                 None
             }
         };
-        
+
         // Postcondition: activity was recently updated (TigerStyle Phase 1.7)
-        assert!(self.last_activity.elapsed() < Duration::from_secs(1),
-            "Activity timestamp must be recent");
-        
+        assert!(
+            self.last_activity.elapsed() < Duration::from_secs(1),
+            "Activity timestamp must be recent"
+        );
+
         Ok(result)
     }
-    
+
     /// Handle incoming STUN request.
     ///
     /// Implements RFC 8445 §7.2.5: receiving a STUN binding request triggers
@@ -866,11 +909,13 @@ impl IceAgent {
         from: SocketAddr,
     ) -> Result<Option<Vec<u8>>, IceError> {
         // Precondition: must be a request
-        assert!(msg.class == StunClass::Request,
-            "handle_stun_request requires Request class");
-        
+        assert!(
+            msg.class == StunClass::Request,
+            "handle_stun_request requires Request class"
+        );
+
         let credentials = self.local_credentials.clone();
-        
+
         // Step 1: Role conflict detection (RFC 8445 §7.2.1.1)
         match self.handle_role_conflict(msg) {
             Ok(()) => {}
@@ -880,17 +925,17 @@ impl IceAgent {
             }
             Err(e) => return Err(e),
         }
-        
+
         // Mark consent freshness (RFC 7675)
         self.last_consent = Instant::now();
-        
+
         // Step 2: Peer-reflexive candidate learning and triggered check (RFC 8445 §7.2.5)
         // When we receive a binding request from a remote address, we must:
         //   a) Check if we already know this remote address as a candidate
         //   b) If not, create a peer-reflexive remote candidate
         //   c) Enqueue a triggered check for the pair
         self.handle_peer_reflexive_and_triggered_check(msg, from);
-        
+
         // Step 3: USE-CANDIDATE handling (RFC 8445 §7.3.1.5)
         // Controlled agent nominates pair when it receives a binding request
         // with USE-CANDIDATE from the controlling agent.
@@ -900,15 +945,15 @@ impl IceAgent {
                 self.update_connection_state();
             }
         }
-        
+
         // Step 4: Generate STUN success response
         if let Some(response) = self.stun_server.handle_request(data, from, &credentials)? {
             return Ok(Some(response.to_vec()));
         }
-        
+
         Ok(None)
     }
-    
+
     /// Handle peer-reflexive candidate learning and triggered checks per RFC 8445 §7.2.5.
     ///
     /// When a STUN binding request arrives from a remote address:
@@ -919,19 +964,17 @@ impl IceAgent {
     /// This is the critical mechanism that allows ICE to work when the signaled
     /// candidates (host, srflx) are unreachable but the actual source address
     /// of the remote peer's STUN packets is reachable.
-    fn handle_peer_reflexive_and_triggered_check(
-        &mut self,
-        msg: &StunMessage,
-        from: SocketAddr,
-    ) {
+    fn handle_peer_reflexive_and_triggered_check(&mut self, msg: &StunMessage, from: SocketAddr) {
         // We need a checklist to add triggered checks
         if self.checklist.is_none() {
             return;
         }
-        
+
         // Extract the PRIORITY attribute from the request (RFC 8445 §7.2.5.3.1)
         // The remote peer includes its candidate priority in the binding request.
-        let remote_priority = msg.attributes.iter()
+        let remote_priority = msg
+            .attributes
+            .iter()
             .flatten()
             .find_map(|attr| {
                 if let super::stun::attributes::StunAttribute::Priority(p) = attr {
@@ -948,10 +991,10 @@ impl IceAgent {
                     self.component,
                 )
             });
-        
+
         // Check if we already have a remote candidate with this address
         let known_remote = self.find_remote_candidate_by_addr(from);
-        
+
         // Get or create the remote candidate
         let remote_candidate = if let Some(existing) = known_remote {
             existing.clone()
@@ -966,13 +1009,13 @@ impl IceAgent {
                 self.component,
                 0, // interface_idx: not meaningful for remote candidates
             );
-            
+
             tracing::info!(
                 address = %from,
                 priority = remote_priority,
                 "Created peer-reflexive remote candidate from incoming STUN request"
             );
-            
+
             // Store the new remote candidate
             if (self.remote_candidate_count as usize) < MAX_CANDIDATES {
                 self.remote_candidates[self.remote_candidate_count as usize] = Some(prflx.clone());
@@ -984,16 +1027,16 @@ impl IceAgent {
                 );
                 return;
             }
-            
+
             prflx
         };
-        
+
         // Find the best local candidate to pair with.
         // Per RFC 8445 §7.2.5.1, use the local candidate from which the
         // request was received. Since we may have multiple local candidates,
         // pick the first host candidate with matching address family.
         let local_candidate = self.find_best_local_candidate_for(from);
-        
+
         let local = match local_candidate {
             Some(c) => c.clone(),
             None => {
@@ -1004,7 +1047,7 @@ impl IceAgent {
                 return;
             }
         };
-        
+
         // Enqueue the triggered check
         if let Some(ref mut checklist) = self.checklist {
             if let Some(pair_idx) = checklist.add_triggered_check(&local, &remote_candidate) {
@@ -1017,7 +1060,7 @@ impl IceAgent {
             }
         }
     }
-    
+
     /// Find an existing remote candidate by address.
     fn find_remote_candidate_by_addr(&self, addr: SocketAddr) -> Option<&Candidate> {
         for i in 0..self.remote_candidate_count as usize {
@@ -1029,40 +1072,40 @@ impl IceAgent {
         }
         None
     }
-    
+
     /// Find the best local candidate to pair with a remote address.
     ///
     /// Prefers host candidates with matching address family.
     /// Falls back to any candidate with matching address family.
     fn find_best_local_candidate_for(&self, remote_addr: SocketAddr) -> Option<&Candidate> {
         let remote_is_ipv4 = remote_addr.is_ipv4();
-        
+
         // First pass: prefer host candidates with matching address family
         let mut best_host: Option<&Candidate> = None;
         let mut best_any: Option<&Candidate> = None;
-        
+
         for i in 0..self.local_candidate_count as usize {
             if let Some(ref candidate) = self.local_candidates[i] {
                 if candidate.address.is_ipv4() != remote_is_ipv4 {
                     continue; // Address family mismatch
                 }
-                
+
                 if candidate.is_host() {
                     // Prefer the host candidate with highest priority
                     if best_host.map_or(true, |b| candidate.priority > b.priority) {
                         best_host = Some(candidate);
                     }
                 }
-                
+
                 if best_any.map_or(true, |b| candidate.priority > b.priority) {
                     best_any = Some(candidate);
                 }
             }
         }
-        
+
         best_host.or(best_any)
     }
-    
+
     /// Handle incoming STUN response.
     ///
     /// # TigerStyle Compliance (Phase 1.7)
@@ -1075,31 +1118,33 @@ impl IceAgent {
         from: SocketAddr,
     ) -> Result<(), IceError> {
         // Precondition: must be a response
-        assert!(msg.class.is_response(),
-            "handle_stun_response requires Response class");
-        
+        assert!(
+            msg.class.is_response(),
+            "handle_stun_response requires Response class"
+        );
+
         if let Some(ref mut checklist) = self.checklist {
             // Use STUN_BUFFER_SIZE for encoding
             let mut response_buf = [0u8; STUN_BUFFER_SIZE];
             let len = msg.encode(&mut response_buf);
-            
+
             if let Some(_pair_idx) = checklist.process_response(&response_buf[..len], from)? {
                 // Check succeeded - update state
                 self.update_connection_state();
-                
+
                 // Update consent timestamp on successful response
                 self.last_consent = Instant::now();
-                
+
                 // Try nomination if controlling
                 if matches!(self.role, IceRole::Controlling) {
                     self.try_nominate();
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Handle role conflict detection per RFC 8445 §7.2.1.1.
     ///
     /// Checks ICE-CONTROLLING/ICE-CONTROLLED attributes in the incoming
@@ -1109,14 +1154,16 @@ impl IceAgent {
     /// switch roles (we send a 487 error response).
     fn handle_role_conflict(&mut self, msg: &StunMessage) -> Result<(), IceError> {
         // Precondition: this must be a request
-        assert!(msg.class == StunClass::Request,
-            "handle_role_conflict requires Request class");
-        
+        assert!(
+            msg.class == StunClass::Request,
+            "handle_role_conflict requires Request class"
+        );
+
         // Extract ICE role attributes from the request
         let mut remote_controlling = false;
         let mut remote_tie_breaker = 0u64;
         let mut has_role_attr = false;
-        
+
         for attr in msg.attributes.iter().flatten() {
             match attr {
                 super::stun::attributes::StunAttribute::IceControlling(tb) => {
@@ -1132,18 +1179,18 @@ impl IceAgent {
                 _ => {}
             }
         }
-        
+
         if !has_role_attr {
             // No role attribute — no conflict possible
             return Ok(());
         }
-        
+
         let we_control = matches!(self.role, IceRole::Controlling);
-        
+
         if we_control && remote_controlling {
             // Both controlling — resolve via tie-breaker
             let our_tie_breaker = self.get_tie_breaker();
-            
+
             if our_tie_breaker >= remote_tie_breaker {
                 // We keep controlling, remote should switch → 487
                 return Err(IceError::RoleConflict);
@@ -1155,7 +1202,7 @@ impl IceAgent {
         } else if !we_control && !remote_controlling {
             // Both controlled — resolve via tie-breaker
             let our_tie_breaker = self.get_tie_breaker();
-            
+
             if our_tie_breaker >= remote_tie_breaker {
                 // We become controlling
                 self.role = IceRole::Controlling;
@@ -1165,19 +1212,20 @@ impl IceAgent {
                 return Err(IceError::RoleConflict);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get the tie-breaker value from the checklist.
     ///
     /// Returns 0 if no checklist exists.
     fn get_tie_breaker(&self) -> u64 {
-        self.checklist.as_ref()
+        self.checklist
+            .as_ref()
             .map(|c| c.tie_breaker())
             .unwrap_or(0)
     }
-    
+
     /// Build a 487 Role Conflict error response per RFC 8445 Section 7.2.1.1.
     ///
     /// # Comment 4 Fix
@@ -1186,25 +1234,25 @@ impl IceAgent {
     /// error response with the correct role attribute (ICE-CONTROLLING or
     /// ICE-CONTROLLED) matching our current role.
     fn build_role_conflict_response(&self, request: &StunMessage) -> Vec<u8> {
-        use super::stun::message::STUN_MAGIC_COOKIE;
         use super::stun::integrity::sign_message;
-        
+        use super::stun::message::STUN_MAGIC_COOKIE;
+
         let mut buf = [0u8; STUN_BUFFER_SIZE];
-        
+
         // Build error response header
         let msg_type = StunMessage::encode_type(StunClass::ErrorResponse, request.method);
         buf[0..2].copy_from_slice(&msg_type.to_be_bytes());
         buf[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         buf[8..20].copy_from_slice(&request.transaction_id);
-        
+
         let mut offset = 20usize;
-        
+
         // Add ERROR-CODE attribute (487 Role Conflict)
         // Type: 0x0009, Length: 4 + reason length
         let reason = b"Role Conflict";
-        let error_class = 4u8;  // 4xx class
+        let error_class = 4u8; // 4xx class
         let error_number = 87u8; // 87 = Role Conflict
-        
+
         buf[offset..offset + 2].copy_from_slice(&0x0009u16.to_be_bytes()); // ERROR-CODE type
         let error_len = 4 + reason.len();
         buf[offset + 2..offset + 4].copy_from_slice(&(error_len as u16).to_be_bytes());
@@ -1214,7 +1262,7 @@ impl IceAgent {
         buf[offset + 7] = error_number;
         buf[offset + 8..offset + 8 + reason.len()].copy_from_slice(reason);
         offset += 4 + ((error_len + 3) & !3); // Pad to 4-byte boundary
-        
+
         // Add our current role attribute so remote knows our state
         let tie_breaker = self.get_tie_breaker();
         if matches!(self.role, IceRole::Controlling) {
@@ -1230,18 +1278,18 @@ impl IceAgent {
             buf[offset + 4..offset + 12].copy_from_slice(&tie_breaker.to_be_bytes());
             offset += 12;
         }
-        
+
         // Update message length
         let attr_len = (offset - 20) as u16;
         buf[2..4].copy_from_slice(&attr_len.to_be_bytes());
-        
+
         // Add MESSAGE-INTEGRITY and FINGERPRINT
         let key = self.local_credentials.local_pwd.as_bytes();
         let final_len = sign_message(&mut buf, offset, key);
-        
+
         buf[..final_len].to_vec()
     }
-    
+
     /// Try to nominate the best succeeded pair (RFC 8445 §8.1.1).
     ///
     /// When the controlling agent has a succeeded pair, it sends a
@@ -1266,7 +1314,7 @@ impl IceAgent {
             }
         }
     }
-    
+
     /// Update connection state based on checklist state.
     fn update_connection_state(&mut self) {
         if let Some(ref checklist) = self.checklist {
@@ -1275,7 +1323,10 @@ impl IceAgent {
                     if checklist.succeeded_count() > 0 {
                         if let Some(pair) = checklist.nominated_pair() {
                             // Postcondition: nominated pair must be succeeded (TigerStyle)
-                            assert!(pair.is_succeeded(), "Nominated pair must be in Succeeded state");
+                            assert!(
+                                pair.is_succeeded(),
+                                "Nominated pair must be in Succeeded state"
+                            );
                             self.selected_pair = Some(pair.clone());
                             self.connection_state = IceConnectionState::Connected;
                         }
@@ -1284,7 +1335,10 @@ impl IceAgent {
                 ChecklistState::Completed => {
                     if let Some(pair) = checklist.nominated_pair() {
                         // Postcondition: nominated pair must be succeeded (TigerStyle)
-                        assert!(pair.is_succeeded(), "Nominated pair must be in Succeeded state");
+                        assert!(
+                            pair.is_succeeded(),
+                            "Nominated pair must be in Succeeded state"
+                        );
                         self.selected_pair = Some(pair.clone());
                         self.connection_state = IceConnectionState::Connected;
                     }
@@ -1295,48 +1349,54 @@ impl IceAgent {
             }
         }
     }
-    
+
     /// Get retransmissions to send.
     ///
     /// Deprecated — use `poll_outbound()` which includes retransmissions.
     #[deprecated(note = "Use poll_outbound() instead")]
     pub fn retransmissions(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut result = Vec::new();
-        
+
         if let Some(ref mut checklist) = self.checklist {
             for (_, dest, buf, len) in checklist.check_retransmissions() {
                 result.push((dest, buf[..len].to_vec()));
             }
         }
-        
+
         result
     }
-    
+
     /// Get selected (nominated) pair.
     pub fn selected_pair(&self) -> Option<&CandidatePair> {
         self.selected_pair.as_ref()
     }
-    
+
     /// Check if connected.
     pub const fn is_connected(&self) -> bool {
-        matches!(self.connection_state, IceConnectionState::Connected | IceConnectionState::Completed)
+        matches!(
+            self.connection_state,
+            IceConnectionState::Connected | IceConnectionState::Completed
+        )
     }
-    
+
     /// Check if failed.
     pub const fn is_failed(&self) -> bool {
-        matches!(self.connection_state, IceConnectionState::Failed | IceConnectionState::Closed)
+        matches!(
+            self.connection_state,
+            IceConnectionState::Failed | IceConnectionState::Closed
+        )
     }
-    
+
     /// Get time since last activity.
     pub fn time_since_activity(&self) -> Duration {
         self.last_activity.elapsed()
     }
-    
+
     /// Get time since last consent.
     pub fn time_since_consent(&self) -> Duration {
         self.last_consent.elapsed()
     }
-    
+
     /// Check consent freshness (RFC 7675).
     ///
     /// Returns true if consent is stale (>30 seconds since last consent).
@@ -1347,43 +1407,45 @@ impl IceAgent {
     /// - Assertion for timestamp validity
     pub fn is_consent_stale(&self) -> bool {
         // Precondition: consent timestamp must be in the past (TigerStyle Phase 1.8)
-        assert!(self.last_consent <= Instant::now(),
-            "Consent timestamp must not be in the future");
-        
+        assert!(
+            self.last_consent <= Instant::now(),
+            "Consent timestamp must not be in the future"
+        );
+
         self.last_consent.elapsed() > Duration::from_secs(CONSENT_TIMEOUT_SECS)
     }
-    
+
     /// Close the agent.
     pub fn close(&mut self) {
         self.connection_state = IceConnectionState::Closed;
         self.selected_pair = None;
         self.checklist = None;
     }
-    
+
     /// Restart ICE.
     ///
     /// This generates new credentials and resets the state.
     pub fn restart(&mut self) -> Result<(), IceError> {
         // Generate new credentials
         let new_credentials = IceCredentials::generate();
-        
+
         // Copy to fixed-size arrays in config
         let ufrag_bytes = new_credentials.local_ufrag.as_bytes();
         let pwd_bytes = new_credentials.local_pwd.as_bytes();
-        
+
         self.config.local_ufrag = [0u8; 32];
         self.config.local_pwd = [0u8; 32];
-        
+
         let ufrag_len = ufrag_bytes.len().min(32);
         let pwd_len = pwd_bytes.len().min(32);
-        
+
         self.config.local_ufrag[..ufrag_len].copy_from_slice(&ufrag_bytes[..ufrag_len]);
         self.config.local_ufrag_len = ufrag_len as u8;
         self.config.local_pwd[..pwd_len].copy_from_slice(&pwd_bytes[..pwd_len]);
         self.config.local_pwd_len = pwd_len as u8;
-        
+
         self.local_credentials = new_credentials;
-        
+
         // Reset state
         self.remote_credentials = None;
         self.connection_state = IceConnectionState::New;
@@ -1396,10 +1458,10 @@ impl IceAgent {
         self.selected_pair = None;
         self.outbound = std::array::from_fn(|_| None);
         self.outbound_count = 0;
-        
+
         Ok(())
     }
-    
+
     /// Get the number of candidate pairs that have been checked.
     ///
     /// Returns the count of pairs that have completed connectivity checks
@@ -1411,7 +1473,7 @@ impl IceAgent {
             0
         }
     }
-    
+
     /// Get statistics.
     pub fn stats(&self) -> IceAgentStats {
         let (pair_count, succeeded_count) = if let Some(ref checklist) = self.checklist {
@@ -1419,7 +1481,7 @@ impl IceAgent {
         } else {
             (0, 0)
         };
-        
+
         IceAgentStats {
             local_candidates: self.local_candidate_count,
             remote_candidates: self.remote_candidate_count,
@@ -1449,7 +1511,9 @@ pub struct IceAgentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ice::candidate::{TYPE_PREF_HOST, TYPE_PREF_PEER_REFLEXIVE, TYPE_PREF_SERVER_REFLEXIVE, TYPE_PREF_RELAY};
+    use crate::ice::candidate::{
+        TYPE_PREF_HOST, TYPE_PREF_PEER_REFLEXIVE, TYPE_PREF_RELAY, TYPE_PREF_SERVER_REFLEXIVE,
+    };
 
     // ========================================================================
     // Basic Agent Tests
@@ -1458,7 +1522,7 @@ mod tests {
     #[test]
     fn test_agent_creation() {
         let agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         assert_eq!(agent.connection_state(), IceConnectionState::New);
         assert_eq!(agent.gathering_state(), IceGatheringState::New);
         assert_eq!(agent.role(), IceRole::Controlling);
@@ -1467,7 +1531,7 @@ mod tests {
     #[test]
     fn test_agent_credentials() {
         let agent = IceAgent::with_defaults(IceRole::Controlled);
-        
+
         let creds = agent.local_credentials();
         assert!(!creds.local_ufrag.is_empty());
         assert!(!creds.local_pwd.is_empty());
@@ -1484,10 +1548,10 @@ mod tests {
     #[test]
     fn test_agent_state_transitions() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Should start in New state
         assert_eq!(agent.connection_state(), IceConnectionState::New);
-        
+
         // Gather candidates via new API
         gather_synthetic(&mut agent);
         assert_eq!(agent.gathering_state(), IceGatheringState::Complete);
@@ -1496,17 +1560,17 @@ mod tests {
     #[test]
     fn test_add_remote_candidate_requires_credentials() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         let addr: SocketAddr = "192.168.1.200:5000".parse().unwrap();
         let candidate = Candidate::new_host(addr, 1, 0);
-        
+
         // Should fail without remote credentials
         let result = agent.add_remote_candidate(candidate.clone());
         assert!(matches!(result, Err(IceError::NoRemoteCredentials)));
-        
+
         // Set remote credentials
         agent.set_remote_credentials(IceCredentials::generate());
-        
+
         // Now should succeed
         let result = agent.add_remote_candidate(candidate);
         assert!(result.is_ok());
@@ -1515,18 +1579,18 @@ mod tests {
     #[test]
     fn test_agent_restart() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         let original_ufrag = agent.local_credentials().local_ufrag.clone();
-        
+
         // Gather some candidates
         gather_synthetic(&mut agent);
-        
+
         // Restart
         agent.restart().unwrap();
-        
+
         // Should have new credentials
         assert_ne!(agent.local_credentials().local_ufrag, original_ufrag);
-        
+
         // Should be back to New state
         assert_eq!(agent.connection_state(), IceConnectionState::New);
         assert_eq!(agent.gathering_state(), IceGatheringState::New);
@@ -1539,7 +1603,7 @@ mod tests {
     #[test]
     fn test_candidate_gathering_bounds() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Add candidates up to the limit via new API
         for i in 0..MAX_CANDIDATES {
             let addr: SocketAddr = format!("127.0.0.{}:9000", i).parse().unwrap();
@@ -1547,17 +1611,22 @@ mod tests {
             agent.add_local_candidate(candidate).unwrap();
         }
         agent.set_gathering_complete();
-        
+
         // Count should be bounded by MAX_CANDIDATES (32)
         let count = agent.local_candidates().count();
-        assert!(count <= MAX_CANDIDATES, "candidate count {} exceeds MAX_CANDIDATES {}", count, MAX_CANDIDATES);
+        assert!(
+            count <= MAX_CANDIDATES,
+            "candidate count {} exceeds MAX_CANDIDATES {}",
+            count,
+            MAX_CANDIDATES
+        );
     }
 
     #[test]
     fn test_remote_candidate_bounds() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
         agent.set_remote_credentials(IceCredentials::generate());
-        
+
         // Add candidates up to the limit
         for i in 0..MAX_CANDIDATES {
             let addr: SocketAddr = format!("192.168.1.{}:5000", i).parse().unwrap();
@@ -1565,7 +1634,7 @@ mod tests {
             let result = agent.add_remote_candidate(candidate);
             assert!(result.is_ok(), "Failed to add candidate {}", i);
         }
-        
+
         // Verify count is at maximum
         assert_eq!(agent.remote_candidate_count() as usize, MAX_CANDIDATES);
     }
@@ -1579,15 +1648,15 @@ mod tests {
     #[should_panic(expected = "start_checks requires GatheringComplete state")]
     fn test_start_checks_requires_gathering_complete() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Try to start checks before gathering - should panic per TigerStyle assertion
         agent.set_remote_credentials(IceCredentials::generate());
-        
+
         // Add remote candidate first
         let addr: SocketAddr = "192.168.1.200:5000".parse().unwrap();
         let candidate = Candidate::new_host(addr, 1, 0);
         let _ = agent.add_remote_candidate(candidate);
-        
+
         // Start checks without gathering should panic
         let _ = agent.start_checks();
     }
@@ -1595,16 +1664,16 @@ mod tests {
     #[test]
     fn test_start_checks_after_gathering() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Gather candidates via new API
         gather_synthetic(&mut agent);
-        
+
         // Set remote credentials and add remote candidate
         agent.set_remote_credentials(IceCredentials::generate());
         let addr: SocketAddr = "192.168.1.200:5000".parse().unwrap();
         let candidate = Candidate::new_host(addr, 1, 0);
         let _ = agent.add_remote_candidate(candidate);
-        
+
         // Now start checks should work
         let result = agent.start_checks();
         assert!(result.is_ok());
@@ -1614,10 +1683,10 @@ mod tests {
     #[test]
     fn test_start_checks_requires_remote_credentials() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Gather candidates via new API
         gather_synthetic(&mut agent);
-        
+
         // Try to start checks without remote credentials
         let result = agent.start_checks();
         assert!(matches!(result, Err(IceError::NoRemoteCredentials)));
@@ -1626,13 +1695,13 @@ mod tests {
     #[test]
     fn test_start_checks_requires_remote_candidates() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Gather candidates via new API
         gather_synthetic(&mut agent);
-        
+
         // Set remote credentials but no candidates
         agent.set_remote_credentials(IceCredentials::generate());
-        
+
         // Try to start checks without remote candidates
         let result = agent.start_checks();
         assert!(matches!(result, Err(IceError::NoCandidates)));
@@ -1646,10 +1715,10 @@ mod tests {
     fn test_role_flip() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
         assert_eq!(agent.role(), IceRole::Controlling);
-        
+
         agent.set_role(IceRole::Controlled);
         assert_eq!(agent.role(), IceRole::Controlled);
-        
+
         agent.set_role(IceRole::Controlling);
         assert_eq!(agent.role(), IceRole::Controlling);
     }
@@ -1670,26 +1739,30 @@ mod tests {
         // Host candidate should have highest type preference (126)
         let host_addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
         let host = Candidate::new_host(host_addr, 1, 0);
-        
+
         // Verify priority follows RFC 8445 formula:
         // priority = (2^24) * type_preference + (2^8) * local_preference + (256 - component_id)
         let type_pref = TYPE_PREF_HOST;
         let local_pref = 65535u32; // Default local preference
         let component = 1u8;
-        
-        let _expected_priority = (1u32 << 24) * type_pref 
+
+        let _expected_priority = (1u32 << 24) * type_pref
             + (1u32 << 8) * (local_pref & 0xFFFF)
             + (256 - component as u32);
-        
+
         // Priority should be consistent with the formula
         assert!(host.priority > 0, "Host priority should be positive");
-        
+
         // Host candidates should have higher priority than relay candidates
         let relay_addr: SocketAddr = "10.0.0.1:3478".parse().unwrap();
         let relay = Candidate::new_relay(relay_addr, host_addr, 1, 0);
-        
-        assert!(host.priority > relay.priority, 
-            "Host priority {} should be > relay priority {}", host.priority, relay.priority);
+
+        assert!(
+            host.priority > relay.priority,
+            "Host priority {} should be > relay priority {}",
+            host.priority,
+            relay.priority
+        );
     }
 
     #[test]
@@ -1708,7 +1781,7 @@ mod tests {
     fn test_agent_with_custom_config() {
         let config = IceConfig::default();
         let agent = IceAgent::new(config, IceRole::Controlled);
-        
+
         assert_eq!(agent.role(), IceRole::Controlled);
         assert_eq!(agent.connection_state(), IceConnectionState::New);
     }
@@ -1716,10 +1789,10 @@ mod tests {
     #[test]
     fn test_agent_component_setting() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Component 1 (RTP) is default
         agent.set_component(1);
-        
+
         // Component 2 (RTCP) should also work
         agent.set_component(2);
     }
@@ -1739,7 +1812,7 @@ mod tests {
     fn test_agent_stats_initial() {
         let agent = IceAgent::with_defaults(IceRole::Controlling);
         let stats = agent.stats();
-        
+
         assert_eq!(stats.local_candidates, 0);
         assert_eq!(stats.remote_candidates, 0);
         assert_eq!(stats.candidate_pairs, 0);
@@ -1751,9 +1824,9 @@ mod tests {
     fn test_agent_stats_after_gathering() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
         gather_synthetic(&mut agent);
-        
+
         let stats = agent.stats();
-        
+
         // Should have gathered at least some candidates (depends on system)
         assert_eq!(stats.gathering_state, IceGatheringState::Complete);
     }
@@ -1765,17 +1838,17 @@ mod tests {
     #[test]
     fn test_agent_close() {
         let mut agent = IceAgent::with_defaults(IceRole::Controlling);
-        
+
         // Gather and setup
         gather_synthetic(&mut agent);
         agent.set_remote_credentials(IceCredentials::generate());
         let addr: SocketAddr = "192.168.1.200:5000".parse().unwrap();
         let _ = agent.add_remote_candidate(Candidate::new_host(addr, 1, 0));
         let _ = agent.start_checks();
-        
+
         // Close the agent
         agent.close();
-        
+
         assert_eq!(agent.connection_state(), IceConnectionState::Closed);
         assert!(agent.selected_pair.is_none());
     }
@@ -1788,11 +1861,11 @@ mod tests {
     fn test_ice_credentials_generation() {
         let creds1 = IceCredentials::generate();
         let creds2 = IceCredentials::generate();
-        
+
         // Each generation should produce unique credentials
         assert_ne!(creds1.local_ufrag, creds2.local_ufrag);
         assert_ne!(creds1.local_pwd, creds2.local_pwd);
-        
+
         // Credentials should have reasonable lengths
         assert!(creds1.local_ufrag.len() >= 4, "ufrag too short");
         assert!(creds1.local_pwd.len() >= 22, "pwd too short");
@@ -1801,7 +1874,7 @@ mod tests {
     #[test]
     fn test_ice_credentials_custom() {
         let creds = IceCredentials::new("myufrag", "mypassword123456789012");
-        
+
         assert_eq!(creds.local_ufrag, "myufrag");
         assert_eq!(creds.local_pwd, "mypassword123456789012");
     }
@@ -1814,16 +1887,16 @@ mod tests {
     fn test_valid_state_transitions() {
         // New → Checking
         assert!(IceConnectionState::New.can_transition_to(IceConnectionState::Checking));
-        
+
         // Checking → Connected
         assert!(IceConnectionState::Checking.can_transition_to(IceConnectionState::Connected));
-        
+
         // Checking → Failed
         assert!(IceConnectionState::Checking.can_transition_to(IceConnectionState::Failed));
-        
+
         // Connected → Completed
         assert!(IceConnectionState::Connected.can_transition_to(IceConnectionState::Completed));
-        
+
         // Connected → Disconnected
         assert!(IceConnectionState::Connected.can_transition_to(IceConnectionState::Disconnected));
     }
@@ -1833,7 +1906,7 @@ mod tests {
         // Terminal states cannot transition
         assert!(!IceConnectionState::Failed.can_transition_to(IceConnectionState::New));
         assert!(!IceConnectionState::Closed.can_transition_to(IceConnectionState::Checking));
-        
+
         // Cannot go backwards
         assert!(!IceConnectionState::Checking.can_transition_to(IceConnectionState::New));
     }
@@ -1843,7 +1916,7 @@ mod tests {
         assert!(IceConnectionState::Connected.is_connected());
         assert!(IceConnectionState::Completed.is_connected());
         assert!(!IceConnectionState::Checking.is_connected());
-        
+
         assert!(IceConnectionState::Failed.is_terminal());
         assert!(IceConnectionState::Closed.is_terminal());
         assert!(!IceConnectionState::Connected.is_terminal());
@@ -1856,10 +1929,10 @@ mod tests {
     #[test]
     fn test_with_server_config_default() {
         use crate::ice::types::IceServerConfig;
-        
+
         let ice_server_config = IceServerConfig::default();
         let agent = IceAgent::with_server_config(&ice_server_config, IceRole::Controlling);
-        
+
         // Should have Google STUN servers as fallback
         assert_eq!(agent.role(), IceRole::Controlling);
         assert_eq!(agent.connection_state(), IceConnectionState::New);
@@ -1868,22 +1941,22 @@ mod tests {
     #[test]
     fn test_with_server_config_custom_stun() {
         use crate::ice::types::IceServerConfig;
-        
+
         let ice_server_config = IceServerConfig {
             stun_servers: vec!["stun:74.125.250.129:19302".to_string()],
             turn_servers: Vec::new(),
             use_google_fallback: false,
         };
         let agent = IceAgent::with_server_config(&ice_server_config, IceRole::Controlled);
-        
+
         assert_eq!(agent.role(), IceRole::Controlled);
         assert_eq!(agent.connection_state(), IceConnectionState::New);
     }
 
     #[test]
     fn test_with_server_config_with_turn() {
-        use crate::ice::types::{IceServerConfig, HighLevelTurnServerConfig};
-        
+        use crate::ice::types::{HighLevelTurnServerConfig, IceServerConfig};
+
         let ice_server_config = IceServerConfig {
             stun_servers: vec!["stun:74.125.250.129:19302".to_string()],
             turn_servers: vec![HighLevelTurnServerConfig::new(
@@ -1894,7 +1967,7 @@ mod tests {
             use_google_fallback: false,
         };
         let agent = IceAgent::with_server_config(&ice_server_config, IceRole::Controlling);
-        
+
         assert_eq!(agent.role(), IceRole::Controlling);
     }
 
@@ -1904,20 +1977,20 @@ mod tests {
         let addr = IceAgent::parse_stun_url("stun:74.125.250.129:19302");
         assert!(addr.is_some());
         assert_eq!(addr.unwrap().port(), 19302);
-        
+
         // STUNS URL
         let addr = IceAgent::parse_stun_url("stuns:74.125.250.129:5349");
         assert!(addr.is_some());
         assert_eq!(addr.unwrap().port(), 5349);
-        
+
         // Legacy format (host:port)
         let addr = IceAgent::parse_stun_url("74.125.250.129:19302");
         assert!(addr.is_some());
-        
+
         // Invalid URL
         let addr = IceAgent::parse_stun_url("invalid");
         assert!(addr.is_none());
-        
+
         // Empty URL
         let addr = IceAgent::parse_stun_url("");
         assert!(addr.is_none());
@@ -1929,16 +2002,16 @@ mod tests {
         let addr = IceAgent::parse_turn_url("turn:192.168.1.100:3478");
         assert!(addr.is_some());
         assert_eq!(addr.unwrap().port(), 3478);
-        
+
         // TURNS URL
         let addr = IceAgent::parse_turn_url("turns:192.168.1.100:5349");
         assert!(addr.is_some());
         assert_eq!(addr.unwrap().port(), 5349);
-        
+
         // Invalid URL
         let addr = IceAgent::parse_turn_url("invalid");
         assert!(addr.is_none());
-        
+
         // Empty URL
         let addr = IceAgent::parse_turn_url("");
         assert!(addr.is_none());
@@ -1947,11 +2020,11 @@ mod tests {
     // ========================================================================
     // Property-Based Tests
     // ========================================================================
-    
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
-        
+
         proptest! {
             /// Property: ICE credentials are always valid length.
             #[test]
@@ -1959,14 +2032,14 @@ mod tests {
                 _ in 0..100u32,  // Just run multiple times
             ) {
                 let creds = IceCredentials::generate();
-                
+
                 // RFC 5245: ufrag >= 4 chars, pwd >= 22 chars
                 prop_assert!(creds.local_ufrag.len() >= 4, "ufrag too short");
                 prop_assert!(creds.local_pwd.len() >= 22, "pwd too short");
                 prop_assert!(creds.local_ufrag.len() <= 256, "ufrag too long");
                 prop_assert!(creds.local_pwd.len() <= 256, "pwd too long");
             }
-            
+
             /// Property: Agent roles are preserved.
             #[test]
             fn prop_role_preserved(
@@ -1974,10 +2047,10 @@ mod tests {
             ) {
                 let role = if role_idx == 0 { IceRole::Controlling } else { IceRole::Controlled };
                 let agent = IceAgent::with_defaults(role);
-                
+
                 prop_assert_eq!(agent.role(), role);
             }
-            
+
             /// Property: Initial state is always New.
             #[test]
             fn prop_initial_state_new(
@@ -1985,13 +2058,13 @@ mod tests {
             ) {
                 let role = if role_idx == 0 { IceRole::Controlling } else { IceRole::Controlled };
                 let agent = IceAgent::with_defaults(role);
-                
+
                 prop_assert_eq!(agent.connection_state(), IceConnectionState::New);
                 prop_assert_eq!(agent.gathering_state(), IceGatheringState::New);
                 prop_assert_eq!(agent.local_candidate_count(), 0);
                 prop_assert_eq!(agent.remote_candidate_count(), 0);
             }
-            
+
             /// Property: Candidate count never exceeds MAX_CANDIDATES.
             #[test]
             fn prop_candidate_count_bounded(
@@ -1999,22 +2072,22 @@ mod tests {
             ) {
                 let mut agent = IceAgent::with_defaults(IceRole::Controlling);
                 agent.set_remote_credentials(IceCredentials::generate());
-                
+
                 let mut added = 0usize;
                 for i in 0..candidate_count {
                     let addr: std::net::SocketAddr = format!("192.168.{}.{}:5000", i / 256, i % 256).parse().unwrap();
                     let candidate = Candidate::new_host(addr, 1, (i % 256) as u8);
-                    
+
                     match agent.add_remote_candidate(candidate) {
                         Ok(_) => added += 1,
                         Err(_) => break,
                     }
                 }
-                
+
                 prop_assert!(agent.remote_candidate_count() as usize <= MAX_CANDIDATES);
                 prop_assert_eq!(agent.remote_candidate_count() as usize, added);
             }
-            
+
             /// Property: State transitions are valid (no invalid transitions).
             #[test]
             fn prop_state_machine_valid_transitions(
@@ -2022,15 +2095,15 @@ mod tests {
             ) {
                 let role = if role_idx == 0 { IceRole::Controlling } else { IceRole::Controlled };
                 let agent = IceAgent::with_defaults(role);
-                
+
                 // New state can only transition to Checking (after gather/start_checks)
                 let state = agent.connection_state();
                 prop_assert_eq!(state, IceConnectionState::New);
-                
+
                 // Terminal states
                 prop_assert!(IceConnectionState::Failed.is_terminal());
                 prop_assert!(IceConnectionState::Closed.is_terminal());
-                
+
                 // Connected states
                 prop_assert!(IceConnectionState::Connected.is_connected());
                 prop_assert!(IceConnectionState::Completed.is_connected());
@@ -2044,22 +2117,30 @@ mod tests {
 // ============================================================================
 
 // Assert candidate limits are bounded
-const _: () = assert!(MAX_CANDIDATES <= 32,
-    "MAX_CANDIDATES must be <= 32 to fit in u8 counter");
+const _: () = assert!(
+    MAX_CANDIDATES <= 32,
+    "MAX_CANDIDATES must be <= 32 to fit in u8 counter"
+);
 
 // Assert candidate pair limit is reasonable
-const _: () = assert!(MAX_CANDIDATE_PAIRS <= 1024,
-    "MAX_CANDIDATE_PAIRS must be <= 1024 to prevent memory exhaustion");
+const _: () = assert!(
+    MAX_CANDIDATE_PAIRS <= 1024,
+    "MAX_CANDIDATE_PAIRS must be <= 1024 to prevent memory exhaustion"
+);
 
 // Assert STUN transaction timeout bounds (TigerStyle Phase 1.1)
 #[allow(dead_code)] // Used in compile-time assertions for protocol timing bounds
 const STUN_TRANSACTION_TIMEOUT_MS: u32 = 500;
 #[allow(dead_code)] // Used in compile-time assertions for protocol timing bounds
 const CHECK_INTERVAL_MS: u32 = 50;
-const _: () = assert!(STUN_TRANSACTION_TIMEOUT_MS >= 100 && STUN_TRANSACTION_TIMEOUT_MS <= 5000,
-    "STUN timeout must be in range 100-5000ms");
-const _: () = assert!(CHECK_INTERVAL_MS >= 10 && CHECK_INTERVAL_MS <= 1000,
-    "Check interval must be in range 10-1000ms");
+const _: () = assert!(
+    STUN_TRANSACTION_TIMEOUT_MS >= 100 && STUN_TRANSACTION_TIMEOUT_MS <= 5000,
+    "STUN timeout must be in range 100-5000ms"
+);
+const _: () = assert!(
+    CHECK_INTERVAL_MS >= 10 && CHECK_INTERVAL_MS <= 1000,
+    "Check interval must be in range 10-1000ms"
+);
 
 // Assert consent timeout is reasonable (RFC 7675)
 const CONSENT_TIMEOUT_SECS: u64 = 30;

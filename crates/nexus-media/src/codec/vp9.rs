@@ -194,6 +194,16 @@ impl Vp9PayloadHeader {
                 }
                 let n_g = data[offset] as usize;
                 offset += 1;
+
+                // Bound PG iteration to prevent DoS from
+                // malformed packets. VP9 spec allows up to 255
+                // but real streams use < 16.
+                if n_g > 64 {
+                    return Err(CodecError::Unsupported {
+                        feature: "VP9 n_g > 64",
+                    });
+                }
+
                 // Each PG entry: 1 byte + variable refs
                 for _ in 0..n_g {
                     if offset >= data.len() {

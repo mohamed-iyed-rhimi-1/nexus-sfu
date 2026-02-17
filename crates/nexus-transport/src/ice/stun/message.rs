@@ -384,7 +384,7 @@ impl StunMessage {
         // Extract method from remaining bits
         let m0 = msg_type & 0x000F;
         let m1 = (msg_type >> 5) & 0x0070;
-        let m2 = (msg_type >> 6) & 0x0F80;
+        let m2 = (msg_type >> 2) & 0x0F80;
         let method_bits = m0 | m1 | m2;
         
         let method = StunMethod::try_from_u16(method_bits)

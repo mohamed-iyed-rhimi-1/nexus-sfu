@@ -46,15 +46,6 @@ const SRTP_AEAD_AES_128_GCM: &str = "SRTP_AEAD_AES_128_GCM";
 
 /// Memory BIO pair for non-blocking DTLS I/O.
 ///
-/// Incoming UDP data is written to `network_bio`. OpenSSL reads from it,
-/// processes the DTLS record, and writes response records to `internal_bio`.
-/// We read from `internal_bio` to get bytes to send over UDP.
-#[allow(dead_code)]
-struct BioPair {
-    /// BIO for network data (we write incoming, OpenSSL reads).
-    network_bio: openssl::ssl::SslStream<MemBio>,
-}
-
 /// In-memory BIO wrapper implementing Read + Write for SslStream.
 ///
 /// Buffers incoming and outgoing data without touching the network.
@@ -91,14 +82,9 @@ impl MemBio {
 
     /// Take outgoing data (DTLS records to send over UDP).
     #[allow(dead_code)]
+    /// Take outgoing data (DTLS records to send over UDP).
     fn take_outgoing(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.outgoing)
-    }
-
-    /// Check if there is outgoing data.
-    #[allow(dead_code)]
-    fn has_outgoing(&self) -> bool {
-        !self.outgoing.is_empty()
     }
 }
 
@@ -151,12 +137,6 @@ impl Write for MemBio {
 pub struct OpenSslDtlsEngine {
     /// SSL context (shared config).
     ctx: SslContext,
-    /// SSL instance for this session.
-    #[allow(dead_code)]
-    ssl: Option<Ssl>,
-    /// Memory BIO for non-blocking I/O.
-    #[allow(dead_code)]
-    bio: MemBio,
     /// Mid-handshake state (during async handshake).
     mid_handshake: Option<MidHandshakeSslStream<MemBio>>,
     /// Completed SSL stream (after handshake).
@@ -272,8 +252,11 @@ impl OpenSslDtlsEngine {
             "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
         ).map_err(|e| DtlsError::handshake_failed(format!("ciphers: {}", e)))?;
 
-        // SRTP profiles — prefer AES128_CM_SHA1_80 for maximum compatibility
-        // with browser and webrtc-rs DTLS stacks that may not support GCM.
+        // SRTP profiles — prefer AES128_CM_SHA1_80 for interoperability.
+        // While RFC 8827 §6.5 recommends GCM, webrtc-rs (used in loadtest)
+        // and some browser versions have incomplete GCM-SRTP support.
+        // AES128_CM_SHA1_80 is universally supported. GCM is offered as
+        // fallback for clients that prefer it.
         ctx_builder.set_tlsext_use_srtp(
             &format!("{}:{}", SRTP_AES128_CM_SHA1_80, SRTP_AEAD_AES_128_GCM)
         ).map_err(|e| DtlsError::handshake_failed(format!("srtp ext: {}", e)))?;
@@ -289,8 +272,6 @@ impl OpenSslDtlsEngine {
 
         Ok(Self {
             ctx,
-            ssl: None,
-            bio: MemBio::new(),
             mid_handshake: None,
             stream: None,
             role,
@@ -414,6 +395,14 @@ impl OpenSslDtlsEngine {
                 }
                 Err(HandshakeError::Failure(mut mid)) => {
                     let _output = mid.get_mut().take_outgoing();
+                    
+                    // Log OpenSSL error details
+                    let ssl_error = mid.error();
+                    tracing::error!(
+                        ssl_error = ?ssl_error,
+                        "OpenSSL handshake failure - detailed error"
+                    );
+                    
                     Err(DtlsError::handshake_failed("OpenSSL handshake failure"))
                 }
                 Err(e) => {
@@ -490,8 +479,13 @@ impl OpenSslDtlsEngine {
             "salt_len must match profile salt_length"
         );
 
-        // Export keying material per RFC 5764
+        // Export keying material per RFC 5764 §4.2.
         // Layout: client_key | server_key | client_salt | server_salt
+        //
+        // Note: RFC 5764 §4.2 specifies the empty context, but RFC 5705 §4
+        // distinguishes "no context" from "empty context" in the PRF seed.
+        // webrtc-rs (and most WebRTC stacks) use "no context" (None) for
+        // DTLS-SRTP key export. We match this for interoperability.
         let material_len = 2 * (key_len + salt_len);
         let mut material = vec![0u8; material_len];
         ssl.export_keying_material(
@@ -499,6 +493,11 @@ impl OpenSslDtlsEngine {
             "EXTRACTOR-dtls_srtp",
             None,
         ).map_err(|e| DtlsError::handshake_failed(format!("SRTP export: {}", e)))?;
+
+        tracing::debug!(
+            material_len,
+            "DTLS-SRTP keying material exported (RFC 5764 §4.2)"
+        );
 
         // Parse material: client_key | server_key | client_salt | server_salt
         let mut offset = 0;

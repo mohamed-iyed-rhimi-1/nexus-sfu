@@ -3,15 +3,29 @@
   "version": "0.1.0",
   "description": "TypeScript SDK for Nexus SFU",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": ["dist"],
-  "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch"
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
   },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["webrtc", "sfu", "media", "video", "audio"],
+  "author": "",
   "license": "Apache-2.0",
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "tsup": "^8.0.1",
+    "typescript": "^5.3.3"
   }
 }

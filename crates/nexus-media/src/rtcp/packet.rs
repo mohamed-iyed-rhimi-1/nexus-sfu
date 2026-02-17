@@ -1,13 +1,19 @@
 //! RTCP packet type parsing: Sender Reports, Receiver Reports,
-//! PLI, NACK, and Sender Report generation.
+//! PLI, NACK, FIR, REMB, Transport-CC, and Sender Report generation.
 
 use nexus_core::RtcpError;
 use super::header::RTCP_VERSION;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sender Report minimum size (header + sender info, no blocks).
 pub const SENDER_REPORT_MIN_SIZE_BYTES: usize = 28;
+
+/// Receiver Report minimum size (header + SSRC, no blocks).
+pub const RECEIVER_REPORT_MIN_SIZE_BYTES: usize = 8;
+
+/// Maximum receiver report blocks per packet (5-bit RC field).
+pub const MAX_REPORT_BLOCKS: usize = 31;
 
 /// Receiver Report block size in bytes.
 pub const RECEIVER_REPORT_BLOCK_SIZE_BYTES: usize = 24;
@@ -268,9 +274,6 @@ impl PliPacket {
     /// * `data` - Raw packet bytes (must be at least 12 bytes)
     #[inline]
     pub fn parse(data: &[u8]) -> Result<Self, RtcpError> {
-        // Precondition assertions
-        debug_assert!(data.len() >= 12 || data.len() < 12);
-
         // Check minimum length
         if data.len() < 12 {
             return Err(RtcpError::TooShort {
@@ -311,9 +314,6 @@ impl PliPacket {
             data[8], data[9], data[10], data[11],
         ]);
 
-        // Postcondition: parsing completed successfully
-        debug_assert!(data.len() >= 12, "PLI packet must be at least 12 bytes");
-
         Ok(PliPacket { sender_ssrc, media_ssrc })
     }
 
@@ -324,9 +324,6 @@ impl PliPacket {
     /// 12-byte PLI packet ready for transmission
     #[inline]
     pub fn build(&self) -> Vec<u8> {
-        // Precondition: struct is valid (no specific constraints on SSRC values)
-        // SSRCs can be any u32 value including 0
-
         let mut packet = vec![0u8; 12];
 
         // Header: V=2, P=0, FMT=1, PT=206
@@ -342,10 +339,6 @@ impl PliPacket {
 
         // Media SSRC
         packet[8..12].copy_from_slice(&self.media_ssrc.to_be_bytes());
-
-        // Postcondition assertions
-        debug_assert_eq!(packet.len(), 12);
-        debug_assert_eq!(packet[1], RTCP_PSFB_PT);
 
         packet
     }
@@ -380,9 +373,6 @@ impl NackPacket {
     /// * `data` - Raw packet bytes (must be at least 12 bytes)
     #[inline]
     pub fn parse(data: &[u8]) -> Result<Self, RtcpError> {
-        // Precondition assertions
-        debug_assert!(data.len() >= 12 || data.len() < 12);
-
         // Check minimum length
         if data.len() < 12 {
             return Err(RtcpError::TooShort {
@@ -478,9 +468,6 @@ impl NackPacket {
     /// NACK packet ready for transmission
     #[inline]
     pub fn build(&self) -> Vec<u8> {
-        // Precondition assertions
-        debug_assert!(self.lost_packets.len() <= MAX_NACK_PACKETS);
-
         // Group lost packets into FCI entries (PID + BLP pairs)
         let fci_entries = self.encode_fci_entries();
         let fci_len = fci_entries.len() * 4;
@@ -509,10 +496,6 @@ impl NackPacket {
             packet[offset..offset + 2].copy_from_slice(&pid.to_be_bytes());
             packet[offset + 2..offset + 4].copy_from_slice(&blp.to_be_bytes());
         }
-
-        // Postcondition assertions
-        debug_assert!(packet.len() >= 12);
-        debug_assert_eq!(packet[1], RTCP_RTPFB_PT);
 
         packet
     }
@@ -567,8 +550,8 @@ pub struct SenderReportGenerator {
     sender_ssrc: u32,
     /// Total packets sent
     packet_count: AtomicU32,
-    /// Total octets sent
-    octet_count: AtomicU64,
+    /// Total octets sent (wraps at u32::MAX per RFC 3550 §6.4.1)
+    octet_count: AtomicU32,
 }
 
 impl SenderReportGenerator {
@@ -583,16 +566,11 @@ impl SenderReportGenerator {
     /// Panics if `sender_ssrc` is zero.
     #[inline]
     pub fn new(sender_ssrc: u32) -> Self {
-        // Precondition assertion
-        assert!(
-            sender_ssrc > 0,
-            "Sender SSRC must be non-zero"
-        );
-
+        assert!(sender_ssrc != 0, "sender SSRC must not be zero");
         Self {
             sender_ssrc,
             packet_count: AtomicU32::new(0),
-            octet_count: AtomicU64::new(0),
+            octet_count: AtomicU32::new(0),
         }
     }
 
@@ -639,7 +617,7 @@ impl SenderReportGenerator {
 
         // Sender's octet count (bytes 24-27)
         let oct_count =
-            self.octet_count.load(Ordering::Relaxed) as u32;
+            self.octet_count.load(Ordering::Relaxed);
         packet[24..28]
             .copy_from_slice(&oct_count.to_be_bytes());
 
@@ -661,7 +639,7 @@ impl SenderReportGenerator {
     pub fn update_stats(&self, packet_size: usize) {
         self.packet_count.fetch_add(1, Ordering::Relaxed);
         self.octet_count.fetch_add(
-            packet_size as u64,
+            packet_size as u32,
             Ordering::Relaxed,
         );
     }
@@ -719,9 +697,6 @@ impl RembPacket {
     /// * `Err(RtcpError)` - Parsing failed
     #[inline]
     pub fn parse(data: &[u8]) -> Result<Self, RtcpError> {
-        // Precondition assertions
-        debug_assert!(data.len() >= 20 || data.len() < 20);
-
         // Check minimum length (header + REMB identifier + bitrate + 1 SSRC)
         if data.len() < 20 {
             return Err(RtcpError::TooShort {
@@ -783,9 +758,6 @@ impl RembPacket {
             offset += 4;
         }
 
-        // Postcondition: parsing completed successfully
-        debug_assert!(ssrcs.len() == num_ssrcs, "All SSRCs must be parsed");
-
         Ok(RembPacket {
             sender_ssrc,
             bitrate_bps,
@@ -844,10 +816,6 @@ impl RembPacket {
             packet[offset..offset + 4].copy_from_slice(&ssrc.to_be_bytes());
         }
 
-        // Postcondition assertions
-        debug_assert!(packet.len() >= 20);
-        debug_assert_eq!(packet[1], RTCP_PSFB_PT);
-
         packet
     }
 
@@ -869,7 +837,8 @@ impl RembPacket {
             exp += 1;
         }
 
-        (exp, mantissa as u32)
+        // Clamp mantissa to 18 bits to prevent silent truncation
+        (exp, (mantissa as u32) & 0x3FFFF)
     }
 }
 
@@ -913,9 +882,6 @@ impl TransportCcFeedback {
     /// * `Err(RtcpError)` - Parsing failed
     #[inline]
     pub fn parse(data: &[u8]) -> Result<Self, RtcpError> {
-        // Precondition assertions
-        debug_assert!(data.len() >= 20 || data.len() < 20);
-
         // Check minimum length
         if data.len() < 20 {
             return Err(RtcpError::TooShort {
@@ -961,9 +927,6 @@ impl TransportCcFeedback {
         // Parse feedback packet count (byte 19)
         let feedback_packet_count = data[19];
 
-        // Postcondition: parsing completed successfully
-        debug_assert!(data.len() >= 20, "Transport-CC feedback must be at least 20 bytes");
-
         Ok(TransportCcFeedback {
             sender_ssrc,
             media_ssrc,
@@ -972,6 +935,308 @@ impl TransportCcFeedback {
             reference_time,
             feedback_packet_count,
         })
+    }
+}
+
+
+// ---------------------------------------------------------------
+// Transport-CC Feedback Builder
+// ---------------------------------------------------------------
+
+/// Builds a Transport-CC feedback packet (RTPFB, FMT=15).
+///
+/// Encodes packet reception status using run-length and status-vector
+/// chunks per draft-holmer-rmcat-transport-wide-cc-extensions-01.
+pub struct TwccFeedbackBuilder;
+
+impl TwccFeedbackBuilder {
+    /// Build a TWCC feedback packet from recorded arrivals.
+    ///
+    /// `arrivals` must be sorted by transport-wide sequence number.
+    /// Each entry is `(twcc_seq, arrival_time_us)`. Missing sequences
+    /// in the range are encoded as "not received".
+    ///
+    /// Returns serialized RTCP packet bytes, or None if empty.
+    pub fn build(
+        sender_ssrc: u32,
+        media_ssrc: u32,
+        fb_pkt_count: u8,
+        arrivals: &[(u16, u64)],
+    ) -> Option<Vec<u8>> {
+        if arrivals.is_empty() {
+            return None;
+        }
+
+        let base_seq = arrivals[0].0;
+        let last_seq = arrivals[arrivals.len() - 1].0;
+        let packet_count = last_seq.wrapping_sub(base_seq).wrapping_add(1) as usize;
+
+        // Bound: max 256 packets per feedback
+        if packet_count == 0 || packet_count > 256 {
+            return None;
+        }
+
+        // Reference time in 64ms units (24-bit)
+        let ref_time_us = arrivals[0].1;
+        let ref_time_64ms = (ref_time_us / 64_000) as u32;
+
+        // Build received/delta arrays
+        let mut received = vec![false; packet_count];
+        let mut delta_250us = vec![0i16; packet_count];
+
+        for &(seq, arrival_us) in arrivals {
+            let idx = seq.wrapping_sub(base_seq) as usize;
+            if idx < packet_count {
+                received[idx] = true;
+                let delta_us = arrival_us as i64 - ref_time_us as i64;
+                delta_250us[idx] = (delta_us / 250).clamp(-32768, 32767) as i16;
+            }
+        }
+
+        let mut buf = Vec::with_capacity(256);
+
+        // RTCP header: V=2, P=0, FMT=15, PT=205
+        buf.push((2 << 6) | 15);
+        buf.push(205);
+        buf.extend_from_slice(&[0, 0]); // length placeholder
+
+        buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+        buf.extend_from_slice(&media_ssrc.to_be_bytes());
+        buf.extend_from_slice(&base_seq.to_be_bytes());
+        buf.extend_from_slice(&(packet_count as u16).to_be_bytes());
+
+        // Reference time (24 bits) + fb_pkt_count
+        buf.push(((ref_time_64ms >> 16) & 0xFF) as u8);
+        buf.push(((ref_time_64ms >> 8) & 0xFF) as u8);
+        buf.push((ref_time_64ms & 0xFF) as u8);
+        buf.push(fb_pkt_count);
+
+        // Status chunks: 1-bit status vector (type=1, symbol_size=0, 14 symbols)
+        let mut remaining = packet_count;
+        let mut idx = 0;
+        while remaining > 0 {
+            let chunk_size = remaining.min(14);
+            let mut chunk: u16 = 1 << 15; // type=1, symbol_size=0
+            for j in 0..chunk_size {
+                if received[idx + j] {
+                    chunk |= 1 << (13 - j);
+                }
+            }
+            buf.extend_from_slice(&chunk.to_be_bytes());
+            idx += chunk_size;
+            remaining -= chunk_size;
+        }
+
+        // Recv deltas for received packets
+        for i in 0..packet_count {
+            if !received[i] { continue; }
+            let d = delta_250us[i];
+            if d >= 0 && d <= 255 {
+                buf.push(d as u8);
+            } else {
+                buf.extend_from_slice(&d.to_be_bytes());
+            }
+        }
+
+        // Pad to 4-byte boundary
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+
+        // Write RTCP length (32-bit words minus 1)
+        let length_words = (buf.len() / 4).saturating_sub(1) as u16;
+        buf[2..4].copy_from_slice(&length_words.to_be_bytes());
+
+        Some(buf)
+    }
+}// ---------------------------------------------------------------
+// Receiver Report
+// ---------------------------------------------------------------
+
+/// Receiver Report packet (PT=201).
+///
+/// Contains reception statistics from one or more sources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceiverReport {
+    /// SSRC of packet sender
+    pub ssrc: u32,
+    /// Reception report blocks (bounded to 31 per RC field)
+    pub blocks: Vec<ReceiverReportBlock>,
+}
+
+impl ReceiverReport {
+    /// Parse Receiver Report from RTCP packet.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Raw packet bytes (must be at least 8 bytes)
+    #[inline]
+    pub fn parse(data: &[u8]) -> Result<Self, RtcpError> {
+        if data.len() < RECEIVER_REPORT_MIN_SIZE_BYTES {
+            return Err(RtcpError::TooShort {
+                actual_bytes: data.len(),
+                min_bytes: RECEIVER_REPORT_MIN_SIZE_BYTES,
+            });
+        }
+
+        let version = (data[0] >> 6) & 0x03;
+        if version != RTCP_VERSION {
+            return Err(RtcpError::InvalidVersion { version });
+        }
+
+        let pt = data[1];
+        if pt != 201 {
+            return Err(RtcpError::InvalidPacketType {
+                packet_type: pt,
+            });
+        }
+
+        let rc = (data[0] & 0x1F) as usize;
+        let ssrc = u32::from_be_bytes([
+            data[4], data[5], data[6], data[7],
+        ]);
+
+        let blocks_start = 8;
+        let needed = blocks_start + rc * RECEIVER_REPORT_BLOCK_SIZE_BYTES;
+        if data.len() < needed {
+            return Err(RtcpError::InvalidReportCount {
+                count: rc as u8,
+                available_bytes: data.len() - blocks_start,
+            });
+        }
+
+        let mut blocks = Vec::with_capacity(rc);
+        for i in 0..rc {
+            let offset = blocks_start + i * RECEIVER_REPORT_BLOCK_SIZE_BYTES;
+            let block = ReceiverReportBlock::parse(
+                &data[offset..offset + RECEIVER_REPORT_BLOCK_SIZE_BYTES],
+            )?;
+            blocks.push(block);
+        }
+
+        Ok(ReceiverReport { ssrc, blocks })
+    }
+}
+
+// ---------------------------------------------------------------
+// FIR (Full Intra Request)
+// ---------------------------------------------------------------
+
+/// FIR entry — one SSRC + sequence number pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirEntry {
+    /// SSRC of the media source to request keyframe from
+    pub ssrc: u32,
+    /// Command sequence number (incremented per request)
+    pub seq_nr: u8,
+}
+
+/// FIR (Full Intra Request) packet (PT=206, FMT=4).
+///
+/// Requests a full intra-coded frame from one or more senders.
+/// Used when PLI is insufficient (e.g., new subscriber joining).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirPacket {
+    /// SSRC of packet sender
+    pub sender_ssrc: u32,
+    /// FIR entries (bounded to 31 per RC field)
+    pub entries: Vec<FirEntry>,
+}
+
+/// RTCP FIR FMT value.
+const RTCP_PSFB_FMT_FIR: u8 = 4;
+
+impl FirPacket {
+    /// Parse FIR packet from RTCP bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Raw packet bytes (must be at least 20 bytes for 1 entry)
+    #[inline]
+    pub fn parse(data: &[u8]) -> Result<Self, RtcpError> {
+        if data.len() < 20 {
+            return Err(RtcpError::TooShort {
+                actual_bytes: data.len(),
+                min_bytes: 20,
+            });
+        }
+
+        let version = (data[0] >> 6) & 0x03;
+        if version != RTCP_VERSION {
+            return Err(RtcpError::InvalidVersion { version });
+        }
+
+        let packet_type = data[1];
+        if packet_type != RTCP_PSFB_PT {
+            return Err(RtcpError::InvalidPacketType { packet_type });
+        }
+
+        let fmt = data[0] & 0x1F;
+        if fmt != RTCP_PSFB_FMT_FIR {
+            return Err(RtcpError::InvalidPacketType {
+                packet_type: fmt,
+            });
+        }
+
+        let sender_ssrc = u32::from_be_bytes([
+            data[4], data[5], data[6], data[7],
+        ]);
+
+        // FCI entries start at byte 12 (after sender + media SSRC)
+        // Each entry: 4 bytes SSRC + 1 byte seq_nr + 3 bytes reserved = 8 bytes
+        let mut entries = Vec::new();
+        let mut offset = 12;
+        let max_entries: usize = 31;
+
+        while offset + 8 <= data.len() && entries.len() < max_entries {
+            let ssrc = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            let seq_nr = data[offset + 4];
+            entries.push(FirEntry { ssrc, seq_nr });
+            offset += 8;
+        }
+
+        Ok(FirPacket {
+            sender_ssrc,
+            entries,
+        })
+    }
+
+    /// Build FIR packet bytes.
+    #[inline]
+    pub fn build(&self) -> Vec<u8> {
+        let fci_len = self.entries.len() * 8;
+        let packet_len = 12 + fci_len;
+        let mut packet = vec![0u8; packet_len];
+
+        // Header: V=2, P=0, FMT=4, PT=206
+        packet[0] = (RTCP_VERSION << 6) | RTCP_PSFB_FMT_FIR;
+        packet[1] = RTCP_PSFB_PT;
+
+        let length_words = (packet_len / 4) - 1;
+        packet[2] = ((length_words >> 8) & 0xFF) as u8;
+        packet[3] = (length_words & 0xFF) as u8;
+
+        // Sender SSRC
+        packet[4..8].copy_from_slice(&self.sender_ssrc.to_be_bytes());
+
+        // Media SSRC (0 for FIR)
+        packet[8..12].copy_from_slice(&0u32.to_be_bytes());
+
+        // FCI entries
+        for (i, entry) in self.entries.iter().enumerate() {
+            let offset = 12 + i * 8;
+            packet[offset..offset + 4]
+                .copy_from_slice(&entry.ssrc.to_be_bytes());
+            packet[offset + 4] = entry.seq_nr;
+            // bytes 5-7 are reserved (already 0)
+        }
+
+        packet
     }
 }
 

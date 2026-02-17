@@ -27,6 +27,9 @@ struct SsrcState {
     highest_seq: u16,
     roc_initialized: bool,
     replay: ReplayProtection,
+    /// Per-SSRC SRTCP index counter (RFC 3711 §3.4).
+    /// Each SSRC has its own SRTCP crypto context with an independent index.
+    srtcp_index: u32,
 }
 
 /// SRTP session for a single direction (send or receive).
@@ -52,9 +55,6 @@ pub struct SrtpContext {
     /// multiple SSRCs share the same DTLS/SRTP session.
     rtcp_replay_per_ssrc: HashMap<u32, ReplayProtection>,
     
-    /// SRTCP index counter (for sending).
-    srtcp_index: u32,
-    
     /// Policy configuration.
     policy: SrtpPolicy,
     
@@ -76,7 +76,6 @@ impl SrtpContext {
             cipher,
             ssrc_states: HashMap::new(),
             rtcp_replay_per_ssrc: HashMap::new(),
-            srtcp_index: 0,
             policy,
             rtp_count: 0,
             rtcp_count: 0,
@@ -132,6 +131,7 @@ impl SrtpContext {
                 highest_seq: 0,
                 roc_initialized: false,
                 replay,
+                srtcp_index: 0,
             }
         })
     }
@@ -333,23 +333,34 @@ impl SrtpContext {
     
     /// Protect RTCP packet.
     ///
-    /// Buffer must have room for 4-byte index + 16-byte tag.
+    /// Uses per-SSRC SRTCP index per RFC 3711 §3.4.
+    /// Buffer must have room for 4-byte index + auth tag.
     pub fn protect_rtcp(
         &mut self,
         packet: &mut [u8],
         packet_len: usize,
     ) -> Result<usize, SrtpError> {
-        // Check for index overflow
-        if self.srtcp_index >= super::SRTCP_INDEX_MASK {
+        // Extract SSRC from RTCP header (bytes 4-7).
+        assert!(packet_len >= 8, "RTCP packet must be at least 8 bytes");
+        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+
+        // Get per-SSRC SRTCP index (RFC 3711 §3.4)
+        let state = self.get_ssrc_state(ssrc);
+        if state.srtcp_index >= super::SRTCP_INDEX_MASK {
             return Err(SrtpError::SrtcpIndexOverflow);
         }
-        
-        let index = self.srtcp_index;
+        let index = state.srtcp_index;
+        state.srtcp_index += 1;
+
         let result = self.cipher.protect_rtcp(packet, packet_len, index)?;
-        
-        self.srtcp_index += 1;
+
+        tracing::trace!(
+            ssrc,
+            srtcp_index = index,
+            "SRTCP protect (per-SSRC index, RFC 3711 §3.4)"
+        );
+
         self.rtcp_count += 1;
-        
         Ok(result)
     }
     

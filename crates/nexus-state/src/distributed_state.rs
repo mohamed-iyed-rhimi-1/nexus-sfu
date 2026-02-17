@@ -75,7 +75,10 @@ const _: () = {
     assert!(MAX_ROOMS > 0, "MAX_ROOMS must be positive");
     assert!(MAX_ROOMS <= 100_000, "MAX_ROOMS must not exceed 100_000");
     assert!(MAX_TRACKS > 0, "MAX_TRACKS must be positive");
-    assert!(MAX_TRACKS <= 1_000_000, "MAX_TRACKS must not exceed 1_000_000");
+    assert!(
+        MAX_TRACKS <= 1_000_000,
+        "MAX_TRACKS must not exceed 1_000_000"
+    );
     assert!(MAX_SUBSCRIPTIONS > 0, "MAX_SUBSCRIPTIONS must be positive");
     assert!(
         MAX_SUBSCRIPTIONS <= 10_000_000,
@@ -281,7 +284,6 @@ impl RoomMetadata {
     #[inline]
     pub fn new(room_id: RoomId, name: String, max_participants: u32, created_at_ns: u64) -> Self {
         assert!(room_id != 0, "room_id must be non-zero");
-        assert!(!name.is_empty(), "name must be non-empty");
         assert!(
             name.len() <= MAX_ROOM_NAME_LEN,
             "name must not exceed MAX_ROOM_NAME_LEN"
@@ -494,7 +496,6 @@ impl DistributedState {
         max_participants: u32,
     ) -> Result<(), CrdtError> {
         assert!(room_id != 0, "room_id must be non-zero");
-        assert!(!name.is_empty(), "name must be non-empty");
         assert!(max_participants > 0, "max_participants must be positive");
 
         // Get current timestamp from clock
@@ -732,7 +733,9 @@ impl DistributedState {
         participants
             .get(&room_id)
             .map(|set| {
-                let mut result = Vec::with_capacity((set.len() as usize).min(MAX_PARTICIPANTS_PER_ROOM as usize));
+                let mut result = Vec::with_capacity(
+                    (set.len() as usize).min(MAX_PARTICIPANTS_PER_ROOM as usize),
+                );
                 // Bounded iteration
                 let mut count = 0;
                 for elem in set.iter() {
@@ -758,7 +761,10 @@ impl DistributedState {
     /// Number of participants (0 if room doesn't exist).
     pub fn participant_count(&self, room_id: RoomId) -> usize {
         let participants = self.participants.read().unwrap();
-        participants.get(&room_id).map(|set| set.len() as usize).unwrap_or(0)
+        participants
+            .get(&room_id)
+            .map(|set| set.len() as usize)
+            .unwrap_or(0)
     }
 
     /// Checks if a participant exists in a room.
@@ -860,7 +866,9 @@ impl DistributedState {
         let mut tracks = self.tracks.write().unwrap();
 
         // Get existing track
-        let reg = tracks.get_mut(&track_id).ok_or(CrdtError::ElementNotFound)?;
+        let reg = tracks
+            .get_mut(&track_id)
+            .ok_or(CrdtError::ElementNotFound)?;
 
         // Update
         reg.set(info, timestamp, self.local_actor);
@@ -1176,7 +1184,11 @@ impl DistributedState {
     /// `Ok(())` on successful merge, or error if merge failed.
     pub fn merge_delta(&self, update: StateUpdate) -> Result<(), CrdtError> {
         match update {
-            StateUpdate::ParticipantAdded { room_id, participant_id, dot } => {
+            StateUpdate::ParticipantAdded {
+                room_id,
+                participant_id,
+                dot,
+            } => {
                 let mut participants = self.participants.write().unwrap();
 
                 // Use room_id from delta to target the specific room
@@ -1198,7 +1210,11 @@ impl DistributedState {
                 Ok(())
             }
 
-            StateUpdate::ParticipantRemoved { room_id, participant_id, dot } => {
+            StateUpdate::ParticipantRemoved {
+                room_id,
+                participant_id,
+                dot,
+            } => {
                 let mut participants = self.participants.write().unwrap();
 
                 // Use room_id from delta to target the specific room
@@ -1543,7 +1559,8 @@ mod tests {
         let state = DistributedState::new(config);
 
         let info = TrackInfo {
-            track_type: 1, content_type: 0,
+            track_type: 1,
+            content_type: 0,
             codec: 100,
             bitrate_kbps: 2500,
             owner_node: 0,
@@ -1559,7 +1576,8 @@ mod tests {
 
         // Update track
         let new_info = TrackInfo {
-            track_type: 1, content_type: 0,
+            track_type: 1,
+            content_type: 0,
             codec: 100,
             bitrate_kbps: 5000,
             owner_node: 0,
@@ -1642,19 +1660,50 @@ mod tests {
         let dot = Dot::new(1, 100);
 
         let delta = DistributedState::generate_participant_added_delta(1, 42, dot);
-        assert!(matches!(delta, StateUpdate::ParticipantAdded { room_id: 1, participant_id: 42, .. }));
+        assert!(matches!(
+            delta,
+            StateUpdate::ParticipantAdded {
+                room_id: 1,
+                participant_id: 42,
+                ..
+            }
+        ));
 
         let delta = DistributedState::generate_participant_removed_delta(1, 42, dot);
-        assert!(matches!(delta, StateUpdate::ParticipantRemoved { room_id: 1, participant_id: 42, .. }));
+        assert!(matches!(
+            delta,
+            StateUpdate::ParticipantRemoved {
+                room_id: 1,
+                participant_id: 42,
+                ..
+            }
+        ));
 
         let info = TrackInfo::default();
         let delta = DistributedState::generate_track_updated_delta(1, info, 100, 1);
-        assert!(matches!(delta, StateUpdate::TrackUpdated { track_id: 1, .. }));
+        assert!(matches!(
+            delta,
+            StateUpdate::TrackUpdated { track_id: 1, .. }
+        ));
 
         let delta = DistributedState::generate_subscription_added_delta(1, 42, dot);
-        assert!(matches!(delta, StateUpdate::SubscriptionAdded { track_id: 1, participant_id: 42, .. }));
+        assert!(matches!(
+            delta,
+            StateUpdate::SubscriptionAdded {
+                track_id: 1,
+                participant_id: 42,
+                ..
+            }
+        ));
 
         let delta = DistributedState::generate_subscription_removed_delta(1, 42, dot);
-        assert!(matches!(delta, StateUpdate::SubscriptionRemoved { track_id: 1, participant_id: 42, .. }));
+        assert!(matches!(
+            delta,
+            StateUpdate::SubscriptionRemoved {
+                track_id: 1,
+                participant_id: 42,
+                ..
+            }
+        ));
     }
 }

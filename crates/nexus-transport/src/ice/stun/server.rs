@@ -342,6 +342,20 @@ pub fn is_binding_indication(data: &[u8]) -> bool {
     class == 0x01 && method == 0x0001 // Indication + Binding
 }
 
+/// Create a STUN Binding Indication for ICE consent freshness (RFC 7675).
+///
+/// Binding Indications are fire-and-forget keepalives — no response expected.
+/// Returns the message length (always 20 bytes = STUN header only).
+pub fn create_binding_indication(buf: &mut [u8], transaction_id: &[u8; 12]) -> usize {
+    assert!(buf.len() >= STUN_HEADER_SIZE);
+    let msg_type = StunMessage::encode_type(StunClass::Indication, StunMethod::Binding);
+    buf[0..2].copy_from_slice(&msg_type.to_be_bytes());
+    buf[2..4].copy_from_slice(&0u16.to_be_bytes()); // length = 0
+    buf[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    buf[8..20].copy_from_slice(transaction_id);
+    STUN_HEADER_SIZE
+}
+
 /// Create a binding request for ICE connectivity checks.
 ///
 /// # Arguments

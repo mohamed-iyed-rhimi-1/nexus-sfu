@@ -1,11 +1,12 @@
 //! SDP media description.
 
 use super::attributes::{
-    IceCandidate, DtlsFingerprint, DtlsSetup, RtpCodec,
+    IceCandidate, DtlsFingerprint, DtlsSetup, RtpCodec, RtcpFeedback,
     SsrcInfo, ExtMap, Fmtp, Direction,
 };
 use super::error::SdpError;
-use super::{MAX_CODECS_PER_MEDIA, MAX_CANDIDATES_PER_MEDIA, MAX_SSRCS_PER_MEDIA, MAX_EXTMAPS_PER_MEDIA};
+use super::{MAX_CODECS_PER_MEDIA, MAX_CANDIDATES_PER_MEDIA, MAX_SSRCS_PER_MEDIA, MAX_EXTMAPS_PER_MEDIA,
+            MAX_RTCP_FB_PER_MEDIA, MAX_SSRC_GROUPS_PER_MEDIA, MAX_RIDS_PER_MEDIA};
 
 /// Media type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,27 +146,61 @@ pub struct MediaDescription {
     /// Number of extmaps.
     pub extmap_count: u8,
     
+    // RTCP feedback (RFC 4585)
+    /// RTCP feedback entries.
+    pub rtcp_fbs: [Option<RtcpFeedback>; MAX_RTCP_FB_PER_MEDIA],
+    /// Number of rtcp-fb entries.
+    pub rtcp_fb_count: u8,
+    
+    // SSRC groups (RFC 5576)
+    /// SSRC group entries (e.g., FID for RTX, SIM for simulcast).
+    pub ssrc_groups: [Option<SsrcGroup>; MAX_SSRC_GROUPS_PER_MEDIA],
+    /// Number of SSRC groups.
+    pub ssrc_group_count: u8,
+    
+    // RID (RFC 8851)
+    /// RID entries for simulcast.
+    pub rids: [Option<Rid>; MAX_RIDS_PER_MEDIA],
+    /// Number of RID entries.
+    pub rid_count: u8,
+    
+    // Simulcast (RFC 8853)
+    /// Simulcast attribute value (raw).
+    pub simulcast: Option<SimulcastAttr>,
+    
+    // Standalone msid (RFC 8830)
+    /// Media stream ID.
+    pub msid: Option<Msid>,
+    
     // RTCP
     /// RTCP-mux enabled.
     pub rtcp_mux: bool,
     /// RTCP-rsize enabled.
     pub rtcp_rsize: bool,
+    /// RTCP-mux-only (RFC 8858).
+    pub rtcp_mux_only: bool,
+    
+    // Misc
+    /// extmap-allow-mixed (RFC 8285).
+    pub extmap_allow_mixed: bool,
+    /// end-of-candidates (RFC 8838).
+    pub end_of_candidates: bool,
 }
 
-/// ICE ufrag.
+/// ICE ufrag (RFC 8445 §5.3: up to 256 ice-chars).
 #[derive(Debug, Clone)]
 pub struct IceUfrag {
-    pub value: [u8; 32],
-    pub len: u8,
+    pub value: [u8; 256],
+    pub len: u16,
 }
 
 impl IceUfrag {
     pub fn new(s: &str) -> Self {
-        let mut value = [0u8; 32];
+        let mut value = [0u8; 256];
         let bytes = s.as_bytes();
-        let len = bytes.len().min(32);
+        let len = bytes.len().min(256);
         value[..len].copy_from_slice(&bytes[..len]);
-        Self { value, len: len as u8 }
+        Self { value, len: len as u16 }
     }
     
     pub fn as_str(&self) -> &str {
@@ -173,20 +208,20 @@ impl IceUfrag {
     }
 }
 
-/// ICE pwd.
+/// ICE pwd (RFC 8445 §5.3: up to 256 ice-chars).
 #[derive(Debug, Clone)]
 pub struct IcePwd {
-    pub value: [u8; 64],
-    pub len: u8,
+    pub value: [u8; 256],
+    pub len: u16,
 }
 
 impl IcePwd {
     pub fn new(s: &str) -> Self {
-        let mut value = [0u8; 64];
+        let mut value = [0u8; 256];
         let bytes = s.as_bytes();
-        let len = bytes.len().min(64);
+        let len = bytes.len().min(256);
         value[..len].copy_from_slice(&bytes[..len]);
-        Self { value, len: len as u8 }
+        Self { value, len: len as u16 }
     }
     
     pub fn as_str(&self) -> &str {
@@ -220,6 +255,46 @@ impl Mid {
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.value[..self.len as usize]).unwrap_or("")
     }
+}
+
+/// SSRC group (RFC 5576, e.g., FID for RTX, SIM for simulcast).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SsrcGroup {
+    /// Semantics (e.g., "FID", "SIM").
+    pub semantics: [u8; 16],
+    pub semantics_len: u8,
+    /// SSRC values in the group.
+    pub ssrcs: [u32; 8],
+    pub ssrc_count: u8,
+}
+
+/// RID entry (RFC 8851).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rid {
+    /// RID identifier.
+    pub id: [u8; 32],
+    pub id_len: u8,
+    /// Direction (send or recv).
+    pub direction: Direction,
+}
+
+/// Simulcast attribute (RFC 8853).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimulcastAttr {
+    /// Raw simulcast value.
+    pub value: [u8; 256],
+    pub value_len: u16,
+}
+
+/// Standalone msid (RFC 8830).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Msid {
+    /// Stream ID.
+    pub stream_id: [u8; 128],
+    pub stream_id_len: u8,
+    /// Track ID (optional).
+    pub track_id: [u8; 128],
+    pub track_id_len: u8,
 }
 
 /// Connection info.
@@ -263,8 +338,19 @@ impl Default for MediaDescription {
             ssrc_values_count: 0,
             extmaps: Default::default(),
             extmap_count: 0,
+            rtcp_fbs: Default::default(),
+            rtcp_fb_count: 0,
+            ssrc_groups: Default::default(),
+            ssrc_group_count: 0,
+            rids: Default::default(),
+            rid_count: 0,
+            simulcast: None,
+            msid: None,
             rtcp_mux: true,
             rtcp_rsize: false,
+            rtcp_mux_only: false,
+            extmap_allow_mixed: false,
+            end_of_candidates: false,
         }
     }
 }
@@ -393,6 +479,36 @@ impl MediaDescription {
         Ok(())
     }
 
+    /// Add an RTCP feedback entry (RFC 4585).
+    pub fn add_rtcp_fb(&mut self, fb: RtcpFeedback) -> Result<(), SdpError> {
+        if self.rtcp_fb_count as usize >= MAX_RTCP_FB_PER_MEDIA {
+            return Ok(()); // Silently drop excess — not fatal
+        }
+        self.rtcp_fbs[self.rtcp_fb_count as usize] = Some(fb);
+        self.rtcp_fb_count += 1;
+        Ok(())
+    }
+
+    /// Add an SSRC group (RFC 5576).
+    pub fn add_ssrc_group(&mut self, group: SsrcGroup) -> Result<(), SdpError> {
+        if self.ssrc_group_count as usize >= MAX_SSRC_GROUPS_PER_MEDIA {
+            return Ok(());
+        }
+        self.ssrc_groups[self.ssrc_group_count as usize] = Some(group);
+        self.ssrc_group_count += 1;
+        Ok(())
+    }
+
+    /// Add a RID entry (RFC 8851).
+    pub fn add_rid(&mut self, rid: Rid) -> Result<(), SdpError> {
+        if self.rid_count as usize >= MAX_RIDS_PER_MEDIA {
+            return Ok(());
+        }
+        self.rids[self.rid_count as usize] = Some(rid);
+        self.rid_count += 1;
+        Ok(())
+    }
+
     /// Find matching codec from offer.
     ///
     /// # TigerStyle Compliance
@@ -444,9 +560,16 @@ impl MediaDescription {
         &self,
         offer_media: &MediaDescription,
     ) -> Result<Vec<RtpCodec>, SdpError> {
-        // Precondition: both must have codecs
-        assert!(self.codec_count > 0, "Must have local codecs");
-        assert!(offer_media.codec_count > 0, "Must have offer codecs");
+        if self.codec_count == 0 {
+            return Err(SdpError::NoCommonCodec {
+                media_type: self.media_type.as_str().to_string(),
+            });
+        }
+        if offer_media.codec_count == 0 {
+            return Err(SdpError::NoCommonCodec {
+                media_type: offer_media.media_type.as_str().to_string(),
+            });
+        }
         
         let mut common_codecs = Vec::new();
         

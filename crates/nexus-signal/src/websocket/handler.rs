@@ -50,10 +50,22 @@ pub const MAX_STATS_PAYLOAD_SIZE: usize = 256;
 
 // Compile-time assertions
 const _: () = {
-    assert!(MAX_SESSION_TICKETS > 0, "MAX_SESSION_TICKETS must be positive");
-    assert!(MAX_SESSION_TICKETS <= 10_000, "MAX_SESSION_TICKETS must not exceed 10_000");
-    assert!(TICKET_LIFETIME_SECS > 0, "TICKET_LIFETIME_SECS must be positive");
-    assert!(MAX_TRACKS_IN_RESPONSE > 0, "MAX_TRACKS_IN_RESPONSE must be positive");
+    assert!(
+        MAX_SESSION_TICKETS > 0,
+        "MAX_SESSION_TICKETS must be positive"
+    );
+    assert!(
+        MAX_SESSION_TICKETS <= 10_000,
+        "MAX_SESSION_TICKETS must not exceed 10_000"
+    );
+    assert!(
+        TICKET_LIFETIME_SECS > 0,
+        "TICKET_LIFETIME_SECS must be positive"
+    );
+    assert!(
+        MAX_TRACKS_IN_RESPONSE > 0,
+        "MAX_TRACKS_IN_RESPONSE must be positive"
+    );
 };
 
 // =============================================================================
@@ -156,7 +168,10 @@ impl std::fmt::Display for SignalingHandlerError {
             Self::TicketNotFound => {
                 write!(f, "[E{}] session ticket not found", self.code())
             }
-            Self::TicketExpired { expires_at, current_time } => {
+            Self::TicketExpired {
+                expires_at,
+                current_time,
+            } => {
                 write!(
                     f,
                     "[E{}] session ticket expired at {}, current time {}",
@@ -196,7 +211,12 @@ impl std::fmt::Display for SignalingHandlerError {
                 write!(f, "[E{}] stats malformed: {}", self.code(), reason)
             }
             Self::TicketStoreFull { capacity } => {
-                write!(f, "[E{}] ticket store full at {} tickets", self.code(), capacity)
+                write!(
+                    f,
+                    "[E{}] ticket store full at {} tickets",
+                    self.code(),
+                    capacity
+                )
             }
         }
     }
@@ -289,11 +309,7 @@ impl SessionTicket {
     /// - ≤70 lines
     /// - ≥2 assertions
     #[inline]
-    pub fn new(
-        ticket_id: [u8; 32],
-        session_data: &[u8],
-        participant_id: ParticipantId,
-    ) -> Self {
+    pub fn new(ticket_id: [u8; 32], session_data: &[u8], participant_id: ParticipantId) -> Self {
         // Precondition: session data must fit in buffer
         assert!(
             session_data.len() <= 256,
@@ -415,7 +431,8 @@ pub struct JoinResponse {
 // =============================================================================
 
 /// Handler function type for message dispatch
-pub type MessageHandler = fn(&mut SignalingHandler, &[u8]) -> Result<Vec<u8>, SignalingHandlerError>;
+pub type MessageHandler =
+    fn(&mut SignalingHandler, &[u8]) -> Result<Vec<u8>, SignalingHandlerError>;
 
 /// Message handler lookup table (fixed-size array)
 pub struct MessageHandlerTable {
@@ -494,7 +511,10 @@ impl SignalingHandler {
     #[inline]
     pub fn new(state: Arc<DistributedState>) -> Self {
         // Precondition: state must be valid
-        assert!(state.local_actor() < 256, "local_actor must be < MAX_ACTORS");
+        assert!(
+            state.local_actor() < 256,
+            "local_actor must be < MAX_ACTORS"
+        );
 
         // Pre-allocate session ticket storage
         let mut session_tickets = Vec::with_capacity(MAX_SESSION_TICKETS);
@@ -772,7 +792,8 @@ impl SignalingHandler {
 
         // If not found, add new entry
         if !found {
-            self.participant_names.push((participant_id, name.to_string()));
+            self.participant_names
+                .push((participant_id, name.to_string()));
         }
 
         // Postcondition: name is stored
@@ -946,7 +967,10 @@ impl SignalingHandler {
         ticket: SessionTicket,
     ) -> Result<(), SignalingHandlerError> {
         // Precondition: ticket must have valid participant_id
-        assert!(ticket.participant_id != 0, "ticket participant_id must be non-zero");
+        assert!(
+            ticket.participant_id != 0,
+            "ticket participant_id must be non-zero"
+        );
 
         // First, try to find an empty slot or expired ticket to replace
         let current_time = SystemTime::now()
@@ -1080,15 +1104,11 @@ mod tests {
         let mut handler = SignalingHandler::with_new_state(1);
 
         // Dispatch ping
-        let response = handler
-            .dispatch_message(MessageType::Ping, &[])
-            .unwrap();
+        let response = handler.dispatch_message(MessageType::Ping, &[]).unwrap();
         assert_eq!(response, vec![MessageType::Pong as u8]);
 
         // Dispatch pong (no-op)
-        let response = handler
-            .dispatch_message(MessageType::Pong, &[])
-            .unwrap();
+        let response = handler.dispatch_message(MessageType::Pong, &[]).unwrap();
         assert!(response.is_empty());
     }
 

@@ -51,8 +51,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
@@ -297,7 +298,7 @@ pub struct XdpPacketLoop {
     /// WHY: Cold-path DTLS and STUN packets need to be routed to the
     /// WebRTC transport for session management.
     #[cfg(all(target_os = "linux", feature = "xdp"))]
-    webrtc_transport: Option<Arc<RwLock<WebRtcTransport>>>,
+    webrtc_transport: Option<Arc<WebRtcTransport>>,
     /// Running flag
     running: AtomicBool,
     /// Statistics (using XdpProcessorStats for compatibility)
@@ -337,7 +338,7 @@ struct ColdPathHandler {
     /// BWE controller for RTCP processing
     bwe: Arc<CongestionController>,
     /// WebRTC transport for DTLS/STUN processing
-    webrtc: Arc<RwLock<WebRtcTransport>>,
+    webrtc: Arc<WebRtcTransport>,
 }
 
 #[cfg(all(target_os = "linux", feature = "xdp"))]
@@ -456,17 +457,7 @@ impl crate::forward::PacketHandler for ColdPathHandler {
 
         // Route to WebRTC transport for DTLS handshake processing
         // The transport will look up the session by source address
-        let result = {
-            let mut transport = match self.webrtc.write() {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!("Failed to acquire WebRTC transport lock: {}", e);
-                    return;
-                }
-            };
-
-            transport.process_packet(data, source_addr)
-        };
+        let result = self.webrtc.process_packet(data, source_addr);
 
         // Handle result - DTLS responses are sent back to the source
         match result {
@@ -526,17 +517,7 @@ impl crate::forward::PacketHandler for ColdPathHandler {
 
         // Route to WebRTC transport for ICE agent processing
         // The transport will look up the session by source address
-        let result = {
-            let mut transport = match self.webrtc.write() {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!("Failed to acquire WebRTC transport lock: {}", e);
-                    return;
-                }
-            };
-
-            transport.process_packet(data, source_addr)
-        };
+        let result = self.webrtc.process_packet(data, source_addr);
 
         // Handle result - STUN responses are sent back to the source
         match result {
@@ -598,7 +579,7 @@ impl XdpPacketLoop {
         #[cfg(all(target_os = "linux", feature = "xdp"))]
         bwe_controller: Option<Arc<CongestionController>>,
         #[cfg(all(target_os = "linux", feature = "xdp"))]
-        webrtc_transport: Option<Arc<RwLock<WebRtcTransport>>>,
+        webrtc_transport: Option<Arc<WebRtcTransport>>,
     ) -> Result<Self, SfuError> {
         // Compile-time checks (TigerStyle)
         const _: () = assert!(XdpPacketLoop::MAX_BATCH_SIZE > 0, "MAX_BATCH_SIZE must be positive");
@@ -673,7 +654,7 @@ impl XdpPacketLoop {
     fn try_init_xdp(
         config: &crate::config::XdpConfig,
         bwe: Arc<CongestionController>,
-        webrtc: Arc<RwLock<WebRtcTransport>>,
+        webrtc: Arc<WebRtcTransport>,
     ) -> Option<XdpPacketProcessor> {
         // First, try to open the forward table
         let forward_table = match ForwardTable::open(&config.forward_table_path) {
@@ -841,35 +822,21 @@ impl XdpPacketLoop {
         };
 
         let session_ids: Vec<nexus_webrtc::webrtc::TransportId> = {
-            let transport = match webrtc_transport.read() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            transport.session_ids()
+            self.webrtc_transport.session_ids()
         };
 
         for session_id in session_ids {
-            let retransmit_result = {
-                let mut transport = match webrtc_transport.write() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-
-                let session = match transport.get_session_mut(session_id) {
-                    Some(s) => s,
-                    None => continue,
-                };
-
+            let retransmit_result = self.webrtc_transport.with_session_mut(session_id, |session| {
                 // Only check sessions in DtlsHandshaking state
                 if session.state() != nexus_webrtc::webrtc::SessionState::DtlsHandshaking {
-                    continue;
+                    return None;
                 }
 
                 // Check for pending retransmission
                 session.poll_dtls_retransmit()
-            };
+            });
 
-            if let Some((dest_addr, data)) = retransmit_result {
+            if let Some(Some((dest_addr, data))) = retransmit_result {
                 // Send via fallback transport
                 if let Err(e) = self.fallback_transport.send(&data, dest_addr) {
                     warn!("Failed to send DTLS retransmit: {:?}", e);
@@ -900,24 +867,16 @@ impl XdpPacketLoop {
         };
 
         let stale_sessions: Vec<nexus_webrtc::webrtc::TransportId> = {
-            let mut transport = match webrtc_transport.write() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            transport.check_consent_freshness()
+            self.webrtc_transport.check_consent_freshness()
         };
 
         for session_id in stale_sessions {
             info!("Session {} failed consent freshness check, closing",
                 session_id.value());
             // Close the session
-            let mut transport = match webrtc_transport.write() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if let Some(session) = transport.get_session_mut(session_id) {
+            self.webrtc_transport.with_session_mut(session_id, |session| {
                 session.close();
-            }
+            });
         }
     }
 
@@ -1004,7 +963,7 @@ impl XdpPacketLoop {
     ///
     /// * 2.1 - Receive cold-path packets via AF_XDP socket
     /// * 2.8 - Integrate shutdown signal handling
-    /// * 28.6 - Use AdaptiveSpinLoop for packet processing
+    /// * 28.6 - Use SpinLoop for packet processing
     ///
     /// # TigerStyle Compliance
     ///
@@ -1015,7 +974,7 @@ impl XdpPacketLoop {
         &mut self,
         shutdown_rx: &std::sync::mpsc::Receiver<()>,
     ) -> Result<(), SfuError> {
-        use crate::spin::AdaptiveSpinLoop;
+        use crate::spin::SpinLoop;
 
         // Compile-time checks
         const _: () = assert!(XdpPacketLoop::MAX_BATCH_SIZE <= 64, "MAX_BATCH_SIZE must not exceed 64");
@@ -1025,7 +984,7 @@ impl XdpPacketLoop {
         info!("XDP packet loop started (XDP active: {})", self.is_xdp_active());
 
         let mut packets_processed: u64 = 0;
-        let mut spin_loop = AdaptiveSpinLoop::with_defaults();
+        let mut spin_loop = SpinLoop::new();
 
         loop {
             // Check for shutdown signal (non-blocking)
@@ -1058,7 +1017,6 @@ impl XdpPacketLoop {
 
             // Adaptive spin: update state and wait appropriately
             spin_loop.on_poll_result(batch_count);
-            spin_loop.wait();
         }
 
         self.running.store(false, Ordering::SeqCst);
@@ -1240,7 +1198,8 @@ impl XdpPacketLoop {
 /// Register ICE credentials for a participant.
 /// Call this when generating SDP answer.
 pub fn register_ice_credentials(ice_ufrag: &str, ice_pwd: &str) {
-    if let Ok(mut creds) = ICE_CREDENTIALS.write() {
+    {
+        let mut creds = ICE_CREDENTIALS.write();
         creds.insert(ice_ufrag.to_string(), ice_pwd.to_string());
         debug!("Registered ICE credentials for ufrag {}", ice_ufrag);
     }
@@ -1249,12 +1208,13 @@ pub fn register_ice_credentials(ice_ufrag: &str, ice_pwd: &str) {
 /// Look up ICE password by ufrag.
 #[allow(dead_code)] // Reserved for STUN message integrity verification
 fn lookup_ice_password(ice_ufrag: &str) -> Option<String> {
-    ICE_CREDENTIALS.read().ok()?.get(ice_ufrag).cloned()
+    ICE_CREDENTIALS.read().get(ice_ufrag).cloned()
 }
 
 /// Remove ICE credentials when participant leaves.
 pub fn unregister_ice_credentials(ice_ufrag: &str) {
-    if let Ok(mut creds) = ICE_CREDENTIALS.write() {
+    {
+        let mut creds = ICE_CREDENTIALS.write();
         creds.remove(ice_ufrag);
     }
 }
@@ -1265,16 +1225,6 @@ const SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
 /// Batch receive size for UDP transport.
 const RECV_BATCH_SIZE: usize = 64;
-
-/// Flush interval for batch sender in microseconds.
-const FLUSH_INTERVAL_US: u64 = 1000;
-
-/// Session idle timeout in seconds.
-/// Sessions with no activity for this duration are cleaned up.
-const SESSION_IDLE_TIMEOUT_SECS: u64 = 30;
-
-/// Cleanup interval for idle sessions in seconds.
-const SESSION_CLEANUP_INTERVAL_SECS: u64 = 10;
 
 /// Main SFU struct wiring all components together.
 ///
@@ -1324,9 +1274,8 @@ pub struct Sfu {
     transport: Option<crate::transport::MediaTransport>,
 
     /// WebRTC transport for session management (ICE/DTLS/SRTP).
-    /// Wrapped in Arc<RwLock<>> for safe concurrent access from
-    /// both the packet processing loop and signaling handlers.
-    webrtc_transport: Arc<RwLock<WebRtcTransport>>,
+    /// Uses interior mutability - all methods take &self instead of &mut self.
+    webrtc_transport: Arc<WebRtcTransport>,
 
     /// Shutdown flag.
     is_shutdown: AtomicBool,
@@ -1397,18 +1346,13 @@ pub struct Sfu {
     #[cfg(all(target_os = "linux", feature = "xdp"))]
     forward_table: Option<ForwardTable>,
 
-    // --- Step-function interval tracking ---
-    // These fields support `step_once()` by persisting interval state across calls.
-    last_flush: Option<crate::clock::ClockInstant>,
-    last_ice_check: Option<crate::clock::ClockInstant>,
-    last_cleanup: Option<crate::clock::ClockInstant>,
-    last_dtls_retransmit: Option<crate::clock::ClockInstant>,
-    last_consent_check: Option<crate::clock::ClockInstant>,
     packets_processed: u64,
     /// Relay manager for inter-node cascade (None if single-node).
     relay_manager: Option<Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>>,
     /// Relay event receiver for orchestrator (taken once at startup).
     relay_event_rx: Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>>,
+    /// Cold-path channel: STUN/DTLS packets → ConnectionMonitor in orchestrator.
+    connection_tx: Option<mpsc::Sender<crate::orchestrator::events::ColdPathPacket>>,
 }
 
 impl Sfu {
@@ -1590,7 +1534,7 @@ impl Sfu {
             .with_bind_addr(config.transport.media_bind_addr)
             .with_max_sessions(max_sessions);
 
-        let mut webrtc_transport = WebRtcTransport::new(webrtc_config).map_err(|e| {
+        let webrtc_transport = WebRtcTransport::new(webrtc_config).map_err(|e| {
             SfuError::Worker(WorkerError::InvalidConfig {
                 message: format!("Failed to create WebRTC transport: {:?}", e),
             })
@@ -1601,14 +1545,11 @@ impl Sfu {
             })
         })?;
 
-        let webrtc_transport = Arc::new(RwLock::new(webrtc_transport));
+        let webrtc_transport = Arc::new(webrtc_transport);
 
         // Postcondition assertions (TigerStyle)
-        {
-            let transport_guard = webrtc_transport.read().unwrap();
-            assert!(transport_guard.state() == WebRtcTransportState::Running);
-            assert_eq!(transport_guard.session_count(), 0);
-        }
+        assert!(webrtc_transport.state() == WebRtcTransportState::Running);
+        assert_eq!(webrtc_transport.session_count(), 0);
 
         info!(
             "WebRTC transport initialized: max_sessions={}",
@@ -1813,19 +1754,35 @@ impl Sfu {
             metrics,
             #[cfg(all(target_os = "linux", feature = "xdp"))]
             forward_table,
-            last_flush: None,
-            last_ice_check: None,
-            last_cleanup: None,
-            last_dtls_retransmit: None,
-            last_consent_check: None,
             packets_processed: 0,
             relay_manager: None,
             relay_event_rx: Some(relay_event_rx),
+            connection_tx: None,
         })
     }
 
     /// Get the SFU configuration.
     #[inline]
+    /// Set the cold-path channel sender for STUN/DTLS packets.
+    pub fn set_connection_tx(&mut self, tx: mpsc::Sender<crate::orchestrator::events::ColdPathPacket>) {
+        self.connection_tx = Some(tx);
+    }
+
+    /// Get the media transport's local address for creating a PacketSender.
+    pub fn media_socket_for_sender(&self) -> Option<Arc<std::net::UdpSocket>> {
+        use std::os::fd::FromRawFd;
+        let transport = self.transport.as_ref()?;
+        let fd = transport.socket_fd();
+        if fd < 0 { return None; }
+        // Safety: we duplicate the fd so both the transport and PacketSender
+        // can use it independently. The dup'd fd is owned by the Arc<UdpSocket>.
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 { return None; }
+        let socket = unsafe { std::net::UdpSocket::from_raw_fd(dup_fd) };
+        socket.set_nonblocking(true).ok()?;
+        Some(Arc::new(socket))
+    }
+
     pub fn config(&self) -> &NexusConfig {
         &self.config
     }
@@ -1878,13 +1835,13 @@ impl Sfu {
 
     /// Get the WebRTC transport.
     ///
-    /// Returns Arc<RwLock<WebRtcTransport>> for thread-safe access.
+    /// Returns &Arc<WebRtcTransport> for thread-safe access.
     ///
     /// # TigerStyle Compliance
     ///
     /// - Inline for zero-cost abstraction
     #[inline]
-    pub fn webrtc_transport(&self) -> &Arc<RwLock<WebRtcTransport>> {
+    pub fn webrtc_transport(&self) -> &Arc<WebRtcTransport> {
         &self.webrtc_transport
     }
 
@@ -1969,17 +1926,15 @@ impl Sfu {
         // Get worker pool
         let worker_pool_arc = self.worker_pool_arc()
             .ok_or("Worker pool not available")?;
-        let worker_pool = worker_pool_arc.read()
-            .map_err(|e| format!("Worker pool lock poisoned: {}", e))?;
+        let worker_pool = worker_pool_arc.read();
         
         // Get worker handle
         let worker = worker_pool.get_worker(worker_id)
             .ok_or(format!("Worker {} not found", worker_id))?;
         
         // Generate unique subscriber ID
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SUBSCRIBER_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let subscriber_id_unique = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        static SUBSCRIBER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let subscriber_id_unique = SUBSCRIBER_ID_COUNTER.fetch_add(1, Ordering::SeqCst) as u32;
         
         // Send ActorSubscribe message to worker
         worker.send(crate::worker::WorkerMessage::ActorSubscribe {
@@ -1987,6 +1942,7 @@ impl Sfu {
             subscriber_id: subscriber_id_unique,
             participant_id: subscriber_id,
             dest_addr,
+            srtp_context: None,
         }).map_err(|e| format!("Failed to send subscribe message to worker: {:?}", e))?;
         
         // Update XDP ForwardTable with new subscriber mapping
@@ -2035,8 +1991,7 @@ impl Sfu {
         // Get worker pool
         let worker_pool_arc = self.worker_pool_arc()
             .ok_or("Worker pool not available")?;
-        let mut worker_pool = worker_pool_arc.write()
-            .map_err(|e| format!("Worker pool lock poisoned: {}", e))?;
+        let mut worker_pool = worker_pool_arc.write();
         
         // Assign track to worker using consistent hashing on SSRC
         // This returns (track_id, worker_id) but we already have track_id
@@ -2088,8 +2043,7 @@ impl Sfu {
         // Precondition: address must be valid (TigerStyle)
         assert!(addr.port() > 0, "Invalid source address port");
 
-        let transport = self.webrtc_transport.read().ok()?;
-        transport.find_session_by_addr(addr)
+        self.webrtc_transport.find_session_by_addr(addr)
     }
 
     /// Check if the SFU is shutdown.
@@ -2340,21 +2294,15 @@ impl Sfu {
     ///
     /// # Requirements
     ///
-    /// * 28.6 - Use AdaptiveSpinLoop for packet processing
+    /// * 28.6 - Use SpinLoop for packet processing
     async fn run_packet_loop(
         &mut self,
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) -> Result<(), SfuError> {
-        use crate::spin::AdaptiveSpinLoop;
+        use crate::spin::SpinLoop;
 
-        let now = crate::clock::ClockInstant::now();
-        self.last_flush = Some(now);
-        self.last_ice_check = Some(now);
-        self.last_cleanup = Some(now);
-        self.last_dtls_retransmit = Some(now);
-        self.last_consent_check = Some(now);
         self.packets_processed = 0;
-        let mut spin_loop = AdaptiveSpinLoop::with_defaults();
+        let mut spin_loop = SpinLoop::new();
 
         info!("Starting packet processing loop");
 
@@ -2380,7 +2328,7 @@ impl Sfu {
 
             // Adaptive spin: update state and wait appropriately (async version)
             spin_loop.on_poll_result(batch_count);
-            spin_loop.wait_async().await;
+            tokio::task::yield_now().await;
         }
 
         info!(
@@ -2396,28 +2344,6 @@ impl Sfu {
     /// (ICE, DTLS, cleanup, flush), and returns the number of packets processed.
     /// The DST simulator calls this directly to drive the SFU one step at a time.
     pub fn step_once(&mut self) -> Result<u32, SfuError> {
-        // TigerStyle: explicit constants for timing
-        const ICE_CHECK_INTERVAL_MS: u64 = 50;
-        const DTLS_RETRANSMIT_INTERVAL_MS: u64 = 200;
-        const CONSENT_CHECK_INTERVAL_SECS: u64 = 15;
-
-        let flush_interval = Duration::from_micros(FLUSH_INTERVAL_US);
-        let ice_check_interval = Duration::from_millis(ICE_CHECK_INTERVAL_MS);
-        let cleanup_interval = Duration::from_secs(SESSION_CLEANUP_INTERVAL_SECS);
-        let dtls_retransmit_interval = Duration::from_millis(DTLS_RETRANSMIT_INTERVAL_MS);
-        let consent_interval = Duration::from_secs(CONSENT_CHECK_INTERVAL_SECS);
-
-        let now = crate::clock::ClockInstant::now();
-
-        // Initialize interval trackers on first call
-        if self.last_flush.is_none() {
-            self.last_flush = Some(now);
-            self.last_ice_check = Some(now);
-            self.last_cleanup = Some(now);
-            self.last_dtls_retransmit = Some(now);
-            self.last_consent_check = Some(now);
-        }
-
         // Receive batch of packets
         let batch_count = {
             let transport = match self.transport.as_mut() {
@@ -2441,7 +2367,6 @@ impl Sfu {
                 }
             };
 
-            // Process received packets
             let count = packets.len() as u32;
             for recv_packet in packets {
                 self.process_packet(&recv_packet.data, recv_packet.source_addr);
@@ -2450,235 +2375,33 @@ impl Sfu {
             count
         };
 
-        // Poll ICE connectivity checks at regular intervals
-        if self.last_ice_check.unwrap().elapsed() >= ice_check_interval {
-            self.last_ice_check = Some(crate::clock::ClockInstant::now());
-            self.poll_ice_checks();
-        }
-
-        // Poll DTLS retransmissions at regular intervals
-        if self.last_dtls_retransmit.unwrap().elapsed() >= dtls_retransmit_interval {
-            self.last_dtls_retransmit = Some(crate::clock::ClockInstant::now());
-            self.poll_dtls_output();
-        }
-
-        // Poll ICE consent freshness at regular intervals
-        if self.last_consent_check.unwrap().elapsed() >= consent_interval {
-            self.last_consent_check = Some(crate::clock::ClockInstant::now());
-        }
-
-        // Cleanup idle sessions at regular intervals
-        if self.last_cleanup.unwrap().elapsed() >= cleanup_interval {
-            self.last_cleanup = Some(crate::clock::ClockInstant::now());
-            self.cleanup_idle_sessions();
-        }
-
-        // Periodic flush check
-        if self.last_flush.unwrap().elapsed() >= flush_interval {
-            self.last_flush = Some(crate::clock::ClockInstant::now());
-
-            // Log statistics periodically
-            if self.packets_processed > 0 && self.packets_processed % 100000 == 0 {
-                debug!(
-                    "Processed {} packets, arena free: {}/{}",
-                    self.packets_processed,
-                    self.arena.free_count(),
-                    self.arena.capacity()
-                );
-            }
-        }
-
         // Drain relay output from workers → RelayManager (cascade forwarding).
-        // Also drain relay input from peers → WorkerPool (cascade receiving).
         if let Some(ref relay_mgr) = self.relay_manager {
             if let Some(ref pool_arc) = self.worker_pool {
-                if let Ok(pool) = pool_arc.read() {
-                    // Workers → relay peers: drain outbound relay packets
-                    let relay_rx = pool.relay_output_rx();
-                    let mgr = relay_mgr.read();
-                    for _ in 0..256 {
-                        match relay_rx.try_recv() {
-                            Ok(out) => {
-                                mgr.relay_packet(out.peer_node, out.track_id, &out.data[..out.len as usize]);
-                            }
-                            Err(_) => break,
+                let pool = pool_arc.read();
+                let relay_rx = pool.relay_output_rx();
+                let mgr = relay_mgr.read();
+                for _ in 0..256 {
+                    match relay_rx.try_recv() {
+                        Ok(out) => {
+                            mgr.relay_packet(out.peer_node, out.track_id, &out.data[..out.len as usize]);
                         }
+                        Err(_) => break,
                     }
-                    // Relay peers → workers: drain inbound relay packets
-                    let inbound_rx = mgr.packet_rx();
-                    for _ in 0..256 {
-                        match inbound_rx.try_recv() {
-                            Ok(pkt) => {
-                                let _ = pool.inject_relay_packet(pkt.track_id, pkt.data, pkt.len);
-                            }
-                            Err(_) => break,
+                }
+                let inbound_rx = mgr.packet_rx();
+                for _ in 0..256 {
+                    match inbound_rx.try_recv() {
+                        Ok(pkt) => {
+                            let _ = pool.inject_relay_packet(pkt.track_id, pkt.data, pkt.len);
                         }
+                        Err(_) => break,
                     }
                 }
             }
         }
 
         Ok(batch_count)
-    }
-
-    /// Poll all WebRTC sessions for pending ICE connectivity checks.
-    ///
-    /// Iterates through all sessions and sends any pending STUN binding requests.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Bounded iteration (max sessions from config)
-    /// - No dynamic allocation
-    /// - Explicit error handling
-    #[inline]
-    fn poll_ice_checks(&self) {
-        // Get session IDs to poll (bounded by max_sessions)
-        let session_ids: Vec<TransportId> = {
-            let transport = match self.webrtc_transport.read() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Failed to acquire WebRTC transport read lock: {}", e);
-                    return;
-                }
-            };
-
-            // Bounded assertion (NASA Rule: put a limit on everything)
-            let session_count = transport.session_count();
-            assert!(
-                session_count <= self.config.transport.max_webrtc_sessions as usize,
-                "Session count must be bounded by config"
-            );
-
-            transport.session_ids()
-        };
-
-        // Process each session: drain all outbound ICE packets
-        // (regular checks, retransmissions, and nominations)
-        for session_id in session_ids {
-            let poll_result: Option<(Vec<(std::net::SocketAddr, Vec<u8>)>, Option<Vec<u8>>, std::net::SocketAddr)> = {
-                let mut transport = match self.webrtc_transport.write() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!("Failed to acquire WebRTC transport write lock: {}", e);
-                        return;
-                    }
-                };
-
-                if let Some(session) = transport.get_session_mut(session_id) {
-                    let (packets, dtls_flight) = session.poll_ice_outbound();
-                    let remote = session.remote_addr();
-                    if !packets.is_empty() || dtls_flight.is_some() {
-                        Some((packets, dtls_flight, remote.unwrap_or_else(|| std::net::SocketAddr::from(([0,0,0,0], 0)))))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-
-            if let Some((packets, dtls_flight, remote_addr)) = poll_result {
-                // Send all ICE outbound packets
-                for (dest_addr, stun_request) in &packets {
-                    self.send_packet(stun_request, *dest_addr);
-                }
-                if !packets.is_empty() {
-                    debug!(
-                        "Sent {} ICE packets for session {}",
-                        packets.len(),
-                        session_id.value()
-                    );
-                }
-
-                // Send DTLS ClientHello if ICE just completed
-                if let Some(ref dtls_data) = dtls_flight {
-                    if remote_addr.port() > 0 {
-                        self.send_packet(dtls_data, remote_addr);
-                        debug!(
-                            "Sent DTLS flight ({} bytes) to {} for session {}",
-                            dtls_data.len(),
-                            remote_addr,
-                            session_id.value()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Poll DTLS sessions for retransmissions during handshake.
-    ///
-    /// Checks sessions in DtlsHandshaking state for DTLS retransmission
-    /// timeouts and sends retransmit data to the remote peer.
-    #[inline]
-    fn poll_dtls_output(&self) {
-        let session_ids: Vec<TransportId> = {
-            let transport = match self.webrtc_transport.read() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            transport.session_ids()
-        };
-
-        for session_id in session_ids {
-            let dtls_result = {
-                let mut transport = match self.webrtc_transport.write() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-
-                let session = match transport.get_session_mut(session_id) {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                session.poll_dtls_retransmit()
-            };
-
-            if let Some((dest_addr, data)) = dtls_result {
-                self.send_packet(&data, dest_addr);
-                debug!(
-                    "Sent DTLS output to {} for session {} ({} bytes)",
-                    dest_addr,
-                    session_id.value(),
-                    data.len()
-                );
-            }
-        }
-    }
-
-    /// Cleanup idle sessions that have timed out.
-    ///
-    /// Removes sessions that have had no activity for SESSION_IDLE_TIMEOUT_SECS.
-    /// Also unregisters ICE credentials for removed sessions.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Bounded iteration (max sessions from config)
-    /// - Returns removed session IDs for logging
-    fn cleanup_idle_sessions(&self) {
-        let removed_ids = {
-            let mut transport = match self.webrtc_transport.write() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(
-                        "Failed to acquire WebRTC transport write lock for cleanup: {}",
-                        e
-                    );
-                    return;
-                }
-            };
-
-            transport.cleanup_idle_sessions(SESSION_IDLE_TIMEOUT_SECS)
-        };
-
-        if !removed_ids.is_empty() {
-            info!(
-                "Cleaned up {} idle sessions: {:?}",
-                removed_ids.len(),
-                removed_ids.iter().map(|id| id.value()).collect::<Vec<_>>()
-            );
-        }
     }
 
     /// Process a single packet by routing through WebRTC sessions.
@@ -2773,24 +2496,39 @@ impl Sfu {
             return;
         }
 
-        // Route through WebRTC transport
-        let result = {
-            let mut transport = match self.webrtc_transport.write() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Failed to acquire WebRTC transport lock: {}", e);
-                    return;
-                }
-            };
+        // Cold path: STUN/DTLS → ConnectionMonitor via channel
+        if packet_type == PacketType::Stun || packet_type == PacketType::Dtls {
+            if let Some(ref tx) = self.connection_tx {
+                let _ = tx.try_send(crate::orchestrator::events::ColdPathPacket {
+                    data: data.to_vec(),
+                    source_addr,
+                });
+            }
+            return;
+        }
 
-            transport.process_packet(data, source_addr)
-        };
+        // Hot path: RTP/RTCP → inline processing via WebRTC transport
+        let mut out_buf = [0u8; 2048];
+        let result = self.webrtc_transport.process_packet(data, source_addr, &mut out_buf);
 
         // Handle result
         match result {
             Ok(Some((_session_id, incoming_data))) => {
                 use nexus_webrtc::webrtc::IncomingData;
                 match incoming_data {
+                    IncomingData::Rtp(len) => {
+                        self.process_decrypted_rtp(&out_buf[..len], source_addr);
+                    }
+                    IncomingData::Rtcp(len) => {
+                        tracing::trace!(
+                            payload_len = len,
+                            first_bytes = ?&out_buf[..len.min(8)],
+                            "Decrypted RTCP compound packet"
+                        );
+                        self.process_decrypted_rtcp(&out_buf[..len]);
+                    }
+                    // STUN/DTLS responses shouldn't arrive here since we routed them above,
+                    // but handle gracefully if they do.
                     IncomingData::Stun(response) => {
                         self.send_packet(&response, source_addr);
                     }
@@ -2798,32 +2536,13 @@ impl Sfu {
                         self.send_packet(&response, source_addr);
                     }
                     IncomingData::StunAndDtls(stun_response, dtls_flight) => {
-                        info!(
-                            stun_len = stun_response.len(),
-                            dtls_len = dtls_flight.len(),
-                            dest = %source_addr,
-                            "Sending StunAndDtls: STUN response + DTLS ClientHello"
-                        );
                         self.send_packet(&stun_response, source_addr);
                         self.send_packet(&dtls_flight, source_addr);
-                    }
-                    IncomingData::Rtp(payload) => {
-                        self.process_decrypted_rtp(&payload, source_addr);
-                    }
-                    IncomingData::Rtcp(payload) => {
-                        tracing::trace!(
-                            payload_len = payload.len(),
-                            first_bytes = ?&payload[..payload.len().min(8)],
-                            "Decrypted RTCP compound packet"
-                        );
-                        self.process_decrypted_rtcp(&payload);
                     }
                     IncomingData::None => {}
                 }
             }
-            Ok(None) => {
-                // Packet processed but no response needed (e.g., STUN indication)
-            }
+            Ok(None) => {}
             Err(e) => {
                 debug!("WebRTC transport error from {}: {:?}", source_addr, e);
             }
@@ -2931,13 +2650,7 @@ impl Sfu {
 
         // Route to worker
         if let Some(ref pool_arc) = self.worker_pool {
-            let pool = match pool_arc.read() {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("Worker pool lock poisoned");
-                    return;
-                }
-            };
+            let pool = pool_arc.read();
             if let Err(e) = pool.route_packet(track_id, slot, source_addr) {
                 debug!("Failed to route packet: {}", e);
             }
@@ -3221,13 +2934,7 @@ impl Sfu {
 
         // Send WorkerMessage::RtcpPli to worker
         if let Some(ref pool_arc) = self.worker_pool {
-            let pool = match pool_arc.read() {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("Worker pool lock poisoned");
-                    return;
-                }
-            };
+            let pool = pool_arc.read();
             if let Some(worker) = pool.get_worker(worker_id) {
                 if let Err(e) = worker.send(crate::worker::WorkerMessage::RtcpPli {
                     media_ssrc,
@@ -3309,35 +3016,26 @@ impl Sfu {
         
         // Get SRTCP key material from session
         let (key_material, srtp_policy) = {
-            let transport = match self.webrtc_transport.read() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Failed to acquire WebRTC transport read lock: {}", e);
-                    return;
+            let session_result = self.webrtc_transport.with_session(session_id, |session| {
+                // Check if session is established (DTLS complete)
+                if session.state() != nexus_webrtc::webrtc::SessionState::Established {
+                    // DTLS not complete yet, will try again on next packet
+                    return None;
                 }
-            };
-            
-            let session = match transport.get_session(session_id) {
-                Some(s) => s,
-                None => {
-                    debug!("Session {} not found", session_id.value());
-                    return;
+                
+                // Get SRTP key material from DTLS session
+                match session.get_srtp_key_material() {
+                    Some((km, policy, _epoch)) => Some((km, policy)),
+                    None => {
+                        debug!("Session {} has no SRTP key material despite being Established", session_id.value());
+                        None
+                    }
                 }
-            };
+            });
             
-            // Check if session is established (DTLS complete)
-            if session.state() != nexus_webrtc::webrtc::SessionState::Established {
-                // DTLS not complete yet, will try again on next packet
-                return;
-            }
-            
-            // Get SRTP key material from DTLS session
-            match session.get_srtp_key_material() {
-                Some((km, policy)) => (km, policy),
-                None => {
-                    debug!("Session {} has no SRTP key material despite being Established", session_id.value());
-                    return;
-                }
+            match session_result {
+                Some(Some(result)) => result,
+                _ => return,
             }
         };
         
@@ -3378,13 +3076,7 @@ impl Sfu {
         // Send SetPublisherSrtcp message to worker
         // This will overwrite any existing context, ensuring current keys are used
         if let Some(ref pool_arc) = self.worker_pool {
-            let pool = match pool_arc.read() {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("Worker pool lock poisoned");
-                    return;
-                }
-            };
+            let pool = pool_arc.read();
             // Lookup worker for this track
             let worker_id = match self.ssrc_router.lookup_by_track(track_id) {
                 Some((_ssrc, wid)) => wid,
@@ -3442,13 +3134,7 @@ impl Sfu {
 
         // Send WorkerMessage::RtcpNack to worker
         if let Some(ref pool_arc) = self.worker_pool {
-            let pool = match pool_arc.read() {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("Worker pool lock poisoned");
-                    return;
-                }
-            };
+            let pool = pool_arc.read();
             if let Some(worker) = pool.get_worker(worker_id) {
                 if let Err(e) = worker.send(crate::worker::WorkerMessage::RtcpNack {
                     media_ssrc,
@@ -3599,11 +3285,7 @@ impl Sfu {
         info!("Initiating graceful drain...");
 
         // Get session count for drain state
-        let session_count = if let Ok(transport) = self.webrtc_transport.read() {
-            transport.session_count() as u32
-        } else {
-            0
-        };
+        let session_count = self.webrtc_transport.session_count() as u32;
         self.drain_state.set_active_sessions(session_count);
 
         info!(
@@ -3762,24 +3444,22 @@ impl Sfu {
 
         // Shutdown WebRTC transport
         info!("Shutting down WebRTC transport...");
-        if let Ok(mut transport) = self.webrtc_transport.write() {
-            let session_count = transport.session_count();
-            transport.stop();
-            info!(
-                "WebRTC transport stopped, cleaned up {} sessions",
-                session_count
-            );
+        let session_count = self.webrtc_transport.session_count();
+        self.webrtc_transport.stop();
+        info!(
+            "WebRTC transport stopped, cleaned up {} sessions",
+            session_count
+        );
 
-            // Postcondition assertion (TigerStyle)
-            assert!(transport.state() == WebRtcTransportState::Stopped);
-        }
+        // Postcondition assertion (TigerStyle)
+        assert!(self.webrtc_transport.state() == WebRtcTransportState::Stopped);
 
         // Shutdown worker pool
         if let Some(pool_arc) = self.worker_pool.take() {
             info!("Shutting down worker pool...");
             match std::sync::Arc::try_unwrap(pool_arc) {
                 Ok(pool_rwlock) => {
-                    let mut pool = pool_rwlock.into_inner().unwrap();
+                    let mut pool = pool_rwlock.into_inner();
                     pool.shutdown().map_err(SfuError::Worker)?;
                     info!("Worker pool shutdown complete");
                 }
@@ -3798,14 +3478,10 @@ impl Sfu {
 
     /// Get statistics snapshot for monitoring.
     pub fn stats(&self) -> SfuStats {
-        let webrtc_stats = if let Ok(transport) = self.webrtc_transport.read() {
-            (
-                transport.session_count() as u32,
-                transport.connected_session_count() as u32,
-            )
-        } else {
-            (0, 0)
-        };
+        let webrtc_stats = (
+            self.webrtc_transport.session_count() as u32,
+            self.webrtc_transport.connected_session_count() as u32,
+        );
 
         // Postcondition assertion (TigerStyle: paired assertion)
         assert!(
@@ -3848,9 +3524,8 @@ impl Drop for Sfu {
             if let Some(pool_arc) = self.worker_pool.take() {
                 match std::sync::Arc::try_unwrap(pool_arc) {
                     Ok(pool_rwlock) => {
-                        if let Ok(mut pool) = pool_rwlock.into_inner() {
-                            let _ = pool.shutdown();
-                        }
+                        let mut pool = pool_rwlock.into_inner();
+                        let _ = pool.shutdown();
                     }
                     Err(_) => {
                         warn!("Could not unwrap worker pool Arc - other references exist");

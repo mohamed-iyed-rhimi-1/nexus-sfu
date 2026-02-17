@@ -50,7 +50,7 @@ pub struct JoinResponse {
     /// Existing participants in the room
     pub participants: Vec<nexus_signal::ParticipantInfo>,
     /// Existing tracks in the room
-    pub tracks: Vec<u64>,
+    pub tracks: Vec<nexus_signal::TrackInfo>,
 }
 
 /// Internal transport connection

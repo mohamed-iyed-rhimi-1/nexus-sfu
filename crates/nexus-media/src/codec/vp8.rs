@@ -152,10 +152,10 @@ impl Vp8PayloadHeader {
             false
         };
 
-        // Postcondition: partition_index is bounded
+        // Postcondition: partition_index is bounded (4-bit field, 0-15)
         debug_assert!(
-            partition_index <= 8,
-            "VP8 partition_index {} exceeds max 8",
+            partition_index <= 15,
+            "VP8 partition_index {} exceeds max 15",
             partition_index
         );
 

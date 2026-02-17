@@ -321,7 +321,7 @@ impl PacketSlot {
         );
         unsafe {
             (*self.ref_count)
-                .fetch_add(1, Ordering::Release);
+                .fetch_add(1, Ordering::AcqRel);
         }
         Self {
             data_ptr: self.data_ptr,
@@ -715,17 +715,8 @@ impl PartitionedPacketSlot {
         );
         
         unsafe {
-            (*self.ref_count).fetch_add(1, Ordering::Release);
+            (*self.ref_count).fetch_add(1, Ordering::AcqRel);
         }
-        
-        // Postcondition: refcount increased
-        let new_count = unsafe {
-            (*self.ref_count).load(Ordering::Acquire)
-        };
-        assert!(
-            new_count > current_count,
-            "refcount must increase after clone"
-        );
 
         Self {
             data_ptr: self.data_ptr,

@@ -168,6 +168,11 @@ impl SessionDescription {
             ..Default::default()
         }
     }
+
+    /// Set the o= line session version (RFC 3264 §8).
+    pub fn set_version(&mut self, version: u64) {
+        self.origin.session_version = version;
+    }
     
     /// Set session name.
     pub fn set_session_name(&mut self, name: &str) {
@@ -214,8 +219,11 @@ impl SessionDescription {
     /// - Validates MIDs exist in media sections
     /// - Bounded string copy
     pub fn set_bundle(&mut self, mids: &[&str]) -> Result<(), SdpError> {
-        // Precondition: MIDs must not be empty
-        assert!(!mids.is_empty(), "BUNDLE MIDs must not be empty");
+        if mids.is_empty() {
+            return Err(SdpError::InvalidFormat {
+                reason: "BUNDLE MIDs must not be empty",
+            });
+        }
         
         // Validate all MIDs exist in media sections
         for mid in mids {
@@ -348,8 +356,11 @@ impl SessionDescription {
         our_pwd: &str,
         our_fingerprint: &DtlsFingerprint,
     ) -> Result<SessionDescription, SdpError> {
-        // Precondition: offer must be valid
-        assert!(self.media_count > 0, "Offer must have media sections");
+        if self.media_count == 0 {
+            return Err(SdpError::InvalidFormat {
+                reason: "offer must have at least one media section",
+            });
+        }
         
         // Validate our credentials
         let our_ufrag_obj = IceUfrag::new(our_ufrag);
@@ -362,7 +373,13 @@ impl SessionDescription {
         answer.set_session_name("Nexus SFU Answer");
         answer.set_ice_credentials(our_ufrag, our_pwd);
         answer.set_fingerprint(our_fingerprint.clone());
-        answer.set_setup(DtlsSetup::Active); // We act as DTLS client
+        // RFC 8842 §5.5: derive setup role from offer
+        let answer_setup = match self.setup {
+            Some(DtlsSetup::Active) => DtlsSetup::Passive,
+            Some(DtlsSetup::Passive) => DtlsSetup::Active,
+            _ => DtlsSetup::Active,
+        };
+        answer.set_setup(answer_setup);
         
         // Copy bundle group
         if self.bundle_group_len > 0 {
@@ -378,6 +395,7 @@ impl SessionDescription {
                     our_ufrag,
                     our_pwd,
                     our_fingerprint,
+                    answer_setup,
                 )?;
                 answer.add_media(answer_media)?;
             }
@@ -401,6 +419,7 @@ impl SessionDescription {
         our_ufrag: &str,
         our_pwd: &str,
         our_fingerprint: &DtlsFingerprint,
+        answer_setup: DtlsSetup,
     ) -> Result<MediaDescription, SdpError> {
         use super::MAX_CODECS_PER_MEDIA;
         
@@ -421,7 +440,7 @@ impl SessionDescription {
         
         // Copy fingerprint
         media.set_fingerprint(our_fingerprint.clone());
-        media.setup = Some(DtlsSetup::Active);
+        media.setup = Some(answer_setup);
         
         // Negotiate codecs: For SFU, we accept all offered codecs since we forward
         // rather than transcode. This allows subscribers to choose their preferred codec.
@@ -443,6 +462,14 @@ impl SessionDescription {
         // RTCP settings
         media.rtcp_mux = offer_media.rtcp_mux;
         media.rtcp_rsize = offer_media.rtcp_rsize;
+        media.rtcp_mux_only = offer_media.rtcp_mux_only;
+
+        // Copy RTCP feedback from offer (RFC 4585) — critical for NACK/PLI/FIR
+        for i in 0..offer_media.rtcp_fb_count as usize {
+            if let Some(ref fb) = offer_media.rtcp_fbs[i] {
+                let _ = media.add_rtcp_fb(fb.clone());
+            }
+        }
 
         // Copy RTP header extensions from offer so the receiver can demux
         // incoming RTP by mid/rid (required by webrtc-rs for on_track).
@@ -451,6 +478,9 @@ impl SessionDescription {
                 let _ = media.add_extmap(ext.clone());
             }
         }
+
+        // Copy extmap-allow-mixed (RFC 8285)
+        media.extmap_allow_mixed = offer_media.extmap_allow_mixed;
         
         Ok(media)
     }
@@ -467,6 +497,7 @@ impl SessionDescription {
         our_ufrag: &str,
         our_pwd: &str,
         our_fingerprint: &DtlsFingerprint,
+        answer_setup: DtlsSetup,
     ) -> Result<MediaDescription, SdpError> {
         use super::MAX_CODECS_PER_MEDIA;
         
@@ -487,7 +518,7 @@ impl SessionDescription {
         
         // Copy fingerprint
         media.set_fingerprint(our_fingerprint.clone());
-        media.setup = Some(DtlsSetup::Active);
+        media.setup = Some(answer_setup);
         
         // Negotiate codecs using local capabilities
         // This returns NoCommonCodec if no matching codec found
@@ -502,6 +533,14 @@ impl SessionDescription {
         // RTCP settings
         media.rtcp_mux = offer_media.rtcp_mux;
         media.rtcp_rsize = offer_media.rtcp_rsize;
+        media.rtcp_mux_only = offer_media.rtcp_mux_only;
+
+        // Copy RTCP feedback from offer (RFC 4585)
+        for i in 0..offer_media.rtcp_fb_count as usize {
+            if let Some(ref fb) = offer_media.rtcp_fbs[i] {
+                let _ = media.add_rtcp_fb(fb.clone());
+            }
+        }
 
         // Copy RTP header extensions from offer so the receiver can demux
         // incoming RTP by mid/rid (required by webrtc-rs for on_track).
@@ -510,20 +549,24 @@ impl SessionDescription {
                 let _ = media.add_extmap(ext.clone());
             }
         }
+
+        // Copy extmap-allow-mixed (RFC 8285)
+        media.extmap_allow_mixed = offer_media.extmap_allow_mixed;
         
         Ok(media)
     }
 
     /// Flip media direction for answer.
     ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Extracted helper for clarity
-    /// - Explicit direction mapping
+    /// RFC 3264 §6.1: sendonly ↔ recvonly, sendrecv → sendrecv (both sides
+    /// can send and receive). For SFU-specific direction narrowing (e.g.,
+    /// publisher m-lines → recvonly), the caller should override after
+    /// calling create_answer.
     pub fn flip_direction(direction: Direction) -> Direction {
         match direction {
             Direction::SendOnly => Direction::RecvOnly,
             Direction::RecvOnly => Direction::SendOnly,
+            Direction::SendRecv => Direction::SendRecv,
             other => other,
         }
     }
@@ -668,6 +711,7 @@ mod tests {
             SessionDescription::flip_direction(Direction::RecvOnly),
             Direction::SendOnly
         );
+        // RFC 3264 §6.1: SendRecv stays SendRecv — caller narrows as needed
         assert_eq!(
             SessionDescription::flip_direction(Direction::SendRecv),
             Direction::SendRecv

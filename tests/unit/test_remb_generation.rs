@@ -305,7 +305,7 @@ mod tests {
             receiver: tokio::sync::mpsc::unbounded_channel().1,
             spsc_receivers: Vec::new(),
             spsc_senders: Vec::new(),
-            spin_loop: nexus_sfu::spin::AdaptiveSpinLoop::with_defaults(),
+            spin_loop: nexus_sfu::spin::SpinLoop::new(),
             should_shutdown: std::sync::atomic::AtomicBool::new(false),
             track_count: std::sync::atomic::AtomicU32::new(0),
             is_running: std::sync::atomic::AtomicBool::new(true),

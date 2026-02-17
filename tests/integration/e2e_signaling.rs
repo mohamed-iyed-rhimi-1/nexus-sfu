@@ -164,7 +164,6 @@ a=recvonly
 "#;
     
     let offer_msg = SignalMessage::Offer {
-        target_participant_id: None,
         sdp: offer_sdp.to_string(),
     };
     let offer_json = offer_msg.to_json().expect("JSON serialization failed");
@@ -186,7 +185,6 @@ a=recvonly
     
     // Send ICE candidates
     let candidate = SignalMessage::Candidate {
-        target_participant_id: None,
         candidate: "candidate:1 1 UDP 21307047062 typ host typ host 0 typ srflx raddr 0.0.0.1 generation 0 network-id 1 ufrag abc network-id 1 component 1 priority 21307047062".to_string(),
         sdp_mid: Some("0".to_string()),
         sdp_mline_index: Some(0),
@@ -279,7 +277,6 @@ a=recvonly
 "#;
     
     let offer_msg = SignalMessage::Offer {
-        target_participant_id: Some(participant_id2),
         sdp: offer_sdp.to_string(),
     };
     let offer_json = offer_msg.to_json().expect("JSON serialization failed");

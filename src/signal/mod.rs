@@ -48,7 +48,7 @@ pub use nexus_signal::websocket::server::{WebSocketServer, OrchestratorEvent};
 pub use server::{SignalingServer, SignalingConfig, ActiveTransport};
 
 // Re-export from nexus_signal
-pub use nexus_signal::{SignalMessage, QuicSignaling, ParticipantInfo};
+pub use nexus_signal::{SignalMessage, QuicSignaling, ParticipantInfo, TrackInfo};
 
 // Legacy constants for backward compatibility
 pub const MAX_CONNECTIONS: u32 = 10_000;

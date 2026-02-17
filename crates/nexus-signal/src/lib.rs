@@ -32,7 +32,7 @@ pub mod websocket;
 pub use config::QuicConfig;
 pub use error::SignalError;
 pub use metrics::SignalMetrics;
-pub use protocol::{SignalMessage, ParticipantInfo, TrackKind, TrackUpdateMessage};
+pub use protocol::{SignalMessage, ParticipantInfo, TrackInfo, TrackKind};
 pub use quic::{QuicConnection, QuicSignaling, SessionStore, SessionTicket};
 
 // WebSocket server types (moved from src/signal/)

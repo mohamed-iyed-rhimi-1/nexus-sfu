@@ -4,8 +4,6 @@ use std::net::SocketAddr;
 
 use super::error::SdpError;
 
-use super::{SHA256_FINGERPRINT_LEN};
-
 /// ICE candidate from SDP a=candidate line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IceCandidate {
@@ -161,8 +159,8 @@ impl IceCandidate {
 pub struct DtlsFingerprint {
     /// Hash algorithm (sha-256, sha-384, sha-512).
     pub algorithm: FingerprintAlgorithm,
-    /// Fingerprint bytes.
-    pub value: [u8; 32],
+    /// Fingerprint bytes (up to 64 for SHA-512).
+    pub value: [u8; 64],
     /// Fingerprint length.
     pub value_len: u8,
 }
@@ -180,14 +178,13 @@ impl DtlsFingerprint {
     ///
     /// Format: algorithm hex:bytes
     ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Validates SHA-256 only (production requirement)
-    /// - Bounded fingerprint length check
-    /// - Paired assertion for parse result
+    /// Accepts SHA-256, SHA-384, SHA-512 per RFC 8122 §5.
     pub fn parse(value: &str) -> Result<Self, SdpError> {
-        // Precondition: value must not be empty
-        assert!(!value.is_empty(), "Fingerprint value must not be empty");
+        if value.is_empty() {
+            return Err(SdpError::InvalidFingerprint {
+                reason: "empty fingerprint value",
+            });
+        }
         
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() != 2 {
@@ -196,9 +193,10 @@ impl DtlsFingerprint {
             });
         }
         
-        // Only SHA-256 is allowed for production WebRTC
-        let algorithm = match parts[0].to_lowercase().as_str() {
-            "sha-256" => FingerprintAlgorithm::Sha256,
+        let (algorithm, expected_len) = match parts[0].to_lowercase().as_str() {
+            "sha-256" => (FingerprintAlgorithm::Sha256, 32usize),
+            "sha-384" => (FingerprintAlgorithm::Sha384, 48usize),
+            "sha-512" => (FingerprintAlgorithm::Sha512, 64usize),
             other => {
                 return Err(SdpError::UnsupportedFingerprintAlgorithm {
                     algorithm: other.to_string(),
@@ -210,27 +208,20 @@ impl DtlsFingerprint {
         let hex_str = parts[1].replace(':', "");
         let bytes = Self::parse_hex_bytes(&hex_str)?;
         
-        // SHA-256 must be exactly 32 bytes
-        if bytes.len() != SHA256_FINGERPRINT_LEN as usize {
+        if bytes.len() != expected_len {
             return Err(SdpError::InvalidFingerprint { 
-                reason: "SHA-256 fingerprint must be 32 bytes" 
+                reason: "fingerprint length does not match algorithm" 
             });
         }
         
-        let mut value_buf = [0u8; 32];
+        let mut value_buf = [0u8; 64];
         value_buf[..bytes.len()].copy_from_slice(&bytes);
         
-        let result = Self {
+        Ok(Self {
             algorithm,
             value: value_buf,
             value_len: bytes.len() as u8,
-        };
-        
-        // Postcondition: result must have correct length
-        assert_eq!(result.value_len, SHA256_FINGERPRINT_LEN,
-            "Parsed fingerprint must be 32 bytes");
-        
-        Ok(result)
+        })
     }
 
     /// Parse hex string to bytes.
@@ -257,26 +248,16 @@ impl DtlsFingerprint {
     }
 
     /// Validate fingerprint is production-ready.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Explicit validation for SHA-256 only
-    /// - Assertion for length bounds
     pub fn validate(&self) -> Result<(), SdpError> {
-        // Only SHA-256 allowed
-        if self.algorithm != FingerprintAlgorithm::Sha256 {
-            return Err(SdpError::UnsupportedFingerprintAlgorithm {
-                algorithm: format!("{:?}", self.algorithm),
-            });
-        }
+        let expected_len = match self.algorithm {
+            FingerprintAlgorithm::Sha256 => 32u8,
+            FingerprintAlgorithm::Sha384 => 48u8,
+            FingerprintAlgorithm::Sha512 => 64u8,
+        };
         
-        // Must be exactly 32 bytes
-        assert_eq!(self.value_len, SHA256_FINGERPRINT_LEN,
-            "Fingerprint length must be 32 bytes");
-        
-        if self.value_len != SHA256_FINGERPRINT_LEN {
+        if self.value_len != expected_len {
             return Err(SdpError::InvalidFingerprint {
-                reason: "SHA-256 must be 32 bytes",
+                reason: "fingerprint length does not match algorithm",
             });
         }
         
@@ -400,7 +381,7 @@ impl RtpCodec {
     }
 }
 
-/// RTCP feedback from SDP a=rtcp-fb line.
+/// RTCP feedback from SDP a=rtcp-fb line (RFC 4585).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RtcpFeedback {
     /// Payload type (* for all).
@@ -415,6 +396,78 @@ pub struct RtcpFeedback {
     pub params_len: u8,
 }
 
+impl RtcpFeedback {
+    /// Parse from rtcp-fb attribute value.
+    ///
+    /// Format: payload_type fb_type [fb_params]
+    /// Example: "96 nack pli", "* transport-cc"
+    pub fn parse(value: &str) -> Result<Self, SdpError> {
+        let parts: Vec<&str> = value.splitn(3, ' ').collect();
+        if parts.len() < 2 {
+            return Err(SdpError::InvalidAttribute {
+                name: "rtcp-fb".to_string(),
+                value: value.to_string(),
+            });
+        }
+
+        let payload_type = if parts[0] == "*" {
+            None
+        } else {
+            Some(parts[0].parse::<u8>().map_err(|_| SdpError::InvalidAttribute {
+                name: "rtcp-fb".to_string(),
+                value: value.to_string(),
+            })?)
+        };
+
+        let mut fb_type = [0u8; 32];
+        let fb_bytes = parts[1].as_bytes();
+        let fb_type_len = fb_bytes.len().min(32);
+        fb_type[..fb_type_len].copy_from_slice(&fb_bytes[..fb_type_len]);
+
+        let mut params = [0u8; 64];
+        let params_len = if parts.len() > 2 {
+            let p = parts[2].as_bytes();
+            let len = p.len().min(64);
+            params[..len].copy_from_slice(&p[..len]);
+            len as u8
+        } else {
+            0
+        };
+
+        Ok(Self {
+            payload_type,
+            fb_type,
+            fb_type_len: fb_type_len as u8,
+            params,
+            params_len,
+        })
+    }
+
+    /// Get feedback type as string.
+    pub fn fb_type_str(&self) -> &str {
+        std::str::from_utf8(&self.fb_type[..self.fb_type_len as usize]).unwrap_or("")
+    }
+
+    /// Get params as string.
+    pub fn params_str(&self) -> &str {
+        std::str::from_utf8(&self.params[..self.params_len as usize]).unwrap_or("")
+    }
+
+    /// Serialize to SDP attribute value.
+    pub fn to_sdp(&self) -> String {
+        let pt = match self.payload_type {
+            Some(pt) => pt.to_string(),
+            None => "*".to_string(),
+        };
+        let fb = self.fb_type_str();
+        if self.params_len > 0 {
+            format!("{} {} {}", pt, fb, self.params_str())
+        } else {
+            format!("{} {}", pt, fb)
+        }
+    }
+}
+
 /// SSRC information from SDP a=ssrc line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SsrcInfo {
@@ -425,9 +478,9 @@ pub struct SsrcInfo {
     /// Attribute name length.
     pub attr_len: u8,
     /// Attribute value.
-    pub value: [u8; 128],
+    pub value: [u8; 256],
     /// Value length.
-    pub value_len: u8,
+    pub value_len: u16,
 }
 
 impl SsrcInfo {
@@ -459,9 +512,9 @@ impl SsrcInfo {
         let attr_len = attr_bytes.len().min(32);
         attribute[..attr_len].copy_from_slice(&attr_bytes[..attr_len]);
         
-        let mut value_buf = [0u8; 128];
+        let mut value_buf = [0u8; 256];
         let val_bytes = val.as_bytes();
-        let value_len = val_bytes.len().min(128);
+        let value_len = val_bytes.len().min(256);
         value_buf[..value_len].copy_from_slice(&val_bytes[..value_len]);
         
         Ok(Self {
@@ -469,7 +522,7 @@ impl SsrcInfo {
             attribute,
             attr_len: attr_len as u8,
             value: value_buf,
-            value_len: value_len as u8,
+            value_len: value_len as u16,
         })
     }
 }

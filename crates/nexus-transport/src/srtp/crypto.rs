@@ -6,7 +6,7 @@
 //! Provides encryption/decryption for SRTP packets.
 
 use aes::Aes128;
-use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit, generic_array::GenericArray as AesGenericArray};
+use aes::cipher::{KeyInit as AesKeyInit, generic_array::GenericArray as AesGenericArray};
 use aes_gcm::{
     Aes128Gcm, Aes256Gcm,
     aead::{AeadInPlace, generic_array::GenericArray},
@@ -404,6 +404,9 @@ impl AesGcmCipher {
     }
     
     /// Encrypt RTCP payload after validation (in-place, zero-copy).
+    ///
+    /// RFC 7714 §9 wire layout: header(8) | ciphertext | E+index(4) | tag(16)
+    /// RFC 7714 §9.1 AAD: RTCP_header(8) || E+SRTCP_index(4)
     fn encrypt_rtcp_payload(
         &self,
         packet: &mut [u8],
@@ -413,38 +416,38 @@ impl AesGcmCipher {
         assert!(packet_len >= RTCP_HEADER_SIZE);
         assert!(packet.len() >= packet_len + 4 + SRTP_AUTH_TAG_SIZE);
         
-        // Get SSRC from header
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-        
-        // Build nonce — per RFC 3711 §3.4, use the 31-bit SRTCP index WITHOUT E flag
         let nonce = self.build_rtcp_nonce(ssrc, srtcp_index);
         let nonce_arr = GenericArray::from_slice(&nonce);
         
-        // AAD is the entire RTCP header (first 8 bytes) - copy for AEAD
-        let mut aad = [0u8; RTCP_HEADER_SIZE];
-        aad.copy_from_slice(&packet[..RTCP_HEADER_SIZE]);
+        // Write E+index BEFORE encryption so it's available for AAD
+        let index_with_e = srtcp_index | super::SRTCP_E_FLAG;
+        packet[packet_len..packet_len + 4].copy_from_slice(&index_with_e.to_be_bytes());
+        
+        // AAD = RTCP header || E+SRTCP_index (RFC 7714 §9.1)
+        let mut aad = [0u8; RTCP_HEADER_SIZE + 4];
+        aad[..RTCP_HEADER_SIZE].copy_from_slice(&packet[..RTCP_HEADER_SIZE]);
+        aad[RTCP_HEADER_SIZE..].copy_from_slice(&index_with_e.to_be_bytes());
         
         // Encrypt payload in-place
         let payload = &mut packet[RTCP_HEADER_SIZE..packet_len];
-        
         let tag = self.rtcp_cipher.encrypt_in_place_detached(
             nonce_arr,
             &aad,
             payload,
         )?;
         
-        // Append auth tag after ciphertext
-        packet[packet_len..packet_len + SRTP_AUTH_TAG_SIZE].copy_from_slice(&tag);
+        // Append tag AFTER E+index: header | ciphertext | E+index(4) | tag(16)
+        let tag_offset = packet_len + 4;
+        packet[tag_offset..tag_offset + SRTP_AUTH_TAG_SIZE].copy_from_slice(&tag);
         
-        // Append SRTCP index with E-flag after tag
-        let index_offset = packet_len + SRTP_AUTH_TAG_SIZE;
-        let index_with_e = srtcp_index | super::SRTCP_E_FLAG;
-        packet[index_offset..index_offset + 4].copy_from_slice(&index_with_e.to_be_bytes());
-        
-        Ok(index_offset + 4)
+        Ok(tag_offset + SRTP_AUTH_TAG_SIZE)
     }
     
     /// Decrypt SRTCP packet in-place.
+    ///
+    /// For AES-GCM (AEAD), packets are always encrypted (E=1).
+    /// RFC 7714 §9 layout: header(8) | ciphertext | E+index(4) | tag(16)
     ///
     /// # TigerStyle
     /// - Buffer bounds validated
@@ -455,10 +458,9 @@ impl AesGcmCipher {
         packet_len: usize,
     ) -> Result<(usize, u32), SrtpError> {
         assert!(packet.len() >= packet_len);
-        assert!(packet_len > 4);
+        assert!(packet_len >= RTCP_HEADER_SIZE + 4 + SRTP_AUTH_TAG_SIZE);
         
-        // Minimum: header(8) + tag(16) + index(4)
-        if packet_len < RTCP_HEADER_SIZE + SRTP_AUTH_TAG_SIZE + 4 {
+        if packet_len < RTCP_HEADER_SIZE + 4 + SRTP_AUTH_TAG_SIZE {
             return Err(SrtpError::PacketTooShort);
         }
         
@@ -466,35 +468,31 @@ impl AesGcmCipher {
             return Err(SrtpError::PacketTooLarge);
         }
         
-        // Extract and validate SRTCP index
-        let (srtcp_index, encrypted) = self.extract_srtcp_index(packet, packet_len)?;
+        // For AEAD ciphers, E is always 1. Extract index from known position.
+        let (srtcp_index, _encrypted) = self.extract_srtcp_index(packet, packet_len)?;
         
-        if !encrypted {
-            // Unencrypted RTCP - just strip the index
-            return Ok((packet_len - 4, srtcp_index));
-        }
-        
-        // Decrypt RTCP payload
         self.decrypt_rtcp_payload(packet, packet_len, srtcp_index)
     }
     
     /// Extract SRTCP index from packet.
+    ///
+    /// RFC 7714 §9 layout: header(8) | ciphertext | E+index(4) | tag(16)
+    /// E+index is at packet_len - SRTP_AUTH_TAG_SIZE - 4.
     #[inline]
     fn extract_srtcp_index(
         &self,
         packet: &[u8],
         packet_len: usize,
     ) -> Result<(u32, bool), SrtpError> {
-        assert!(packet_len >= 4);
+        assert!(packet_len >= RTCP_HEADER_SIZE + SRTP_AUTH_TAG_SIZE + 4);
         
-        let index_offset = packet_len - 4;
-        let index_bytes = [
+        let index_offset = packet_len - SRTP_AUTH_TAG_SIZE - 4;
+        let index_with_e = u32::from_be_bytes([
             packet[index_offset],
             packet[index_offset + 1],
             packet[index_offset + 2],
             packet[index_offset + 3],
-        ];
-        let index_with_e = u32::from_be_bytes(index_bytes);
+        ]);
         let srtcp_index = index_with_e & super::SRTCP_INDEX_MASK;
         let encrypted = (index_with_e & super::SRTCP_E_FLAG) != 0;
         
@@ -502,6 +500,9 @@ impl AesGcmCipher {
     }
     
     /// Decrypt RTCP payload after validation (in-place, zero-copy).
+    ///
+    /// RFC 7714 §9 layout: header(8) | ciphertext | E+index(4) | tag(16)
+    /// RFC 7714 §9.1 AAD: RTCP_header(8) || E+SRTCP_index(4)
     fn decrypt_rtcp_payload(
         &self,
         packet: &mut [u8],
@@ -510,29 +511,26 @@ impl AesGcmCipher {
     ) -> Result<(usize, u32), SrtpError> {
         assert!(packet_len >= RTCP_HEADER_SIZE + SRTP_AUTH_TAG_SIZE + 4);
         
-        // SRTCP structure: header(8) | ciphertext | tag(16) | index(4)
-        let index_offset = packet_len - 4;
-        let tag_offset = index_offset - SRTP_AUTH_TAG_SIZE;
+        // Layout: header(8) | ciphertext | E+index(4) | tag(16)
+        let tag_offset = packet_len - SRTP_AUTH_TAG_SIZE;
+        let index_offset = tag_offset - 4;
         
-        // Get SSRC
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-        
-        // Build nonce — per RFC 3711 §3.4, use the 31-bit SRTCP index WITHOUT E flag
         let nonce = self.build_rtcp_nonce(ssrc, srtcp_index);
         let nonce_arr = GenericArray::from_slice(&nonce);
         
-        // AAD is header - copy for AEAD
-        let mut aad = [0u8; RTCP_HEADER_SIZE];
-        aad.copy_from_slice(&packet[..RTCP_HEADER_SIZE]);
+        // AAD = RTCP header || E+SRTCP_index (RFC 7714 §9.1)
+        let mut aad = [0u8; RTCP_HEADER_SIZE + 4];
+        aad[..RTCP_HEADER_SIZE].copy_from_slice(&packet[..RTCP_HEADER_SIZE]);
+        aad[RTCP_HEADER_SIZE..].copy_from_slice(&packet[index_offset..tag_offset]);
         
         // Extract tag
         let mut tag_bytes = [0u8; SRTP_AUTH_TAG_SIZE];
-        tag_bytes.copy_from_slice(&packet[tag_offset..index_offset]);
+        tag_bytes.copy_from_slice(&packet[tag_offset..packet_len]);
         let tag = GenericArray::from_slice(&tag_bytes);
         
-        // Decrypt payload in-place
-        let payload = &mut packet[RTCP_HEADER_SIZE..tag_offset];
-        
+        // Decrypt payload in-place (between header and E+index)
+        let payload = &mut packet[RTCP_HEADER_SIZE..index_offset];
         self.rtcp_cipher.decrypt_in_place_detached(
             nonce_arr,
             &aad,
@@ -614,35 +612,19 @@ impl AesCmHmacCipher {
     
     /// AES-128-CM keystream generation (RFC 3711 Section 4.1).
     ///
-    /// IV = (salt XOR (SSRC || packet_index)) << 16
+    /// Uses the `ctr` crate's Ctr128BE for interoperability with webrtc-rs.
     fn aes_cm_encrypt(
         key: &[u8; 16],
         iv: &[u8; 16],
         data: &mut [u8],
     ) {
-        assert!(key.len() == 16);
-        
-        let cipher = Aes128::new(AesGenericArray::from_slice(key));
-        let mut counter_block = *iv;
-        let mut offset = 0;
-        let mut counter = 0u16;
-        
-        while offset < data.len() {
-            counter_block[14] = (counter >> 8) as u8;
-            counter_block[15] = counter as u8;
-            
-            let mut block = AesGenericArray::clone_from_slice(&counter_block);
-            cipher.encrypt_block(&mut block);
-            
-            let remaining = data.len() - offset;
-            let xor_len = remaining.min(16);
-            for i in 0..xor_len {
-                data[offset + i] ^= block[i];
-            }
-            
-            offset += 16;
-            counter += 1;
-        }
+        use ctr::cipher::{KeyIvInit, StreamCipher};
+        type Aes128Ctr = ctr::Ctr128BE<Aes128>;
+        let mut cipher = Aes128Ctr::new(
+            AesGenericArray::from_slice(key),
+            AesGenericArray::from_slice(iv),
+        );
+        cipher.apply_keystream(data);
     }
     
     /// Build IV for RTP AES-CM (RFC 3711 Section 4.1).

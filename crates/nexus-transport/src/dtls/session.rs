@@ -217,7 +217,7 @@ pub struct DtlsSession {
     started_at: Instant,
     
     /// Output buffer.
-    output_buf: [u8; 4096],
+    output_buf: [u8; 16384],
     
     /// Output length.
     output_len: usize,
@@ -230,10 +230,6 @@ pub struct DtlsSession {
 
     /// SHA-256 fingerprint of the certificate.
     fingerprint_sha256: [u8; 32],
-    
-    /// ECDHE private key (P-256, 32 bytes) - legacy, kept for compatibility.
-    #[allow(dead_code)] // Legacy field kept for backward compatibility with non-ring path
-    ecdhe_private_key: [u8; 32],
     
     /// Ring ECDHE private key (P-256) - used for actual key agreement.
     /// This is Option because it gets consumed during agree_ephemeral.
@@ -324,12 +320,11 @@ impl DtlsSession {
             selected_srtp_profile: None,
             master_secret: [0u8; 48],
             started_at: Instant::now(),
-            output_buf: [0u8; 4096],
+            output_buf: [0u8; 16384],
             output_len: 0,
             certificate_der,
             certificate_len: cert_len as u16,
             fingerprint_sha256,
-            ecdhe_private_key: [0u8; 32], // Legacy field, no longer used
             ecdhe_private_key_ring: Some(ecdhe_private_key_ring),
             ecdhe_public_key,
             peer_public_key: [0u8; 65],

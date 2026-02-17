@@ -2110,6 +2110,7 @@ dependencies = [
  "core_affinity",
  "crc32fast",
  "crossbeam",
+ "ctr",
  "getrandom 0.2.17",
  "hmac",
  "io-uring",
@@ -2127,15 +2128,19 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "webrtc-srtp",
 ]
 
 [[package]]
 name = "nexus-webrtc"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "dashmap",
  "nexus-core",
  "nexus-media",
  "nexus-transport",
+ "parking_lot",
  "proptest",
  "rand 0.8.5",
  "serde",

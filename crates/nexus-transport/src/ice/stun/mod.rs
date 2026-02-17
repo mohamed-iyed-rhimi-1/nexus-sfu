@@ -48,7 +48,7 @@ pub use attributes::{
     ATTR_ICE_CONTROLLED, ATTR_ICE_CONTROLLING,
 };
 pub use integrity::{compute_message_integrity, verify_message_integrity};
-pub use server::StunServer;
+pub use server::{StunServer, create_binding_indication};
 
 /// Maximum STUN message size (from RFC 5389).
 pub const STUN_MAX_MESSAGE_SIZE: u32 = 548;

@@ -193,6 +193,31 @@ impl SdpPrinter {
         // SSRCs
         Self::print_ssrcs(media, lines);
 
+        // SSRC groups (RFC 5576)
+        Self::print_ssrc_groups(media, lines);
+
+        // RTCP feedback (RFC 4585)
+        Self::print_rtcp_fbs(media, lines);
+
+        // RID (RFC 8851)
+        Self::print_rids(media, lines);
+
+        // Simulcast (RFC 8853)
+        Self::print_simulcast(media, lines);
+
+        // Standalone msid (RFC 8830)
+        Self::print_msid(media, lines);
+
+        // extmap-allow-mixed (RFC 8285)
+        if media.extmap_allow_mixed {
+            lines.push("a=extmap-allow-mixed".to_string());
+        }
+
+        // end-of-candidates (RFC 8838)
+        if media.end_of_candidates {
+            lines.push("a=end-of-candidates".to_string());
+        }
+
         // ICE candidates
         Self::print_candidates(media, lines);
     }
@@ -282,6 +307,9 @@ impl SdpPrinter {
         if media.rtcp_mux {
             lines.push("a=rtcp-mux".to_string());
         }
+        if media.rtcp_mux_only {
+            lines.push("a=rtcp-mux-only".to_string());
+        }
         if media.rtcp_rsize {
             lines.push("a=rtcp-rsize".to_string());
         }
@@ -341,6 +369,63 @@ impl SdpPrinter {
                 let val =
                     std::str::from_utf8(&ssrc.value[..ssrc.value_len as usize]).unwrap_or("");
                 lines.push(format!("a=ssrc:{} {}:{}", ssrc.ssrc, attr, val));
+            }
+        }
+    }
+
+    /// Print SSRC group lines (RFC 5576).
+    fn print_ssrc_groups(media: &MediaDescription, lines: &mut Vec<String>) {
+        for i in 0..media.ssrc_group_count as usize {
+            if let Some(ref group) = media.ssrc_groups[i] {
+                let sem = std::str::from_utf8(&group.semantics[..group.semantics_len as usize])
+                    .unwrap_or("");
+                let ssrcs: Vec<String> = group.ssrcs[..group.ssrc_count as usize]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                lines.push(format!("a=ssrc-group:{} {}", sem, ssrcs.join(" ")));
+            }
+        }
+    }
+
+    /// Print RTCP feedback lines (RFC 4585).
+    fn print_rtcp_fbs(media: &MediaDescription, lines: &mut Vec<String>) {
+        for i in 0..media.rtcp_fb_count as usize {
+            if let Some(ref fb) = media.rtcp_fbs[i] {
+                lines.push(format!("a=rtcp-fb:{}", fb.to_sdp()));
+            }
+        }
+    }
+
+    /// Print RID lines (RFC 8851).
+    fn print_rids(media: &MediaDescription, lines: &mut Vec<String>) {
+        for i in 0..media.rid_count as usize {
+            if let Some(ref rid) = media.rids[i] {
+                let id = std::str::from_utf8(&rid.id[..rid.id_len as usize]).unwrap_or("");
+                lines.push(format!("a=rid:{} {}", id, rid.direction.as_str()));
+            }
+        }
+    }
+
+    /// Print simulcast line (RFC 8853).
+    fn print_simulcast(media: &MediaDescription, lines: &mut Vec<String>) {
+        if let Some(ref sim) = media.simulcast {
+            let val = std::str::from_utf8(&sim.value[..sim.value_len as usize]).unwrap_or("");
+            lines.push(format!("a=simulcast:{}", val));
+        }
+    }
+
+    /// Print standalone msid (RFC 8830).
+    fn print_msid(media: &MediaDescription, lines: &mut Vec<String>) {
+        if let Some(ref msid) = media.msid {
+            let stream = std::str::from_utf8(&msid.stream_id[..msid.stream_id_len as usize])
+                .unwrap_or("");
+            if msid.track_id_len > 0 {
+                let track = std::str::from_utf8(&msid.track_id[..msid.track_id_len as usize])
+                    .unwrap_or("");
+                lines.push(format!("a=msid:{} {}", stream, track));
+            } else {
+                lines.push(format!("a=msid:{}", stream));
             }
         }
     }

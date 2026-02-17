@@ -56,7 +56,11 @@ pub struct MediaRecvPacket {
 impl MediaRecvPacket {
     /// Create a new media receive packet.
     pub fn new(data: Vec<u8>, source_addr: SocketAddr, recv_time_ns: u64) -> Self {
-        Self { data, source_addr, recv_time_ns }
+        Self {
+            data,
+            source_addr,
+            recv_time_ns,
+        }
     }
 
     /// Get the length of the packet data.
@@ -156,10 +160,7 @@ impl MediaTransport {
     /// # TigerStyle
     /// - ≥2 assertions (preconditions and postconditions)
     /// - Explicit error handling with fallback
-    pub fn bind(
-        addr: SocketAddr,
-        udp_config: TransportConfig,
-    ) -> Result<Self, TransportError> {
+    pub fn bind(addr: SocketAddr, udp_config: TransportConfig) -> Result<Self, TransportError> {
         // Precondition: address must be valid (port 0 is allowed for ephemeral ports)
         assert!(
             addr.ip().is_unspecified() || addr.ip().is_loopback() || !addr.ip().is_unspecified(),
@@ -176,12 +177,25 @@ impl MediaTransport {
             match IoUringTransport::bind(addr, uring_config) {
                 Ok(transport) => {
                     // Postcondition: verify transport is bound
-                    let bound_addr = transport.local_addr().expect("Transport must have local address");
-                    assert!(bound_addr.port() > 0, "Transport must be bound to a valid port");
+                    let bound_addr = transport
+                        .local_addr()
+                        .expect("Transport must have local address");
+                    assert!(
+                        bound_addr.port() > 0,
+                        "Transport must be bound to a valid port"
+                    );
 
                     // Log socket configuration
-                    let mode = if transport.is_sqpoll_enabled() { "SQPOLL" } else { "standard" };
-                    let multishot = if transport.is_multishot_active() { "multishot" } else { "batch" };
+                    let mode = if transport.is_sqpoll_enabled() {
+                        "SQPOLL"
+                    } else {
+                        "standard"
+                    };
+                    let multishot = if transport.is_multishot_active() {
+                        "multishot"
+                    } else {
+                        "batch"
+                    };
 
                     if let Some(info) = transport.socket_info() {
                         tracing::info!(
@@ -194,7 +208,11 @@ impl MediaTransport {
                             info.gso_enabled
                         );
                     } else {
-                        tracing::info!("✓ io_uring transport active: mode={}, recv={}", mode, multishot);
+                        tracing::info!(
+                            "✓ io_uring transport active: mode={}, recv={}",
+                            mode,
+                            multishot
+                        );
                     }
 
                     return Ok(Self::IoUring(transport));
@@ -217,8 +235,13 @@ impl MediaTransport {
         let transport = UdpTransport::bind(addr, udp_config)?;
 
         // Postcondition: verify transport is bound
-        let bound_addr = transport.local_addr().expect("Transport must have local address");
-        assert!(bound_addr.port() > 0, "Transport must be bound to a valid port");
+        let bound_addr = transport
+            .local_addr()
+            .expect("Transport must have local address");
+        assert!(
+            bound_addr.port() > 0,
+            "Transport must be bound to a valid port"
+        );
 
         #[cfg(target_os = "linux")]
         tracing::info!("✓ Standard UDP transport active (recvmmsg/sendmmsg fallback)");
@@ -332,7 +355,11 @@ impl MediaTransport {
     /// Send a packet and capture it in the send log (sim only).
     /// For non-sim builds, this delegates to the regular send.
     #[cfg(feature = "sim")]
-    pub fn send_captured(&mut self, data: &[u8], dest: SocketAddr) -> Result<usize, TransportError> {
+    pub fn send_captured(
+        &mut self,
+        data: &[u8],
+        dest: SocketAddr,
+    ) -> Result<usize, TransportError> {
         match self {
             Self::Simulated(queues) => {
                 queues.send_log.push((dest, data.to_vec()));

@@ -364,7 +364,6 @@ impl HeadlessClient {
                     };
 
                     let msg = SignalMessage::IceCandidate {
-                        target_participant_id: 0, // SFU is target
                         candidate: candidate_json.candidate,
                         sdp_mid: candidate_json.sdp_mid,
                         sdp_mline_index: candidate_json.sdp_mline_index.map(|i| i as u32),
@@ -456,7 +455,6 @@ impl HeadlessClient {
         {
             let mut sig = signaling.lock().await;
             sig.send(SignalMessage::Offer {
-                target_participant_id: None, // Broadcast to SFU
                 sdp: offer.sdp,
             })
             .await
@@ -718,7 +716,6 @@ impl HeadlessClient {
                 .map_err(|e| ClientError::OfferFailed(format!("Failed to set local description: {}", e)))?;
 
             sig.send(SignalMessage::Offer {
-                target_participant_id: None,
                 sdp: offer.sdp,
             })
             .await
@@ -1140,7 +1137,6 @@ impl HeadlessClient {
 
                                 let mut sig = signaling.lock().await;
                                 sig.send(SignalMessage::Answer {
-                                    target_participant_id: 0,
                                     sdp: answer.sdp,
                                 })
                                 .await
@@ -1192,7 +1188,6 @@ impl HeadlessClient {
 
                                 let mut sig = signaling.lock().await;
                                 sig.send(SignalMessage::Answer {
-                                    target_participant_id: 0,
                                     sdp: answer.sdp,
                                 })
                                 .await
@@ -1330,7 +1325,6 @@ impl HeadlessClient {
                                     }
                                     let mut sig = signaling.lock().await;
                                     let _ = sig.send(SignalMessage::Answer {
-                                        target_participant_id: 0,
                                         sdp: answer.sdp,
                                     }).await;
                                     tracing::info!("[bg-signaling] Renegotiation answer sent");

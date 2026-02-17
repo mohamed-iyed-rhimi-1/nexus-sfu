@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 //! Nexus SFU MVP - High-performance WebRTC Selective Forwarding Unit
 //!
 //! This is the Minimum Viable Product implementation focusing on four key optimizations:
@@ -18,8 +20,6 @@
 //!
 //! - 500-1000 participants per room
 //! - P50 latency < 20ms, P99 < 50ms
-
-#![deny(warnings)]
 //! - 500K+ packets/sec/core
 //! - < 500KB memory per participant
 //!
@@ -55,6 +55,7 @@ pub mod sfu;
 pub mod signal;
 pub mod spin;
 pub mod state;
+pub mod track_registry;
 pub mod tracing;
 pub mod types;
 pub mod worker;
@@ -177,11 +178,10 @@ pub use forward::{
     SsrcError, SsrcRouter,
     Subscriber, SubscriberList, SubscriberListStats, SubscriberListStatsSnapshot,
     ViewportFilter, DEFAULT_COLD_TIMEOUT_NS, MAX_SUBSCRIBERS_PER_TRACK,
-    XdpPacketProcessor, XdpProcessorConfig, XdpProcessorStats, XdpProcessorStatsSnapshot,
     PacketType, PacketHandler,
 };
 pub use sfu::{Sfu, SfuStats, DrainState};
-pub use spin::{AdaptiveSpinLoop, SpinState};
+pub use spin::SpinLoop;
 pub use state::{ForwardEntry, ForwardTable, XdpError};
 pub use tracing::{
     init_tracing, init_tracing_extended, ExtendedLoggingConfig, TracingError,

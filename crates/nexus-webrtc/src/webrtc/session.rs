@@ -44,11 +44,12 @@
 //! // Start connectivity checks
 //! session.start_ice()?;
 //!
-//! // Process incoming packets
-//! match session.process_incoming(data, from)? {
+//! // Process incoming packets (caller provides output buffer)
+//! let mut out = [0u8; 2048];
+//! match session.process_incoming(data, from, &mut out)? {
 //!     IncomingData::Stun(response) => send(response),
-//!     IncomingData::Rtp(decrypted) => handle_rtp(decrypted),
-//!     IncomingData::Rtcp(decrypted) => handle_rtcp(decrypted),
+//!     IncomingData::Rtp(len) => handle_rtp(&out[..len]),
+//!     IncomingData::Rtcp(len) => handle_rtcp(&out[..len]),
 //!     IncomingData::None => {},
 //! }
 //!
@@ -57,7 +58,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tracing::warn;
 
@@ -101,11 +102,6 @@ pub const ICE_CHECK_TIMEOUT_MS: u32 = 5000;
 
 /// DTLS handshake timeout in milliseconds (RFC 6347: 30 seconds).
 pub const DTLS_HANDSHAKE_TIMEOUT_MS: u32 = 30000;
-
-/// DTLS handshake timeout as Duration.
-#[allow(dead_code)] // Reserved for DTLS handshake timeout enforcement
-pub const DTLS_HANDSHAKE_TIMEOUT: Duration =
-    Duration::from_millis(DTLS_HANDSHAKE_TIMEOUT_MS as u64);
 
 /// Default consent timeout in seconds (RFC 7675).
 pub const CONSENT_TIMEOUT_SECS: u64 = 30;
@@ -272,8 +268,8 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             id: TransportId(1),
-            ice_role: IceRole::Controlling,
-            dtls_role: DtlsRole::Client,
+            ice_role: IceRole::Controlled,  // SFU sends offer, so it's controlled (RFC 8445 §6.1.1)
+            dtls_role: DtlsRole::Server,    // SFU sends offer with setup:actpass, acts as server (RFC 8842)
             remote_addr: None,
             srtp_profile: ProtectionProfile::AeadAes128Gcm,
             ice_gathering_timeout_ms: ICE_GATHERING_TIMEOUT_MS,
@@ -404,6 +400,11 @@ pub struct HealthReport {
 // ============================================================================
 
 /// Incoming data classification after processing.
+///
+/// RTP/RTCP variants carry the decrypted length written to the caller's
+/// output buffer (zero-alloc hot path). STUN/DTLS variants carry owned
+/// data since signaling responses are infrequent and produced by
+/// ICE/DTLS agents that allocate internally.
 #[derive(Debug)]
 pub enum IncomingData {
     /// STUN response to send.
@@ -415,11 +416,11 @@ pub enum IncomingData {
     /// STUN response followed by DTLS flight to send (ICE connected, starting handshake).
     StunAndDtls(Vec<u8>, Vec<u8>),
 
-    /// Decrypted RTP payload.
-    Rtp(Vec<u8>),
+    /// Decrypted RTP payload length (data written to caller's output buffer).
+    Rtp(usize),
 
-    /// Decrypted RTCP payload.
-    Rtcp(Vec<u8>),
+    /// Decrypted RTCP payload length (data written to caller's output buffer).
+    Rtcp(usize),
 
     /// No data to return.
     None,
@@ -486,6 +487,12 @@ pub struct WebRtcSession {
     /// Remote ICE credentials (for restart detection).
     remote_ice_ufrag: Option<String>,
     remote_ice_pwd: Option<String>,
+
+    /// DTLS key generation counter (RFC 8829 §4.1.8.1).
+    /// Incremented only on actual DTLS renegotiation (new fingerprint or
+    /// ICE restart). Renegotiations that don't change ICE credentials or
+    /// DTLS fingerprint reuse the existing DTLS connection and keys.
+    dtls_generation: u64,
 }
 
 /// Internal statistics tracking.
@@ -500,6 +507,9 @@ struct SessionStatsInternal {
     rtcp_packets_sent: u64,
     rtcp_packets_received: u64,
 }
+
+/// ICE outbound poll result: (STUN packets to send, optional DTLS flight).
+pub type IcePollResult = (Vec<(SocketAddr, Vec<u8>)>, Option<Vec<u8>>);
 
 impl WebRtcSession {
     /// Create new WebRTC session.
@@ -569,6 +579,7 @@ impl WebRtcSession {
             current_mids: Vec::new(),
             remote_ice_ufrag: None,
             remote_ice_pwd: None,
+            dtls_generation: 0,
         };
 
         // Postcondition: session must start in New state
@@ -738,7 +749,7 @@ impl WebRtcSession {
     /// - Assertions for preconditions
     pub fn get_srtp_key_material(
         &self,
-    ) -> Option<(nexus_transport::srtp::KeyMaterial, nexus_transport::srtp::SrtpPolicy)> {
+    ) -> Option<(nexus_transport::srtp::KeyMaterial, nexus_transport::srtp::SrtpPolicy, u64)> {
         // Check if DTLS is established
         let dtls = self.dtls_session.as_ref()?;
         if dtls.state() != nexus_transport::dtls::SessionState::Established {
@@ -786,7 +797,16 @@ impl WebRtcSession {
             ..nexus_transport::srtp::SrtpPolicy::default()
         };
 
-        Some((key_material, policy))
+        Some((key_material, policy, self.dtls_generation))
+    }
+
+    /// Get current DTLS key generation.
+    ///
+    /// Incremented only on actual DTLS renegotiation (RFC 8829 §4.1.8.1).
+    /// Callers can compare this to a cached value to detect key changes.
+    #[inline]
+    pub fn dtls_generation(&self) -> u64 {
+        self.dtls_generation
     }
 
     /// Set remote ICE credentials.
@@ -794,6 +814,16 @@ impl WebRtcSession {
     /// # TigerStyle
     /// - Precondition: credentials must not be empty
     /// - Precondition: credentials bounded (ufrag ≤ 32, pwd ≤ 128)
+    /// Get remote ICE ufrag if set.
+    pub fn remote_ice_ufrag(&self) -> Option<&str> {
+        self.remote_ice_ufrag.as_deref()
+    }
+
+    /// Get remote ICE pwd if set.
+    pub fn remote_ice_pwd(&self) -> Option<&str> {
+        self.remote_ice_pwd.as_deref()
+    }
+
     pub fn set_remote_ice_credentials(&mut self, credentials: IceCredentials) {
         // Precondition: credentials must not be empty
         assert!(
@@ -996,10 +1026,11 @@ impl WebRtcSession {
 
     /// Gather ICE candidates.
     ///
-    /// # TigerStyle
-    /// - Precondition: state must be New
     /// Legacy synchronous gathering. Deprecated — gathering is now
     /// handled by the async orchestrator via `add_local_candidate`.
+    ///
+    /// # TigerStyle
+    /// - Precondition: state must be New
     #[deprecated(note = "Use add_local_candidate + mark_gathering_complete + start_connectivity_checks")]
     pub fn gather_candidates(&mut self) -> Result<(), WebRtcError> {
         if self.state != SessionState::New {
@@ -1112,20 +1143,18 @@ impl WebRtcSession {
             self.transition_state(SessionState::IceGathering)?;
         }
 
-        // Transition to IceConnecting
-        self.transition_state(SessionState::IceConnecting)?;
-
-        // Start checks if we have everything we need
+        // Only transition to IceConnecting if we can actually start checks
         if let Some(ref mut agent) = self.ice_agent {
-            let already_checking = agent.connection_state() == IceConnectionState::Checking
-                || agent.connection_state() == IceConnectionState::Connected;
-            if !already_checking
-                && agent.remote_candidate_count() > 0
-                && agent.gathering_state() == IceGatheringState::Complete
-            {
-                if let Err(e) = agent.start_checks() {
-                    tracing::warn!("Failed to start ICE checks: {:?}", e);
-                }
+            let can_start = agent.remote_candidate_count() > 0
+                && agent.gathering_state() == IceGatheringState::Complete;
+            
+            if can_start {
+                agent.start_checks()?;
+                // Only NOW transition to IceConnecting after checks started
+                self.transition_state(SessionState::IceConnecting)?;
+            } else {
+                // Stay in IceGathering - caller will retry when conditions are met
+                return Ok(());
             }
         }
 
@@ -1247,7 +1276,7 @@ impl WebRtcSession {
     /// # TigerStyle
     /// - Only produces output in IceConnecting state
     /// - Bounded output from agent.poll_outbound()
-    pub fn poll_ice_outbound(&mut self) -> (Vec<(SocketAddr, Vec<u8>)>, Option<Vec<u8>>) {
+    pub fn poll_ice_outbound(&mut self) -> IcePollResult {
         if self.state != SessionState::IceConnecting {
             return (Vec::new(), None);
         }
@@ -1568,6 +1597,9 @@ impl WebRtcSession {
         self.srtp_session = Some(inbound_ctx);
         self.srtp_outbound = Some(outbound_ctx);
 
+        // Bump DTLS generation — keys have changed (RFC 8829 §4.1.8.1)
+        self.dtls_generation += 1;
+
         // Postcondition: both SRTP contexts must exist
         assert!(
             self.srtp_session.is_some(),
@@ -1615,6 +1647,11 @@ impl WebRtcSession {
     /// # Postcondition
     ///
     /// * ICE agent reset if `ice_restarted == true`
+    ///
+    /// # Note
+    ///
+    /// This processes an incoming *offer* from the remote side. For processing
+    /// the remote *answer* to an offer we sent, use `handle_renegotiation_answer`.
     pub fn handle_renegotiation_offer(
         &mut self,
         offer: &crate::sdp::SessionDescription,
@@ -1705,6 +1742,68 @@ impl WebRtcSession {
         Ok((added_mids, removed_mids, ice_restarted))
     }
 
+    /// Process the remote answer to a renegotiation offer we sent.
+    ///
+    /// Unlike `handle_renegotiation_offer`, this does NOT check for ICE restart
+    /// because the SFU is the offerer — only the offerer can trigger ICE restart
+    /// (RFC 8829 §4.1.16). The answer simply confirms the media sections.
+    ///
+    /// # Preconditions
+    ///
+    /// * `state == SessionState::Established`
+    /// * `answer.media_count <= 10`
+    pub fn handle_renegotiation_answer(
+        &mut self,
+        answer: &crate::sdp::SessionDescription,
+    ) -> Result<(Vec<String>, Vec<String>), WebRtcError> {
+        assert_eq!(
+            self.state,
+            SessionState::Established,
+            "Renegotiation answer only allowed in Established state"
+        );
+        assert!(
+            answer.media_count <= 10,
+            "Media sections must be bounded to 10"
+        );
+
+        tracing::info!(session_id = self.config.id.0, "Processing renegotiation answer");
+
+        let mut added_mids = Vec::new();
+        let mut removed_mids = Vec::new();
+
+        let mut new_mids = Vec::new();
+        for i in 0..answer.media_count as usize {
+            if let Some(media) = &answer.media[i] {
+                if let Some(mid) = &media.mid {
+                    new_mids.push(mid.as_str().to_string());
+                }
+            }
+        }
+
+        for mid in &new_mids {
+            if !self.current_mids.contains(mid) {
+                added_mids.push(mid.clone());
+            }
+        }
+
+        for mid in &self.current_mids {
+            if !new_mids.contains(mid) {
+                removed_mids.push(mid.clone());
+            }
+        }
+
+        self.current_mids = new_mids;
+
+        tracing::info!(
+            session_id = self.config.id.0,
+            added = added_mids.len(),
+            removed = removed_mids.len(),
+            "Renegotiation answer processed"
+        );
+
+        Ok((added_mids, removed_mids))
+    }
+
     /// Restart ICE for renegotiation.
     ///
     /// Resets ICE agent, generates new credentials, and regathers candidates.
@@ -1770,23 +1869,19 @@ impl WebRtcSession {
         &mut self,
         data: &[u8],
         from: SocketAddr,
+        out: &mut [u8],
     ) -> Result<IncomingData, WebRtcError> {
-        // Precondition: data must not be empty
-        assert!(!data.is_empty(), "Incoming data must not be empty");
+        if data.is_empty() {
+            return Err(WebRtcError::PacketTooShort);
+        }
 
-        // Precondition: data length must be bounded
-        assert!(
-            data.len() <= MAX_PACKET_SIZE,
-            "Incoming data must be <= MAX_PACKET_SIZE"
-        );
+        if data.len() > MAX_PACKET_SIZE {
+            return Err(WebRtcError::PacketTooLarge);
+        }
 
         // Precondition: session must not be closed
         if self.state.is_terminal() {
             return Err(WebRtcError::Closed);
-        }
-
-        if data.is_empty() {
-            return Err(WebRtcError::PacketTooShort);
         }
 
         // Update activity timestamp
@@ -1856,8 +1951,8 @@ impl WebRtcSession {
         match packet_type {
             PacketType::Stun => self.process_stun(data, from),
             PacketType::Dtls => self.process_dtls(data, from),
-            PacketType::Rtp => self.process_rtp(data, from),
-            PacketType::Rtcp => self.process_rtcp(data, from),
+            PacketType::Rtp => self.process_rtp(data, from, out),
+            PacketType::Rtcp => self.process_rtcp(data, from, out),
             PacketType::Unknown => Err(WebRtcError::UnknownPacketType),
         }
     }
@@ -1972,7 +2067,35 @@ impl WebRtcSession {
         // Process DTLS in a scope to limit borrow lifetime
         let (response_data, dtls_established) = {
             if let Some(ref mut engine) = self.openssl_dtls {
+                tracing::debug!(
+                    is_established = engine.is_established(),
+                    data_len = data.len(),
+                    first_bytes = ?&data[..data.len().min(4)],
+                    "Processing DTLS packet in OpenSSL engine"
+                );
+                
                 let output = engine.process(data).map_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        state = ?self.state,
+                        data_len = data.len(),
+                        first_byte = data[0],
+                        dtls_content_type = data[0],
+                        from = %from,
+                        "DTLS process failed - detailed error"
+                    );
+                    
+                    // Log additional context for handshake failures
+                    if data[0] == 21 {
+                        let alert_level = if data.len() > 13 { data[13] } else { 0 };
+                        let alert_desc = if data.len() > 14 { data[14] } else { 0 };
+                        tracing::error!(
+                            alert_level,
+                            alert_description = alert_desc,
+                            "DTLS Alert received (content_type=21). Level: 1=warning, 2=fatal. Common: 40=handshake_failure, 42=bad_certificate, 43=unsupported_certificate"
+                        );
+                    }
+                    
                     tracing::warn!("DTLS process failed: {}", e);
                     WebRtcError::DtlsHandshakeFailed
                 })?;
@@ -2042,7 +2165,7 @@ impl WebRtcSession {
     /// - Precondition: state is Established
     /// - Precondition: srtp_session exists
     /// - Buffer bleed protection
-    fn process_rtp(&mut self, data: &[u8], _from: SocketAddr) -> Result<IncomingData, WebRtcError> {
+    fn process_rtp(&mut self, data: &[u8], _from: SocketAddr, out: &mut [u8]) -> Result<IncomingData, WebRtcError> {
         // Precondition: session must be established
         if self.state != SessionState::Established {
             return Err(WebRtcError::InvalidState);
@@ -2065,12 +2188,11 @@ impl WebRtcSession {
             return Err(WebRtcError::PacketTooLarge);
         }
 
-        // Zero work buffer before use (prevent buffer bleed)
-        self.work_buffer[..len].fill(0);
+        // Copy to work buffer for in-place decryption
         self.work_buffer[..len].copy_from_slice(data);
 
         // Postcondition: data copied correctly
-        assert_eq!(
+        debug_assert_eq!(
             &self.work_buffer[..len],
             data,
             "Data must be copied correctly"
@@ -2111,9 +2233,13 @@ impl WebRtcSession {
 
         self.stats.rtp_packets_received += 1;
 
-        Ok(IncomingData::Rtp(
-            self.work_buffer[..decrypted_len].to_vec(),
-        ))
+        // Copy decrypted data to caller's output buffer (zero-alloc)
+        if out.len() < decrypted_len {
+            return Err(WebRtcError::PacketTooLarge);
+        }
+        out[..decrypted_len].copy_from_slice(&self.work_buffer[..decrypted_len]);
+
+        Ok(IncomingData::Rtp(decrypted_len))
     }
 
     /// Process RTCP packet.
@@ -2126,6 +2252,7 @@ impl WebRtcSession {
         &mut self,
         data: &[u8],
         _from: SocketAddr,
+        out: &mut [u8],
     ) -> Result<IncomingData, WebRtcError> {
         // Precondition: session must be established
         if self.state != SessionState::Established {
@@ -2149,8 +2276,7 @@ impl WebRtcSession {
             return Err(WebRtcError::PacketTooLarge);
         }
 
-        // Zero work buffer before use (prevent buffer bleed)
-        self.work_buffer[..len].fill(0);
+        // Copy to work buffer for in-place decryption
         self.work_buffer[..len].copy_from_slice(data);
 
         let decrypted_len = match srtp.unprotect_rtcp(&mut *self.work_buffer, len) {
@@ -2186,9 +2312,13 @@ impl WebRtcSession {
 
         self.stats.rtcp_packets_received += 1;
 
-        Ok(IncomingData::Rtcp(
-            self.work_buffer[..decrypted_len].to_vec(),
-        ))
+        // Copy decrypted data to caller's output buffer (zero-alloc)
+        if out.len() < decrypted_len {
+            return Err(WebRtcError::PacketTooLarge);
+        }
+        out[..decrypted_len].copy_from_slice(&self.work_buffer[..decrypted_len]);
+
+        Ok(IncomingData::Rtcp(decrypted_len))
     }
 
     // ========================================================================
@@ -2361,17 +2491,16 @@ impl WebRtcSession {
 
     /// Get transport statistics.
     pub fn transport_stats(&self) -> TransportStats {
-        TransportStats {
-            packets_sent: self.stats.packets_sent,
-            packets_received: self.stats.packets_received,
-            bytes_sent: self.stats.bytes_sent,
-            bytes_received: self.stats.bytes_received,
-            rtp_packets_sent: self.stats.rtp_packets_sent,
-            rtp_packets_received: self.stats.rtp_packets_received,
-            rtcp_packets_sent: self.stats.rtcp_packets_sent,
-            rtcp_packets_received: self.stats.rtcp_packets_received,
-            ..Default::default()
-        }
+        TransportStats::from_values(
+            self.stats.packets_sent,
+            self.stats.packets_received,
+            self.stats.bytes_sent,
+            self.stats.bytes_received,
+            self.stats.rtp_packets_sent,
+            self.stats.rtp_packets_received,
+            self.stats.rtcp_packets_sent,
+            self.stats.rtcp_packets_received,
+        )
     }
 
     /// Check if session is healthy.
@@ -2685,9 +2814,11 @@ mod tests {
         let config = SessionConfig::default();
         let mut session = WebRtcSession::new(config).unwrap();
 
-        // Can't start connectivity checks from Established state
+        // start_connectivity_checks from Established is idempotent (Ok)
+        // because late trickle candidates may arrive after ICE completes
+        // (RFC 8838 §10).
         session.force_state_for_testing(SessionState::Established);
-        assert_eq!(session.start_connectivity_checks().unwrap_err(), WebRtcError::InvalidState);
+        assert!(session.start_connectivity_checks().is_ok());
     }
 
     #[test]
@@ -2695,7 +2826,7 @@ mod tests {
         let data = IncomingData::None;
         assert!(format!("{:?}", data).contains("None"));
 
-        let rtp = IncomingData::Rtp(vec![0x80, 0x00]);
+        let rtp = IncomingData::Rtp(2);
         assert!(format!("{:?}", rtp).contains("Rtp"));
     }
 

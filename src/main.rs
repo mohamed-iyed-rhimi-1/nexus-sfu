@@ -424,6 +424,20 @@ async fn run(config: NexusConfig) -> ExitCode {
 
     info!("Signaling server started (QUIC-first with WebSocket fallback)");
 
+    // Shared SSRC resolver: orchestrator registers tracks by MID, packet loop resolves SSRCs
+    let _ssrc_resolver = std::sync::Arc::new(
+        nexus_sfu::track_registry::SsrcResolver::new()
+    );
+
+    // Create cold-path channel (packet loop → orchestrator for STUN/DTLS)
+    let (connection_tx, connection_rx) =
+        tokio::sync::mpsc::channel::<nexus_sfu::orchestrator::events::ColdPathPacket>(4096);
+
+    // Create PacketSender for ConnectionMonitor
+    let media_socket = sfu.media_socket_for_sender()
+        .expect("Media socket must be available for PacketSender");
+    let packet_sender = nexus_sfu::orchestrator::connection::PacketSender::new(media_socket);
+
     // Start session orchestrator
     let worker_pool_arc = sfu
         .worker_pool_arc()
@@ -436,13 +450,16 @@ async fn run(config: NexusConfig) -> ExitCode {
         sfu.distributed_state().clone(),
         worker_pool_arc,
         config.transport.media_bind_addr,
+        packet_sender,
     );
     if let Some(rx) = relay_event_rx {
         orchestrator.set_relay_event_rx(rx);
     }
 
+    // ssrc_resolver is used internally by the SFU packet loop
+
     let orchestrator_handle = tokio::spawn(async move {
-        orchestrator.run(orchestrator_rx).await;
+        orchestrator.run(orchestrator_rx, connection_rx).await;
     });
 
     info!("Session orchestrator started");
@@ -486,6 +503,9 @@ async fn run(config: NexusConfig) -> ExitCode {
         info!("API server disabled");
         None
     };
+
+    // Wire cold-path channel into SFU packet loop
+    sfu.set_connection_tx(connection_tx);
 
     // Run SFU packet processing loop
     let result = sfu.run_with_signals().await;

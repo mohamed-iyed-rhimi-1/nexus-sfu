@@ -36,8 +36,8 @@ pub use attributes::{
     SsrcInfo, ExtMap, Fmtp, Direction, FingerprintAlgorithm, CandidateType,
 };
 pub use error::SdpError;
-pub use media::{MediaDescription, MediaType, TransportProtocol, Mid};
-pub use negotiator::{CodecCapability, CodecType, SdpNegotiator, default_supported_codecs};
+pub use media::{MediaDescription, MediaType, TransportProtocol, Mid, SsrcGroup, Rid, SimulcastAttr, Msid};
+pub use negotiator::{CodecCapability, CodecType, RecycledMline, SdpNegotiator, default_supported_codecs};
 pub use parser::SdpParser;
 pub use printer::SdpPrinter;
 pub use session::{SessionDescription, Origin, Timing};
@@ -89,14 +89,20 @@ pub const MIN_ICE_UFRAG_LEN: usize = 4;
 /// Minimum ICE pwd length (RFC 8445).
 pub const MIN_ICE_PWD_LEN: usize = 22;
 
-/// Maximum ICE ufrag length.
-pub const MAX_ICE_UFRAG_LEN: usize = 32;
+/// Maximum ICE ufrag length (RFC 8445 §5.3: up to 256 ice-chars).
+pub const MAX_ICE_UFRAG_LEN: usize = 256;
 
-/// Maximum ICE pwd length.
-pub const MAX_ICE_PWD_LEN: usize = 64;
+/// Maximum ICE pwd length (RFC 8445 §5.3: up to 256 ice-chars).
+pub const MAX_ICE_PWD_LEN: usize = 256;
 
-/// SHA-256 fingerprint length in bytes.
-pub const SHA256_FINGERPRINT_LEN: u8 = 32;
+/// Maximum RTCP feedback entries per media section.
+pub const MAX_RTCP_FB_PER_MEDIA: usize = 32;
+
+/// Maximum SSRC groups per media section.
+pub const MAX_SSRC_GROUPS_PER_MEDIA: usize = 8;
+
+/// Maximum RID entries per media section.
+pub const MAX_RIDS_PER_MEDIA: usize = 4;
 
 #[cfg(test)]
 mod tests {

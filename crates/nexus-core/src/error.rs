@@ -167,6 +167,12 @@ pub enum RtpError {
 
     /// Invalid header extension
     InvalidExtension,
+
+    /// Invalid padding (last byte is 0 or exceeds payload)
+    InvalidPadding {
+        padding_len: u8,
+        available_bytes: usize,
+    },
 }
 
 impl fmt::Display for RtpError {
@@ -201,6 +207,16 @@ impl fmt::Display for RtpError {
             }
             RtpError::InvalidExtension => {
                 write!(f, "invalid header extension")
+            }
+            RtpError::InvalidPadding {
+                padding_len,
+                available_bytes,
+            } => {
+                write!(
+                    f,
+                    "invalid padding: padding_len {} exceeds available {} bytes",
+                    padding_len, available_bytes
+                )
             }
         }
     }

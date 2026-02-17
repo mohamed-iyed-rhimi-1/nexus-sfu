@@ -52,6 +52,7 @@ pub use transport::{WebRtcTransport, TransportConfig, TransportState};
 pub use types::{
     TransportId, MediaType, TransportStats,
     IceParameters, DtlsParameters, DtlsFingerprint, DtlsRole,
+    FingerprintAlgorithm,
 };
 
 // ============================================================================

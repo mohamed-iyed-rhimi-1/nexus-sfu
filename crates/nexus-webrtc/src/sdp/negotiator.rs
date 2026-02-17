@@ -141,6 +141,26 @@ pub fn default_supported_codecs() -> Vec<CodecCapability> {
     ]
 }
 
+/// Recycled m-line descriptor for renegotiation offers.
+///
+/// Contains the exact codecs and extensions negotiated in the initial
+/// offer/answer exchange, per JSEP §5.2.2.
+#[derive(Debug, Clone)]
+pub struct RecycledMline<'a> {
+    pub mid: &'a str,
+    pub media_kind: u8,
+    pub codecs: &'a [RtpCodec],
+    pub fmtps: &'a [super::Fmtp],
+    /// All PTs from the client's original offer for this m-line.
+    /// Chrome's BUNDLE demuxer may still associate these with this m-line
+    /// even if our answer didn't include them (RFC 8843 §9.2).
+    pub offer_pts: &'a [u8],
+    pub extmaps: &'a [super::ExtMap],
+    /// Direction from the server's answer. Recycled m-lines must preserve
+    /// this so Chrome doesn't reject direction changes on existing transceivers.
+    pub direction: super::Direction,
+}
+
 /// SDP negotiator for WebRTC offer/answer.
 ///
 /// Handles codec negotiation, ICE credential exchange, and DTLS setup.
@@ -150,7 +170,6 @@ pub fn default_supported_codecs() -> Vec<CodecCapability> {
 /// - Bounded codec lists
 /// - Explicit error handling
 /// - Precondition/postcondition assertions
-#[derive(Debug, Clone)]
 pub struct SdpNegotiator {
     /// Supported codecs for negotiation.
     supported_codecs: Vec<CodecCapability>,
@@ -268,8 +287,9 @@ impl SdpNegotiator {
     /// - Bounded codec negotiation
     /// - Explicit error handling
     pub fn negotiate(&self, offer_sdp: &str) -> Result<String, SdpError> {
-        // Precondition: offer must not be empty
-        assert!(!offer_sdp.is_empty(), "Offer SDP must not be empty");
+        if offer_sdp.is_empty() {
+            return Err(SdpError::InvalidFormat { reason: "empty offer SDP" });
+        }
 
         // Parse the offer
         let offer = SdpParser::parse(offer_sdp)?;
@@ -313,7 +333,24 @@ impl SdpNegotiator {
         answer.set_session_name("Nexus SFU");
         answer.set_ice_credentials(&self.ice_ufrag, &self.ice_pwd);
         answer.set_fingerprint(self.dtls_fingerprint.clone());
-        answer.set_setup(DtlsSetup::Active); // We act as DTLS client
+        // RFC 8842 §5.5: answerer role depends on offerer's setup attribute.
+        let answer_setup = match offer.setup {
+            Some(DtlsSetup::Active) => DtlsSetup::Passive,
+            Some(DtlsSetup::Passive) => DtlsSetup::Active,
+            _ => DtlsSetup::Active, // actpass or absent → default to active
+        };
+        answer.set_setup(answer_setup);
+
+        // RFC 8858: WebRTC mandates rtcp-mux. Reject offers without it.
+        for i in 0..offer.media_count as usize {
+            if let Some(ref m) = offer.media[i] {
+                if !m.rtcp_mux {
+                    return Err(SdpError::InvalidFormat {
+                        reason: "WebRTC requires rtcp-mux on all media sections (RFC 8858)",
+                    });
+                }
+            }
+        }
 
         // Copy BUNDLE group if present
         if offer.bundle_group_len > 0 {
@@ -324,7 +361,7 @@ impl SdpNegotiator {
         // Process each media section
         for i in 0..offer.media_count as usize {
             if let Some(ref offer_media) = offer.media[i] {
-                let answer_media = self.create_answer_media(offer_media)?;
+                let answer_media = self.create_answer_media(offer_media, answer_setup)?;
                 answer.add_media(answer_media)?;
             }
         }
@@ -360,6 +397,7 @@ impl SdpNegotiator {
     fn create_answer_media(
         &self,
         offer_media: &MediaDescription,
+        answer_setup: DtlsSetup,
     ) -> Result<MediaDescription, SdpError> {
         // Precondition: offer media must have codecs
         assert!(
@@ -387,17 +425,57 @@ impl SdpNegotiator {
 
         // Set DTLS fingerprint (Requirement 4.3)
         media.set_fingerprint(self.dtls_fingerprint.clone());
-        media.setup = Some(DtlsSetup::Active);
+        media.setup = Some(answer_setup);
 
         // Negotiate codecs
         let negotiated = self.negotiate_codecs(offer_media)?;
+        let mut negotiated_pts: [u8; 16] = [0; 16];
+        let mut negotiated_pt_count = 0usize;
+        for codec in &negotiated {
+            if negotiated_pt_count < 16 {
+                negotiated_pts[negotiated_pt_count] = codec.payload_type;
+                negotiated_pt_count += 1;
+            }
+        }
         for codec in negotiated {
             media.add_codec(codec)?;
+        }
+
+        // Echo RTX codecs (RFC 4588) whose apt fmtp points to a negotiated PT.
+        // Without RTX in the answer, browsers won't use retransmission.
+        for i in 0..offer_media.codec_count as usize {
+            if let Some(ref offer_codec) = offer_media.codecs[i] {
+                if offer_codec.name_str().eq_ignore_ascii_case("rtx") {
+                    // Find the apt=<pt> in fmtp for this RTX codec
+                    if let Some(primary_pt) = Self::find_rtx_apt(offer_media, offer_codec.payload_type) {
+                        if negotiated_pts[..negotiated_pt_count].contains(&primary_pt) {
+                            let _ = media.add_codec(offer_codec.clone());
+                            // Echo the fmtp line too
+                            for j in 0..offer_media.fmtp_count as usize {
+                                if let Some(ref fmtp) = offer_media.fmtps[j] {
+                                    if fmtp.payload_type == offer_codec.payload_type {
+                                        let _ = media.add_fmtp(fmtp.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // RTCP settings
         media.rtcp_mux = offer_media.rtcp_mux;
         media.rtcp_rsize = offer_media.rtcp_rsize;
+        media.rtcp_mux_only = offer_media.rtcp_mux_only;
+
+        // Copy RTCP feedback from offer (RFC 4585) — critical for NACK/PLI/FIR
+        for i in 0..offer_media.rtcp_fb_count as usize {
+            if let Some(ref fb) = offer_media.rtcp_fbs[i] {
+                let _ = media.add_rtcp_fb(fb.clone());
+            }
+        }
 
         // Copy RTP header extensions from offer so the receiver can demux
         // incoming RTP by mid/rid (required by webrtc-rs for on_track).
@@ -406,6 +484,9 @@ impl SdpNegotiator {
                 let _ = media.add_extmap(ext.clone());
             }
         }
+
+        // Copy extmap-allow-mixed (RFC 8285)
+        media.extmap_allow_mixed = offer_media.extmap_allow_mixed;
 
         // Add local ICE candidates to answer (Requirement 4.1)
         // Bounded by MAX_CANDIDATES_PER_MEDIA per TigerStyle
@@ -490,6 +571,26 @@ impl SdpNegotiator {
         );
 
         Ok(negotiated)
+    }
+
+    /// Extract the `apt` value from an RTX codec's fmtp line.
+    /// Returns the primary codec's payload type that this RTX codec retransmits.
+    fn find_rtx_apt(media: &MediaDescription, rtx_pt: u8) -> Option<u8> {
+        for i in 0..media.fmtp_count as usize {
+            if let Some(ref fmtp) = media.fmtps[i] {
+                if fmtp.payload_type == rtx_pt {
+                    let params = std::str::from_utf8(&fmtp.params[..fmtp.params_len as usize])
+                        .unwrap_or("");
+                    for param in params.split(';') {
+                        let param = param.trim();
+                        if let Some(val) = param.strip_prefix("apt=") {
+                            return val.trim().parse::<u8>().ok();
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Find a matching codec from our supported list.
@@ -605,28 +706,26 @@ impl SdpNegotiator {
     /// subscriber has subscribed to. This allows the client's WebRTC stack
     /// to map incoming RTP packets to transceivers and fire `on_track`.
     ///
-    /// # Arguments
-    ///
-    /// * `session_id` - SDP origin session ID (reuse from initial offer)
-    /// * `tracks` - Slice of (ssrc, media_kind, mid) tuples for subscribed tracks.
-    ///              `media_kind`: 0 = audio, 1 = video. `mid` is the media section ID.
-    ///
-    /// # Returns
-    ///
-    /// SDP offer string on success.
-    ///
     /// # TigerStyle Compliance
     ///
     /// - ≥2 assertions validating preconditions and postconditions
     /// - Bounded track count (MAX_MEDIA_SECTIONS)
     /// - No dynamic allocation beyond String building
+    #[allow(clippy::too_many_arguments)]
     pub fn create_renegotiation_offer(
         &self,
         session_id: u64,
-        existing_mids: &[(&str, u8)], // (mid, media_kind) from initial offer — recycled as inactive
+        session_version: u64,
+        existing_mids: &[RecycledMline<'_>],
         tracks: &[(u32, u8, &str)],
-        mid_ext_id: u8, // Negotiated MID RTP header extension ID from initial offer
-    ) -> Result<String, SdpError> {
+        mid_ext_id: u8,
+        video_extmaps: &[(u8, &str)],
+        audio_extmaps: &[(u8, &str)],
+        negotiated_video_codec: Option<&RtpCodec>,
+        negotiated_audio_codec: Option<&RtpCodec>,
+        negotiated_video_fmtp: Option<&super::Fmtp>,
+        negotiated_audio_fmtp: Option<&super::Fmtp>,
+    ) -> Result<(String, Vec<u8>), SdpError> {
         // Precondition: must have at least one track
         assert!(!tracks.is_empty(), "Must have at least one track for renegotiation");
         // Precondition: bounded track count
@@ -636,45 +735,100 @@ impl SdpNegotiator {
         );
 
         let mut offer = SessionDescription::new(session_id);
+        // RFC 3264 §8: o= version MUST be incremented on each new offer
+        offer.set_version(session_version);
         offer.set_session_name("Nexus SFU");
         offer.set_ice_credentials(&self.ice_ufrag, &self.ice_pwd);
         offer.set_fingerprint(self.dtls_fingerprint.clone());
-        offer.set_setup(DtlsSetup::Active);
+        // RFC 8842 §5.5: offerer MUST use actpass.
+        offer.set_setup(DtlsSetup::Actpass);
 
         let mut bundle_mids: Vec<&str> = Vec::with_capacity(existing_mids.len() + tracks.len());
 
-        // First: include existing m-lines as recycled (port 0, recvonly) per JSEP §5.2.2
-        for &(mid, media_kind) in existing_mids {
-            let media_type = if media_kind == 0 {
+        // Collect all PTs used by recycled m-lines so new sendonly m-lines
+        // can avoid conflicts. RFC 8843 §9.2 requires unique PT-to-MID
+        // mapping within a BUNDLE group; Chrome enforces this strictly
+        // regardless of direction.
+        //
+        // CRITICAL: Include ALL PTs from the client's original offer, not just
+        // the answer's PTs. Chrome's BUNDLE demuxer retains PT→MID associations
+        // from the original offer even for PTs the SFU's answer didn't include.
+        // Reusing such a PT for a new m-line causes "Failed to set up demuxing"
+        // errors (ERROR_CONTENT).
+        let mut used_pts: [bool; 128] = [false; 128];
+        for recycled in existing_mids {
+            for codec in recycled.codecs {
+                used_pts[codec.payload_type as usize] = true;
+            }
+            for &pt in recycled.offer_pts {
+                if (pt as usize) < 128 {
+                    used_pts[pt as usize] = true;
+                }
+            }
+        }
+
+        // First: include existing m-lines recycled per JSEP §5.2.2.
+        // Use the exact codecs and extensions from the initial negotiation.
+        for recycled in existing_mids {
+            let media_type = if recycled.media_kind == 0 {
                 super::MediaType::Audio
             } else {
                 super::MediaType::Video
             };
             let mut media = super::MediaDescription::new(
                 media_type,
-                0, // port 0 = recycled/rejected
+                9,
                 super::TransportProtocol::UdpTlsRtpSavpf,
             );
-            media.mid = Some(super::Mid::new(mid));
-            media.direction = super::Direction::Inactive;
+            media.mid = Some(super::Mid::new(recycled.mid));
+            media.direction = recycled.direction;
             media.set_ice_credentials(&self.ice_ufrag, &self.ice_pwd);
+            media.ice_options.trickle = true;
             media.set_fingerprint(self.dtls_fingerprint.clone());
-            media.setup = Some(DtlsSetup::Active);
+            media.setup = Some(DtlsSetup::Actpass);
             media.rtcp_mux = true;
 
-            // Need at least one codec for valid SDP
-            for codec_cap in &self.supported_codecs {
-                let is_audio = codec_cap.codec_type.is_audio();
-                let want_audio = media_kind == 0;
-                if is_audio == want_audio {
-                    let _ = media.add_codec(codec_cap.to_rtp_codec());
-                    break;
-                }
+            // Use the previously negotiated codecs (with browser's PTs)
+            for codec in recycled.codecs {
+                let _ = media.add_codec(codec.clone());
+            }
+
+            // Use the previously negotiated fmtp lines (required for H264 etc.)
+            for fmtp in recycled.fmtps {
+                let _ = media.add_fmtp(fmtp.clone());
+            }
+
+            // Use the previously negotiated extensions
+            for ext in recycled.extmaps {
+                let _ = media.add_extmap(ext.clone());
+            }
+
+            // Ensure MID extension is present (may already be in extmaps)
+            let has_mid_ext = recycled.extmaps.iter().any(|e| {
+                let uri = std::str::from_utf8(&e.uri[..e.uri_len as usize]).unwrap_or("");
+                uri.contains("sdes:mid")
+            });
+            if !has_mid_ext {
+                let _ = media.add_extmap(super::ExtMap {
+                    id: mid_ext_id,
+                    uri: {
+                        let mut buf = [0u8; 128];
+                        let s = b"urn:ietf:params:rtp-hdrext:sdes:mid";
+                        buf[..s.len()].copy_from_slice(s);
+                        buf
+                    },
+                    uri_len: 35,
+                    direction: None,
+                });
             }
 
             offer.add_media(media)?;
-            bundle_mids.push(mid);
+            bundle_mids.push(recycled.mid);
         }
+
+        // Track the actual PT assigned to each new sendonly m-line.
+        // Index corresponds to the tracks slice.
+        let mut track_pts: Vec<u8> = Vec::with_capacity(tracks.len());
 
         for &(ssrc, media_kind, mid) in tracks {
             // Precondition: SSRC must be non-zero
@@ -699,14 +853,63 @@ impl SdpNegotiator {
             media.set_ice_credentials(&self.ice_ufrag, &self.ice_pwd);
             media.ice_options.trickle = true;
             media.set_fingerprint(self.dtls_fingerprint.clone());
-            media.setup = Some(DtlsSetup::Active);
+            media.setup = Some(DtlsSetup::Actpass);
 
-            // Add codecs matching the media type
-            for codec_cap in &self.supported_codecs {
-                let is_audio = codec_cap.codec_type.is_audio();
-                let want_audio = media_kind == 0;
-                if is_audio == want_audio {
-                    let _ = media.add_codec(codec_cap.to_rtp_codec());
+            // Use the negotiated codec for this media type (RFC 3264 §8).
+            // If the negotiated PT conflicts with a recycled m-line, pick an
+            // unused dynamic PT (96-127) to satisfy BUNDLE uniqueness (RFC 8843 §9.2).
+            let negotiated_codec = if media_kind == 0 {
+                negotiated_audio_codec
+            } else {
+                negotiated_video_codec
+            };
+            let negotiated_fmtp = if media_kind == 0 {
+                negotiated_audio_fmtp
+            } else {
+                negotiated_video_fmtp
+            };
+            if let Some(codec) = negotiated_codec {
+                let mut c = codec.clone();
+                let original_pt = c.payload_type;
+                if used_pts[c.payload_type as usize] {
+                    // Find an unused dynamic PT (96-127, RFC 3551 §6)
+                    let mut new_pt = None;
+                    for pt in 96..=127u8 {
+                        if !used_pts[pt as usize] {
+                            new_pt = Some(pt);
+                            break;
+                        }
+                    }
+                    match new_pt {
+                        Some(pt) => c.payload_type = pt,
+                        None => return Err(SdpError::TooManyMedia {
+                            count: existing_mids.len() + tracks.len(),
+                            max: 32, // dynamic PT space exhausted
+                        }),
+                    }
+                }
+                used_pts[c.payload_type as usize] = true;
+                track_pts.push(c.payload_type);
+                let _ = media.add_codec(c.clone());
+
+                // Add fmtp for the codec if available (required for H264 etc.)
+                if let Some(fmtp) = negotiated_fmtp {
+                    let mut f = fmtp.clone();
+                    // Update fmtp PT to match the (possibly remapped) codec PT
+                    if f.payload_type == original_pt {
+                        f.payload_type = c.payload_type;
+                    }
+                    let _ = media.add_fmtp(f);
+                }
+            } else {
+                track_pts.push(0); // no override needed
+                // Fallback: use our default codecs if no negotiation happened yet
+                for codec_cap in &self.supported_codecs {
+                    let is_audio = codec_cap.codec_type.is_audio();
+                    let want_audio = media_kind == 0;
+                    if is_audio == want_audio {
+                        let _ = media.add_codec(codec_cap.to_rtp_codec());
+                    }
                 }
             }
 
@@ -714,51 +917,47 @@ impl SdpNegotiator {
             media.rtcp_mux = true;
             media.rtcp_rsize = true;
 
-            // Add RTP header extensions for track demuxing (required by webrtc-rs)
-            let _ = media.add_extmap(super::ExtMap {
-                id: mid_ext_id,
-                uri: {
-                    let mut buf = [0u8; 128];
-                    let s = b"urn:ietf:params:rtp-hdrext:sdes:mid";
-                    buf[..s.len()].copy_from_slice(s);
-                    buf
-                },
-                uri_len: 35,
-                direction: None,
-            });
-            let _ = media.add_extmap(super::ExtMap {
-                id: 2,
-                uri: {
-                    let mut buf = [0u8; 128];
-                    let s = b"urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
-                    buf[..s.len()].copy_from_slice(s);
-                    buf
-                },
-                uri_len: 46,
-                direction: None,
-            });
-            let _ = media.add_extmap(super::ExtMap {
-                id: 3,
-                uri: {
-                    let mut buf = [0u8; 128];
-                    let s = b"urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id";
-                    buf[..s.len()].copy_from_slice(s);
-                    buf
-                },
-                uri_len: 54,
-                direction: None,
-            });
-            let _ = media.add_extmap(super::ExtMap {
-                id: 4,
-                uri: {
-                    let mut buf = [0u8; 128];
-                    let s = b"http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
-                    buf[..s.len()].copy_from_slice(s);
-                    buf
-                },
-                uri_len: 73,
-                direction: None,
-            });
+            // Add RTCP feedback capabilities so the subscriber's browser
+            // sends NACK, PLI, REMB, and transport-cc (RFC 4585, RFC 8888).
+            // Without these, the browser won't send any feedback for subscribed tracks.
+            if negotiated_codec.is_some() {
+                let pt = media.codecs.iter()
+                    .filter_map(|c| c.as_ref())
+                    .next()
+                    .map(|c| c.payload_type);
+                if let Some(pt) = pt {
+                    let pt_str = pt.to_string();
+                    if media_kind != 0 {
+                        // Video: nack, nack pli, goog-remb, transport-cc
+                        let _ = media.add_rtcp_fb(super::RtcpFeedback::parse(&format!("{} nack", pt_str)).unwrap());
+                        let _ = media.add_rtcp_fb(super::RtcpFeedback::parse(&format!("{} nack pli", pt_str)).unwrap());
+                        let _ = media.add_rtcp_fb(super::RtcpFeedback::parse(&format!("{} goog-remb", pt_str)).unwrap());
+                        let _ = media.add_rtcp_fb(super::RtcpFeedback::parse(&format!("{} transport-cc", pt_str)).unwrap());
+                    } else {
+                        // Audio: transport-cc
+                        let _ = media.add_rtcp_fb(super::RtcpFeedback::parse(&format!("{} transport-cc", pt_str)).unwrap());
+                    }
+                }
+            }
+
+            // Use negotiated extmap IDs from the initial exchange (RFC 8843 §9.1).
+            // In a BUNDLE, all m-lines share the same ID space, but each media
+            // type only includes its own applicable extensions. This prevents
+            // audio-only extensions (e.g. ssrc-audio-level) from appearing on
+            // video m-lines, which Chrome correctly rejects.
+            let type_extmaps = if media_kind == 0 { audio_extmaps } else { video_extmaps };
+            for &(ext_id, ext_uri) in type_extmaps {
+                let uri_bytes = ext_uri.as_bytes();
+                let uri_len = uri_bytes.len().min(128);
+                let mut buf = [0u8; 128];
+                buf[..uri_len].copy_from_slice(&uri_bytes[..uri_len]);
+                let _ = media.add_extmap(super::ExtMap {
+                    id: ext_id,
+                    uri: buf,
+                    uri_len: uri_len as u8,
+                    direction: None,
+                });
+            }
 
             // Add SSRC with cname and msid attributes (RFC 5576)
             let cname_str = format!("nexus-{}", ssrc);
@@ -789,11 +988,8 @@ impl SdpNegotiator {
             bundle_mids.push(mid);
         }
 
-        // Set BUNDLE group
-        if bundle_mids.len() > 1 {
-            offer.set_bundle(&bundle_mids)?;
-        } else if bundle_mids.len() == 1 {
-            // Single media section — still set BUNDLE for consistency
+        // Set BUNDLE group (any non-empty set of mids)
+        if !bundle_mids.is_empty() {
             offer.set_bundle(&bundle_mids)?;
         }
 
@@ -810,7 +1006,7 @@ impl SdpNegotiator {
             "Renegotiation offer must contain SSRC attributes"
         );
 
-        Ok(offer_sdp)
+        Ok((offer_sdp, track_pts))
     }
 }
 

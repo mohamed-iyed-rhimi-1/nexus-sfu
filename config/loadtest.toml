@@ -1,0 +1,112 @@
+# Nexus SFU Load Test Configuration
+# 1 publisher + 100 viewers in one room, plain WS (no TLS)
+
+drain_timeout_ms = 1
+
+[transport]
+media_bind_addr = "0.0.0.0:10000"
+signaling_bind_addr = "0.0.0.0:8080"
+recv_buffer_size_bytes = 16777216       # 16MB
+send_buffer_size_bytes = 16777216       # 16MB
+batch_size = 64
+batch_flush_interval_us = 1000          # 1ms
+max_webrtc_sessions = 200
+tls_cert_path = ""                      # Empty = plain WS (no TLS)
+tls_key_path = ""
+stun_servers = []
+
+[memory]
+arena_size_mb = 128                     # 128MB for 100 viewers
+ring_buffer_size = 512
+
+[worker]
+num_workers = 1
+cpu_affinity = false
+realtime_priority = false
+
+[room]
+max_participants_per_room = 150         # 1 publisher + 100 viewers + headroom
+max_rooms = 10
+empty_room_timeout_ms = 120000          # 2 min
+
+[bwe]
+initial_bandwidth_bps = 1000000         # 1 Mbps
+min_bandwidth_bps = 100000
+max_bandwidth_bps = 10000000            # 10 Mbps
+loss_threshold_percent = 10
+decrease_factor = 0.9
+increase_bps = 100000
+
+[quic]
+bind_addr = "0.0.0.0:8443"
+max_connections = 200
+max_session_tickets = 200
+session_ticket_ttl_secs = 86400
+max_bi_streams = 200
+max_uni_streams = 200
+stream_recv_window_bytes = 1048576
+connection_recv_window_bytes = 8388608
+keep_alive_interval_ms = 5000
+idle_timeout_ms = 30000
+enable_0rtt = false
+cert_path = "./certs/dev-cert.pem"
+key_path = "./certs/dev-key.pem"
+
+[gossip]
+probe_interval_ms = 5000
+ping_timeout_ms = 1000
+suspect_timeout_ms = 10000
+fanout = 1
+max_piggyback_updates = 8
+
+[cluster]
+node_id = 0
+
+[actor]
+max_track_actors = 400                  # 2 tracks × 101 participants + headroom
+max_participant_actors = 150
+max_room_actors = 10
+message_queue_size = 2048
+migration_queue_size = 5
+supervision_restart_limit = 3
+
+[api]
+bind_addr = "127.0.0.1:8081"
+jwt_secret = "dev-secret-minimum-32-characters-long"
+enabled = true
+
+[metrics]
+bind_addr = "127.0.0.1:9090"
+collection_interval_ms = 2000
+enable_prometheus = true
+
+[security]
+jwt_secret = "dev-secret-minimum-32-characters-long"
+
+[logging]
+level = "info"                          # Info level to reduce noise during load test
+structured = true
+include_timestamps = true
+include_thread_ids = true
+
+[xdp]
+enabled = false
+interface = ""
+queue_id = 0
+forward_table_path = "/sys/fs/bpf/nexus/forward_table"
+stats_map_path = "/sys/fs/bpf/nexus/stats_map"
+umem_num_frames = 4096
+umem_frame_size = 4096
+fill_ring_size = 2048
+comp_ring_size = 2048
+rx_ring_size = 2048
+tx_ring_size = 2048
+batch_size = 64
+poll_timeout_ms = 100
+attach_mode = "skb"
+fallback_on_failure = true
+
+[ice_servers]
+stun_servers = []
+turn_servers = []
+use_google_fallback = true

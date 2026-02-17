@@ -6,4 +6,4 @@ mod tests;
 pub use capnp_codec::{MessageBuilder, MessageReader, signaling_capnp, metrics_capnp};
 
 // Re-export message types
-pub use messages::{SignalMessage, ParticipantInfo, TrackKind, TrackUpdateMessage};
+pub use messages::{SignalMessage, ParticipantInfo, TrackInfo, TrackKind};

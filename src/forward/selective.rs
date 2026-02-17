@@ -312,11 +312,10 @@ impl ViewportFilter {
     /// - Requirement 9.6: Track statistics for filtered vs forwarded
     #[inline(always)]
     pub fn should_forward(&self, source_participant_id: u32) -> bool {
-        // TigerStyle: Assert preconditions
-        assert!(
-            source_participant_id != 0,
-            "source_participant_id must not be 0"
-        );
+        // Gracefully handle participant_id == 0 (unbound tracks from AssignTrack)
+        if source_participant_id == 0 {
+            return true;
+        }
 
         // Check pinned first (highest priority)
         if self.pinned_participants.contains(&source_participant_id) {
@@ -352,11 +351,9 @@ impl ViewportFilter {
     /// - source_participant_id != 0
     #[inline(always)]
     pub fn should_forward_no_stats(&self, source_participant_id: u32) -> bool {
-        // TigerStyle: Assert preconditions
-        assert!(
-            source_participant_id != 0,
-            "source_participant_id must not be 0"
-        );
+        if source_participant_id == 0 {
+            return true;
+        }
 
         // Check pinned first
         if self.pinned_participants.contains(&source_participant_id) {
@@ -702,10 +699,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "source_participant_id must not be 0")]
     fn test_viewport_filter_should_forward_zero_id() {
         let filter = ViewportFilter::new();
-        let _ = filter.should_forward(0);
+        // participant_id == 0 (unbound track) should always forward
+        assert!(filter.should_forward(0));
     }
 
     #[test]
@@ -726,10 +723,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "source_participant_id must not be 0")]
     fn test_viewport_filter_should_forward_no_stats_zero_id() {
         let filter = ViewportFilter::new();
-        let _ = filter.should_forward_no_stats(0);
+        // participant_id == 0 (unbound track) should always forward
+        assert!(filter.should_forward_no_stats(0));
     }
 
     #[test]

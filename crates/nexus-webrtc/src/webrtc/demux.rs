@@ -83,10 +83,14 @@ impl PacketType {
         }
 
         let payload_type: u8 = data[1] & 0x7F;
-        debug_assert!(payload_type <= 127, "Payload type exceeds 7 bits");
 
+        // RFC 5761 §4: RTCP packet types 200-207 map to 72-79 after
+        // masking with 0x7F. WebRTC uses dynamic RTP PTs 96-127, so
+        // there is no overlap. We also include 64-71 in the RTCP range
+        // per RFC 5761's reservation of PTs 64-95 to avoid future
+        // conflicts — any packet in this range on a muxed port is RTCP.
         match payload_type {
-            72..=76 => Self::Rtcp,
+            72..=79 => Self::Rtcp,
             _ => Self::Rtp,
         }
     }
@@ -145,8 +149,9 @@ impl ValidationResult {
 }
 
 pub fn validate_stun_packet(data: &[u8]) -> ValidationResult {
-    assert!(data.len() <= 65535, "STUN packet exceeds maximum size");
-    assert!(!data.is_empty(), "Empty STUN data");
+    if data.is_empty() {
+        return ValidationResult::invalid("Empty STUN data", RecoveryHint::Drop);
+    }
 
     if data.len() < MIN_STUN_SIZE {
         return ValidationResult::invalid(
@@ -180,8 +185,9 @@ pub fn validate_stun_packet(data: &[u8]) -> ValidationResult {
 }
 
 pub fn validate_dtls_packet(data: &[u8]) -> ValidationResult {
-    assert!(data.len() <= 65535, "DTLS record exceeds maximum size");
-    assert!(!data.is_empty(), "Empty DTLS data");
+    if data.is_empty() {
+        return ValidationResult::invalid("Empty DTLS data", RecoveryHint::Drop);
+    }
 
     if data.len() < MIN_DTLS_SIZE {
         return ValidationResult::invalid(
@@ -220,8 +226,9 @@ pub fn validate_dtls_packet(data: &[u8]) -> ValidationResult {
 }
 
 pub fn validate_rtp_packet(data: &[u8]) -> ValidationResult {
-    assert!(data.len() <= 65535, "RTP packet exceeds maximum MTU");
-    assert!(!data.is_empty(), "Empty RTP data");
+    if data.is_empty() {
+        return ValidationResult::invalid("Empty RTP data", RecoveryHint::Drop);
+    }
 
     if data.len() < MIN_RTP_SIZE {
         return ValidationResult::invalid(
@@ -269,8 +276,9 @@ pub fn validate_rtp_packet(data: &[u8]) -> ValidationResult {
 }
 
 pub fn validate_rtcp_packet(data: &[u8]) -> ValidationResult {
-    assert!(data.len() <= 65535, "RTCP packet exceeds maximum size");
-    assert!(!data.is_empty(), "Empty RTCP data");
+    if data.is_empty() {
+        return ValidationResult::invalid("Empty RTCP data", RecoveryHint::Drop);
+    }
 
     if data.len() < MIN_RTCP_SIZE {
         return ValidationResult::invalid(
@@ -321,12 +329,11 @@ pub enum RecoveryAction {
 }
 
 pub fn recover_from_malformed_packet(
-    data: &[u8],
+    _data: &[u8],
     packet_type: PacketType,
     validation: &ValidationResult,
 ) -> RecoveryAction {
-    assert!(!validation.valid, "Cannot recover from valid packet");
-    assert!(data.len() <= 65535, "Data too large");
+    debug_assert!(!validation.valid, "Cannot recover from valid packet");
 
     let hint: RecoveryHint = validation.recovery_hint.unwrap_or(RecoveryHint::Drop);
 
@@ -360,8 +367,9 @@ pub fn recover_from_malformed_packet(
 // ============================================================================
 
 pub fn demux_and_validate(data: &[u8]) -> (PacketType, ValidationResult) {
-    assert!(data.len() <= 65535, "Packet too large for demux");
-    assert!(!data.is_empty(), "Empty packet for demux");
+    if data.is_empty() {
+        return (PacketType::Unknown, ValidationResult::invalid("Empty packet", RecoveryHint::Drop));
+    }
 
     let packet_type: PacketType = PacketType::classify(data);
 

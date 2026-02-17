@@ -50,6 +50,8 @@ pub struct RelayManager {
     packet_rx: Receiver<RelayPacket>,
     /// Background receiver thread handle.
     recv_handle: Option<JoinHandle<()>>,
+    /// Shutdown flag for the receiver thread.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RelayManager {
@@ -65,6 +67,8 @@ impl RelayManager {
         let recv_socket = UdpSocket::bind(relay_addr)?;
         let recv_addr = recv_socket.local_addr()?;
         recv_socket.set_nonblocking(false)?; // Blocking for the receiver thread.
+        // Set read timeout so the receiver thread can check the shutdown flag
+        recv_socket.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
 
         let (packet_tx, packet_rx) = bounded(RELAY_RECV_CHANNEL_CAP);
 
@@ -78,6 +82,7 @@ impl RelayManager {
             packet_tx,
             packet_rx,
             recv_handle: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -89,10 +94,11 @@ impl RelayManager {
 
         let socket = self.recv_socket.clone();
         let tx = self.packet_tx.clone();
+        let shutdown = self.shutdown.clone();
 
         let handle = thread::Builder::new()
             .name("nexus-relay-recv".into())
-            .spawn(move || relay_recv_loop(socket, tx))
+            .spawn(move || relay_recv_loop(socket, tx, shutdown))
             .expect("failed to spawn relay receiver thread");
 
         self.recv_handle = Some(handle);
@@ -182,22 +188,32 @@ impl RelayManager {
 
 impl Drop for RelayManager {
     fn drop(&mut self) {
-        // Receiver thread will exit when socket is closed.
-        // We can't join here because the blocking recv won't unblock.
-        // The thread will terminate when the process exits.
+        self.shutdown.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.recv_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 /// Background receiver loop — reads relay packets and sends to channel.
 ///
 /// NASA Rule 1: no recursion. NASA Rule 2: loop bounded by channel lifetime.
-fn relay_recv_loop(socket: Arc<UdpSocket>, tx: Sender<RelayPacket>) {
+fn relay_recv_loop(
+    socket: Arc<UdpSocket>,
+    tx: Sender<RelayPacket>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut buf = [0u8; MAX_RELAY_PACKET];
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+
         let n = match socket.recv(&mut buf) {
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => continue,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 // Socket closed or fatal error — exit thread.

@@ -2,15 +2,14 @@ use serde::{Deserialize, Serialize};
 
 /// Signal message types for WebRTC signaling.
 ///
-/// These messages are exchanged between clients and the SFU for:
-/// - Room management (join/leave)
-/// - SDP negotiation (offer/answer)
-/// - ICE candidate exchange
-/// - Track subscription management
-/// - Connection health (ping/pong)
+/// The SFU is the sole offerer — clients only send Answer.
+/// This eliminates glare (JSEP §5.4) and ensures media only
+/// flows after the client accepts the offer (RFC 3264 §8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalMessage {
+    // ── Room management ──
+
     /// Create a new room.
     Create {
         room_name: Option<String>,
@@ -30,7 +29,7 @@ pub enum SignalMessage {
         participant_id: u64,
         room_id: u64,
         participants: Vec<ParticipantInfo>,
-        tracks: Vec<u64>,
+        tracks: Vec<TrackInfo>,
     },
     /// Leave room request.
     Leave,
@@ -43,70 +42,60 @@ pub enum SignalMessage {
     ParticipantLeft {
         participant_id: u64,
     },
-    /// SDP offer.
+
+    // ── SDP negotiation (SFU-driven) ──
+
+    /// Client declares intent to publish media tracks.
+    /// SFU responds with an Offer containing recvonly m-lines.
+    Publish {
+        kinds: Vec<String>,
+        contents: Vec<String>,
+    },
+    /// Client stops publishing tracks.
+    Unpublish {
+        track_ids: Vec<u64>,
+    },
+    /// SDP offer from SFU to client (SFU is sole offerer).
     Offer {
-        target_participant_id: Option<u64>,
         sdp: String,
     },
-    /// SDP offer received from another participant.
-    OfferReceived {
-        from_participant_id: u64,
-        sdp: String,
-    },
-    /// SDP answer.
+    /// SDP answer from client to SFU.
+    /// Client's SDP contains SSRCs and codec parameters.
     Answer {
-        target_participant_id: u64,
         sdp: String,
     },
-    /// SDP answer received from another participant.
-    AnswerReceived {
-        from_participant_id: u64,
-        sdp: String,
-    },
-    /// ICE candidate.
+
+    // ── ICE ──
+
+    /// ICE candidate exchange (bidirectional).
     IceCandidate {
-        target_participant_id: u64,
         candidate: String,
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u32>,
     },
     /// End of ICE candidates signal (Trickle ICE, RFC 8838).
     EndOfCandidates,
-    /// Client stats report.
-    Stats {
-        tracks_count: u32,
-        packets_sent: u64,
-        packets_received: u64,
-        bytes_sent: u64,
-        bytes_received: u64,
-    },
-    /// Error response.
-    Error {
-        code: String,
-        message: String,
-    },
-    /// Ping (keepalive).
-    Ping,
-    /// Pong (keepalive response).
-    Pong,
-    /// Subscribe to a track.
+
+    // ── Track subscription ──
+
+    /// Subscribe to one or more tracks.
+    /// SFU responds with Subscribed + Offer.
     Subscribe {
-        track_id: u64,
+        track_ids: Vec<u64>,
     },
-    /// Subscription confirmed.
+    /// Subscription confirmed (no media yet — wait for Offer/Answer).
     Subscribed {
-        track_id: u64,
-        subscriber_id: u32,
+        track_ids: Vec<u64>,
     },
-    /// Unsubscribe from a track.
+    /// Unsubscribe from one or more tracks.
     Unsubscribe {
-        track_id: u64,
+        track_ids: Vec<u64>,
     },
     /// Unsubscription confirmed.
     Unsubscribed {
-        track_id: u64,
+        track_ids: Vec<u64>,
     },
-    /// Track published notification.
+    /// Track published notification (new track available in room).
     TrackPublished {
         publisher_id: u64,
         track_id: u64,
@@ -118,17 +107,12 @@ pub enum SignalMessage {
     TrackUnpublished {
         track_id: u64,
     },
-    /// Server shutdown notification.
-    ServerShutdown {
-        reason: String,
-        drain_seconds: u32,
-    },
+
+    // ── Viewport optimization ──
+
     /// Update viewport (visible/pinned participants).
-    /// Client sends this when the UI layout changes.
     Viewport {
-        /// Participant IDs currently visible in the client's UI.
         visible: Vec<u64>,
-        /// Participant IDs pinned by the user (always receive video).
         pinned: Vec<u64>,
     },
     /// Viewport update acknowledged.
@@ -137,7 +121,6 @@ pub enum SignalMessage {
         pinned_count: u32,
     },
     /// Declare content type for a published track.
-    /// Client sends this after publishing to mark a track as screen share.
     SetContent {
         track_id: u64,
         /// "camera", "screen", or "audio".
@@ -147,6 +130,34 @@ pub enum SignalMessage {
     ContentSet {
         track_id: u64,
         content: String,
+    },
+
+    // ── Connection health ──
+
+    /// Ping (keepalive).
+    Ping,
+    /// Pong (keepalive response).
+    Pong,
+    /// Client stats report.
+    Stats {
+        tracks_count: u32,
+        packets_sent: u64,
+        packets_received: u64,
+        bytes_sent: u64,
+        bytes_received: u64,
+    },
+
+    // ── Errors & shutdown ──
+
+    /// Error response.
+    Error {
+        code: String,
+        message: String,
+    },
+    /// Server shutdown notification.
+    ServerShutdown {
+        reason: String,
+        drain_seconds: u32,
     },
 }
 
@@ -169,13 +180,15 @@ pub struct ParticipantInfo {
     pub name: String,
 }
 
-/// Track update message (server→client).
+/// Track info returned in Joined and TrackPublished.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrackUpdateMessage {
-    pub track_id: String,
-    pub participant_id: String,
-    pub kind: TrackKind,
-    pub enabled: bool,
+pub struct TrackInfo {
+    pub track_id: u64,
+    pub publisher_id: u64,
+    /// "audio" or "video".
+    pub kind: String,
+    /// "camera", "screen", or "audio".
+    pub content: String,
 }
 
 /// Track kind (audio or video).
