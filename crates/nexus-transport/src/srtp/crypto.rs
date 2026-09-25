@@ -558,18 +558,19 @@ impl core::fmt::Debug for AesGcmCipher {
 /// Handles encryption/decryption of SRTP/SRTCP packets using
 /// AES-128 counter mode for encryption and HMAC-SHA1 for authentication.
 pub struct AesCmHmacCipher {
-    /// RTP encryption key (AES-128).
-    rtp_key: [u8; 16],
+    /// RTP AES-128 key schedule, expanded once at construction.
+    rtp_aes: Aes128,
     /// RTP salt (14 bytes for CM mode).
     rtp_salt: [u8; 14],
-    /// RTP HMAC-SHA1 auth key (20 bytes).
-    rtp_auth_key: [u8; 20],
-    /// RTCP encryption key (AES-128).
-    rtcp_key: [u8; 16],
+    /// RTP HMAC-SHA1 state keyed once (inner/outer pads precomputed);
+    /// cloned per packet instead of re-keying.
+    rtp_mac: HmacSha1,
+    /// RTCP AES-128 key schedule.
+    rtcp_aes: Aes128,
     /// RTCP salt (14 bytes for CM mode).
     rtcp_salt: [u8; 14],
-    /// RTCP HMAC-SHA1 auth key (20 bytes).
-    rtcp_auth_key: [u8; 20],
+    /// RTCP HMAC-SHA1 keyed state.
+    rtcp_mac: HmacSha1,
     /// Authentication tag length (10 for SHA1-80, 4 for SHA1-32).
     tag_len: usize,
 }
@@ -583,27 +584,23 @@ impl AesCmHmacCipher {
         let tag_len = keys.profile.tag_len();
         assert!(tag_len == 10 || tag_len == 4);
 
-        let mut rtp_key = [0u8; 16];
         let mut rtp_salt = [0u8; 14];
-        let mut rtp_auth_key = [0u8; 20];
-        let mut rtcp_key = [0u8; 16];
         let mut rtcp_salt = [0u8; 14];
-        let mut rtcp_auth_key = [0u8; 20];
-
-        rtp_key.copy_from_slice(keys.rtp_key());
         rtp_salt.copy_from_slice(keys.rtp_salt());
-        rtp_auth_key.copy_from_slice(&keys.rtp_auth[..keys.rtp_auth_len]);
-        rtcp_key.copy_from_slice(keys.rtcp_key());
         rtcp_salt.copy_from_slice(keys.rtcp_salt());
-        rtcp_auth_key.copy_from_slice(&keys.rtcp_auth[..keys.rtcp_auth_len]);
+
+        let rtp_mac = <HmacSha1 as Mac>::new_from_slice(&keys.rtp_auth[..keys.rtp_auth_len])
+            .map_err(|_| SrtpError::InvalidKeyMaterial)?;
+        let rtcp_mac = <HmacSha1 as Mac>::new_from_slice(&keys.rtcp_auth[..keys.rtcp_auth_len])
+            .map_err(|_| SrtpError::InvalidKeyMaterial)?;
 
         Ok(Self {
-            rtp_key,
+            rtp_aes: Aes128::new(AesGenericArray::from_slice(keys.rtp_key())),
             rtp_salt,
-            rtp_auth_key,
-            rtcp_key,
+            rtp_mac,
+            rtcp_aes: Aes128::new(AesGenericArray::from_slice(keys.rtcp_key())),
             rtcp_salt,
-            rtcp_auth_key,
+            rtcp_mac,
             tag_len,
         })
     }
@@ -611,13 +608,13 @@ impl AesCmHmacCipher {
     /// AES-128-CM keystream generation (RFC 3711 Section 4.1).
     ///
     /// Uses the `ctr` crate's Ctr128BE for interoperability with webrtc-rs.
-    fn aes_cm_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
-        use ctr::cipher::{KeyIvInit, StreamCipher};
-        type Aes128Ctr = ctr::Ctr128BE<Aes128>;
-        let mut cipher = Aes128Ctr::new(
-            AesGenericArray::from_slice(key),
-            AesGenericArray::from_slice(iv),
-        );
+    /// Starts from the pre-expanded key schedule; copying it is far cheaper
+    /// than re-running key expansion per packet.
+    fn aes_cm_encrypt(aes: &Aes128, iv: &[u8; 16], data: &mut [u8]) {
+        use ctr::cipher::{InnerIvInit, StreamCipher, StreamCipherCoreWrapper};
+        type Aes128CtrCore = ctr::CtrCore<Aes128, ctr::flavors::Ctr128BE>;
+        let core = Aes128CtrCore::inner_iv_init(aes.clone(), AesGenericArray::from_slice(iv));
+        let mut cipher = StreamCipherCoreWrapper::from_core(core);
         cipher.apply_keystream(data);
     }
 
@@ -680,11 +677,10 @@ impl AesCmHmacCipher {
     }
 
     /// Compute HMAC-SHA1 over data, return truncated tag.
-    fn compute_auth_tag(auth_key: &[u8; 20], data: &[u8], roc: u32, tag_len: usize) -> [u8; 20] {
+    fn compute_auth_tag(keyed: &HmacSha1, data: &[u8], roc: u32, tag_len: usize) -> [u8; 20] {
         assert!(tag_len <= 20);
 
-        let mut mac =
-            <HmacSha1 as Mac>::new_from_slice(auth_key).expect("HMAC key length is always valid");
+        let mut mac = keyed.clone();
         mac.update(data);
         // Append ROC (4 bytes, big-endian) per RFC 3711 Section 4.2
         mac.update(&roc.to_be_bytes());
@@ -719,14 +715,14 @@ impl AesCmHmacCipher {
         // Encrypt payload in-place using AES-CM
         let iv = Self::build_rtp_iv(&self.rtp_salt, header.ssrc, index);
         Self::aes_cm_encrypt(
-            &self.rtp_key,
+            &self.rtp_aes,
             &iv,
             &mut packet[header.header_len..packet_len],
         );
 
         // Compute HMAC-SHA1 over header + encrypted payload, with ROC appended
         let tag = Self::compute_auth_tag(
-            &self.rtp_auth_key,
+            &self.rtp_mac,
             &packet[..packet_len],
             index.roc(),
             self.tag_len,
@@ -766,7 +762,7 @@ impl AesCmHmacCipher {
 
         // Verify HMAC-SHA1 tag
         let expected_tag = Self::compute_auth_tag(
-            &self.rtp_auth_key,
+            &self.rtp_mac,
             &packet[..ciphertext_end],
             index.roc(),
             self.tag_len,
@@ -791,7 +787,7 @@ impl AesCmHmacCipher {
         // Decrypt payload in-place using AES-CM
         let iv = Self::build_rtp_iv(&self.rtp_salt, header.ssrc, index);
         Self::aes_cm_encrypt(
-            &self.rtp_key,
+            &self.rtp_aes,
             &iv,
             &mut packet[header.header_len..ciphertext_end],
         );
@@ -831,7 +827,7 @@ impl AesCmHmacCipher {
         // The E flag is only an encryption indicator, not part of the index.
         let iv = Self::build_rtcp_iv(&self.rtcp_salt, ssrc, srtcp_index);
         Self::aes_cm_encrypt(
-            &self.rtcp_key,
+            &self.rtcp_aes,
             &iv,
             &mut packet[RTCP_HEADER_SIZE..packet_len],
         );
@@ -842,8 +838,7 @@ impl AesCmHmacCipher {
 
         // Compute HMAC over header + encrypted_payload + E+index
         let auth_end = packet_len + 4;
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.rtcp_auth_key)
-            .expect("HMAC key length is always valid");
+        let mut mac = self.rtcp_mac.clone();
         mac.update(&packet[..auth_end]);
         let result = mac.finalize().into_bytes();
 
@@ -876,8 +871,7 @@ impl AesCmHmacCipher {
         let index_offset = tag_offset - 4;
 
         // Verify HMAC over header + encrypted_payload + E+index
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.rtcp_auth_key)
-            .expect("HMAC key length is always valid");
+        let mut mac = self.rtcp_mac.clone();
         mac.update(&packet[..tag_offset]);
         let expected = mac.finalize().into_bytes();
 
@@ -904,7 +898,7 @@ impl AesCmHmacCipher {
         // Per RFC 3711 §3.4: IV uses the 31-bit SRTCP index WITHOUT the E flag.
         let iv = Self::build_rtcp_iv(&self.rtcp_salt, ssrc, srtcp_index);
         Self::aes_cm_encrypt(
-            &self.rtcp_key,
+            &self.rtcp_aes,
             &iv,
             &mut packet[RTCP_HEADER_SIZE..index_offset],
         );

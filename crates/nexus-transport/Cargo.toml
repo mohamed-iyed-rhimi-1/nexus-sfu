@@ -35,6 +35,12 @@ rcgen = "0.12"
 openssl = { version = "0.10", features = ["vendored"] }
 
 # Linux io_uring support (optional, Linux only)
+# SHA-1 (HMAC for SRTP_AES128_CM_SHA1_80, the profile browsers negotiate)
+# only uses the ARMv8 SHA-1 instructions with the `asm` feature, detected at
+# runtime. x86_64 uses SHA-NI without it.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha1 = { version = "0.10", features = ["asm"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.6", optional = true }
 
