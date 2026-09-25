@@ -127,9 +127,19 @@ proptest = "1.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
 webrtc = "0.10"
+# Session hooks used by benches/real_path.rs and benches/memory.rs
+nexus-webrtc = { path = "crates/nexus-webrtc", features = ["test-hooks"] }
 
 [[example]]
 name = "basic_sfu"
+
+[[bench]]
+name = "real_path"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
 
 [[bench]]
 name = "forwarding"

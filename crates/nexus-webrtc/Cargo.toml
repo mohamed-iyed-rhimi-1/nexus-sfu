@@ -21,6 +21,11 @@ parking_lot = "0.12"
 arc-swap = "1.6"
 dashmap = "5.5"
 
+[features]
+# Exposes session testing hooks (e.g. installing SRTP keys without a DTLS
+# handshake) to benches and tests in other crates. Never enable in production.
+test-hooks = []
+
 [dev-dependencies]
 proptest = "1.4"
 tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros"] }

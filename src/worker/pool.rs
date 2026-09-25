@@ -799,6 +799,31 @@ impl MediaWorker {
         })
     }
 
+    /// Create a worker that is driven by the caller instead of a thread.
+    ///
+    /// Returns the worker and the sender for its message channel. The
+    /// caller runs it with [`MediaWorker::process_one_iteration`]. Used by
+    /// benches to exercise the real forwarding path in-process.
+    #[doc(hidden)]
+    pub fn new_standalone(
+        arena_size_mb: u32,
+        socket_fd: i32,
+    ) -> Result<(Self, Sender<WorkerMessage>), WorkerError> {
+        assert!(arena_size_mb > 0, "arena_size_mb must be positive");
+        assert!(socket_fd >= 0, "socket_fd must be a valid descriptor");
+        let (sender, receiver) = channel::bounded(DEFAULT_CHANNEL_CAPACITY);
+        let worker = Self::new(
+            0,
+            0,
+            arena_size_mb,
+            socket_fd,
+            receiver,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        Ok((worker, sender))
+    }
+
     /// Set SPSC channel handles for cross-worker communication.
     ///
     /// Called by WorkerPool after creating the channel mesh.
@@ -3590,6 +3615,16 @@ impl MediaWorker {
     }
 
     /// Get worker statistics.
+    /// Packets handed to the kernel and packets whose send failed.
+    #[doc(hidden)]
+    pub fn send_stats(&self) -> (u64, u64) {
+        let stats = self.batch_sender.stats();
+        (
+            stats.packets_sent.load(Ordering::Relaxed),
+            stats.packets_failed.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn stats(&self) -> WorkerStats {
         WorkerStats {
             track_count: self.actors.len() as u32,

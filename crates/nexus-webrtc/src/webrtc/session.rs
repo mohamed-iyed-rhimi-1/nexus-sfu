@@ -2855,8 +2855,33 @@ enum FingerprintCheck {
 // Testing Hooks
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl WebRtcSession {
+    /// Install SRTP contexts and mark the session Established, skipping ICE
+    /// and DTLS. Used by benches to drive the real media path.
+    pub fn install_srtp_for_testing(&mut self, inbound: &KeyMaterial, outbound: &KeyMaterial) {
+        let inbound_policy = SrtpPolicy {
+            profile: inbound.profile,
+            ..SrtpPolicy::default()
+        };
+        let outbound_policy = SrtpPolicy {
+            profile: outbound.profile,
+            ..SrtpPolicy::default()
+        };
+        self.srtp_session = SrtpContext::new(inbound, inbound_policy).ok();
+        self.srtp_outbound = SrtpContext::new(outbound, outbound_policy).ok();
+        assert!(
+            self.srtp_session.is_some(),
+            "inbound SRTP context must build"
+        );
+        assert!(
+            self.srtp_outbound.is_some(),
+            "outbound SRTP context must build"
+        );
+        self.state = SessionState::Established;
+        self.state_entered_at = Instant::now();
+    }
+
     /// Force state for testing (bypasses validation).
     pub fn force_state_for_testing(&mut self, state: SessionState) {
         self.state = state;
