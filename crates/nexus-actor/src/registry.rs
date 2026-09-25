@@ -10,7 +10,9 @@ use parking_lot::RwLock;
 use crate::types::*;
 
 /// Maximum actors in registry
-const MAX_REGISTRY_SIZE: usize = 100_000;
+/// Largest capacity `ActorRegistry::with_capacity` accepts. This, not
+/// `MAX_TRACKS`, bounds the track capacity an `ActorManager` can be built with.
+pub const MAX_REGISTRY_SIZE: usize = 100_000;
 
 /// Actor type discriminator
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

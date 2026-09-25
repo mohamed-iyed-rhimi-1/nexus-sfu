@@ -733,14 +733,10 @@ impl MediaWorker {
         track_count: Arc<AtomicU32>,
         is_running: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
-        // TigerStyle: Assert preconditions
-        let num_cpus = num_cpus::get() as u32;
-        assert!(
-            core_id < num_cpus,
-            "core_id {} must be < num_cpus {}",
-            core_id,
-            num_cpus
-        );
+        // core_id is validated by the caller against the machine's core list.
+        // It cannot be checked here: this runs on the worker thread after it
+        // is pinned, and on Linux num_cpus::get() then reports 1 (it counts
+        // the thread's affinity mask), which aborted every worker but core 0.
 
         let arena = PacketArena::new(arena_size_mb).map_err(|_| WorkerError::InvalidConfig {
             message: format!("failed to create arena of {}MB", arena_size_mb),
@@ -3866,6 +3862,15 @@ impl WorkerPool {
             let init_error_clone = Arc::clone(&init_error);
             // Note: _scheduling_policy_clone is prefixed with _ because it's only used on Linux
             let _scheduling_policy_clone = Arc::clone(&scheduling_policy_atomic);
+
+            // Precondition: core index is valid for this machine. Checked here,
+            // before pinning, because a pinned thread only sees its own core.
+            assert!(
+                core_ids.is_empty() || (core_id as usize) < core_ids.len(),
+                "core_id {} must be < core count {}",
+                core_id,
+                core_ids.len()
+            );
 
             // Get core affinity ID if available
             let affinity_core_id = if !core_ids.is_empty() {

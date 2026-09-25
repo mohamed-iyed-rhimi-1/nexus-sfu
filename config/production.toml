@@ -99,8 +99,8 @@ node_id = 0
 
 [actor]
 max_track_actors = 1000000              # 1M tracks
-max_participant_actors = 100000         # 100K participants
-max_room_actors = 10000                 # 10K rooms
+max_participant_actors = 10000          # Compiled maximum: x10 tracks <= nexus_actor::MAX_REGISTRY_SIZE
+max_room_actors = 1000                  # Compiled maximum (nexus_actor::MAX_ROOMS)
 message_queue_size = 4096               # Larger queues
 migration_queue_size = 10
 supervision_restart_limit = 3

@@ -97,7 +97,7 @@ pub use migration_executor::{
 };
 pub use migration_queue::{MigrationQueue, MigrationRequest};
 pub use participant::ParticipantActor;
-pub use registry::{ActorId, ActorRegistry, ActorType};
+pub use registry::{ActorId, ActorRegistry, ActorType, MAX_REGISTRY_SIZE};
 pub use room::RoomActor;
 pub use supervisor::ActorSupervisor;
 pub use track::{MigrationEvent, PacketRingBuffer, Subscriber, SubscriberList, TrackActor};

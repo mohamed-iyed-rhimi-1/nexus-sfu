@@ -158,6 +158,33 @@ impl NexusConfig {
             ));
         }
 
+        // Actor limits must fit the actor system's compiled capacity;
+        // ActorManager::new asserts these, so an oversized value would
+        // otherwise abort at startup instead of failing config validation.
+        // Track capacity is derived as participants * 10 (see Sfu::new).
+        let actor_limits = [
+            (
+                "actor.max_room_actors",
+                self.actor.max_room_actors as usize,
+                nexus_actor::MAX_ROOMS,
+            ),
+            (
+                "actor.max_participant_actors",
+                self.actor.max_participant_actors as usize,
+                nexus_actor::MAX_PARTICIPANTS,
+            ),
+            (
+                "actor.max_participant_actors (x10 tracks)",
+                self.actor.max_participant_actors as usize * 10,
+                nexus_actor::MAX_TRACKS.min(nexus_actor::MAX_REGISTRY_SIZE),
+            ),
+        ];
+        for (field, value, max) in actor_limits {
+            if value > max {
+                return Err(ConfigError::invalid(field, &format!("must be <= {}", max)));
+            }
+        }
+
         // Worker count should not exceed 2x CPU cores
         let cpu_count = num_cpus::get() as u32;
         let worker_count = if self.worker.num_workers == 0 {

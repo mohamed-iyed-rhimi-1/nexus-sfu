@@ -102,9 +102,21 @@ fn test_env_var_overrides() {
         config.security.jwt_secret,
         "env-override-secret-at-least-32ch!"
     );
+    // The API secret is validated separately; the env var must fill it too
+    assert_eq!(config.api.jwt_secret, "env-override-secret-at-least-32ch!");
+
+    // Test 3: TLS paths reach the fields the signaling server reads
+    env::set_var("NEXUS_TLS_CERT_PATH", "/tmp/test-cert.pem");
+    env::set_var("NEXUS_TLS_KEY_PATH", "/tmp/test-key.pem");
+    let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
+    assert_eq!(config.transport.tls_cert_path, "/tmp/test-cert.pem");
+    assert_eq!(config.transport.tls_key_path, "/tmp/test-key.pem");
+    assert_eq!(config.quic.cert_path, "/tmp/test-cert.pem");
 
     // Cleanup
     env::remove_var("NEXUS_JWT_SECRET");
+    env::remove_var("NEXUS_TLS_CERT_PATH");
+    env::remove_var("NEXUS_TLS_KEY_PATH");
 }
 
 #[test]
@@ -292,4 +304,35 @@ fn test_hot_reload_validates_before_applying() {
 
     // Validation should fail
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn test_actor_limits_beyond_compiled_capacity_are_rejected() {
+    // Previously accepted, then aborted at startup in ActorManager::new.
+    let mut config = NexusConfig::default();
+    config.actor.max_room_actors = nexus_actor::MAX_ROOMS as u32 + 1;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("actor.max_room_actors"), "{err}");
+
+    let mut config = NexusConfig::default();
+    config.actor.max_room_actors = nexus_actor::MAX_ROOMS as u32;
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_shipped_configs_validate() {
+    // Every config file in the repo must load; production.toml never
+    // started before because of an out-of-range actor limit.
+    for name in ["development", "production", "loadtest", "default"] {
+        let path = format!("{}/config/{}.toml", env!("CARGO_MANIFEST_DIR"), name);
+        let mut config = ConfigLoader::from_file(&path)
+            .unwrap_or_else(|e| panic!("{name}.toml failed to load: {e}"));
+        // production.toml leaves secrets empty for NEXUS_JWT_SECRET to fill.
+        let secret = "0123456789abcdef0123456789abcdef".to_string();
+        config.api.jwt_secret = secret.clone();
+        config.security.jwt_secret = secret;
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("{name}.toml is invalid: {e}"));
+    }
 }

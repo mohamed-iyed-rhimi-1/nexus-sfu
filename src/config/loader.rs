@@ -59,7 +59,9 @@ impl ConfigLoader {
     ///
     /// # Supported Environment Variables
     ///
-    /// - `NEXUS_JWT_SECRET`: JWT secret for authentication (security.jwt_secret)
+    /// - `NEXUS_JWT_SECRET`: JWT secret for authentication (security.jwt_secret
+    ///   and api.jwt_secret; both are validated, and production.toml leaves
+    ///   both empty for this variable to fill)
     /// - `NEXUS_TLS_CERT_PATH`: TLS certificate path (quic.cert_path, requires nexus-signal)
     /// - `NEXUS_TLS_KEY_PATH`: TLS key path (quic.key_path, requires nexus-signal)
     /// - `NEXUS_WORKER_COUNT`: Number of worker threads (worker.num_workers)
@@ -73,14 +75,18 @@ impl ConfigLoader {
     pub fn merge_from_env(mut config: NexusConfig) -> Result<NexusConfig, ConfigError> {
         // Security settings from environment (sensitive data)
         if let Ok(jwt_secret) = env::var("NEXUS_JWT_SECRET") {
+            config.api.jwt_secret = jwt_secret.clone();
             config.security.jwt_secret = jwt_secret;
         }
 
-        // TLS paths
+        // TLS paths: the signaling server reads transport.tls_*; QUIC config
+        // keeps its own copy. Set both so the override actually applies.
         if let Ok(cert_path) = env::var("NEXUS_TLS_CERT_PATH") {
+            config.transport.tls_cert_path = cert_path.clone();
             config.quic.cert_path = cert_path;
         }
         if let Ok(key_path) = env::var("NEXUS_TLS_KEY_PATH") {
+            config.transport.tls_key_path = key_path.clone();
             config.quic.key_path = key_path;
         }
 

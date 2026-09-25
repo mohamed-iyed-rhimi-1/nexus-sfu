@@ -167,6 +167,8 @@ pub struct ApiServer {
     bind_addr: SocketAddr,
     /// Axum router with all routes configured
     router: Router,
+    /// Shared state, kept so readiness can be flipped after startup
+    state: Arc<AppState>,
 }
 
 impl ApiServer {
@@ -213,12 +215,16 @@ impl ApiServer {
                 state.clone(),
                 jwt_auth_middleware,
             ))
-            .with_state(state);
+            .with_state(Arc::clone(&state));
 
         // TigerStyle: Postcondition assertion
         assert!(bind_addr.port() > 0, "Router must be configured");
 
-        Self { bind_addr, router }
+        Self {
+            bind_addr,
+            router,
+            state,
+        }
     }
 
     /// Create a new API server with distributed state for room synchronization.
@@ -274,12 +280,16 @@ impl ApiServer {
                 state.clone(),
                 jwt_auth_middleware,
             ))
-            .with_state(state);
+            .with_state(Arc::clone(&state));
 
         // TigerStyle: Postcondition assertion
         assert!(bind_addr.port() > 0, "Router must be configured");
 
-        Self { bind_addr, router }
+        Self {
+            bind_addr,
+            router,
+            state,
+        }
     }
 
     /// Get the bind address
@@ -287,11 +297,13 @@ impl ApiServer {
         self.bind_addr
     }
 
-    /// Set the server as ready to accept connections.
+    /// Mark the SFU ready: `/ready` returns 200 from now on.
     ///
-    /// Call this after SFU initialization is complete.
-    pub fn set_ready(&self, state: &Arc<AppState>) {
-        state.set_ready(true);
+    /// Call this after SFU initialization is complete. Until then `/ready`
+    /// returns 503 so orchestrators hold traffic back.
+    pub fn set_ready(&self) {
+        self.state.set_ready(true);
+        assert!(self.state.is_ready.load(Ordering::SeqCst));
     }
 
     /// Run the API server.
@@ -579,6 +591,15 @@ mod tests {
         let state = AppState::new(&test_secret(), None);
         state.set_ready(true);
         assert!(state.is_ready.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_api_server_set_ready() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let server = ApiServer::new(addr, &test_secret(), None);
+        assert!(!server.state.is_ready.load(Ordering::SeqCst));
+        server.set_ready();
+        assert!(server.state.is_ready.load(Ordering::SeqCst));
     }
 
     #[test]

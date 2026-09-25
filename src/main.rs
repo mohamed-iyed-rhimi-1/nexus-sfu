@@ -479,6 +479,9 @@ async fn run(config: NexusConfig) -> ExitCode {
             sfu.metrics().cloned(),
             sfu.distributed_state().clone(),
         );
+        // The API starts last: worker pool, signaling and orchestrator are
+        // already running, so the SFU can take traffic.
+        api_server.set_ready();
         let api_shutdown = sfu.shared_shutdown().clone();
         Some(tokio::spawn(async move {
             tokio::select! {
