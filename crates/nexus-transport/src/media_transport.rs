@@ -172,8 +172,12 @@ impl MediaTransport {
         {
             tracing::info!("Attempting io_uring transport (default on Linux)...");
 
-            // Use default config which includes 16MB buffers, GRO, GSO
-            let uring_config = IoUringConfig::default();
+            // Default io_uring settings, with the configured socket buffer sizes.
+            let uring_config = IoUringConfig {
+                recv_buffer_size_bytes: udp_config.recv_buffer_size_bytes,
+                send_buffer_size_bytes: udp_config.send_buffer_size_bytes,
+                ..IoUringConfig::default()
+            };
             match IoUringTransport::bind(addr, uring_config) {
                 Ok(transport) => {
                     // Postcondition: verify transport is bound
@@ -199,11 +203,11 @@ impl MediaTransport {
 
                     if let Some(info) = transport.socket_info() {
                         tracing::info!(
-                            "✓ io_uring transport active: mode={}, recv={}, buffers={}MB/{}MB, GRO={}, GSO={}",
+                            "✓ io_uring transport active: mode={}, recv={}, buffers={}KB/{}KB, GRO={}, GSO={}",
                             mode,
                             multishot,
-                            info.actual_recv / 1024 / 1024,
-                            info.actual_send / 1024 / 1024,
+                            crate::socket_config::usable_buffer_size(info.actual_recv) / 1024,
+                            crate::socket_config::usable_buffer_size(info.actual_send) / 1024,
                             info.gro_enabled,
                             info.gso_enabled
                         );

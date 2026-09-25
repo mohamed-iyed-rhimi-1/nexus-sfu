@@ -331,9 +331,13 @@ impl IoUringTransport {
             .set_nonblocking(true)
             .map_err(|source| TransportError::SetSockOptFailed { source })?;
 
-        // Configure high-performance socket (16MB buffers, GRO, GSO)
-        let socket_info =
-            crate::socket_config::configure_high_performance_socket(socket.as_raw_fd()).ok();
+        // Configure high-performance socket (buffers, GRO, GSO)
+        let socket_info = crate::socket_config::configure_high_performance_socket(
+            socket.as_raw_fd(),
+            i32::try_from(config.recv_buffer_size_bytes).ok(),
+            i32::try_from(config.send_buffer_size_bytes).ok(),
+        )
+        .ok();
 
         // Initialize io_uring with SQPOLL if requested
         let ring = Self::init_io_uring(&config)?;

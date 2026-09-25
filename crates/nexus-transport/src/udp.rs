@@ -298,7 +298,19 @@ impl UdpTransport {
                 source: io::Error::last_os_error(),
             });
         }
+        Self::warn_if_capped(fd, recv_size, send_size);
         Ok(())
+    }
+
+    /// Read back the buffer sizes the kernel granted and warn if capped.
+    fn warn_if_capped(fd: RawFd, recv_size: libc::c_int, send_size: libc::c_int) {
+        use crate::socket_config::{get_socket_option, warn_if_buffer_capped, BufferDirection};
+        if let Ok(actual) = get_socket_option(fd, libc::SO_RCVBUF) {
+            warn_if_buffer_capped(BufferDirection::Recv, recv_size, actual);
+        }
+        if let Ok(actual) = get_socket_option(fd, libc::SO_SNDBUF) {
+            warn_if_buffer_capped(BufferDirection::Send, send_size, actual);
+        }
     }
 
     #[cfg(target_os = "macos")]

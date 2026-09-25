@@ -130,24 +130,8 @@ pub fn configure_socket_buffers(
     let actual_recv = get_socket_option(fd, libc::SO_RCVBUF)?;
     let actual_send = get_socket_option(fd, libc::SO_SNDBUF)?;
 
-    // Log warnings if sizes were capped
-    if actual_recv < requested_recv {
-        tracing::warn!(
-            "Receive buffer capped at {}MB (requested {}MB). Consider: sysctl -w net.core.rmem_max={}",
-            actual_recv / 1024 / 1024,
-            requested_recv / 1024 / 1024,
-            requested_recv
-        );
-    }
-
-    if actual_send < requested_send {
-        tracing::warn!(
-            "Send buffer capped at {}MB (requested {}MB). Consider: sysctl -w net.core.wmem_max={}",
-            actual_send / 1024 / 1024,
-            requested_send / 1024 / 1024,
-            requested_send
-        );
-    }
+    warn_if_buffer_capped(BufferDirection::Recv, requested_recv, actual_recv);
+    warn_if_buffer_capped(BufferDirection::Send, requested_send, actual_send);
 
     Ok(SocketBufferInfo {
         requested_recv,
@@ -159,8 +143,75 @@ pub fn configure_socket_buffers(
     })
 }
 
+/// Which socket buffer a size check refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferDirection {
+    /// SO_RCVBUF
+    Recv,
+    /// SO_SNDBUF
+    Send,
+}
+
+impl BufferDirection {
+    /// The kernel limit that caps this buffer.
+    fn limit_sysctl(self) -> &'static str {
+        match (self, cfg!(target_os = "linux")) {
+            (Self::Recv, true) => "net.core.rmem_max",
+            (Self::Send, true) => "net.core.wmem_max",
+            (_, false) => "kern.ipc.maxsockbuf",
+        }
+    }
+}
+
+/// Usable buffer bytes behind a getsockopt(SO_RCVBUF/SO_SNDBUF) value.
+///
+/// Linux doubles the requested size to account for bookkeeping overhead
+/// and reports the doubled value; other platforms report it as set.
+#[inline]
+pub fn usable_buffer_size(reported: i32) -> i32 {
+    if cfg!(target_os = "linux") {
+        reported / 2
+    } else {
+        reported
+    }
+}
+
+/// Whether the kernel gave a smaller buffer than requested.
+#[inline]
+pub fn buffer_is_capped(requested: i32, reported: i32) -> bool {
+    assert!(requested > 0, "requested buffer size must be > 0");
+    usable_buffer_size(reported) < requested
+}
+
+/// Log a warning, with the sysctl to raise, when a socket buffer was capped.
+///
+/// A capped receive buffer drops packets during bursts (keyframes, many
+/// publishers at once) long before the CPU is busy. Linux caps at
+/// `net.core.rmem_max`, which defaults to about 208 KB.
+///
+/// Returns whether the buffer was capped.
+pub fn warn_if_buffer_capped(direction: BufferDirection, requested: i32, reported: i32) -> bool {
+    let capped = buffer_is_capped(requested, reported);
+    if capped {
+        tracing::warn!(
+            "UDP {} buffer is {} KB, {} KB requested: capped by {}. \
+             Bursts will drop packets. Raise it with: sysctl -w {}={}",
+            match direction {
+                BufferDirection::Recv => "receive",
+                BufferDirection::Send => "send",
+            },
+            usable_buffer_size(reported) / 1024,
+            requested / 1024,
+            direction.limit_sysctl(),
+            direction.limit_sysctl(),
+            requested
+        );
+    }
+    capped
+}
+
 /// Get a socket option value.
-fn get_socket_option(fd: RawFd, option: libc::c_int) -> io::Result<i32> {
+pub(crate) fn get_socket_option(fd: RawFd, option: libc::c_int) -> io::Result<i32> {
     let mut value: libc::c_int = 0;
     let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
 
@@ -314,12 +365,14 @@ pub fn check_gso_available(_fd: RawFd) -> io::Result<bool> {
 /// Configure a socket for high-performance UDP I/O with all optimizations.
 ///
 /// This is the main entry point for socket configuration. It:
-/// 1. Sets 16MB socket buffers
+/// 1. Sets socket buffers (default 16MB)
 /// 2. Enables GRO if available
 /// 3. Checks GSO availability
 ///
 /// # Arguments
 /// * `fd` - Socket file descriptor
+/// * `recv_size` - Receive buffer size (None: 16MB)
+/// * `send_size` - Send buffer size (None: 16MB)
 ///
 /// # Returns
 /// `SocketBufferInfo` with configuration results.
@@ -327,12 +380,16 @@ pub fn check_gso_available(_fd: RawFd) -> io::Result<bool> {
 /// # TigerStyle
 /// - ≤70 lines
 /// - ≥2 assertions
-pub fn configure_high_performance_socket(fd: RawFd) -> io::Result<SocketBufferInfo> {
+pub fn configure_high_performance_socket(
+    fd: RawFd,
+    recv_size: Option<i32>,
+    send_size: Option<i32>,
+) -> io::Result<SocketBufferInfo> {
     // Assertion: fd must be valid
     assert!(fd >= 0, "socket fd must be valid (>= 0)");
 
     // Configure buffers
-    let mut info = configure_socket_buffers(fd, None, None)?;
+    let mut info = configure_socket_buffers(fd, recv_size, send_size)?;
 
     // Enable GRO
     info.gro_enabled = enable_gro(fd)?;
@@ -360,6 +417,32 @@ mod tests {
     use super::*;
     use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn test_buffer_is_capped() {
+        const REQ: i32 = 16 * 1024 * 1024;
+        // What getsockopt reports when the kernel grants the full request.
+        let granted = if cfg!(target_os = "linux") {
+            2 * REQ
+        } else {
+            REQ
+        };
+        assert!(!buffer_is_capped(REQ, granted));
+
+        // Linux default net.core.rmem_max: 212992 bytes, reported doubled.
+        let default_linux = if cfg!(target_os = "linux") {
+            2 * 212_992
+        } else {
+            212_992
+        };
+        assert!(buffer_is_capped(REQ, default_linux));
+        assert!(warn_if_buffer_capped(
+            BufferDirection::Recv,
+            REQ,
+            default_linux
+        ));
+        assert!(!warn_if_buffer_capped(BufferDirection::Send, REQ, granted));
+    }
 
     #[test]
     fn test_configure_socket_buffers() {
@@ -421,7 +504,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let fd = socket.as_raw_fd();
 
-        let info = configure_high_performance_socket(fd).unwrap();
+        let info = configure_high_performance_socket(fd, None, None).unwrap();
 
         assert!(info.actual_recv > 0);
         assert!(info.actual_send > 0);

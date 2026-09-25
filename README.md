@@ -167,6 +167,22 @@ cd deploy/docker
 ./run.sh
 ```
 
+### TLS
+
+Signaling needs a certificate. Mount it as `/etc/nexus/tls/cert.pem` and `key.pem` (the paths in `config/production.toml`), or set `NEXUS_TLS_CERT_PATH` and `NEXUS_TLS_KEY_PATH`. If the paths are set but the files can't be loaded, the SFU refuses to start rather than falling back to unencrypted WebSocket. Leaving both paths empty gives plain WebSocket, for local development only.
+
+### Host tuning (Linux)
+
+The SFU asks for 16 MB UDP socket buffers. Linux caps them at `net.core.rmem_max` / `wmem_max`, about 208 KB by default, and a small receive buffer drops packets during bursts even when the CPU is idle. The SFU logs a warning at startup when this happens. Raise the limits on the host (containers share the host's setting):
+
+```bash
+sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+# persist across reboots
+echo -e "net.core.rmem_max=16777216\nnet.core.wmem_max=16777216" | sudo tee /etc/sysctl.d/99-nexus-sfu.conf
+```
+
+Worker threads are pinned to CPU cores when `worker.cpu_affinity = true` (production config) and left to the scheduler when it is `false`.
+
 ### Monitoring
 
 Nexus exports Prometheus metrics on the configured metrics endpoint. A Grafana dashboard is included at `deploy/grafana/dashboard.json`.
