@@ -175,10 +175,7 @@ impl InvariantChecker {
                     self.violations.push(InvariantViolation {
                         time_ns,
                         invariant_name: "track_ownership".into(),
-                        message: format!(
-                            "track '{}': no room association found",
-                            track_label
-                        ),
+                        message: format!("track '{}': no room association found", track_label),
                     });
                     continue;
                 }
@@ -354,11 +351,7 @@ impl InvariantChecker {
     /// Check that all arena slots have been freed (no leaks).
     ///
     /// At simulation end, `arena.free_count()` should equal `arena.capacity()`.
-    pub fn check_arena_leak(
-        &mut self,
-        arena: &nexus_transport::arena::PacketArena,
-        time_ns: u64,
-    ) {
+    pub fn check_arena_leak(&mut self, arena: &nexus_transport::arena::PacketArena, time_ns: u64) {
         let free = arena.free_count();
         let capacity = arena.capacity();
         if free != capacity {
@@ -399,10 +392,7 @@ impl InvariantChecker {
                 self.violations.push(InvariantViolation {
                     time_ns,
                     invariant_name: "RingBufferPeekCorrectness".to_string(),
-                    message: format!(
-                        "Ring buffer peek(seq={}) returned None, expected data",
-                        seq
-                    ),
+                    message: format!("Ring buffer peek(seq={}) returned None, expected data", seq),
                 });
             }
         }
@@ -487,7 +477,10 @@ mod tests {
 
         assert!(checker.has_violations());
         assert_eq!(checker.violations().len(), 1);
-        assert_eq!(checker.violations()[0].invariant_name, "actor_state_machine");
+        assert_eq!(
+            checker.violations()[0].invariant_name,
+            "actor_state_machine"
+        );
     }
 
     #[test]
@@ -606,7 +599,9 @@ mod tests {
 
         checker.check_track_ownership(&track_owner, &track_room, &room_participants, 0);
         assert!(checker.has_violations());
-        assert!(checker.violations()[0].message.contains("no room association"));
+        assert!(checker.violations()[0]
+            .message
+            .contains("no room association"));
     }
 
     // -- check_packet_delivery ----------------------------------------------
@@ -616,7 +611,10 @@ mod tests {
         let mut checker = InvariantChecker::new();
 
         let mut sent = HashMap::new();
-        sent.insert(("video-1".into(), "bob".into()), vec![vec![1, 2], vec![3, 4]]);
+        sent.insert(
+            ("video-1".into(), "bob".into()),
+            vec![vec![1, 2], vec![3, 4]],
+        );
 
         let mut received = HashMap::new();
         received.insert(
@@ -638,7 +636,10 @@ mod tests {
         let mut checker = InvariantChecker::new();
 
         let mut sent = HashMap::new();
-        sent.insert(("video-1".into(), "bob".into()), vec![vec![1, 2], vec![3, 4]]);
+        sent.insert(
+            ("video-1".into(), "bob".into()),
+            vec![vec![1, 2], vec![3, 4]],
+        );
 
         let mut received = HashMap::new();
         received.insert(("video-1".into(), "bob".into()), vec![vec![1, 2]]);
@@ -658,7 +659,10 @@ mod tests {
         let mut checker = InvariantChecker::new();
 
         let mut sent = HashMap::new();
-        sent.insert(("video-1".into(), "bob".into()), vec![vec![1, 2], vec![3, 4]]);
+        sent.insert(
+            ("video-1".into(), "bob".into()),
+            vec![vec![1, 2], vec![3, 4]],
+        );
 
         let received: HashMap<(String, String), Vec<Vec<u8>>> = HashMap::new();
 

@@ -47,55 +47,79 @@ impl IceCandidate {
     /// Format: foundation component transport priority address port typ type [raddr rport]
     pub fn parse(value: &str) -> Result<Self, SdpError> {
         let parts: Vec<&str> = value.split_whitespace().collect();
-        
+
         if parts.len() < 8 {
-            return Err(SdpError::InvalidCandidate { reason: "too few fields" });
+            return Err(SdpError::InvalidCandidate {
+                reason: "too few fields",
+            });
         }
-        
+
         // Parse foundation
         let mut foundation = [0u8; 32];
         let foundation_bytes = parts[0].as_bytes();
         let foundation_len = foundation_bytes.len().min(32);
         foundation[..foundation_len].copy_from_slice(&foundation_bytes[..foundation_len]);
-        
+
         // Parse component
-        let component = parts[1].parse::<u8>()
-            .map_err(|_| SdpError::InvalidCandidate { reason: "invalid component" })?;
-        
+        let component = parts[1]
+            .parse::<u8>()
+            .map_err(|_| SdpError::InvalidCandidate {
+                reason: "invalid component",
+            })?;
+
         // Parse transport
         let transport = match parts[2].to_lowercase().as_str() {
             "udp" => CandidateTransport::Udp,
             "tcp" => CandidateTransport::Tcp,
-            _ => return Err(SdpError::InvalidCandidate { reason: "unknown transport" }),
+            _ => {
+                return Err(SdpError::InvalidCandidate {
+                    reason: "unknown transport",
+                })
+            }
         };
-        
+
         // Parse priority
-        let priority = parts[3].parse::<u32>()
-            .map_err(|_| SdpError::InvalidCandidate { reason: "invalid priority" })?;
-        
+        let priority = parts[3]
+            .parse::<u32>()
+            .map_err(|_| SdpError::InvalidCandidate {
+                reason: "invalid priority",
+            })?;
+
         // Parse address and port
         let addr = parts[4];
-        let port = parts[5].parse::<u16>()
-            .map_err(|_| SdpError::InvalidCandidate { reason: "invalid port" })?;
-        
-        let address: SocketAddr = format!("{}:{}", addr, port)
-            .parse()
-            .map_err(|_| SdpError::InvalidCandidate { reason: "invalid address" })?;
-        
+        let port = parts[5]
+            .parse::<u16>()
+            .map_err(|_| SdpError::InvalidCandidate {
+                reason: "invalid port",
+            })?;
+
+        let address: SocketAddr =
+            format!("{}:{}", addr, port)
+                .parse()
+                .map_err(|_| SdpError::InvalidCandidate {
+                    reason: "invalid address",
+                })?;
+
         // parts[6] should be "typ"
         if parts[6] != "typ" {
-            return Err(SdpError::InvalidCandidate { reason: "expected 'typ'" });
+            return Err(SdpError::InvalidCandidate {
+                reason: "expected 'typ'",
+            });
         }
-        
+
         // Parse type
         let typ = match parts[7] {
             "host" => CandidateType::Host,
             "srflx" => CandidateType::Srflx,
             "prflx" => CandidateType::Prflx,
             "relay" => CandidateType::Relay,
-            _ => return Err(SdpError::InvalidCandidate { reason: "unknown type" }),
+            _ => {
+                return Err(SdpError::InvalidCandidate {
+                    reason: "unknown type",
+                })
+            }
         };
-        
+
         // Parse optional related address
         let related_addr = if parts.len() >= 12 && parts[8] == "raddr" && parts[10] == "rport" {
             let raddr = parts[9];
@@ -107,7 +131,7 @@ impl IceCandidate {
         } else {
             None
         };
-        
+
         Ok(Self {
             foundation,
             foundation_len: foundation_len as u8,
@@ -119,7 +143,7 @@ impl IceCandidate {
             related_addr,
         })
     }
-    
+
     /// Serialize to SDP attribute value.
     pub fn to_sdp(&self) -> String {
         let foundation = std::str::from_utf8(&self.foundation[..self.foundation_len as usize])
@@ -134,7 +158,7 @@ impl IceCandidate {
             CandidateType::Prflx => "prflx",
             CandidateType::Relay => "relay",
         };
-        
+
         let mut result = format!(
             "{} {} {} {} {} {} typ {}",
             foundation,
@@ -145,11 +169,11 @@ impl IceCandidate {
             self.address.port(),
             typ
         );
-        
+
         if let Some(raddr) = self.related_addr {
             result.push_str(&format!(" raddr {} rport {}", raddr.ip(), raddr.port()));
         }
-        
+
         result
     }
 }
@@ -185,14 +209,14 @@ impl DtlsFingerprint {
                 reason: "empty fingerprint value",
             });
         }
-        
+
         let parts: Vec<&str> = value.split_whitespace().collect();
         if parts.len() != 2 {
-            return Err(SdpError::InvalidFingerprint { 
-                reason: "expected algorithm and fingerprint" 
+            return Err(SdpError::InvalidFingerprint {
+                reason: "expected algorithm and fingerprint",
             });
         }
-        
+
         let (algorithm, expected_len) = match parts[0].to_lowercase().as_str() {
             "sha-256" => (FingerprintAlgorithm::Sha256, 32usize),
             "sha-384" => (FingerprintAlgorithm::Sha384, 48usize),
@@ -203,20 +227,20 @@ impl DtlsFingerprint {
                 });
             }
         };
-        
+
         // Parse hex fingerprint (format: XX:XX:XX:...)
         let hex_str = parts[1].replace(':', "");
         let bytes = Self::parse_hex_bytes(&hex_str)?;
-        
+
         if bytes.len() != expected_len {
-            return Err(SdpError::InvalidFingerprint { 
-                reason: "fingerprint length does not match algorithm" 
+            return Err(SdpError::InvalidFingerprint {
+                reason: "fingerprint length does not match algorithm",
             });
         }
-        
+
         let mut value_buf = [0u8; 64];
         value_buf[..bytes.len()].copy_from_slice(&bytes);
-        
+
         Ok(Self {
             algorithm,
             value: value_buf,
@@ -234,17 +258,19 @@ impl DtlsFingerprint {
     fn parse_hex_bytes(hex_str: &str) -> Result<Vec<u8>, SdpError> {
         // Check for odd-length hex string which would cause panic during parsing
         if hex_str.len() % 2 != 0 {
-            return Err(SdpError::InvalidFingerprint { 
-                reason: "hex string has odd length" 
+            return Err(SdpError::InvalidFingerprint {
+                reason: "hex string has odd length",
             });
         }
-        
+
         let bytes: Result<Vec<u8>, _> = (0..hex_str.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&hex_str[i..i+2], 16))
+            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
             .collect();
-        
-        bytes.map_err(|_| SdpError::InvalidFingerprint { reason: "invalid hex" })
+
+        bytes.map_err(|_| SdpError::InvalidFingerprint {
+            reason: "invalid hex",
+        })
     }
 
     /// Validate fingerprint is production-ready.
@@ -254,16 +280,16 @@ impl DtlsFingerprint {
             FingerprintAlgorithm::Sha384 => 48u8,
             FingerprintAlgorithm::Sha512 => 64u8,
         };
-        
+
         if self.value_len != expected_len {
             return Err(SdpError::InvalidFingerprint {
                 reason: "fingerprint length does not match algorithm",
             });
         }
-        
+
         Ok(())
     }
-    
+
     /// Serialize to SDP attribute value.
     pub fn to_sdp(&self) -> String {
         let algo = match self.algorithm {
@@ -271,12 +297,12 @@ impl DtlsFingerprint {
             FingerprintAlgorithm::Sha384 => "sha-384",
             FingerprintAlgorithm::Sha512 => "sha-512",
         };
-        
+
         let hex: Vec<String> = self.value[..self.value_len as usize]
             .iter()
             .map(|b| format!("{:02X}", b))
             .collect();
-        
+
         format!("{} {}", algo, hex.join(":"))
     }
 }
@@ -301,7 +327,7 @@ impl DtlsSetup {
             _ => None,
         }
     }
-    
+
     /// Convert to string.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -335,26 +361,26 @@ impl RtpCodec {
     pub fn parse(payload_type: u8, value: &str) -> Result<Self, SdpError> {
         let parts: Vec<&str> = value.split('/').collect();
         if parts.len() < 2 {
-            return Err(SdpError::InvalidAttribute { 
-                name: "rtpmap".to_string(), 
-                value: value.to_string() 
+            return Err(SdpError::InvalidAttribute {
+                name: "rtpmap".to_string(),
+                value: value.to_string(),
             });
         }
-        
+
         let mut name = [0u8; 32];
         let name_bytes = parts[0].as_bytes();
         let name_len = name_bytes.len().min(32);
         name[..name_len].copy_from_slice(&name_bytes[..name_len]);
-        
-        let clock_rate = parts[1].parse::<u32>()
-            .map_err(|_| SdpError::InvalidAttribute { 
-                name: "rtpmap".to_string(), 
-                value: value.to_string() 
+
+        let clock_rate = parts[1]
+            .parse::<u32>()
+            .map_err(|_| SdpError::InvalidAttribute {
+                name: "rtpmap".to_string(),
+                value: value.to_string(),
             })?;
-        
-        let channels = parts.get(2)
-            .and_then(|s| s.parse::<u8>().ok());
-        
+
+        let channels = parts.get(2).and_then(|s| s.parse::<u8>().ok());
+
         Ok(Self {
             payload_type,
             name,
@@ -363,13 +389,12 @@ impl RtpCodec {
             channels,
         })
     }
-    
+
     /// Get codec name as string.
     pub fn name_str(&self) -> &str {
-        std::str::from_utf8(&self.name[..self.name_len as usize])
-            .unwrap_or("unknown")
+        std::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("unknown")
     }
-    
+
     /// Serialize to rtpmap value.
     pub fn to_sdp(&self) -> String {
         let name = self.name_str();
@@ -413,10 +438,14 @@ impl RtcpFeedback {
         let payload_type = if parts[0] == "*" {
             None
         } else {
-            Some(parts[0].parse::<u8>().map_err(|_| SdpError::InvalidAttribute {
-                name: "rtcp-fb".to_string(),
-                value: value.to_string(),
-            })?)
+            Some(
+                parts[0]
+                    .parse::<u8>()
+                    .map_err(|_| SdpError::InvalidAttribute {
+                        name: "rtcp-fb".to_string(),
+                        value: value.to_string(),
+                    })?,
+            )
         };
 
         let mut fb_type = [0u8; 32];
@@ -488,35 +517,35 @@ impl SsrcInfo {
     ///
     /// Format: ssrc attribute:value
     pub fn parse(value: &str) -> Result<Self, SdpError> {
-        let space_pos = value.find(' ')
-            .ok_or(SdpError::InvalidAttribute { 
-                name: "ssrc".to_string(), 
-                value: value.to_string() 
+        let space_pos = value.find(' ').ok_or(SdpError::InvalidAttribute {
+            name: "ssrc".to_string(),
+            value: value.to_string(),
+        })?;
+
+        let ssrc = value[..space_pos]
+            .parse::<u32>()
+            .map_err(|_| SdpError::InvalidAttribute {
+                name: "ssrc".to_string(),
+                value: value.to_string(),
             })?;
-        
-        let ssrc = value[..space_pos].parse::<u32>()
-            .map_err(|_| SdpError::InvalidAttribute { 
-                name: "ssrc".to_string(), 
-                value: value.to_string() 
-            })?;
-        
+
         let rest = &value[space_pos + 1..];
         let (attr, val) = if let Some(colon_pos) = rest.find(':') {
             (&rest[..colon_pos], &rest[colon_pos + 1..])
         } else {
             (rest, "")
         };
-        
+
         let mut attribute = [0u8; 32];
         let attr_bytes = attr.as_bytes();
         let attr_len = attr_bytes.len().min(32);
         attribute[..attr_len].copy_from_slice(&attr_bytes[..attr_len]);
-        
+
         let mut value_buf = [0u8; 256];
         let val_bytes = val.as_bytes();
         let value_len = val_bytes.len().min(256);
         value_buf[..value_len].copy_from_slice(&val_bytes[..value_len]);
-        
+
         Ok(Self {
             ssrc,
             attribute,
@@ -560,7 +589,7 @@ impl Direction {
             _ => None,
         }
     }
-    
+
     /// Convert to string.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -588,24 +617,25 @@ impl Fmtp {
     ///
     /// Format: payload_type parameters
     pub fn parse(value: &str) -> Result<Self, SdpError> {
-        let space_pos = value.find(' ')
-            .ok_or(SdpError::InvalidAttribute { 
-                name: "fmtp".to_string(), 
-                value: value.to_string() 
-            })?;
-        
-        let payload_type = value[..space_pos].parse::<u8>()
-            .map_err(|_| SdpError::InvalidAttribute { 
-                name: "fmtp".to_string(), 
-                value: value.to_string() 
-            })?;
-        
+        let space_pos = value.find(' ').ok_or(SdpError::InvalidAttribute {
+            name: "fmtp".to_string(),
+            value: value.to_string(),
+        })?;
+
+        let payload_type =
+            value[..space_pos]
+                .parse::<u8>()
+                .map_err(|_| SdpError::InvalidAttribute {
+                    name: "fmtp".to_string(),
+                    value: value.to_string(),
+                })?;
+
         let params_str = &value[space_pos + 1..];
         let mut params = [0u8; 256];
         let params_bytes = params_str.as_bytes();
         let params_len = params_bytes.len().min(256);
         params[..params_len].copy_from_slice(&params_bytes[..params_len]);
-        
+
         Ok(Self {
             payload_type,
             params,
@@ -617,64 +647,64 @@ impl Fmtp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_ice_candidate_parse() {
         let candidate = "1 1 udp 2130706431 192.168.1.1 54321 typ host";
         let parsed = IceCandidate::parse(candidate).unwrap();
-        
+
         assert_eq!(parsed.component, 1);
         assert_eq!(parsed.transport, CandidateTransport::Udp);
         assert_eq!(parsed.priority, 2130706431);
         assert_eq!(parsed.typ, CandidateType::Host);
     }
-    
+
     #[test]
     fn test_ice_candidate_roundtrip() {
         let candidate = "1 1 udp 2130706431 192.168.1.1 54321 typ host";
         let parsed = IceCandidate::parse(candidate).unwrap();
         let serialized = parsed.to_sdp();
-        
+
         assert!(serialized.contains("192.168.1.1"));
         assert!(serialized.contains("54321"));
         assert!(serialized.contains("host"));
     }
-    
+
     #[test]
     fn test_dtls_fingerprint_parse() {
         let fp = "sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90";
         let parsed = DtlsFingerprint::parse(fp).unwrap();
-        
+
         assert_eq!(parsed.algorithm, FingerprintAlgorithm::Sha256);
         assert_eq!(parsed.value_len, 32);
         assert_eq!(parsed.value[0], 0xAB);
         assert_eq!(parsed.value[1], 0xCD);
     }
-    
+
     #[test]
     fn test_dtls_setup_parse() {
         assert_eq!(DtlsSetup::parse("active"), Some(DtlsSetup::Active));
         assert_eq!(DtlsSetup::parse("passive"), Some(DtlsSetup::Passive));
         assert_eq!(DtlsSetup::parse("actpass"), Some(DtlsSetup::Actpass));
     }
-    
+
     #[test]
     fn test_rtp_codec_parse() {
         let codec = RtpCodec::parse(111, "opus/48000/2").unwrap();
-        
+
         assert_eq!(codec.payload_type, 111);
         assert_eq!(codec.name_str(), "opus");
         assert_eq!(codec.clock_rate, 48000);
         assert_eq!(codec.channels, Some(2));
     }
-    
+
     #[test]
     fn test_ssrc_info_parse() {
         let ssrc = SsrcInfo::parse("1234567890 cname:test").unwrap();
-        
+
         assert_eq!(ssrc.ssrc, 1234567890);
     }
-    
+
     #[test]
     fn test_direction() {
         assert_eq!(Direction::parse("sendrecv"), Some(Direction::SendRecv));

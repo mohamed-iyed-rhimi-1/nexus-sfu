@@ -79,7 +79,6 @@ pub use protocol::ProtocolStats;
 pub use protocol::{PendingPing, RelayEvent, SwimProtocol};
 pub use transport::{GossipTransport, TransportStats};
 pub use types::{
-    GossipMessage, PeerInfo, PeerState, StateUpdate,
-    MAX_MESSAGE_SIZE, MAX_PEERS, MAX_PIGGYBACK_UPDATES,
-    GOSSIP_FANOUT, PING_TIMEOUT_MS, PROBE_INTERVAL_MS, SUSPECT_TIMEOUT_MS,
+    GossipMessage, PeerInfo, PeerState, StateUpdate, GOSSIP_FANOUT, MAX_MESSAGE_SIZE, MAX_PEERS,
+    MAX_PIGGYBACK_UPDATES, PING_TIMEOUT_MS, PROBE_INTERVAL_MS, SUSPECT_TIMEOUT_MS,
 };

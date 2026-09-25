@@ -144,71 +144,41 @@ impl Validate for TransportConfig {
 
         // Positive-space assertions
         if self.recv_buffer_size_bytes == 0 {
-            errors.push(
-                "transport.recv_buffer_size_bytes must be > 0"
-                    .to_string(),
-            );
+            errors.push("transport.recv_buffer_size_bytes must be > 0".to_string());
         }
         if self.send_buffer_size_bytes == 0 {
-            errors.push(
-                "transport.send_buffer_size_bytes must be > 0"
-                    .to_string(),
-            );
+            errors.push("transport.send_buffer_size_bytes must be > 0".to_string());
         }
         if self.batch_size == 0 {
-            errors.push(
-                "transport.batch_size must be > 0".to_string(),
-            );
+            errors.push("transport.batch_size must be > 0".to_string());
         }
         if self.batch_flush_interval_us == 0 {
-            errors.push(
-                "transport.batch_flush_interval_us must be > 0"
-                    .to_string(),
-            );
+            errors.push("transport.batch_flush_interval_us must be > 0".to_string());
         }
 
         // Negative-space assertions (upper bounds)
         const MAX_BUFFER_BYTES: u32 = 1_073_741_824; // 1 GB
         if self.recv_buffer_size_bytes > MAX_BUFFER_BYTES {
-            errors.push(
-                "transport.recv_buffer_size_bytes must be <= 1 GB"
-                    .to_string(),
-            );
+            errors.push("transport.recv_buffer_size_bytes must be <= 1 GB".to_string());
         }
         if self.send_buffer_size_bytes > MAX_BUFFER_BYTES {
-            errors.push(
-                "transport.send_buffer_size_bytes must be <= 1 GB"
-                    .to_string(),
-            );
+            errors.push("transport.send_buffer_size_bytes must be <= 1 GB".to_string());
         }
 
         // Batch size must be power of 2 for efficient modulo
-        if self.batch_size > 0
-            && !self.batch_size.is_power_of_two()
-        {
-            errors.push(
-                "transport.batch_size must be power of 2"
-                    .to_string(),
-            );
+        if self.batch_size > 0 && !self.batch_size.is_power_of_two() {
+            errors.push("transport.batch_size must be power of 2".to_string());
         }
         if self.batch_size > 64 {
-            errors.push(
-                "transport.batch_size must be <= 64".to_string(),
-            );
+            errors.push("transport.batch_size must be <= 64".to_string());
         }
 
         // WebRTC session bounds
         if self.max_webrtc_sessions == 0 {
-            errors.push(
-                "transport.max_webrtc_sessions must be > 0"
-                    .to_string(),
-            );
+            errors.push("transport.max_webrtc_sessions must be > 0".to_string());
         }
         if self.max_webrtc_sessions > 100_000 {
-            errors.push(
-                "transport.max_webrtc_sessions must be <= 100000"
-                    .to_string(),
-            );
+            errors.push("transport.max_webrtc_sessions must be <= 100000".to_string());
         }
 
         // TLS paths: both or neither must be set
@@ -238,10 +208,7 @@ impl TransportConfig {
     }
 
     /// Set the signaling bind address.
-    pub fn with_signaling_addr(
-        mut self,
-        addr: SocketAddr,
-    ) -> Self {
+    pub fn with_signaling_addr(mut self, addr: SocketAddr) -> Self {
         self.signaling_bind_addr = addr;
         self
     }
@@ -284,28 +251,16 @@ impl Validate for MemoryConfig {
         let mut errors = Vec::new();
 
         if self.arena_size_mb == 0 {
-            errors.push(
-                "memory.arena_size_mb must be > 0".to_string(),
-            );
+            errors.push("memory.arena_size_mb must be > 0".to_string());
         }
         if self.arena_size_mb > 4096 {
-            errors.push(
-                "memory.arena_size_mb must be <= 4096 (4 GB)"
-                    .to_string(),
-            );
+            errors.push("memory.arena_size_mb must be <= 4096 (4 GB)".to_string());
         }
         if self.ring_buffer_size == 0 {
-            errors.push(
-                "memory.ring_buffer_size must be > 0".to_string(),
-            );
+            errors.push("memory.ring_buffer_size must be > 0".to_string());
         }
-        if self.ring_buffer_size > 0
-            && !self.ring_buffer_size.is_power_of_two()
-        {
-            errors.push(
-                "memory.ring_buffer_size must be power of 2"
-                    .to_string(),
-            );
+        if self.ring_buffer_size > 0 && !self.ring_buffer_size.is_power_of_two() {
+            errors.push("memory.ring_buffer_size must be power of 2".to_string());
         }
 
         if errors.is_empty() {
@@ -378,9 +333,7 @@ impl Validate for WorkerConfig {
         // because it depends on the CPU count at runtime.
 
         // Validate realtime_priority_level when realtime_priority is enabled
-        if self.realtime_priority
-            && !(1..=99).contains(&self.realtime_priority_level)
-        {
+        if self.realtime_priority && !(1..=99).contains(&self.realtime_priority_level) {
             errors.push(
                 "worker.realtime_priority_level must be in \
                  range 1..=99 when realtime_priority is true"
@@ -429,32 +382,19 @@ impl Validate for RoomConfig {
         let mut errors = Vec::new();
 
         if self.max_participants_per_room == 0 {
-            errors.push(
-                "room.max_participants_per_room must be > 0"
-                    .to_string(),
-            );
+            errors.push("room.max_participants_per_room must be > 0".to_string());
         }
         if self.max_participants_per_room > 10_000 {
-            errors.push(
-                "room.max_participants_per_room must be <= 10000"
-                    .to_string(),
-            );
+            errors.push("room.max_participants_per_room must be <= 10000".to_string());
         }
         if self.max_rooms == 0 {
-            errors.push(
-                "room.max_rooms must be > 0".to_string(),
-            );
+            errors.push("room.max_rooms must be > 0".to_string());
         }
         if self.max_rooms > 100_000 {
-            errors.push(
-                "room.max_rooms must be <= 100000".to_string(),
-            );
+            errors.push("room.max_rooms must be <= 100000".to_string());
         }
         if self.empty_room_timeout_ms == 0 {
-            errors.push(
-                "room.empty_room_timeout_ms must be > 0"
-                    .to_string(),
-            );
+            errors.push("room.empty_room_timeout_ms must be > 0".to_string());
         }
 
         if errors.is_empty() {
@@ -509,25 +449,16 @@ impl Validate for BweConfig {
 
         // Positive-space assertions
         if self.initial_bandwidth_bps == 0 {
-            errors.push(
-                "bwe.initial_bandwidth_bps must be > 0"
-                    .to_string(),
-            );
+            errors.push("bwe.initial_bandwidth_bps must be > 0".to_string());
         }
         if self.min_bandwidth_bps == 0 {
-            errors.push(
-                "bwe.min_bandwidth_bps must be > 0".to_string(),
-            );
+            errors.push("bwe.min_bandwidth_bps must be > 0".to_string());
         }
         if self.max_bandwidth_bps == 0 {
-            errors.push(
-                "bwe.max_bandwidth_bps must be > 0".to_string(),
-            );
+            errors.push("bwe.max_bandwidth_bps must be > 0".to_string());
         }
         if self.increase_bps == 0 {
-            errors.push(
-                "bwe.increase_bps must be > 0".to_string(),
-            );
+            errors.push("bwe.increase_bps must be > 0".to_string());
         }
 
         // Ordering: min <= initial <= max
@@ -548,20 +479,12 @@ impl Validate for BweConfig {
 
         // Loss threshold is a percentage
         if self.loss_threshold_percent > 100 {
-            errors.push(
-                "bwe.loss_threshold_percent must be <= 100"
-                    .to_string(),
-            );
+            errors.push("bwe.loss_threshold_percent must be <= 100".to_string());
         }
 
         // Decrease factor must be in open interval (0, 1)
-        if self.decrease_factor <= 0.0
-            || self.decrease_factor >= 1.0
-        {
-            errors.push(
-                "bwe.decrease_factor must be in (0.0, 1.0)"
-                    .to_string(),
-            );
+        if self.decrease_factor <= 0.0 || self.decrease_factor >= 1.0 {
+            errors.push("bwe.decrease_factor must be in (0.0, 1.0)".to_string());
         }
 
         if errors.is_empty() {
@@ -595,10 +518,7 @@ pub struct LoggingConfig {
 }
 
 /// Log verbosity level.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Trace,
@@ -664,8 +584,7 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            jwt_secret:
-                "dev-secret-change-in-production".to_string(),
+            jwt_secret: "dev-secret-change-in-production!".to_string(),
         }
     }
 }
@@ -678,6 +597,12 @@ impl Validate for SecurityConfig {
             errors.push(
                 "security.jwt_secret must not be empty \
                  (set NEXUS_JWT_SECRET env var)"
+                    .to_string(),
+            );
+        } else if self.jwt_secret.len() < 32 {
+            errors.push(
+                "security.jwt_secret must be at least 32 characters \
+                 for adequate security"
                     .to_string(),
             );
         }
@@ -732,29 +657,16 @@ impl Validate for ActorConfig {
         let mut errors = Vec::new();
 
         if self.max_track_actors == 0 {
-            errors.push(
-                "actor.max_track_actors must be > 0".to_string(),
-            );
+            errors.push("actor.max_track_actors must be > 0".to_string());
         }
         if self.max_track_actors > 1_000_000 {
-            errors.push(
-                "actor.max_track_actors must be <= 1000000"
-                    .to_string(),
-            );
+            errors.push("actor.max_track_actors must be <= 1000000".to_string());
         }
         if self.message_queue_size == 0 {
-            errors.push(
-                "actor.message_queue_size must be > 0"
-                    .to_string(),
-            );
+            errors.push("actor.message_queue_size must be > 0".to_string());
         }
-        if self.message_queue_size > 0
-            && !self.message_queue_size.is_power_of_two()
-        {
-            errors.push(
-                "actor.message_queue_size must be power of 2"
-                    .to_string(),
-            );
+        if self.message_queue_size > 0 && !self.message_queue_size.is_power_of_two() {
+            errors.push("actor.message_queue_size must be power of 2".to_string());
         }
 
         if errors.is_empty() {
@@ -798,16 +710,10 @@ impl Validate for MetricsConfig {
         let mut errors = Vec::new();
 
         if self.bind_addr.parse::<SocketAddr>().is_err() {
-            errors.push(
-                "metrics.bind_addr must be a valid socket address"
-                    .to_string(),
-            );
+            errors.push("metrics.bind_addr must be a valid socket address".to_string());
         }
         if self.collection_interval_ms == 0 {
-            errors.push(
-                "metrics.collection_interval_ms must be > 0"
-                    .to_string(),
-            );
+            errors.push("metrics.collection_interval_ms must be > 0".to_string());
         }
         if self.collection_interval_ms > 60_000 {
             errors.push(
@@ -903,9 +809,7 @@ mod tests {
             ..Default::default()
         };
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter().any(|e| e.contains("power of 2"))
-        );
+        assert!(errs.iter().any(|e| e.contains("power of 2")));
     }
 
     #[test]
@@ -927,9 +831,7 @@ mod tests {
             ..Default::default()
         };
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter().any(|e| e.contains("max_participants"))
-        );
+        assert!(errs.iter().any(|e| e.contains("max_participants")));
     }
 
     #[test]
@@ -946,9 +848,7 @@ mod tests {
             ..Default::default()
         };
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter().any(|e| e.contains("min_bandwidth_bps"))
-        );
+        assert!(errs.iter().any(|e| e.contains("min_bandwidth_bps")));
     }
 
     #[test]
@@ -958,9 +858,7 @@ mod tests {
             ..Default::default()
         };
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter().any(|e| e.contains("decrease_factor"))
-        );
+        assert!(errs.iter().any(|e| e.contains("decrease_factor")));
     }
 
     #[test]
@@ -971,14 +869,8 @@ mod tests {
 
     #[test]
     fn test_log_level_from_str() {
-        assert_eq!(
-            "debug".parse::<LogLevel>().unwrap(),
-            LogLevel::Debug
-        );
-        assert_eq!(
-            "INFO".parse::<LogLevel>().unwrap(),
-            LogLevel::Info
-        );
+        assert_eq!("debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
+        assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
         assert!("invalid".parse::<LogLevel>().is_err());
     }
 
@@ -1036,18 +928,12 @@ mod tests {
             ..Default::default()
         };
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("collection_interval_ms"))
-        );
+        assert!(errs.iter().any(|e| e.contains("collection_interval_ms")));
     }
 
     #[test]
     fn test_config_error_display() {
-        let err = ConfigError::invalid(
-            "transport.batch_size",
-            "must be > 0",
-        );
+        let err = ConfigError::invalid("transport.batch_size", "must be > 0");
         let msg = err.to_string();
         assert!(msg.contains("transport.batch_size"));
         assert!(msg.contains("must be > 0"));
@@ -1065,13 +951,9 @@ mod tests {
     fn test_transport_config_serde_roundtrip() {
         let cfg = TransportConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
-        let decoded: TransportConfig =
-            serde_json::from_str(&json).unwrap();
+        let decoded: TransportConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg.batch_size, decoded.batch_size);
-        assert_eq!(
-            cfg.recv_buffer_size_bytes,
-            decoded.recv_buffer_size_bytes
-        );
+        assert_eq!(cfg.recv_buffer_size_bytes, decoded.recv_buffer_size_bytes);
         assert_eq!(cfg.tls_cert_path, decoded.tls_cert_path);
         assert_eq!(cfg.tls_key_path, decoded.tls_key_path);
         assert_eq!(cfg.stun_servers, decoded.stun_servers);
@@ -1081,15 +963,9 @@ mod tests {
     fn test_bwe_config_serde_roundtrip() {
         let cfg = BweConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
-        let decoded: BweConfig =
-            serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            cfg.initial_bandwidth_bps,
-            decoded.initial_bandwidth_bps
-        );
-        assert_eq!(
-            cfg.decrease_factor, decoded.decrease_factor
-        );
+        let decoded: BweConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.initial_bandwidth_bps, decoded.initial_bandwidth_bps);
+        assert_eq!(cfg.decrease_factor, decoded.decrease_factor);
     }
 
     #[test]

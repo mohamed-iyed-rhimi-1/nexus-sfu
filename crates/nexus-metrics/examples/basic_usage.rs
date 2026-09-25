@@ -37,11 +37,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Show some derived metrics
     println!("\nDerived Metrics:");
-    println!("Average forwarding latency: {:.2}ms", collector.sfu.avg_forwarding_latency_ms());
+    println!(
+        "Average forwarding latency: {:.2}ms",
+        collector.sfu.avg_forwarding_latency_ms()
+    );
     println!("P50 latency: {:.2}ms", collector.sfu.p50_latency_ms());
     println!("P99 latency: {:.2}ms", collector.sfu.p99_latency_ms());
     println!("Total actors: {}", collector.actors.total_actors());
-    println!("Total packets processed: {}", collector.workers.total_packets_processed());
+    println!(
+        "Total packets processed: {}",
+        collector.workers.total_packets_processed()
+    );
 
     Ok(())
 }

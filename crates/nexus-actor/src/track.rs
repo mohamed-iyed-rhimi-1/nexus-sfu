@@ -265,19 +265,19 @@ pub struct TrackActor {
     pub migration_start_time: AtomicU64,
     /// Migration retry count
     pub migration_retry_count: AtomicU32,
-    
+
     // === Migration Callback ===
     /// Optional callback sender for migration events
     migration_callback: Option<Sender<MigrationEvent>>,
-    
+
     // === Migration Metrics ===
     /// Shared migration metrics
     migration_metrics: Option<Arc<MigrationMetrics>>,
-    
+
     // === Packet Reordering ===
     /// Reordering buffer for out-of-order packets (max 32 packets)
     reorder_buffer: Vec<Option<(MigrationSeqNum, PacketSlot)>>,
-    
+
     // === Simulcast Layers ===
     /// Simulcast layers (pre-allocated, max 3)
     simulcast_layers: [Option<SimulcastLayer>; 3],
@@ -666,7 +666,8 @@ impl TrackActor {
             }
             _ => {
                 // Already terminated or initializing, just set terminated
-                self.state.store(ActorState::Terminated as u32, Ordering::Release);
+                self.state
+                    .store(ActorState::Terminated as u32, Ordering::Release);
             }
         }
     }
@@ -705,7 +706,7 @@ impl TrackActor {
                 snapshot,
             });
         }
-        
+
         // Packet processing is now frozen (state is Migrating)
     }
 
@@ -719,10 +720,7 @@ impl TrackActor {
     fn handle_resume_migration(&mut self, migration_id: MigrationId) {
         assert!(migration_id != 0, "migration_id must not be 0");
         let current_migration = self.migration_id.load(Ordering::Acquire);
-        assert_eq!(
-            current_migration, migration_id,
-            "migration_id mismatch"
-        );
+        assert_eq!(current_migration, migration_id, "migration_id mismatch");
 
         // Calculate migration latency
         let now = std::time::SystemTime::now()
@@ -786,7 +784,7 @@ impl TrackActor {
     /// - Layers added in increasing bitrate order
     pub fn add_simulcast_layer(&mut self, layer: SimulcastLayer) {
         assert!(self.layer_count < 3, "Maximum 3 simulcast layers supported");
-        
+
         // Verify increasing bitrate order
         if self.layer_count > 0 {
             let prev_layer = self.simulcast_layers[self.layer_count as usize - 1].unwrap();
@@ -795,14 +793,15 @@ impl TrackActor {
                 "Layers must be added in increasing bitrate order"
             );
         }
-        
+
         self.simulcast_layers[self.layer_count as usize] = Some(layer);
         self.layer_count += 1;
     }
 
     /// Set allocated bitrate from bandwidth coordinator
     pub fn set_allocated_bitrate(&self, bitrate_bps: u64) {
-        self.allocated_bitrate_bps.store(bitrate_bps, Ordering::Relaxed);
+        self.allocated_bitrate_bps
+            .store(bitrate_bps, Ordering::Relaxed);
     }
 
     /// Select best layer for allocated bitrate
@@ -811,7 +810,7 @@ impl TrackActor {
     /// Returns 0 if no allocation or no layers configured.
     pub fn select_layer(&self) -> u8 {
         let allocated = self.allocated_bitrate_bps.load(Ordering::Relaxed);
-        
+
         if allocated == 0 || self.layer_count == 0 {
             return 0;
         }
@@ -1022,7 +1021,8 @@ impl TrackActor {
 
         // Snapshot subscribers
         let subscribers = self.subscribers.load();
-        let mut subscriber_snapshots = Vec::with_capacity(subscribers.hot.len() + subscribers.cold.len());
+        let mut subscriber_snapshots =
+            Vec::with_capacity(subscribers.hot.len() + subscribers.cold.len());
 
         for sub in subscribers.hot.iter() {
             subscriber_snapshots.push(SubscriberSnapshot {
@@ -1121,14 +1121,15 @@ impl TrackActor {
         if seq_num == last_seq + 1 {
             // Process immediately
             self.handle_packet(packet);
-            self.last_processed_seq_num.store(seq_num, Ordering::Release);
+            self.last_processed_seq_num
+                .store(seq_num, Ordering::Release);
 
             // Check reorder buffer for consecutive packets
             self.drain_reorder_buffer();
         } else if seq_num > last_seq + 1 {
             // Future packet - buffer it
             let gap = (seq_num - last_seq - 1) as usize;
-            
+
             if gap >= MAX_REORDER_WINDOW {
                 // Gap too large - this indicates packet loss or severe reordering
                 // Record sequence gap
@@ -1139,8 +1140,9 @@ impl TrackActor {
 
                 // Process anyway to avoid blocking, but log the gap
                 self.handle_packet(packet);
-                self.last_processed_seq_num.store(seq_num, Ordering::Release);
-                
+                self.last_processed_seq_num
+                    .store(seq_num, Ordering::Release);
+
                 // Clear reorder buffer as we've skipped ahead
                 for slot in &mut self.reorder_buffer {
                     *slot = None;
@@ -1153,7 +1155,7 @@ impl TrackActor {
         } else {
             // Old packet (seq_num <= last_seq) - drop as duplicate
             self.packets_dropped.fetch_add(1, Ordering::Relaxed);
-            
+
             // Record duplicate
             if let Some(ref metrics) = self.migration_metrics {
                 metrics.record_packet_duplication(1);
@@ -1167,11 +1169,11 @@ impl TrackActor {
     /// - Iterates up to MAX_REORDER_WINDOW
     fn drain_reorder_buffer(&mut self) {
         let mut drained = 0;
-        
+
         while drained < MAX_REORDER_WINDOW {
             let last_seq = self.last_processed_seq_num.load(Ordering::Acquire);
             let next_expected = last_seq + 1;
-            
+
             // Look for next expected packet in buffer
             let mut found = false;
             for slot in &mut self.reorder_buffer {
@@ -1180,7 +1182,8 @@ impl TrackActor {
                         // Found next packet
                         if let Some((_, packet)) = slot.take() {
                             self.handle_packet(packet);
-                            self.last_processed_seq_num.store(next_expected, Ordering::Release);
+                            self.last_processed_seq_num
+                                .store(next_expected, Ordering::Release);
                             found = true;
                             drained += 1;
                             break;
@@ -1188,7 +1191,7 @@ impl TrackActor {
                     }
                 }
             }
-            
+
             if !found {
                 break; // No more consecutive packets
             }

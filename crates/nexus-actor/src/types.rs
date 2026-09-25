@@ -171,7 +171,7 @@ const _: () = {
     assert!(std::mem::size_of::<ActorHealth>() == 1);
     assert!(std::mem::size_of::<MediaKind>() == 1);
     assert!(MAX_ACTOR_QUEUE_SIZE.is_power_of_two());
-    
+
     // Capacity sanity checks
     assert!(MAX_ROOMS > 0);
     assert!(MAX_PARTICIPANTS_PER_ROOM > 0);
@@ -180,11 +180,11 @@ const _: () = {
     assert!(MAX_SUBSCRIPTIONS_PER_PARTICIPANT > 0);
     assert!(MAX_TRACKS_PER_ROOM > 0);
     assert!(MAX_TRACKS > 0);
-    
+
     // Ensure capacity relationships are valid
     assert!(MAX_PARTICIPANTS >= MAX_ROOMS * MAX_PARTICIPANTS_PER_ROOM as usize);
     assert!(MAX_TRACKS >= MAX_PARTICIPANTS * MAX_TRACKS_PER_PARTICIPANT);
-    
+
     // Migration constraints
     assert!(MAX_CONCURRENT_MIGRATIONS > 0);
     assert!(MAX_CONCURRENT_MIGRATIONS <= 100);

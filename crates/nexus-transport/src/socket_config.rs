@@ -67,7 +67,6 @@ impl SocketBufferInfo {
     }
 }
 
-
 /// Configure socket buffers for high-performance I/O.
 ///
 /// Sets SO_RCVBUF and SO_SNDBUF to the specified sizes (default 16MB).
@@ -181,7 +180,6 @@ fn get_socket_option(fd: RawFd, option: libc::c_int) -> io::Result<i32> {
         Ok(value)
     }
 }
-
 
 /// Enable GRO (Generic Receive Offload) on a UDP socket.
 ///
@@ -312,7 +310,6 @@ pub fn check_gso_available(_fd: RawFd) -> io::Result<bool> {
     tracing::info!("UDP_SEGMENT (GSO) not available on this platform");
     Ok(false)
 }
-
 
 /// Configure a socket for high-performance UDP I/O with all optimizations.
 ///

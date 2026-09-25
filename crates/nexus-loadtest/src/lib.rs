@@ -12,15 +12,18 @@
 //!
 //! # Example
 //!
+//! Signaling requires a JWT: pass `--token`, or `--jwt-secret` to mint one per
+//! client. `--insecure` accepts the SFU's self-signed development certificate.
+//!
 //! ```bash
 //! # Run a webinar test with 100 viewers
-//! nexus-loadtest webinar --sfu-url wss://localhost:8443 --room test --viewers 100
+//! nexus-loadtest webinar --sfu-url wss://localhost:8080 --insecure --jwt-secret "$JWT_SECRET" --room test --viewers 100
 //!
 //! # Run a conference test with 10 participants
-//! nexus-loadtest conference --sfu-url wss://localhost:8443 --room test --participants 10
+//! nexus-loadtest conference --sfu-url wss://localhost:8080 --insecure --jwt-secret "$JWT_SECRET" --room test --participants 10
 //!
 //! # Run a stress test across 5 rooms
-//! nexus-loadtest stress --sfu-url wss://localhost:8443 --rooms 5 --participants-per-room 20
+//! nexus-loadtest stress --sfu-url wss://localhost:8080 --insecure --jwt-secret "$JWT_SECRET" --rooms 5 --participants-per-room 20
 //! ```
 
 #![deny(warnings)]
@@ -40,8 +43,8 @@ pub mod signaling;
 // Re-export commonly used types at crate root
 pub use cli::{Cli, Command};
 pub use config::{
-    ClientConfig, ClientRole, ConferenceConfig, OutputFormat, PerformanceTargets, StressConfig,
-    TestConfig, WebinarConfig,
+    ClientConfig, ClientRole, ConferenceConfig, ConnectionOptions, OutputFormat,
+    PerformanceTargets, StressConfig, TestConfig, WebinarConfig,
 };
 pub use error::{ClientError, LoadTestError, SignalingError};
 pub use metrics::{AggregatedMetrics, ClientMetrics, MetricsCollector};

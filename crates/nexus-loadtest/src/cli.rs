@@ -16,6 +16,29 @@ pub struct Cli {
     /// Verbose output for debugging
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
+
+    /// Pre-issued JWT sent in the signaling auth handshake (overrides --jwt-secret)
+    #[arg(long, global = true)]
+    pub token: Option<String>,
+
+    /// HS256 secret used to mint a JWT per client (the SFU's `jwt_secret`)
+    #[arg(long, global = true)]
+    pub jwt_secret: Option<String>,
+
+    /// Skip TLS certificate verification for wss:// (self-signed dev certs only)
+    #[arg(long, global = true)]
+    pub insecure: bool,
+}
+
+impl Cli {
+    /// Signaling auth/TLS options shared by every client in the run
+    pub fn connection_options(&self) -> crate::config::ConnectionOptions {
+        crate::config::ConnectionOptions {
+            auth_token: self.token.clone(),
+            jwt_secret: self.jwt_secret.clone(),
+            insecure_tls: self.insecure,
+        }
+    }
 }
 
 /// Available test scenarios
@@ -23,7 +46,7 @@ pub struct Cli {
 pub enum Command {
     /// Webinar scenario: 1 broadcaster + N viewers
     Webinar {
-        /// SFU WebSocket/QUIC URL (e.g., wss://localhost:8443)
+        /// SFU WebSocket/QUIC URL (e.g., wss://localhost:8080)
         #[arg(long, required = true)]
         sfu_url: String,
 
@@ -54,7 +77,7 @@ pub enum Command {
 
     /// Conference scenario: N participants all publishing/subscribing
     Conference {
-        /// SFU WebSocket/QUIC URL (e.g., wss://localhost:8443)
+        /// SFU WebSocket/QUIC URL (e.g., wss://localhost:8080)
         #[arg(long, required = true)]
         sfu_url: String,
 
@@ -85,7 +108,7 @@ pub enum Command {
 
     /// Stress scenario: multiple rooms with configurable participants
     Stress {
-        /// SFU WebSocket/QUIC URL (e.g., wss://localhost:8443)
+        /// SFU WebSocket/QUIC URL (e.g., wss://localhost:8080)
         #[arg(long, required = true)]
         sfu_url: String,
 

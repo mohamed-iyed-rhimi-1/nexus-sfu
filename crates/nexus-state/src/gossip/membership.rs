@@ -124,10 +124,7 @@ impl MembershipList {
             actor_id < MAX_ACTORS as u64,
             "actor_id must be < MAX_ACTORS"
         );
-        assert!(
-            actor_id != self.local_actor,
-            "cannot add self to peer list"
-        );
+        assert!(actor_id != self.local_actor, "cannot add self to peer list");
 
         // Check if peer already exists (bounded loop)
         for i in 0..MAX_PEERS {
@@ -256,18 +253,13 @@ impl MembershipList {
             }
         }
 
-        let idx = match found_idx {
-            Some(i) => i,
-            None => return Err(GossipError::PeerNotFound { actor_id }),
+        let Some(idx) = found_idx else {
+            return Err(GossipError::PeerNotFound { actor_id });
         };
 
         // Validate state transition (no borrow conflict now)
-        let transition_valid = self.validate_transition(
-            old_state,
-            new_state,
-            old_incarnation,
-            incarnation,
-        );
+        let transition_valid =
+            Self::validate_transition(old_state, new_state, old_incarnation, incarnation);
 
         if !transition_valid {
             return Err(GossipError::InvalidStateTransition {
@@ -292,7 +284,6 @@ impl MembershipList {
     /// Validate a state transition according to SWIM rules.
     #[inline]
     fn validate_transition(
-        &self,
         from: PeerState,
         to: PeerState,
         from_incarnation: u64,
@@ -383,10 +374,7 @@ impl MembershipList {
     /// # Panics
     /// Panics if actor_id == local_actor (cannot suspect self)
     pub fn mark_suspect(&mut self, actor_id: ActorId, incarnation: u64) -> Result<(), GossipError> {
-        assert!(
-            actor_id != self.local_actor,
-            "cannot suspect self"
-        );
+        assert!(actor_id != self.local_actor, "cannot suspect self");
         assert!(
             actor_id < MAX_ACTORS as u64,
             "actor_id must be < MAX_ACTORS"
@@ -409,10 +397,7 @@ impl MembershipList {
     /// # Panics
     /// Panics if actor_id == local_actor
     pub fn mark_dead(&mut self, actor_id: ActorId) -> Result<(), GossipError> {
-        assert!(
-            actor_id != self.local_actor,
-            "cannot mark self as dead"
-        );
+        assert!(actor_id != self.local_actor, "cannot mark self as dead");
         assert!(
             actor_id < MAX_ACTORS as u64,
             "actor_id must be < MAX_ACTORS"
@@ -420,9 +405,7 @@ impl MembershipList {
 
         // Find the peer to get current incarnation
         // The Dead transition is always allowed, so we keep the current incarnation
-        let current_incarnation = self.find_peer(actor_id)
-            .map(|p| p.incarnation())
-            .unwrap_or(0);
+        let current_incarnation = self.find_peer(actor_id).map_or(0, |p| p.incarnation());
 
         let result = self.update_state(actor_id, PeerState::Dead, current_incarnation);
 
@@ -709,7 +692,10 @@ mod tests {
         let mut list = MembershipList::new(1);
 
         let result = list.remove_peer(99);
-        assert!(matches!(result, Err(GossipError::PeerNotFound { actor_id: 99 })));
+        assert!(matches!(
+            result,
+            Err(GossipError::PeerNotFound { actor_id: 99 })
+        ));
     }
 
     #[test]

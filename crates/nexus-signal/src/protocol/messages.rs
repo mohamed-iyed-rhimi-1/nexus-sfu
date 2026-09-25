@@ -9,11 +9,8 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type")]
 pub enum SignalMessage {
     // ── Room management ──
-
     /// Create a new room.
-    Create {
-        room_name: Option<String>,
-    },
+    Create { room_name: Option<String> },
     /// Room created response.
     Created {
         room_id: u64,
@@ -34,17 +31,11 @@ pub enum SignalMessage {
     /// Leave room request.
     Leave,
     /// Participant joined notification.
-    ParticipantJoined {
-        participant_id: u64,
-        name: String,
-    },
+    ParticipantJoined { participant_id: u64, name: String },
     /// Participant left notification.
-    ParticipantLeft {
-        participant_id: u64,
-    },
+    ParticipantLeft { participant_id: u64 },
 
     // ── SDP negotiation (SFU-driven) ──
-
     /// Client declares intent to publish media tracks.
     /// SFU responds with an Offer containing recvonly m-lines.
     Publish {
@@ -52,21 +43,20 @@ pub enum SignalMessage {
         contents: Vec<String>,
     },
     /// Client stops publishing tracks.
-    Unpublish {
-        track_ids: Vec<u64>,
-    },
+    Unpublish { track_ids: Vec<u64> },
     /// SDP offer from SFU to client (SFU is sole offerer).
     Offer {
         sdp: String,
+        /// Subscribed track carried by each sendonly m-line, so clients can
+        /// tell which remote track a transceiver receives. Omitted when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tracks: Vec<OfferTrack>,
     },
     /// SDP answer from client to SFU.
     /// Client's SDP contains SSRCs and codec parameters.
-    Answer {
-        sdp: String,
-    },
+    Answer { sdp: String },
 
     // ── ICE ──
-
     /// ICE candidate exchange (bidirectional).
     IceCandidate {
         candidate: String,
@@ -77,24 +67,15 @@ pub enum SignalMessage {
     EndOfCandidates,
 
     // ── Track subscription ──
-
     /// Subscribe to one or more tracks.
     /// SFU responds with Subscribed + Offer.
-    Subscribe {
-        track_ids: Vec<u64>,
-    },
+    Subscribe { track_ids: Vec<u64> },
     /// Subscription confirmed (no media yet — wait for Offer/Answer).
-    Subscribed {
-        track_ids: Vec<u64>,
-    },
+    Subscribed { track_ids: Vec<u64> },
     /// Unsubscribe from one or more tracks.
-    Unsubscribe {
-        track_ids: Vec<u64>,
-    },
+    Unsubscribe { track_ids: Vec<u64> },
     /// Unsubscription confirmed.
-    Unsubscribed {
-        track_ids: Vec<u64>,
-    },
+    Unsubscribed { track_ids: Vec<u64> },
     /// Track published notification (new track available in room).
     TrackPublished {
         publisher_id: u64,
@@ -104,17 +85,11 @@ pub enum SignalMessage {
         content: String,
     },
     /// Track unpublished notification.
-    TrackUnpublished {
-        track_id: u64,
-    },
+    TrackUnpublished { track_id: u64 },
 
     // ── Viewport optimization ──
-
     /// Update viewport (visible/pinned participants).
-    Viewport {
-        visible: Vec<u64>,
-        pinned: Vec<u64>,
-    },
+    Viewport { visible: Vec<u64>, pinned: Vec<u64> },
     /// Viewport update acknowledged.
     ViewportUpdated {
         visible_count: u32,
@@ -127,13 +102,9 @@ pub enum SignalMessage {
         content: String,
     },
     /// Content type set acknowledged.
-    ContentSet {
-        track_id: u64,
-        content: String,
-    },
+    ContentSet { track_id: u64, content: String },
 
     // ── Connection health ──
-
     /// Ping (keepalive).
     Ping,
     /// Pong (keepalive response).
@@ -148,17 +119,10 @@ pub enum SignalMessage {
     },
 
     // ── Errors & shutdown ──
-
     /// Error response.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
     /// Server shutdown notification.
-    ServerShutdown {
-        reason: String,
-        drain_seconds: u32,
-    },
+    ServerShutdown { reason: String, drain_seconds: u32 },
 }
 
 impl SignalMessage {
@@ -180,6 +144,13 @@ pub struct ParticipantInfo {
     pub name: String,
 }
 
+/// A subscribed track and the m-line (mid) that carries it in an Offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferTrack {
+    pub track_id: u64,
+    pub mid: String,
+}
+
 /// Track info returned in Joined and TrackPublished.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
@@ -197,4 +168,37 @@ pub struct TrackInfo {
 pub enum TrackKind {
     Audio,
     Video,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_offer_serializes_track_mids() {
+        let offer = SignalMessage::Offer {
+            sdp: "v=0".to_string(),
+            tracks: vec![OfferTrack {
+                track_id: 7,
+                mid: "2".to_string(),
+            }],
+        };
+        let json: serde_json::Value = serde_json::from_str(&offer.to_json().unwrap()).unwrap();
+        assert_eq!(json["type"], "Offer");
+        assert_eq!(json["tracks"][0]["track_id"], 7);
+        assert_eq!(json["tracks"][0]["mid"], "2");
+    }
+
+    #[test]
+    fn test_offer_without_tracks_stays_compatible() {
+        // Older SFUs and clients: no `tracks` field
+        let parsed = SignalMessage::from_json(r#"{"type":"Offer","sdp":"v=0"}"#).unwrap();
+        assert!(matches!(parsed, SignalMessage::Offer { ref tracks, .. } if tracks.is_empty()));
+
+        let empty = SignalMessage::Offer {
+            sdp: "v=0".to_string(),
+            tracks: Vec::new(),
+        };
+        assert!(!empty.to_json().unwrap().contains("tracks"));
+    }
 }

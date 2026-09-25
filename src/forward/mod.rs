@@ -62,11 +62,11 @@
 //! - Requirement 19.7: XdpPacketProcessor integrates XDP fast path with user-space cold path
 
 pub mod multicast;
+pub mod processor;
 mod router;
 pub mod selective;
-pub mod processor;
 
-pub use router::{SsrcRouter, SsrcError};
+pub use router::{SsrcError, SsrcRouter};
 
 // Re-export subscriber types from multicast module
 pub use multicast::{
@@ -75,16 +75,16 @@ pub use multicast::{
 };
 
 // Re-export selective forwarding types
-// Note: ViewportFilter is also available in multicast for backward compatibility
+// ViewportFilter is the canonical implementation; multicast::Subscriber uses it directly.
 pub use selective::{
-    ViewportFilter, ViewportFilterStats, ViewportFilterStatsSnapshot,
-    MAX_VISIBLE_PARTICIPANTS, MAX_PRIORITY,
+    ViewportFilter, ViewportFilterStats, ViewportFilterStatsSnapshot, MAX_PRIORITY,
+    MAX_VISIBLE_PARTICIPANTS,
 };
 
 // Re-export XDP processor types
 pub use processor::{
-    XdpPacketProcessor, XdpProcessorConfig, XdpProcessorStats, XdpProcessorStatsSnapshot,
-    PacketType, PacketHandler, process_fallback_batch,
+    process_fallback_batch, PacketHandler, PacketType, XdpPacketProcessor, XdpProcessorConfig,
+    XdpProcessorStats, XdpProcessorStatsSnapshot,
 };
 
 #[cfg(test)]

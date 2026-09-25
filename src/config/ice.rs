@@ -36,10 +36,10 @@ pub const GOOGLE_STUN_SERVERS: &[&str] = &[
 pub struct TurnServerConfig {
     /// TURN server URL (e.g., "turn:turn.example.com:3478").
     pub url: String,
-    
+
     /// Username for TURN authentication.
     pub username: String,
-    
+
     /// Credential (password) for TURN authentication.
     pub credential: String,
 }
@@ -52,7 +52,11 @@ impl TurnServerConfig {
     /// * `url` - TURN server URL
     /// * `username` - Authentication username
     /// * `credential` - Authentication credential/password
-    pub fn new(url: impl Into<String>, username: impl Into<String>, credential: impl Into<String>) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        username: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
         Self {
             url: url.into(),
             username: username.into(),
@@ -66,22 +70,22 @@ impl TurnServerConfig {
         if self.url.is_empty() {
             return Err("TURN server URL must not be empty".to_string());
         }
-        
+
         // Precondition: URL must start with turn: or turns:
         if !self.url.starts_with("turn:") && !self.url.starts_with("turns:") {
             return Err("TURN server URL must start with 'turn:' or 'turns:'".to_string());
         }
-        
+
         // Precondition: Username must not be empty
         if self.username.is_empty() {
             return Err("TURN server username must not be empty".to_string());
         }
-        
+
         // Precondition: Credential must not be empty
         if self.credential.is_empty() {
             return Err("TURN server credential must not be empty".to_string());
         }
-        
+
         Ok(())
     }
 }
@@ -96,11 +100,11 @@ pub struct IceServerConfig {
     /// Primary STUN server URLs (e.g., "stun:stun.example.com:3478").
     #[serde(default)]
     pub stun_servers: Vec<String>,
-    
+
     /// Primary TURN server configurations.
     #[serde(default)]
     pub turn_servers: Vec<TurnServerConfig>,
-    
+
     /// Use Google STUN servers as fallback when no primary STUN servers configured.
     #[serde(default = "default_use_google_fallback")]
     pub use_google_fallback: bool,
@@ -152,10 +156,6 @@ impl IceServerConfig {
 
     /// Validate the ICE server configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Precondition: STUN server count must not exceed maximum
-        assert!(self.stun_servers.len() <= MAX_STUN_SERVERS,
-            "STUN server count must not exceed {}", MAX_STUN_SERVERS);
-        
         if self.stun_servers.len() > MAX_STUN_SERVERS {
             return Err(ConfigError::invalid(
                 "ice_servers.stun_servers",
@@ -163,10 +163,6 @@ impl IceServerConfig {
             ));
         }
 
-        // Precondition: TURN server count must not exceed maximum
-        assert!(self.turn_servers.len() <= MAX_TURN_SERVERS,
-            "TURN server count must not exceed {}", MAX_TURN_SERVERS);
-        
         if self.turn_servers.len() > MAX_TURN_SERVERS {
             return Err(ConfigError::invalid(
                 "ice_servers.turn_servers",
@@ -182,7 +178,7 @@ impl IceServerConfig {
                     "URL must not be empty",
                 ));
             }
-            
+
             // STUN URLs should start with stun: or stuns:
             if !url.starts_with("stun:") && !url.starts_with("stuns:") {
                 return Err(ConfigError::invalid(
@@ -204,7 +200,7 @@ impl IceServerConfig {
 
         // Postcondition: Must have STUN servers or fallback enabled
         // (warning only, not an error - some deployments may use TURN only)
-        
+
         Ok(())
     }
 }
@@ -216,7 +212,7 @@ mod tests {
     #[test]
     fn test_ice_server_config_default() {
         let config = IceServerConfig::default();
-        
+
         assert!(config.stun_servers.is_empty());
         assert!(config.turn_servers.is_empty());
         assert!(config.use_google_fallback);
@@ -226,18 +222,17 @@ mod tests {
     fn test_effective_stun_servers_with_fallback() {
         let config = IceServerConfig::default();
         let servers = config.effective_stun_servers();
-        
+
         assert_eq!(servers.len(), GOOGLE_STUN_SERVERS.len());
         assert!(servers[0].contains("google.com"));
     }
 
     #[test]
     fn test_effective_stun_servers_with_primary() {
-        let config = IceServerConfig::with_stun_servers(vec![
-            "stun:stun.example.com:3478".to_string(),
-        ]);
+        let config =
+            IceServerConfig::with_stun_servers(vec!["stun:stun.example.com:3478".to_string()]);
         let servers = config.effective_stun_servers();
-        
+
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0], "stun:stun.example.com:3478");
     }
@@ -250,34 +245,22 @@ mod tests {
             use_google_fallback: false,
         };
         let servers = config.effective_stun_servers();
-        
+
         assert!(servers.is_empty());
     }
 
     #[test]
     fn test_turn_server_config_validation() {
-        let valid = TurnServerConfig::new(
-            "turn:turn.example.com:3478",
-            "user",
-            "pass",
-        );
+        let valid = TurnServerConfig::new("turn:turn.example.com:3478", "user", "pass");
         assert!(valid.validate().is_ok());
 
         let invalid_url = TurnServerConfig::new("", "user", "pass");
         assert!(invalid_url.validate().is_err());
 
-        let invalid_scheme = TurnServerConfig::new(
-            "http://turn.example.com:3478",
-            "user",
-            "pass",
-        );
+        let invalid_scheme = TurnServerConfig::new("http://turn.example.com:3478", "user", "pass");
         assert!(invalid_scheme.validate().is_err());
 
-        let invalid_user = TurnServerConfig::new(
-            "turn:turn.example.com:3478",
-            "",
-            "pass",
-        );
+        let invalid_user = TurnServerConfig::new("turn:turn.example.com:3478", "", "pass");
         assert!(invalid_user.validate().is_err());
     }
 

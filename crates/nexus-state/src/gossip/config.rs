@@ -11,7 +11,10 @@
 
 use std::net::SocketAddr;
 
-use super::types::{GOSSIP_FANOUT, MAX_PEERS, MAX_PIGGYBACK_UPDATES, PING_TIMEOUT_MS, PROBE_INTERVAL_MS, SUSPECT_TIMEOUT_MS};
+use super::types::{
+    GOSSIP_FANOUT, MAX_PEERS, MAX_PIGGYBACK_UPDATES, PING_TIMEOUT_MS, PROBE_INTERVAL_MS,
+    SUSPECT_TIMEOUT_MS,
+};
 use crate::error::GossipError;
 use crate::types::ActorId;
 
@@ -182,6 +185,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if `ms == 0`
     #[inline]
+    #[must_use]
     pub fn with_probe_interval(mut self, ms: u64) -> Self {
         assert!(ms > 0, "probe_interval_ms must be > 0");
         self.probe_interval_ms = ms;
@@ -193,6 +197,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if `ms == 0`
     #[inline]
+    #[must_use]
     pub fn with_ping_timeout(mut self, ms: u64) -> Self {
         assert!(ms > 0, "ping_timeout_ms must be > 0");
         self.ping_timeout_ms = ms;
@@ -204,6 +209,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if `ms == 0`
     #[inline]
+    #[must_use]
     pub fn with_suspect_timeout(mut self, ms: u64) -> Self {
         assert!(ms > 0, "suspect_timeout_ms must be > 0");
         self.suspect_timeout_ms = ms;
@@ -215,6 +221,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if `fanout == 0` or `fanout > MAX_PEERS`
     #[inline]
+    #[must_use]
     pub fn with_fanout(mut self, fanout: usize) -> Self {
         assert!(fanout > 0, "fanout must be > 0");
         assert!(fanout <= MAX_PEERS, "fanout must be <= MAX_PEERS");
@@ -227,6 +234,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if `max == 0` or `max > MAX_PIGGYBACK_UPDATES`
     #[inline]
+    #[must_use]
     pub fn with_max_piggyback_updates(mut self, max: usize) -> Self {
         assert!(max > 0, "max_piggyback_updates must be > 0");
         assert!(
@@ -242,6 +250,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if `peers.len() > MAX_SEED_PEERS`
     #[inline]
+    #[must_use]
     pub fn with_seed_peers(mut self, peers: Vec<SeedPeer>) -> Self {
         assert!(
             peers.len() <= MAX_SEED_PEERS,
@@ -256,6 +265,7 @@ impl GossipConfig {
     /// # Panics
     /// Panics if adding would exceed MAX_SEED_PEERS
     #[inline]
+    #[must_use]
     pub fn with_seed_peer(mut self, actor_id: ActorId, addr: SocketAddr) -> Self {
         assert!(
             self.seed_peers.len() < MAX_SEED_PEERS,
@@ -356,15 +366,19 @@ mod tests {
 
     #[test]
     fn test_validate_zero_probe_interval() {
-        let mut config = GossipConfig::default();
-        config.probe_interval_ms = 0;
+        let config = GossipConfig {
+            probe_interval_ms: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_zero_ping_timeout() {
-        let mut config = GossipConfig::default();
-        config.ping_timeout_ms = 0;
+        let config = GossipConfig {
+            ping_timeout_ms: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
@@ -380,29 +394,37 @@ mod tests {
 
     #[test]
     fn test_validate_zero_fanout() {
-        let mut config = GossipConfig::default();
-        config.fanout = 0;
+        let config = GossipConfig {
+            fanout: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_fanout_exceeds_max() {
-        let mut config = GossipConfig::default();
-        config.fanout = MAX_PEERS + 1;
+        let config = GossipConfig {
+            fanout: MAX_PEERS + 1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_zero_piggyback() {
-        let mut config = GossipConfig::default();
-        config.max_piggyback_updates = 0;
+        let config = GossipConfig {
+            max_piggyback_updates: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_piggyback_exceeds_max() {
-        let mut config = GossipConfig::default();
-        config.max_piggyback_updates = MAX_PIGGYBACK_UPDATES + 1;
+        let config = GossipConfig {
+            max_piggyback_updates: MAX_PIGGYBACK_UPDATES + 1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

@@ -136,7 +136,12 @@ impl ProgressDisplay {
     }
 
     /// Update progress for stress test with room information
-    pub fn update_stress(&self, metrics: &AggregatedMetrics, active_rooms: usize, failed_rooms: usize) {
+    pub fn update_stress(
+        &self,
+        metrics: &AggregatedMetrics,
+        active_rooms: usize,
+        failed_rooms: usize,
+    ) {
         if !self.enabled {
             return;
         }
@@ -167,7 +172,8 @@ impl ProgressDisplay {
             return;
         }
 
-        self.progress_bar.set_position(self.total_duration.as_secs());
+        self.progress_bar
+            .set_position(self.total_duration.as_secs());
         self.progress_bar.finish_with_message("Test complete");
 
         // Show final summary
@@ -237,7 +243,7 @@ mod tests {
     fn test_progress_display_update_with_metrics() {
         let display = ProgressDisplay::new(OutputFormat::Console, Duration::from_secs(60));
         let metrics = AggregatedMetrics::default();
-        
+
         // Should not panic
         display.update(&metrics);
     }
@@ -246,7 +252,7 @@ mod tests {
     fn test_progress_display_finish() {
         let display = ProgressDisplay::new(OutputFormat::Console, Duration::from_secs(60));
         let metrics = AggregatedMetrics::default();
-        
+
         // Should not panic
         display.finish(&metrics);
     }
@@ -255,7 +261,7 @@ mod tests {
     fn test_progress_display_disabled_operations() {
         let display = ProgressDisplay::new(OutputFormat::Json, Duration::from_secs(60));
         let metrics = AggregatedMetrics::default();
-        
+
         // All operations should be no-ops when disabled
         display.set_connecting(10);
         display.set_connected(8, 2);

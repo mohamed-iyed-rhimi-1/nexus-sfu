@@ -89,14 +89,10 @@ pub fn is_keyframe(codec: MediaCodec, data: &[u8]) -> bool {
     }
 
     match codec {
-        MediaCodec::Vp8 => vp8::Vp8PayloadHeader::parse(data)
-            .map_or(false, |h| h.is_keyframe),
-        MediaCodec::Vp9 => vp9::Vp9PayloadHeader::parse(data)
-            .map_or(false, |h| h.is_keyframe),
-        MediaCodec::H264 => h264::H264PayloadHeader::parse(data)
-            .map_or(false, |h| h.is_keyframe()),
-        MediaCodec::Av1 => av1::Av1PayloadHeader::parse(data)
-            .map_or(false, |h| h.is_keyframe()),
+        MediaCodec::Vp8 => vp8::Vp8PayloadHeader::parse(data).map_or(false, |h| h.is_keyframe),
+        MediaCodec::Vp9 => vp9::Vp9PayloadHeader::parse(data).map_or(false, |h| h.is_keyframe),
+        MediaCodec::H264 => h264::H264PayloadHeader::parse(data).map_or(false, |h| h.is_keyframe()),
+        MediaCodec::Av1 => av1::Av1PayloadHeader::parse(data).map_or(false, |h| h.is_keyframe()),
         MediaCodec::Opus => true,
     }
 }

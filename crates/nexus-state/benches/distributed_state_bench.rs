@@ -2,18 +2,22 @@
 //!
 //! Run with: cargo bench --bench distributed_state_bench
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use nexus_state::{DistributedState, DistributedStateConfig, Dot};
 use nexus_state::gossip::types::{StateUpdate, TrackInfo};
+use nexus_state::{
+    DistributedState, DistributedStateConfig, Dot, MAX_PARTICIPANTS_PER_ROOM, MAX_ROOMS,
+};
 
 /// Benchmark adding participants to a room
 fn bench_add_participant(c: &mut Criterion) {
     let config = DistributedStateConfig::new(1);
     let state = DistributedState::new(config);
-    state.create_room(1, "Benchmark Room".to_string(), 10000).unwrap();
+    state
+        .create_room(1, "Benchmark Room".to_string(), MAX_PARTICIPANTS_PER_ROOM)
+        .unwrap();
 
-    let mut participant_id = 1u32;
+    let mut participant_id = 1u64;
 
     c.bench_function("add_participant", |b| {
         b.iter(|| {
@@ -27,14 +31,16 @@ fn bench_add_participant(c: &mut Criterion) {
 fn bench_remove_participant(c: &mut Criterion) {
     let config = DistributedStateConfig::new(1);
     let state = DistributedState::new(config);
-    state.create_room(1, "Benchmark Room".to_string(), 10000).unwrap();
+    state
+        .create_room(1, "Benchmark Room".to_string(), MAX_PARTICIPANTS_PER_ROOM)
+        .unwrap();
 
     // Pre-populate with participants
     for i in 1..=1000 {
         let _ = state.add_participant(1, i);
     }
 
-    let mut participant_id = 1u32;
+    let mut participant_id = 1u64;
 
     c.bench_function("remove_participant", |b| {
         b.iter(|| {
@@ -53,18 +59,18 @@ fn bench_get_participants(c: &mut Criterion) {
     for size in [10, 100, 500, 1000].iter() {
         let config = DistributedStateConfig::new(1);
         let state = DistributedState::new(config);
-        state.create_room(1, "Benchmark Room".to_string(), 10000).unwrap();
+        state
+            .create_room(1, "Benchmark Room".to_string(), MAX_PARTICIPANTS_PER_ROOM)
+            .unwrap();
 
         // Pre-populate with participants
         for i in 1..=*size {
             let _ = state.add_participant(1, i);
         }
 
-        group.throughput(Throughput::Elements(*size as u64));
+        group.throughput(Throughput::Elements(*size));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| {
-                black_box(state.get_participants(1))
-            })
+            b.iter(|| black_box(state.get_participants(1)))
         });
     }
 
@@ -76,9 +82,11 @@ fn bench_add_track(c: &mut Criterion) {
     let config = DistributedStateConfig::new(1);
     let state = DistributedState::new(config);
 
-    let mut track_id = 1u32;
+    let mut track_id = 1u64;
     let info = TrackInfo {
         track_type: 1,
+        content_type: 0,
+        owner_node: 0,
         codec: 100,
         bitrate_kbps: 2500,
     };
@@ -99,6 +107,8 @@ fn bench_update_track(c: &mut Criterion) {
     // Pre-create track
     let info = TrackInfo {
         track_type: 1,
+        content_type: 0,
+        owner_node: 0,
         codec: 100,
         bitrate_kbps: 2500,
     };
@@ -111,6 +121,8 @@ fn bench_update_track(c: &mut Criterion) {
             bitrate = (bitrate % 10000) + 100;
             let new_info = TrackInfo {
                 track_type: 1,
+                content_type: 0,
+                owner_node: 0,
                 codec: 100,
                 bitrate_kbps: bitrate,
             };
@@ -128,13 +140,15 @@ fn bench_get_track(c: &mut Criterion) {
     for i in 1..=100 {
         let info = TrackInfo {
             track_type: (i % 2) as u8,
+            content_type: 0,
+            owner_node: 0,
             codec: 100,
             bitrate_kbps: 2500,
         };
         state.add_track(i, info).unwrap();
     }
 
-    let mut track_id = 1u32;
+    let mut track_id = 1u64;
 
     c.bench_function("get_track", |b| {
         b.iter(|| {
@@ -149,8 +163,8 @@ fn bench_add_subscription(c: &mut Criterion) {
     let config = DistributedStateConfig::new(1);
     let state = DistributedState::new(config);
 
-    let mut track_id = 1u32;
-    let mut participant_id = 1u32;
+    let mut track_id = 1u64;
+    let mut participant_id = 1u64;
 
     c.bench_function("add_subscription", |b| {
         b.iter(|| {
@@ -174,11 +188,9 @@ fn bench_get_subscriptions_for_track(c: &mut Criterion) {
             let _ = state.add_subscription(1, i);
         }
 
-        group.throughput(Throughput::Elements(*size as u64));
+        group.throughput(Throughput::Elements(*size));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| {
-                black_box(state.get_subscriptions_for_track(1))
-            })
+            b.iter(|| black_box(state.get_subscriptions_for_track(1)))
         });
     }
 
@@ -198,11 +210,9 @@ fn bench_get_subscriptions_for_participant(c: &mut Criterion) {
             let _ = state.add_subscription(i, 1);
         }
 
-        group.throughput(Throughput::Elements(*size as u64));
+        group.throughput(Throughput::Elements(*size));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| {
-                black_box(state.get_subscriptions_for_participant(1))
-            })
+            b.iter(|| black_box(state.get_subscriptions_for_participant(1)))
         });
     }
 
@@ -213,7 +223,9 @@ fn bench_get_subscriptions_for_participant(c: &mut Criterion) {
 fn bench_merge_delta(c: &mut Criterion) {
     let config = DistributedStateConfig::new(1);
     let state = DistributedState::new(config);
-    state.create_room(1, "Benchmark".to_string(), 10000).unwrap();
+    state
+        .create_room(1, "Benchmark".to_string(), MAX_PARTICIPANTS_PER_ROOM)
+        .unwrap();
 
     let mut clock = 1u64;
 
@@ -222,7 +234,7 @@ fn bench_merge_delta(c: &mut Criterion) {
             clock += 1;
             let delta = StateUpdate::ParticipantAdded {
                 room_id: 1,
-                participant_id: (clock % 1000) as u32 + 1,
+                participant_id: (clock % 1000) + 1,
                 dot: Dot::new(2, clock),
             };
             let _ = black_box(state.merge_delta(delta));
@@ -244,6 +256,8 @@ fn bench_merge_delta_track_updated(c: &mut Criterion) {
                 track_id: 1,
                 info: TrackInfo {
                     track_type: 1,
+                    content_type: 0,
+                    owner_node: 0,
                     codec: 100,
                     bitrate_kbps: (clock % 10000) as u32,
                 },
@@ -266,8 +280,8 @@ fn bench_merge_delta_subscription_added(c: &mut Criterion) {
         b.iter(|| {
             clock += 1;
             let delta = StateUpdate::SubscriptionAdded {
-                track_id: (clock % 1000) as u32 + 1,
-                participant_id: (clock % 100) as u32 + 1,
+                track_id: (clock % 1000) + 1,
+                participant_id: (clock % 100) + 1,
                 dot: Dot::new(2, clock),
             };
             let _ = black_box(state.merge_delta(delta));
@@ -282,25 +296,31 @@ fn bench_merge_deltas_batch(c: &mut Criterion) {
     for batch_size in [1, 4, 8, 16].iter() {
         let config = DistributedStateConfig::new(1);
         let state = DistributedState::new(config);
-        state.create_room(1, "Benchmark".to_string(), 10000).unwrap();
+        state
+            .create_room(1, "Benchmark".to_string(), MAX_PARTICIPANTS_PER_ROOM)
+            .unwrap();
 
         let mut clock = 1u64;
 
         group.throughput(Throughput::Elements(*batch_size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(batch_size), batch_size, |b, &size| {
-            b.iter(|| {
-                let mut updates = Vec::with_capacity(size);
-                for _ in 0..size {
-                    clock += 1;
-                    updates.push(StateUpdate::ParticipantAdded {
-                        room_id: 1,
-                        participant_id: (clock % 1000) as u32 + 1,
-                        dot: Dot::new(2, clock),
-                    });
-                }
-                let _ = black_box(state.merge_deltas(updates));
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            batch_size,
+            |b, &size| {
+                b.iter(|| {
+                    let mut updates = Vec::with_capacity(size);
+                    for _ in 0..size {
+                        clock += 1;
+                        updates.push(StateUpdate::ParticipantAdded {
+                            room_id: 1,
+                            participant_id: (clock % 1000) + 1,
+                            dot: Dot::new(2, clock),
+                        });
+                    }
+                    let _ = black_box(state.merge_deltas(updates));
+                })
+            },
+        );
     }
 
     group.finish();
@@ -308,7 +328,7 @@ fn bench_merge_deltas_batch(c: &mut Criterion) {
 
 /// Benchmark creating rooms
 fn bench_create_room(c: &mut Criterion) {
-    let config = DistributedStateConfig::with_limits(1, 50000, 100, 100);
+    let config = DistributedStateConfig::with_limits(1, MAX_ROOMS, 100, 100);
     let state = DistributedState::new(config);
 
     let mut room_id = 1u32;
@@ -348,7 +368,9 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
 
     let config = DistributedStateConfig::new(1);
     let state = Arc::new(DistributedState::new(config));
-    state.create_room(1, "Concurrent".to_string(), 10000).unwrap();
+    state
+        .create_room(1, "Concurrent".to_string(), MAX_PARTICIPANTS_PER_ROOM)
+        .unwrap();
 
     c.bench_function("concurrent_add_participant_4_threads", |b| {
         b.iter(|| {
@@ -377,25 +399,33 @@ fn bench_generate_deltas(c: &mut Criterion) {
     let dot = Dot::new(1, 100);
     let info = TrackInfo {
         track_type: 1,
+        content_type: 0,
+        owner_node: 0,
         codec: 100,
         bitrate_kbps: 2500,
     };
 
     c.bench_function("generate_participant_added_delta", |b| {
         b.iter(|| {
-            black_box(DistributedState::generate_participant_added_delta(42, dot))
+            black_box(DistributedState::generate_participant_added_delta(
+                1, 42, dot,
+            ))
         })
     });
 
     c.bench_function("generate_track_updated_delta", |b| {
         b.iter(|| {
-            black_box(DistributedState::generate_track_updated_delta(1, info, 100, 1))
+            black_box(DistributedState::generate_track_updated_delta(
+                1, info, 100, 1,
+            ))
         })
     });
 
     c.bench_function("generate_subscription_added_delta", |b| {
         b.iter(|| {
-            black_box(DistributedState::generate_subscription_added_delta(1, 42, dot))
+            black_box(DistributedState::generate_subscription_added_delta(
+                1, 42, dot,
+            ))
         })
     });
 }

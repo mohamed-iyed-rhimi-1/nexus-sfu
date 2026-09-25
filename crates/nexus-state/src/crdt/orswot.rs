@@ -34,7 +34,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::{CrdtError, CrdtResult};
-use crate::types::{Dot, MAX_ELEMENTS, MAX_TOMBSTONES, MAX_ACTORS};
+use crate::types::{Dot, MAX_ACTORS, MAX_ELEMENTS, MAX_TOMBSTONES};
 
 /// An entry in the Orswot set
 #[derive(Debug, Clone, Copy)]
@@ -70,8 +70,8 @@ impl<T: Copy> Default for Entry<T> {
 /// # Memory Model
 /// Uses Box for initial allocation (one-time at creation), but performs zero
 /// heap allocation after initialization. All operations on the hot path
-/// (add, remove, contains, merge, iter) are allocation-free. 
-/// 
+/// (add, remove, contains, merge, iter) are allocation-free.
+///
 /// Note: The `snapshot()` method uses Vec and is intended for testing/debugging,
 /// not for hot path operations. Use `iter()` or `write_elements_to()` for
 /// zero-allocation element access.
@@ -181,16 +181,15 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
             if let Some(ref existing) = self.entries[i].element {
                 if *existing == element {
                     // Element exists - check if we should update the dot
-                    if self.entries[i].dot == dot {
-                        // Same dot - idempotent
-                        return Ok(false);
-                    } else if dot > self.entries[i].dot {
+                    return match dot.cmp(&self.entries[i].dot) {
                         // Newer dot - update
-                        self.entries[i].dot = dot;
-                        return Ok(true);
-                    }
-                    // Older dot - ignore
-                    return Ok(false);
+                        std::cmp::Ordering::Greater => {
+                            self.entries[i].dot = dot;
+                            Ok(true)
+                        }
+                        // Same dot is idempotent; older dot is ignored
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => Ok(false),
+                    };
                 }
             }
         }
@@ -213,7 +212,10 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
                 self.count.fetch_add(1, Ordering::Release);
 
                 // Postcondition: element is now in set
-                debug_assert!(self.contains(&element), "Postcondition: element must be in set after add");
+                debug_assert!(
+                    self.contains(&element),
+                    "Postcondition: element must be in set after add"
+                );
                 return Ok(true);
             }
         }
@@ -262,18 +264,21 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
             if let Some(ref existing) = self.entries[i].element {
                 if existing == element {
                     let entry_dot = self.entries[i].dot;
-                    
+
                     // Only remove if remove dot is >= add dot
                     if dot >= entry_dot {
                         // Add to tombstones
                         self.add_tombstone(entry_dot)?;
-                        
+
                         // Remove element
                         self.entries[i].element = None;
                         self.count.fetch_sub(1, Ordering::Release);
 
                         // Postcondition: element not in set
-                        debug_assert!(!self.contains(element), "Postcondition: element must not be in set after remove");
+                        debug_assert!(
+                            !self.contains(element),
+                            "Postcondition: element must not be in set after remove"
+                        );
                         return Ok(true);
                     }
                     // Remove dot is older - reject
@@ -380,7 +385,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
                 if !self.has_tombstone(&tombstone_dot) {
                     self.add_tombstone(tombstone_dot)?;
                 }
-                
+
                 // Remove any element with this dot
                 self.remove_by_dot(&tombstone_dot);
             }
@@ -390,7 +395,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
         for i in 0..MAX_ELEMENTS {
             if let Some(element) = other.entries[i].element {
                 let dot = other.entries[i].dot;
-                
+
                 // Skip if tombstoned
                 if self.is_tombstoned(&dot) {
                     continue;
@@ -410,22 +415,20 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     }
 
     /// Returns a snapshot of the set for comparison
-    /// 
+    ///
     /// Note: This method allocates Vec for the snapshot. Use for testing
     /// and debugging, not on the hot path. For zero-allocation element
     /// access, use `iter()` or `write_elements_to()`.
     pub fn snapshot(&self) -> OrswotSnapshot<T> {
         // Collect elements
-        let mut elements: Vec<(T, Dot)> = self.entries
+        let mut elements: Vec<(T, Dot)> = self
+            .entries
             .iter()
             .filter_map(|e| e.element.map(|el| (el, e.dot)))
             .collect();
 
         // Collect tombstones
-        let mut tombstones: Vec<Dot> = self.tombstones
-            .iter()
-            .filter_map(|opt| *opt)
-            .collect();
+        let mut tombstones: Vec<Dot> = self.tombstones.iter().filter_map(|opt| *opt).collect();
 
         // Sort for deterministic comparison
         elements.sort_by_key(|(_, dot)| *dot);
@@ -438,10 +441,10 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     }
 
     /// Writes elements into a caller-provided buffer
-    /// 
+    ///
     /// # Arguments
     /// * `buffer` - A mutable slice to write elements into
-    /// 
+    ///
     /// # Returns
     /// The number of elements written (may be less than set length if buffer is too small)
     pub fn write_elements_to(&self, buffer: &mut [(T, Dot)]) -> u32 {
@@ -462,10 +465,10 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     }
 
     /// Writes tombstones into a caller-provided buffer
-    /// 
+    ///
     /// # Arguments
     /// * `buffer` - A mutable slice to write tombstones into
-    /// 
+    ///
     /// # Returns
     /// The number of tombstones written
     pub fn write_tombstones_to(&self, buffer: &mut [Dot]) -> u32 {
@@ -565,8 +568,8 @@ impl<T: Copy + Eq + Hash + std::fmt::Debug> std::fmt::Debug for Orswot<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid heap allocation by using a debug helper that iterates
         struct ElementsDebug<'a, T: Copy + Eq + Hash + std::fmt::Debug>(&'a Orswot<T>);
-        
-        impl<'a, T: Copy + Eq + Hash + std::fmt::Debug> std::fmt::Debug for ElementsDebug<'a, T> {
+
+        impl<T: Copy + Eq + Hash + std::fmt::Debug> std::fmt::Debug for ElementsDebug<'_, T> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.debug_list().entries(self.0.iter()).finish()
             }
@@ -581,7 +584,7 @@ impl<T: Copy + Eq + Hash + std::fmt::Debug> std::fmt::Debug for Orswot<T> {
 }
 
 /// A snapshot of an Orswot for comparison
-/// 
+///
 /// Uses Vec for storage since snapshots are typically used for testing
 /// and debugging, not on the hot path. This avoids stack overflow with
 /// large fixed arrays.
@@ -603,21 +606,21 @@ impl<T: Copy + Eq + Hash> PartialEq for OrswotSnapshot<T> {
         if self.tombstones.len() != other.tombstones.len() {
             return false;
         }
-        
+
         // Check all elements in self are in other
         for elem in &self.elements {
             if !other.elements.contains(elem) {
                 return false;
             }
         }
-        
+
         // Check all tombstones in self are in other
         for tomb in &self.tombstones {
             if !other.tombstones.contains(tomb) {
                 return false;
             }
         }
-        
+
         true
     }
 }
@@ -666,7 +669,7 @@ mod tests {
     #[test]
     fn test_orswot_add_single() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         let added = set.add(42, Dot::new(1, 1)).unwrap();
         assert!(added);
         assert!(set.contains(&42));
@@ -676,10 +679,10 @@ mod tests {
     #[test]
     fn test_orswot_add_duplicate_idempotent() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         let added1 = set.add(42, Dot::new(1, 1)).unwrap();
         let added2 = set.add(42, Dot::new(1, 1)).unwrap();
-        
+
         assert!(added1);
         assert!(!added2); // Idempotent - already exists with same dot
         assert_eq!(set.len(), 1);
@@ -688,10 +691,10 @@ mod tests {
     #[test]
     fn test_orswot_add_same_element_newer_dot() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         set.add(42, Dot::new(1, 1)).unwrap();
         let updated = set.add(42, Dot::new(1, 5)).unwrap();
-        
+
         assert!(updated); // Updated with newer dot
         assert_eq!(set.len(), 1);
     }
@@ -699,10 +702,10 @@ mod tests {
     #[test]
     fn test_orswot_remove() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         set.add(42, Dot::new(1, 1)).unwrap();
         assert!(set.contains(&42));
-        
+
         let removed = set.remove(&42, Dot::new(1, 2)).unwrap();
         assert!(removed);
         assert!(!set.contains(&42));
@@ -713,7 +716,7 @@ mod tests {
     #[test]
     fn test_orswot_remove_nonexistent() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         let removed = set.remove(&42, Dot::new(1, 1)).unwrap();
         assert!(!removed);
     }
@@ -721,19 +724,19 @@ mod tests {
     #[test]
     fn test_orswot_add_after_remove() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         // Add with dot (1, 1)
         set.add(42, Dot::new(1, 1)).unwrap();
-        
+
         // Remove with dot (1, 2)
         set.remove(&42, Dot::new(1, 2)).unwrap();
         assert!(!set.contains(&42));
-        
+
         // Try to re-add with older dot (1, 1) - should be rejected (tombstoned)
         let re_added = set.add(42, Dot::new(1, 1)).unwrap();
         assert!(!re_added);
         assert!(!set.contains(&42));
-        
+
         // Add with newer dot (1, 3) - should succeed
         let re_added = set.add(42, Dot::new(1, 3)).unwrap();
         assert!(re_added);
@@ -745,23 +748,23 @@ mod tests {
         let mut a: Orswot<u32> = Orswot::new();
         a.add(1, Dot::new(0, 1)).unwrap();
         a.add(2, Dot::new(0, 2)).unwrap();
-        
+
         let mut b: Orswot<u32> = Orswot::new();
         b.add(3, Dot::new(1, 1)).unwrap();
         b.add(4, Dot::new(1, 2)).unwrap();
-        
+
         // merge(a, b)
         let mut ab: Orswot<u32> = Orswot::new();
         ab.add(1, Dot::new(0, 1)).unwrap();
         ab.add(2, Dot::new(0, 2)).unwrap();
         ab.merge(&b).unwrap();
-        
+
         // merge(b, a)
         let mut ba: Orswot<u32> = Orswot::new();
         ba.add(3, Dot::new(1, 1)).unwrap();
         ba.add(4, Dot::new(1, 2)).unwrap();
         ba.merge(&a).unwrap();
-        
+
         // Assert commutativity
         assert_eq!(ab.snapshot(), ba.snapshot());
     }
@@ -770,28 +773,28 @@ mod tests {
     fn test_orswot_merge_associative() {
         let mut a: Orswot<u32> = Orswot::new();
         a.add(1, Dot::new(0, 1)).unwrap();
-        
+
         let mut b: Orswot<u32> = Orswot::new();
         b.add(2, Dot::new(1, 1)).unwrap();
-        
+
         let mut c: Orswot<u32> = Orswot::new();
         c.add(3, Dot::new(2, 1)).unwrap();
-        
+
         // (a merge b) merge c
         let mut ab_c: Orswot<u32> = Orswot::new();
         ab_c.add(1, Dot::new(0, 1)).unwrap();
         ab_c.merge(&b).unwrap();
         ab_c.merge(&c).unwrap();
-        
+
         // a merge (b merge c)
         let mut bc: Orswot<u32> = Orswot::new();
         bc.add(2, Dot::new(1, 1)).unwrap();
         bc.merge(&c).unwrap();
-        
+
         let mut a_bc: Orswot<u32> = Orswot::new();
         a_bc.add(1, Dot::new(0, 1)).unwrap();
         a_bc.merge(&bc).unwrap();
-        
+
         // Assert associativity
         assert_eq!(ab_c.snapshot(), a_bc.snapshot());
     }
@@ -801,11 +804,11 @@ mod tests {
         let mut set: Orswot<u32> = Orswot::new();
         set.add(1, Dot::new(0, 1)).unwrap();
         set.add(2, Dot::new(1, 1)).unwrap();
-        
+
         let before = set.snapshot();
         set.merge(&set.clone_for_merge()).unwrap();
         let after = set.snapshot();
-        
+
         // Assert idempotence
         assert_eq!(before, after);
     }
@@ -815,19 +818,19 @@ mod tests {
         // Simulate concurrent add and remove
         let mut a: Orswot<u32> = Orswot::new();
         a.add(42, Dot::new(0, 1)).unwrap();
-        
+
         let mut b: Orswot<u32> = Orswot::new();
         b.add(42, Dot::new(0, 1)).unwrap();
-        
+
         // A adds with newer dot
         a.add(42, Dot::new(0, 5)).unwrap();
-        
+
         // B removes
         b.remove(&42, Dot::new(0, 2)).unwrap();
-        
+
         // Merge - the add with newer dot should win
         a.merge(&b).unwrap();
-        
+
         // Element should still be present (add wins due to newer dot)
         assert!(a.contains(&42));
     }
@@ -835,23 +838,23 @@ mod tests {
     #[test]
     fn test_orswot_capacity_exhausted() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         // Fill to capacity
         for i in 0..MAX_ELEMENTS as u32 {
-            let actor = (i % MAX_ACTORS as u32) as u64;
-            let clock = (i / MAX_ACTORS as u32 + 1) as u64;
+            let actor = u64::from(i % MAX_ACTORS as u32);
+            let clock = u64::from(i / MAX_ACTORS as u32 + 1);
             set.add(i, Dot::new(actor, clock)).unwrap();
         }
-        
+
         // Next add should fail
-        let result = set.add(999999, Dot::new(0, 999999));
+        let result = set.add(999_999, Dot::new(0, 999_999));
         assert!(matches!(result, Err(CrdtError::CapacityExhausted { .. })));
     }
 
     #[test]
     fn test_orswot_invalid_dot() {
         let mut set: Orswot<u32> = Orswot::new();
-        
+
         // Invalid actor ID
         let result = set.add(42, Dot::new_unchecked(MAX_ACTORS as u64, 1));
         assert!(matches!(result, Err(CrdtError::InvalidDot { .. })));
@@ -863,7 +866,7 @@ mod tests {
         set.add(1, Dot::new(0, 1)).unwrap();
         set.add(2, Dot::new(0, 2)).unwrap();
         set.add(3, Dot::new(0, 3)).unwrap();
-        
+
         let elements: Vec<_> = set.iter().copied().collect();
         assert_eq!(elements.len(), 3);
         assert!(elements.contains(&1));
@@ -876,7 +879,7 @@ mod tests {
         let mut set: Orswot<u32> = Orswot::new();
         set.add(1, Dot::new(0, 1)).unwrap();
         set.add(2, Dot::new(1, 1)).unwrap();
-        
+
         let snap = set.snapshot();
         assert_eq!(snap.len(), 2);
         assert!(snap.contains(&1));
@@ -944,26 +947,26 @@ mod proptests {
             for (elem, dot) in &ops_a {
                 let _ = a.add(*elem, *dot);
             }
-            
+
             let mut b: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_b {
                 let _ = b.add(*elem, *dot);
             }
-            
+
             // merge(A, B)
             let mut ab: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_a {
                 let _ = ab.add(*elem, *dot);
             }
             let _ = ab.merge(&b);
-            
+
             // merge(B, A)
             let mut ba: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_b {
                 let _ = ba.add(*elem, *dot);
             }
             let _ = ba.merge(&a);
-            
+
             // Assert commutativity
             prop_assert_eq!(ab.snapshot(), ba.snapshot());
         }
@@ -978,17 +981,17 @@ mod proptests {
             for (elem, dot) in &ops_a {
                 let _ = a.add(*elem, *dot);
             }
-            
+
             let mut b: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_b {
                 let _ = b.add(*elem, *dot);
             }
-            
+
             let mut c: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_c {
                 let _ = c.add(*elem, *dot);
             }
-            
+
             // (A merge B) merge C
             let mut ab_c: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_a {
@@ -996,20 +999,20 @@ mod proptests {
             }
             let _ = ab_c.merge(&b);
             let _ = ab_c.merge(&c);
-            
+
             // A merge (B merge C)
             let mut bc: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_b {
                 let _ = bc.add(*elem, *dot);
             }
             let _ = bc.merge(&c);
-            
+
             let mut a_bc: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops_a {
                 let _ = a_bc.add(*elem, *dot);
             }
             let _ = a_bc.merge(&bc);
-            
+
             // Assert associativity
             prop_assert_eq!(ab_c.snapshot(), a_bc.snapshot());
         }
@@ -1022,18 +1025,18 @@ mod proptests {
             for (elem, dot) in &ops {
                 let _ = set.add(*elem, *dot);
             }
-            
+
             let before = set.snapshot();
-            
+
             // Create a copy for merging
             let mut copy: Orswot<u32> = Orswot::new();
             for (elem, dot) in &ops {
                 let _ = copy.add(*elem, *dot);
             }
-            
+
             let _ = set.merge(&copy);
             let after = set.snapshot();
-            
+
             // Assert idempotence
             prop_assert_eq!(before, after);
         }
@@ -1047,25 +1050,25 @@ mod proptests {
             for (elem, dot) in &adds_a {
                 let _ = a.add(*elem, *dot);
             }
-            
+
             let mut b: Orswot<u32> = Orswot::new();
             for (elem, dot) in &adds_b {
                 let _ = b.add(*elem, *dot);
             }
-            
+
             // Merge both ways
             let mut ab: Orswot<u32> = Orswot::new();
             for (elem, dot) in &adds_a {
                 let _ = ab.add(*elem, *dot);
             }
             let _ = ab.merge(&b);
-            
+
             let mut ba: Orswot<u32> = Orswot::new();
             for (elem, dot) in &adds_b {
                 let _ = ba.add(*elem, *dot);
             }
             let _ = ba.merge(&a);
-            
+
             // Both should converge to same state
             prop_assert_eq!(ab.snapshot(), ba.snapshot());
         }
@@ -1076,15 +1079,15 @@ mod proptests {
             actor in arb_actor_id()
         ) {
             let mut set: Orswot<u32> = Orswot::new();
-            
+
             // Add with dot D1 (clock 1)
             let _ = set.add(elem, Dot::new(actor, 1));
             prop_assert!(set.contains(&elem));
-            
+
             // Remove with dot D2 (clock 2) - newer
             let _ = set.remove(&elem, Dot::new(actor, 2));
             prop_assert!(!set.contains(&elem));
-            
+
             // Try to re-add with D1 (clock 1) - should be rejected (tombstoned)
             let re_added = set.add(elem, Dot::new(actor, 1)).unwrap();
             prop_assert!(!re_added);

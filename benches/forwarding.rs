@@ -8,13 +8,12 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
+use nexus_media::rtp::RtpHeader;
 use nexus_sfu::{
-    arena::PacketArena,
     forward::{SsrcRouter, Subscriber, SubscriberList},
-    media::rtp::RtpHeader,
-    ring_buffer::RingBuffer,
     transport::BatchSender,
 };
+use nexus_transport::{arena::PacketArena, ring_buffer::RingBuffer};
 
 // =============================================================================
 // RTP Parsing Benchmark Helpers
@@ -60,7 +59,7 @@ fn create_rtp_packet_with_csrc(count: u8) -> Vec<u8> {
     packet[2..4].copy_from_slice(&1234u16.to_be_bytes()); // Sequence number
     packet[4..8].copy_from_slice(&5678u32.to_be_bytes()); // Timestamp
     packet[8..12].copy_from_slice(&0xDEADBEEFu32.to_be_bytes()); // SSRC
-    // Fill CSRC entries
+                                                                 // Fill CSRC entries
     for i in 0..count as usize {
         let csrc = (0x11111111u32).wrapping_mul((i + 1) as u32);
         let offset = 12 + i * 4;
@@ -79,10 +78,10 @@ fn create_rtp_packet_with_extension() -> Vec<u8> {
     packet[2..4].copy_from_slice(&1234u16.to_be_bytes()); // Sequence number
     packet[4..8].copy_from_slice(&5678u32.to_be_bytes()); // Timestamp
     packet[8..12].copy_from_slice(&0xDEADBEEFu32.to_be_bytes()); // SSRC
-    // Extension header
+                                                                 // Extension header
     packet[12..14].copy_from_slice(&[0xBE, 0xDE]); // Profile-specific (RFC 5285)
     packet[14..16].copy_from_slice(&ext_words.to_be_bytes()); // Length in words
-    // Extension data (filled with pattern)
+                                                              // Extension data (filled with pattern)
     for i in 0..ext_data_size {
         packet[16 + i] = (i % 256) as u8;
     }
@@ -98,7 +97,7 @@ fn create_rtp_packet_large() -> Vec<u8> {
     packet[2..4].copy_from_slice(&1234u16.to_be_bytes()); // Sequence number
     packet[4..8].copy_from_slice(&5678u32.to_be_bytes()); // Timestamp
     packet[8..12].copy_from_slice(&0xDEADBEEFu32.to_be_bytes()); // SSRC
-    // Fill payload with pattern
+                                                                 // Fill payload with pattern
     for i in 0..payload_size {
         packet[12 + i] = (i % 256) as u8;
     }
@@ -111,29 +110,29 @@ fn create_rtp_packet_large() -> Vec<u8> {
 /// - 5% with extension - advanced features like abs-send-time
 fn create_rtp_batch_64() -> Vec<Vec<u8>> {
     let mut packets = Vec::with_capacity(64);
-    
+
     // 80% minimal (51 packets)
     for _ in 0..51 {
         packets.push(create_rtp_packet_minimal());
     }
-    
+
     // 15% with CSRC (10 packets)
     for _ in 0..10 {
         packets.push(create_rtp_packet_with_csrc(2));
     }
-    
+
     // 5% with extension (3 packets)
     for _ in 0..3 {
         packets.push(create_rtp_packet_with_extension());
     }
-    
+
     packets
 }
 
 /// Create a test packet slot with RTP-like data
 fn create_test_packet(arena: &PacketArena, seq: u16) -> nexus_sfu::PacketSlot {
     let mut slot = arena.alloc().expect("Failed to allocate packet slot");
-    
+
     // Create a minimal RTP header (12 bytes) + payload
     let data = slot.data_mut();
     data[0] = 0x80; // V=2, P=0, X=0, CC=0
@@ -145,10 +144,10 @@ fn create_test_packet(arena: &PacketArena, seq: u16) -> nexus_sfu::PacketSlot {
     // SSRC (4 bytes)
     data[8..12].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
     // Payload (160 bytes for audio-like packet)
-    for i in 12..172 {
-        data[i] = (i % 256) as u8;
+    for (i, byte) in data.iter_mut().enumerate().take(172).skip(12) {
+        *byte = (i % 256) as u8;
     }
-    
+
     slot.set_len(172);
     slot
 }
@@ -156,7 +155,7 @@ fn create_test_packet(arena: &PacketArena, seq: u16) -> nexus_sfu::PacketSlot {
 /// Benchmark packet arena allocation and deallocation
 fn bench_arena_alloc(c: &mut Criterion) {
     let arena = PacketArena::new(64).expect("Failed to create arena");
-    
+
     c.bench_function("arena_alloc_dealloc", |b| {
         b.iter(|| {
             let slot = arena.alloc().expect("Failed to allocate");
@@ -170,7 +169,7 @@ fn bench_arena_alloc(c: &mut Criterion) {
 fn bench_ring_buffer_push(c: &mut Criterion) {
     let arena = PacketArena::new(64).expect("Failed to create arena");
     let ring_buffer: RingBuffer<2048> = RingBuffer::new();
-    
+
     c.bench_function("ring_buffer_push", |b| {
         let mut seq = 0u16;
         b.iter(|| {
@@ -185,12 +184,14 @@ fn bench_ring_buffer_push(c: &mut Criterion) {
 /// Benchmark SSRC router lookup
 fn bench_ssrc_lookup(c: &mut Criterion) {
     let router = SsrcRouter::new();
-    
+
     // Register 1000 SSRCs
     for i in 1..=1000u32 {
-        router.register(i, i as u64, i % 8).expect("Failed to register SSRC");
+        router
+            .register(i, i as u64, i % 8)
+            .expect("Failed to register SSRC");
     }
-    
+
     c.bench_function("ssrc_lookup", |b| {
         let mut ssrc = 1u32;
         b.iter(|| {
@@ -206,17 +207,17 @@ fn bench_batch_sender_queue(c: &mut Criterion) {
     let arena = PacketArena::new(64).expect("Failed to create arena");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
     let socket_fd = socket.as_raw_fd();
-    
+
     let mut sender = BatchSender::new(socket_fd, 64, 1000);
     let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-    
+
     c.bench_function("batch_sender_queue", |b| {
         let mut seq = 0u16;
         b.iter(|| {
             let packet = create_test_packet(&arena, seq);
             sender.queue(dest, packet);
             seq = seq.wrapping_add(1);
-            
+
             // Flush periodically to avoid memory buildup
             if sender.pending_count() >= 64 {
                 let _ = sender.flush();
@@ -228,17 +229,19 @@ fn bench_batch_sender_queue(c: &mut Criterion) {
 /// Benchmark subscriber list iteration (hot path)
 fn bench_subscriber_iteration(c: &mut Criterion) {
     let mut group = c.benchmark_group("subscriber_iteration");
-    
+
     for subscriber_count in [100, 500, 1000].iter() {
         let mut list = SubscriberList::new(5_000_000_000);
-        
+
         // Add subscribers
         for i in 1..=*subscriber_count {
-            let addr: SocketAddr = format!("192.168.{}.{}:5000", i / 256, i % 256).parse().unwrap();
+            let addr: SocketAddr = format!("192.168.{}.{}:5000", i / 256, i % 256)
+                .parse()
+                .unwrap();
             let subscriber = Subscriber::new(i as u32, i as u64, addr);
             list.add(subscriber);
         }
-        
+
         group.throughput(Throughput::Elements(*subscriber_count as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(subscriber_count),
@@ -255,26 +258,26 @@ fn bench_subscriber_iteration(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
 /// Benchmark packet forwarding to multiple subscribers
 fn bench_packet_forwarding(c: &mut Criterion) {
     let mut group = c.benchmark_group("packet_forwarding");
-    
+
     for subscriber_count in [100, 500, 1000].iter() {
         let arena = PacketArena::new(64).expect("Failed to create arena");
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
         let socket_fd = socket.as_raw_fd();
-        
+
         // Create subscriber list
         let mut subscribers: Vec<SocketAddr> = Vec::with_capacity(*subscriber_count);
         for i in 1..=*subscriber_count {
             let addr: SocketAddr = format!("127.0.0.1:{}", 10000 + i).parse().unwrap();
             subscribers.push(addr);
         }
-        
+
         group.throughput(Throughput::Elements(*subscriber_count as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(subscriber_count),
@@ -282,18 +285,18 @@ fn bench_packet_forwarding(c: &mut Criterion) {
             |b, _| {
                 let mut sender = BatchSender::new(socket_fd, 64, 1000);
                 let mut seq = 0u16;
-                
+
                 b.iter(|| {
                     // Create a packet
                     let packet = create_test_packet(&arena, seq);
                     seq = seq.wrapping_add(1);
-                    
+
                     // Forward to all subscribers (simulating track forwarding)
                     for dest in &subscribers {
                         let packet_clone = packet.clone_shallow();
                         sender.queue(*dest, packet_clone);
                     }
-                    
+
                     // Flush the batch
                     let (sent, _failed) = sender.flush();
                     black_box(sent);
@@ -301,7 +304,7 @@ fn bench_packet_forwarding(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -309,16 +312,16 @@ fn bench_packet_forwarding(c: &mut Criterion) {
 fn bench_batch_sender_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_sender_throughput");
     group.throughput(Throughput::Elements(64)); // 64 packets per batch
-    
+
     let arena = PacketArena::new(64).expect("Failed to create arena");
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
     let socket_fd = socket.as_raw_fd();
-    
+
     group.bench_function("batch_64_packets", |b| {
         let mut sender = BatchSender::new(socket_fd, 64, 1000);
         let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let mut seq = 0u16;
-        
+
         b.iter(|| {
             // Queue 64 packets
             for _ in 0..64 {
@@ -326,13 +329,13 @@ fn bench_batch_sender_throughput(c: &mut Criterion) {
                 sender.queue(dest, packet);
                 seq = seq.wrapping_add(1);
             }
-            
+
             // Flush
             let (sent, _failed) = sender.flush();
             black_box(sent);
         });
     });
-    
+
     group.finish();
 }
 
@@ -340,7 +343,7 @@ fn bench_batch_sender_throughput(c: &mut Criterion) {
 fn bench_shallow_clone(c: &mut Criterion) {
     let arena = PacketArena::new(64).expect("Failed to create arena");
     let packet = create_test_packet(&arena, 0);
-    
+
     c.bench_function("packet_shallow_clone", |b| {
         b.iter(|| {
             let cloned = packet.clone_shallow();
@@ -352,7 +355,7 @@ fn bench_shallow_clone(c: &mut Criterion) {
 /// Benchmark end-to-end forwarding pipeline
 fn bench_forwarding_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("forwarding_pipeline");
-    
+
     // Target: 500K packets/sec/core
     // This benchmark measures the complete forwarding path:
     // 1. Allocate packet from arena
@@ -360,29 +363,31 @@ fn bench_forwarding_pipeline(c: &mut Criterion) {
     // 3. Store in ring buffer
     // 4. Clone and queue to batch sender for each subscriber
     // 5. Flush batch
-    
+
     for subscriber_count in [100, 500, 1000].iter() {
         let arena = PacketArena::new(64).expect("Failed to create arena");
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
         let socket_fd = socket.as_raw_fd();
-        
+
         // Setup SSRC router
         let router = SsrcRouter::new();
         let ssrc = 0xDEADBEEF_u32;
         let track_id = 1u64;
         let worker_id = 0u32;
-        router.register(ssrc, track_id, worker_id).expect("Failed to register SSRC");
-        
+        router
+            .register(ssrc, track_id, worker_id)
+            .expect("Failed to register SSRC");
+
         // Setup ring buffer
         let ring_buffer: RingBuffer<2048> = RingBuffer::new();
-        
+
         // Setup subscribers
         let mut subscribers: Vec<SocketAddr> = Vec::with_capacity(*subscriber_count);
         for i in 1..=*subscriber_count {
             let addr: SocketAddr = format!("127.0.0.1:{}", 10000 + i).parse().unwrap();
             subscribers.push(addr);
         }
-        
+
         group.throughput(Throughput::Elements(1)); // 1 packet through pipeline
         group.bench_with_input(
             BenchmarkId::new("subscribers", subscriber_count),
@@ -390,26 +395,26 @@ fn bench_forwarding_pipeline(c: &mut Criterion) {
             |b, _| {
                 let mut sender = BatchSender::new(socket_fd, 64, 1000);
                 let mut seq = 0u16;
-                
+
                 b.iter(|| {
                     // 1. Allocate packet
                     let packet = create_test_packet(&arena, seq);
                     seq = seq.wrapping_add(1);
-                    
+
                     // 2. Lookup SSRC route
                     let route = router.lookup(ssrc);
                     black_box(route);
-                    
+
                     // 3. Store in ring buffer
                     let ring_seq = ring_buffer.push(packet.clone_shallow());
                     black_box(ring_seq);
-                    
+
                     // 4. Forward to subscribers
                     for dest in &subscribers {
                         let packet_clone = packet.clone_shallow();
                         sender.queue(*dest, packet_clone);
                     }
-                    
+
                     // 5. Flush batch
                     let (sent, _failed) = sender.flush();
                     black_box(sent);
@@ -417,7 +422,7 @@ fn bench_forwarding_pipeline(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -550,8 +555,9 @@ fn bench_rtp_parse_batch_64(c: &mut Criterion) {
         BenchmarkId::new("scalar_prefetch", "64_packets"),
         &packet_refs,
         |b, packets| {
+            let mut out = vec![None; 64];
             b.iter(|| {
-                let results = RtpHeader::parse_batch_scalar(black_box(packets));
+                let results = RtpHeader::parse_batch_scalar(black_box(packets), &mut out);
                 black_box(results)
             });
         },
@@ -565,8 +571,9 @@ fn bench_rtp_parse_batch_64(c: &mut Criterion) {
                 BenchmarkId::new("avx2", "64_packets"),
                 &packet_refs,
                 |b, packets| {
+                    let mut out = vec![None; 64];
                     b.iter(|| {
-                        let results = RtpHeader::parse_batch_avx2(black_box(packets));
+                        let results = RtpHeader::parse_batch_avx2(black_box(packets), &mut out);
                         black_box(results)
                     });
                 },
@@ -582,8 +589,9 @@ fn bench_rtp_parse_batch_64(c: &mut Criterion) {
                 BenchmarkId::new("avx512", "64_packets"),
                 &packet_refs,
                 |b, packets| {
+                    let mut out = vec![None; 64];
                     b.iter(|| {
-                        let results = RtpHeader::parse_batch_avx512(black_box(packets));
+                        let results = RtpHeader::parse_batch_avx512(black_box(packets), &mut out);
                         black_box(results)
                     });
                 },
@@ -596,8 +604,9 @@ fn bench_rtp_parse_batch_64(c: &mut Criterion) {
         BenchmarkId::new("optimal", "64_packets"),
         &packet_refs,
         |b, packets| {
+            let mut out = vec![None; 64];
             b.iter(|| {
-                let results = RtpHeader::parse_batch_optimal(black_box(packets));
+                let results = RtpHeader::parse_batch_optimal(black_box(packets), &mut out);
                 black_box(results)
             });
         },
@@ -624,28 +633,20 @@ fn bench_rtp_parse_comparison(c: &mut Criterion) {
 
     for (name, packet) in packet_types.iter() {
         // Standard parsing
-        group.bench_with_input(
-            BenchmarkId::new("standard", *name),
-            packet,
-            |b, p| {
-                b.iter(|| {
-                    let result = RtpHeader::parse(black_box(p));
-                    black_box(result)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("standard", *name), packet, |b, p| {
+            b.iter(|| {
+                let result = RtpHeader::parse(black_box(p));
+                black_box(result)
+            });
+        });
 
         // SIMD parsing
-        group.bench_with_input(
-            BenchmarkId::new("simd", *name),
-            packet,
-            |b, p| {
-                b.iter(|| {
-                    let result = RtpHeader::parse_simd(black_box(p));
-                    black_box(result)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("simd", *name), packet, |b, p| {
+            b.iter(|| {
+                let result = RtpHeader::parse_simd(black_box(p));
+                black_box(result)
+            });
+        });
     }
 
     group.finish();
@@ -674,9 +675,10 @@ fn bench_rtp_parse_realistic_workload(c: &mut Criterion) {
     let mut batch_idx = 0usize;
 
     group.bench_function("64_packet_batch", |b| {
+        let mut out = vec![None; 64];
         b.iter(|| {
             let packets = &batch_refs[batch_idx % batch_refs.len()];
-            let results = RtpHeader::parse_batch_optimal(black_box(packets));
+            let results = RtpHeader::parse_batch_optimal(black_box(packets), &mut out);
             batch_idx = batch_idx.wrapping_add(1);
             black_box(results)
         });

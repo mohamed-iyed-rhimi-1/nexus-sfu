@@ -83,7 +83,8 @@ impl TracingMetrics {
     /// * `latency_ns` - Latency in nanoseconds
     #[inline(always)]
     pub fn record_forward_latency(&self, latency_ns: u64) {
-        self.forward_latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.forward_latency_sum_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.forward_count.fetch_add(1, Ordering::Relaxed);
 
         // Update histogram bucket (convert to microseconds)
@@ -110,14 +111,16 @@ impl TracingMetrics {
     /// Record a receive latency sample.
     #[inline(always)]
     pub fn record_recv_latency(&self, latency_ns: u64) {
-        self.recv_latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.recv_latency_sum_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.recv_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a send latency sample.
     #[inline(always)]
     pub fn record_send_latency(&self, latency_ns: u64) {
-        self.send_latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.send_latency_sum_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.send_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -127,13 +130,17 @@ impl TracingMetrics {
     /// the packets-per-second rate.
     pub fn update_packet_rate(&self) {
         let current_count = self.forward_count.load(Ordering::Relaxed);
-        let last_count = self.last_forward_count.swap(current_count, Ordering::Relaxed);
+        let last_count = self
+            .last_forward_count
+            .swap(current_count, Ordering::Relaxed);
 
         let current_time_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let last_time_ns = self.last_sample_time_ns.swap(current_time_ns, Ordering::Relaxed);
+        let last_time_ns = self
+            .last_sample_time_ns
+            .swap(current_time_ns, Ordering::Relaxed);
 
         // Calculate rate if we have a valid time delta
         if last_time_ns > 0 && current_time_ns > last_time_ns {
@@ -228,13 +235,13 @@ impl TracingMetrics {
         let cinf = c10ms + binf;
 
         [
-            (0.000010, c10us),   // 10us
-            (0.000050, c50us),   // 50us
-            (0.000100, c100us),  // 100us
-            (0.000500, c500us),  // 500us
-            (0.001000, c1ms),    // 1ms
-            (0.005000, c5ms),    // 5ms
-            (0.010000, c10ms),   // 10ms
+            (0.000010, c10us),  // 10us
+            (0.000050, c50us),  // 50us
+            (0.000100, c100us), // 100us
+            (0.000500, c500us), // 500us
+            (0.001000, c1ms),   // 1ms
+            (0.005000, c5ms),   // 5ms
+            (0.010000, c10ms),  // 10ms
             (f64::INFINITY, cinf),
         ]
     }
@@ -383,13 +390,13 @@ mod tests {
         let metrics = TracingMetrics::new();
 
         // Record samples in different buckets
-        metrics.record_forward_latency(5_000);      // 5us -> <10us
-        metrics.record_forward_latency(30_000);     // 30us -> <50us
-        metrics.record_forward_latency(75_000);     // 75us -> <100us
-        metrics.record_forward_latency(300_000);    // 300us -> <500us
-        metrics.record_forward_latency(750_000);    // 750us -> <1ms
-        metrics.record_forward_latency(3_000_000);  // 3ms -> <5ms
-        metrics.record_forward_latency(7_000_000);  // 7ms -> <10ms
+        metrics.record_forward_latency(5_000); // 5us -> <10us
+        metrics.record_forward_latency(30_000); // 30us -> <50us
+        metrics.record_forward_latency(75_000); // 75us -> <100us
+        metrics.record_forward_latency(300_000); // 300us -> <500us
+        metrics.record_forward_latency(750_000); // 750us -> <1ms
+        metrics.record_forward_latency(3_000_000); // 3ms -> <5ms
+        metrics.record_forward_latency(7_000_000); // 7ms -> <10ms
         metrics.record_forward_latency(15_000_000); // 15ms -> >10ms
 
         let buckets = metrics.forward_latency_bucket_counts();

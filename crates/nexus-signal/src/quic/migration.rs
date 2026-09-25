@@ -43,8 +43,12 @@ impl MigrationHandler {
         // Validate new path
         self.validate_path(&conn.connection, new_addr).await?;
 
-        // Record migration
-        conn.record_migration();
+        // Record migration — reject if limit exceeded
+        if !conn.record_migration() {
+            return Err(SignalError::MigrationFailed(
+                "migration count exceeded maximum".into(),
+            ));
+        }
 
         tracing::info!(
             connection_id = conn.connection_id,

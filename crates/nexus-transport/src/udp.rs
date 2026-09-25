@@ -143,20 +143,13 @@ impl TransportStats {
     /// Get snapshot of current statistics.
     pub fn snapshot(&self) -> TransportStatsSnapshot {
         TransportStatsSnapshot {
-            packets_received: self.packets_received
-                .load(Ordering::Relaxed),
-            packets_sent: self.packets_sent
-                .load(Ordering::Relaxed),
-            packets_dropped: self.packets_dropped
-                .load(Ordering::Relaxed),
-            bytes_received: self.bytes_received
-                .load(Ordering::Relaxed),
-            bytes_sent: self.bytes_sent
-                .load(Ordering::Relaxed),
-            recv_errors: self.recv_errors
-                .load(Ordering::Relaxed),
-            send_errors: self.send_errors
-                .load(Ordering::Relaxed),
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            recv_errors: self.recv_errors.load(Ordering::Relaxed),
+            send_errors: self.send_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -194,12 +187,12 @@ pub struct RecvPacket {
 
 impl RecvPacket {
     /// Create a new received packet.
-    pub fn new(
-        data: Vec<u8>,
-        source_addr: SocketAddr,
-        recv_time_ns: u64,
-    ) -> Self {
-        Self { data, source_addr, recv_time_ns }
+    pub fn new(data: Vec<u8>, source_addr: SocketAddr, recv_time_ns: u64) -> Self {
+        Self {
+            data,
+            source_addr,
+            recv_time_ns,
+        }
     }
 
     /// Get the length of the packet data in bytes.
@@ -234,10 +227,7 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     /// Create a new UDP transport bound to the specified address.
-    pub fn bind(
-        addr: SocketAddr,
-        config: TransportConfig,
-    ) -> Result<Self, TransportError> {
+    pub fn bind(addr: SocketAddr, config: TransportConfig) -> Result<Self, TransportError> {
         assert!(
             config.recv_buffer_size_bytes > 0,
             "recv_buffer_size_bytes must be > 0"
@@ -248,16 +238,12 @@ impl UdpTransport {
         );
 
         let socket = std::net::UdpSocket::bind(addr)
-            .map_err(|source| TransportError::BindFailed {
-                addr, source,
-            })?;
-        socket.set_nonblocking(true)
-            .map_err(|source| {
-                TransportError::SetSockOptFailed { source }
-            })?;
+            .map_err(|source| TransportError::BindFailed { addr, source })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|source| TransportError::SetSockOptFailed { source })?;
         Self::set_socket_buffers(&socket, &config)?;
-        let recv_buffers =
-            vec![[0u8; MAX_PACKET_SIZE_BYTES]; MAX_BATCH_SIZE];
+        let recv_buffers = vec![[0u8; MAX_PACKET_SIZE_BYTES]; MAX_BATCH_SIZE];
 
         #[cfg(target_os = "macos")]
         let kqueue_fd = Self::init_kqueue(&socket)?;
@@ -282,14 +268,14 @@ impl UdpTransport {
         config: &TransportConfig,
     ) -> Result<(), TransportError> {
         let fd = socket.as_raw_fd();
-        let recv_size =
-            config.recv_buffer_size_bytes as libc::c_int;
+        let recv_size = config.recv_buffer_size_bytes as libc::c_int;
         let result = unsafe {
             libc::setsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
                 &recv_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>()
-                    as libc::socklen_t,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
         if result < 0 {
@@ -297,14 +283,14 @@ impl UdpTransport {
                 source: io::Error::last_os_error(),
             });
         }
-        let send_size =
-            config.send_buffer_size_bytes as libc::c_int;
+        let send_size = config.send_buffer_size_bytes as libc::c_int;
         let result = unsafe {
             libc::setsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
                 &send_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>()
-                    as libc::socklen_t,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
         if result < 0 {
@@ -316,9 +302,7 @@ impl UdpTransport {
     }
 
     #[cfg(target_os = "macos")]
-    fn init_kqueue(
-        socket: &std::net::UdpSocket,
-    ) -> Result<RawFd, TransportError> {
+    fn init_kqueue(socket: &std::net::UdpSocket) -> Result<RawFd, TransportError> {
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
             return Err(TransportError::SetSockOptFailed {
@@ -336,8 +320,12 @@ impl UdpTransport {
         }];
         let result = unsafe {
             libc::kevent(
-                kq, changelist.as_ptr(), 1,
-                std::ptr::null_mut(), 0, std::ptr::null(),
+                kq,
+                changelist.as_ptr(),
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
             )
         };
         if result < 0 {
@@ -350,9 +338,7 @@ impl UdpTransport {
     }
 
     /// Receive packets in batch.
-    pub fn recv_batch(
-        &mut self, max_packets: usize,
-    ) -> Result<Vec<RecvPacket>, TransportError> {
+    pub fn recv_batch(&mut self, max_packets: usize) -> Result<Vec<RecvPacket>, TransportError> {
         assert!(max_packets > 0, "max_packets must be > 0");
         let max_packets = max_packets.min(MAX_BATCH_SIZE);
 
@@ -369,35 +355,25 @@ impl UdpTransport {
 
     #[cfg(not(target_os = "macos"))]
     fn recv_batch_standard(
-        &mut self, max_packets: usize,
+        &mut self,
+        max_packets: usize,
     ) -> Result<Vec<RecvPacket>, TransportError> {
         let mut packets = Vec::with_capacity(max_packets);
         let recv_time_ns = Self::current_time_ns();
         for i in 0..max_packets {
-            match self.socket.recv_from(
-                &mut self.recv_buffers[i],
-            ) {
+            match self.socket.recv_from(&mut self.recv_buffers[i]) {
                 Ok((len, addr)) => {
-                    let data =
-                        self.recv_buffers[i][..len].to_vec();
+                    let data = self.recv_buffers[i][..len].to_vec();
                     self.stats.record_recv(len as u64);
-                    packets.push(RecvPacket::new(
-                        data, addr, recv_time_ns,
-                    ));
+                    packets.push(RecvPacket::new(data, addr, recv_time_ns));
                 }
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock =>
-                {
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
                 Err(e) => {
                     self.stats.record_recv_error();
                     if packets.is_empty() {
-                        return Err(
-                            TransportError::RecvFailed {
-                                source: e,
-                            },
-                        );
+                        return Err(TransportError::RecvFailed { source: e });
                     }
                     break;
                 }
@@ -407,23 +383,29 @@ impl UdpTransport {
     }
 
     #[cfg(target_os = "macos")]
-    fn recv_batch_kqueue(
-        &mut self, max_packets: usize,
-    ) -> Result<Vec<RecvPacket>, TransportError> {
+    fn recv_batch_kqueue(&mut self, max_packets: usize) -> Result<Vec<RecvPacket>, TransportError> {
         let mut packets = Vec::with_capacity(max_packets);
         let recv_time_ns = Self::current_time_ns();
         let mut eventlist = [libc::kevent {
-            ident: 0, filter: 0, flags: 0,
-            fflags: 0, data: 0,
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
             udata: std::ptr::null_mut(),
         }];
         let timeout = libc::timespec {
-            tv_sec: 0, tv_nsec: 0,
+            tv_sec: 0,
+            tv_nsec: 0,
         };
         let nevents = unsafe {
             libc::kevent(
-                self.kqueue_fd, std::ptr::null(), 0,
-                eventlist.as_mut_ptr(), 1, &timeout,
+                self.kqueue_fd,
+                std::ptr::null(),
+                0,
+                eventlist.as_mut_ptr(),
+                1,
+                &timeout,
             )
         };
         if nevents < 0 {
@@ -434,31 +416,19 @@ impl UdpTransport {
         }
         if nevents > 0 {
             for i in 0..max_packets {
-                match self.socket.recv_from(
-                    &mut self.recv_buffers[i],
-                ) {
+                match self.socket.recv_from(&mut self.recv_buffers[i]) {
                     Ok((len, addr)) => {
-                        let data =
-                            self.recv_buffers[i][..len].to_vec();
+                        let data = self.recv_buffers[i][..len].to_vec();
                         self.stats.record_recv(len as u64);
-                        packets.push(RecvPacket::new(
-                            data, addr, recv_time_ns,
-                        ));
+                        packets.push(RecvPacket::new(data, addr, recv_time_ns));
                     }
-                    Err(ref e)
-                        if e.kind()
-                            == io::ErrorKind::WouldBlock =>
-                    {
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         break;
                     }
                     Err(e) => {
                         self.stats.record_recv_error();
                         if packets.is_empty() {
-                            return Err(
-                                TransportError::RecvFailed {
-                                    source: e,
-                                },
-                            );
+                            return Err(TransportError::RecvFailed { source: e });
                         }
                         break;
                     }
@@ -469,9 +439,7 @@ impl UdpTransport {
     }
 
     /// Send a packet to the specified destination.
-    pub fn send(
-        &self, data: &[u8], dest: SocketAddr,
-    ) -> Result<usize, TransportError> {
+    pub fn send(&self, data: &[u8], dest: SocketAddr) -> Result<usize, TransportError> {
         assert!(!data.is_empty(), "data must not be empty");
         assert!(
             data.len() <= MAX_PACKET_SIZE_BYTES,
@@ -484,9 +452,7 @@ impl UdpTransport {
             }
             Err(e) => {
                 self.stats.record_send_error();
-                Err(TransportError::SendFailed {
-                    dest, source: e,
-                })
+                Err(TransportError::SendFailed { dest, source: e })
             }
         }
     }
@@ -568,10 +534,7 @@ impl UdpTransport {
     #[cfg(not(target_os = "linux"))]
     pub fn enable_gso(&mut self) -> Result<(), TransportError> {
         Err(TransportError::SetSockOptFailed {
-            source: io::Error::new(
-                io::ErrorKind::Unsupported,
-                "GSO is only supported on Linux",
-            ),
+            source: io::Error::new(io::ErrorKind::Unsupported, "GSO is only supported on Linux"),
         })
     }
 
@@ -623,10 +586,7 @@ impl UdpTransport {
     #[cfg(not(target_os = "linux"))]
     pub fn enable_gro(&mut self) -> Result<(), TransportError> {
         Err(TransportError::SetSockOptFailed {
-            source: io::Error::new(
-                io::ErrorKind::Unsupported,
-                "GRO is only supported on Linux",
-            ),
+            source: io::Error::new(io::ErrorKind::Unsupported, "GRO is only supported on Linux"),
         })
     }
 
@@ -779,11 +739,8 @@ impl UdpTransport {
             }
 
             let data = self.recv_buffers[i][..len].to_vec();
-            let addr = Self::sockaddr_to_socket_addr(
-                &sockaddrs[i],
-                msghdrs[i].msg_hdr.msg_namelen,
-            )
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+            let addr = Self::sockaddr_to_socket_addr(&sockaddrs[i], msghdrs[i].msg_hdr.msg_namelen)
+                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
 
             self.stats.record_recv(len as u64);
             packets.push(RecvPacket::new(data, addr, recv_time_ns));
@@ -898,7 +855,8 @@ impl UdpTransport {
                 (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
                 let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
                 *data_ptr = segment_size;
-                msghdr.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize;
+                msghdr.msg_controllen =
+                    libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize;
             }
         }
 
@@ -931,7 +889,10 @@ impl UdpTransport {
                     (*sa).sin_port = addr_v4.port().to_be();
                     (*sa).sin_addr.s_addr = u32::from_ne_bytes(addr_v4.ip().octets());
                 }
-                (storage, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
             }
             SocketAddr::V6(addr_v6) => {
                 let sa = &mut storage as *mut _ as *mut libc::sockaddr_in6;
@@ -942,7 +903,10 @@ impl UdpTransport {
                     (*sa).sin6_addr.s6_addr = addr_v6.ip().octets();
                     (*sa).sin6_scope_id = addr_v6.scope_id();
                 }
-                (storage, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
             }
         }
     }
@@ -980,9 +944,7 @@ mod tests {
     #[test]
     fn test_transport_config_default() {
         let config = TransportConfig::default();
-        assert_eq!(
-            config.recv_buffer_size_bytes, 16 * 1024 * 1024
-        );
+        assert_eq!(config.recv_buffer_size_bytes, 16 * 1024 * 1024);
         assert!(config.validate().is_ok());
     }
 
@@ -1001,8 +963,7 @@ mod tests {
     #[test]
     fn test_udp_transport_bind() {
         let config = TransportConfig::default();
-        let addr: SocketAddr =
-            "127.0.0.1:0".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let transport = UdpTransport::bind(addr, config);
         assert!(transport.is_ok());
     }

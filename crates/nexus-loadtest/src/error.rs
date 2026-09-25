@@ -85,6 +85,10 @@ pub enum SignalingError {
     /// Connection attempt timed out
     #[error("Connection timeout after {0:?}")]
     Timeout(std::time::Duration),
+
+    /// Auth handshake rejected, or no credentials to send
+    #[error("Authentication failed: {0}")]
+    AuthFailed(String),
 }
 
 /// Client-specific errors

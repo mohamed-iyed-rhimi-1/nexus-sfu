@@ -66,10 +66,7 @@ impl<const N: usize> RingBuffer<N> {
     /// (SPSC invariant).
     #[inline(always)]
     pub fn push(&self, packet: PacketSlot) -> u32 {
-        assert!(
-            packet.len() > 0,
-            "packet.data_len_bytes must be > 0"
-        );
+        assert!(packet.len() > 0, "packet.data_len_bytes must be > 0");
         let head = self.head.load(Ordering::Acquire);
         let seq = self.head_seq.load(Ordering::Acquire);
         let index = (head & Self::mask()) as usize;
@@ -77,16 +74,34 @@ impl<const N: usize> RingBuffer<N> {
             let slots = &mut *self.slots.get();
             slots[index] = Some(packet);
         }
-        self.head.store(
-            head.wrapping_add(1), Ordering::Release,
-        );
-        self.head_seq.store(
-            seq.wrapping_add(1), Ordering::Release,
-        );
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        self.head_seq.store(seq.wrapping_add(1), Ordering::Release);
         seq
     }
 
-    /// Pop the oldest packet from the buffer.
+    /// Push a packet, retaining at most `limit` packets (`1..=N`).
+    ///
+    /// The packet that falls out of the window is released now, returning its
+    /// arena slot, instead of lingering until the ring wraps. Use this when
+    /// the ring is sized for the largest window but the configured one is
+    /// smaller: retention then costs `limit` arena slots, not `N`.
+    #[inline(always)]
+    pub fn push_bounded(&self, packet: PacketSlot, limit: u32) -> u32 {
+        assert!(limit > 0 && limit as usize <= N, "limit must be in 1..=N");
+        let seq = self.push(packet);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) > limit {
+            let evict = (head.wrapping_sub(limit + 1) & Self::mask()) as usize;
+            // Same single-owner access as push(); drops the slot's arena reference
+            unsafe {
+                let slots = &mut *self.slots.get();
+                slots[evict] = None;
+            }
+        }
+        seq
+    }
+
     /// Pop the oldest packet from the buffer.
     ///
     /// If the producer has overwritten the slot (head advanced past
@@ -110,9 +125,8 @@ impl<const N: usize> RingBuffer<N> {
             let slots = &mut *self.slots.get();
             slots[index].take()
         };
-        self.tail.store(
-            actual_tail.wrapping_add(1), Ordering::Release,
-        );
+        self.tail
+            .store(actual_tail.wrapping_add(1), Ordering::Release);
         packet
     }
 
@@ -129,8 +143,7 @@ impl<const N: usize> RingBuffer<N> {
             return None;
         }
         let slot_offset = seq.wrapping_sub(tail_seq);
-        let index = (tail.wrapping_add(slot_offset)
-            & Self::mask()) as usize;
+        let index = (tail.wrapping_add(slot_offset) & Self::mask()) as usize;
         unsafe {
             let slots = &*self.slots.get();
             slots[index].as_ref()
@@ -176,8 +189,7 @@ impl<const N: usize> RingBuffer<N> {
             let mut current = tail;
             let max_iterations = skipped.min(N as u32);
             for _ in 0..max_iterations {
-                let index =
-                    (current & Self::mask()) as usize;
+                let index = (current & Self::mask()) as usize;
                 slots[index] = None;
                 current = current.wrapping_add(1);
             }
@@ -209,9 +221,7 @@ mod tests {
     use super::*;
     use crate::arena::PacketArena;
 
-    fn create_test_packet(
-        arena: &PacketArena, value: u8,
-    ) -> PacketSlot {
+    fn create_test_packet(arena: &PacketArena, value: u8) -> PacketSlot {
         let mut slot = arena.alloc().unwrap();
         slot.data_mut()[0] = value;
         slot.set_len(1);
@@ -237,6 +247,24 @@ mod tests {
             assert_eq!(popped.data()[0], i);
         }
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_push_bounded_releases_slots_outside_window() {
+        let arena = PacketArena::new(1).unwrap();
+        let free_before = arena.free_count();
+        let buffer: RingBuffer<8> = RingBuffer::new();
+
+        let mut last_seq = 0;
+        for i in 0..6 {
+            last_seq = buffer.push_bounded(create_test_packet(&arena, i), 2);
+        }
+
+        // Only the 2 newest packets hold arena slots; older ones were released
+        assert_eq!(free_before - arena.free_count(), 2);
+        assert!(buffer.peek(last_seq).is_some());
+        assert!(buffer.peek(last_seq - 1).is_some());
+        assert!(buffer.peek(last_seq - 2).is_none());
     }
 
     #[test]

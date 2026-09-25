@@ -68,13 +68,26 @@ impl RelayLink {
     /// # TigerStyle: ≥2 assertions
     #[inline]
     pub fn send_packet(&self, track_id: TrackId, rtp_data: &[u8]) -> io::Result<usize> {
-        assert!(track_id > 0, "track_id must be non-zero");
-        assert!(!rtp_data.is_empty(), "rtp_data must be non-empty");
+        if track_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "track_id must be non-zero",
+            ));
+        }
+        if rtp_data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rtp_data must be non-empty",
+            ));
+        }
 
         let mut buf = [0u8; MAX_RELAY_PACKET];
         let total_len = RELAY_HEADER_SIZE + rtp_data.len();
         if total_len > MAX_RELAY_PACKET {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "packet too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet too large",
+            ));
         }
 
         buf[..RELAY_HEADER_SIZE].copy_from_slice(&track_id.to_be_bytes());
@@ -88,20 +101,28 @@ impl RelayLink {
     /// `buf` must be at least `MAX_RELAY_PACKET` bytes.
     ///
     /// # TigerStyle: ≥2 assertions
-    pub fn recv_packet<'a>(&self, buf: &'a mut [u8; MAX_RELAY_PACKET]) -> io::Result<(TrackId, &'a [u8])> {
-        assert!(buf.len() >= MAX_RELAY_PACKET, "buffer too small");
-
+    pub fn recv_packet<'a>(
+        &self,
+        buf: &'a mut [u8; MAX_RELAY_PACKET],
+    ) -> io::Result<(TrackId, &'a [u8])> {
         let n = self.socket.recv(buf)?;
         if n < RELAY_HEADER_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "relay packet too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "relay packet too short",
+            ));
         }
 
         let track_id = u64::from_be_bytes([
-            buf[0], buf[1], buf[2], buf[3],
-            buf[4], buf[5], buf[6], buf[7],
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ]);
 
-        assert!(track_id > 0, "received relay packet with zero track_id");
+        if track_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "received relay packet with zero track_id",
+            ));
+        }
 
         Ok((track_id, &buf[RELAY_HEADER_SIZE..n]))
     }

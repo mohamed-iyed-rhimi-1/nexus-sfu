@@ -216,7 +216,9 @@ fn test_track_actor_migration_messages() {
 
     // Begin migration
     sender
-        .send(TrackActorMessage::BeginMigration { target_worker_id: 5 })
+        .send(TrackActorMessage::BeginMigration {
+            target_worker_id: 5,
+        })
         .unwrap();
     actor.process_messages();
     assert_eq!(actor.state(), ActorState::Migrating);

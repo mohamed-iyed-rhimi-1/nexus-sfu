@@ -42,7 +42,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # WebSocket signaling
-tokio-tungstenite = "0.21"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+# TLS config for wss:// (matches tokio-tungstenite 0.21) and JWT minting for the auth handshake
+rustls = { version = "0.22", features = ["ring"] }
+jsonwebtoken = "9.2"
 futures-util = "0.3"
 
 # HTTP server for Prometheus metrics endpoint

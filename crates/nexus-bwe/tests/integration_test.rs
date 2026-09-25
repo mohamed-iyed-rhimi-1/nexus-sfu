@@ -3,8 +3,7 @@
 //! Verifies end-to-end bandwidth allocation from GCC to TrackActor system.
 
 use nexus_bwe::{
-    BandwidthCoordinator, MediaKind, RembGenerator, SpeakerDetector, TrackAllocation,
-    TrackPriority,
+    BandwidthCoordinator, MediaKind, RembGenerator, SpeakerDetector, TrackAllocation, TrackPriority,
 };
 
 #[test]
@@ -178,9 +177,8 @@ fn test_remb_bitrate_encoding() {
 
         // Extract encoded bitrate
         let exp = (packet[17] >> 2) & 0x3F;
-        let mantissa = (((packet[17] & 0x03) as u32) << 16)
-            | ((packet[18] as u32) << 8)
-            | (packet[19] as u32);
+        let mantissa =
+            (((packet[17] & 0x03) as u32) << 16) | ((packet[18] as u32) << 8) | (packet[19] as u32);
 
         // Decode and verify within 5% error
         let decoded = (mantissa as u64) << exp;

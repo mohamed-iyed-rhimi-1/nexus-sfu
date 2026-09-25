@@ -332,7 +332,7 @@ fn test_message_processing_bounded() {
 
     // Second call processes remaining messages
     room.process_messages();
-    
+
     // Verify room is still active
     assert_eq!(room.state(), ActorState::Active);
 }

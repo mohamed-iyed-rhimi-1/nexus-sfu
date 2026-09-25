@@ -8,8 +8,8 @@
 //! Property 6: PacketArena Alloc/Dealloc and Refcount Invariant
 //! Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6
 
-use proptest::prelude::*;
 use proptest::collection::vec;
+use proptest::prelude::*;
 
 use crate::arena::{PacketArena, PacketSlot};
 

@@ -9,7 +9,10 @@ use nexus_dst::scenario::Scenario;
 use nexus_dst::scenarios;
 
 #[derive(Parser)]
-#[command(name = "nexus-dst", about = "Deterministic Simulation Testing for Nexus SFU")]
+#[command(
+    name = "nexus-dst",
+    about = "Deterministic Simulation Testing for Nexus SFU"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -154,7 +157,11 @@ fn cmd_run(
     }
 
     // 7. Exit code based on pass/fail
-    if report.passed { 0 } else { 1 }
+    if report.passed {
+        0
+    } else {
+        1
+    }
 }
 
 fn cmd_check(path: PathBuf) -> i32 {
@@ -228,5 +235,9 @@ fn cmd_report(path: PathBuf) -> i32 {
     // Output human-readable format
     print!("{}", report.to_human_readable());
 
-    if report.passed { 0 } else { 1 }
+    if report.passed {
+        0
+    } else {
+        1
+    }
 }

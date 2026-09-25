@@ -25,7 +25,7 @@ fn bench_gcounter_increment(c: &mut Criterion) {
     group.bench_function("increment", |b| {
         let counter = GCounter::new();
         let mut actor = 0u64;
-        
+
         b.iter(|| {
             counter.increment(actor, 1);
             actor = (actor + 1) % (MAX_ACTORS as u64);
@@ -46,9 +46,7 @@ fn bench_gcounter_value(c: &mut Criterion) {
     }
 
     group.bench_function("value", |b| {
-        b.iter(|| {
-            black_box(counter.value())
-        });
+        b.iter(|| black_box(counter.value()));
     });
 
     group.finish();
@@ -104,9 +102,7 @@ fn bench_lwwreg_get(c: &mut Criterion) {
     let reg = LWWReg::with_timestamp(42u32, 100, 0);
 
     group.bench_function("get", |b| {
-        b.iter(|| {
-            black_box(reg.get())
-        });
+        b.iter(|| black_box(reg.get()));
     });
 
     group.finish();
@@ -163,7 +159,8 @@ fn bench_orswot_add_to_populated(c: &mut Criterion) {
             || {
                 let mut set = Orswot::<u32>::new();
                 for i in 0..100 {
-                    set.add(i, Dot::new((i % MAX_ACTORS as u32) as u64, 1)).unwrap();
+                    set.add(i, Dot::new((i % MAX_ACTORS as u32) as u64, 1))
+                        .unwrap();
                 }
                 set
             },
@@ -206,13 +203,12 @@ fn bench_orswot_contains(c: &mut Criterion) {
 
     let mut set = Orswot::<u32>::new();
     for i in 0..100 {
-        set.add(i, Dot::new((i % MAX_ACTORS as u32) as u64, 1)).unwrap();
+        set.add(i, Dot::new((i % MAX_ACTORS as u32) as u64, 1))
+            .unwrap();
     }
 
     group.bench_function("contains_100", |b| {
-        b.iter(|| {
-            black_box(set.contains(&50))
-        });
+        b.iter(|| black_box(set.contains(&50)));
     });
 
     group.finish();
@@ -253,7 +249,8 @@ fn bench_orswot_iter(c: &mut Criterion) {
 
     let mut set = Orswot::<u32>::new();
     for i in 0..100 {
-        set.add(i, Dot::new((i % MAX_ACTORS as u32) as u64, 1)).unwrap();
+        set.add(i, Dot::new((i % MAX_ACTORS as u32) as u64, 1))
+            .unwrap();
     }
 
     group.bench_function("iter_100", |b| {

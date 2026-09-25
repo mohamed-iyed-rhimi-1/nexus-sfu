@@ -144,9 +144,7 @@ impl Vp8PayloadHeader {
         // The first byte of the VP8 payload (after descriptor)
         // has bit 0 = 0 for keyframes, 1 for interframes.
         // Only valid when start_of_partition is true.
-        let is_keyframe = if start_of_partition
-            && offset < data.len()
-        {
+        let is_keyframe = if start_of_partition && offset < data.len() {
             (data[offset] & 0x01) == 0
         } else {
             false
@@ -224,8 +222,7 @@ mod tests {
     #[test]
     fn test_extended_with_picture_id_15bit() {
         // X=1, S=1 | I=1 | PictureID M=1, 0x1234 | kf byte
-        let data: &[u8] =
-            &[0x90, 0x80, 0x92, 0x34, 0x00];
+        let data: &[u8] = &[0x90, 0x80, 0x92, 0x34, 0x00];
         let hdr = Vp8PayloadHeader::parse(data).unwrap();
         assert_eq!(hdr.picture_id, Some(0x1234));
         assert_eq!(hdr.header_len_bytes, 4);

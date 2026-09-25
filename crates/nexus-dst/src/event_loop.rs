@@ -26,9 +26,7 @@ pub enum SimEventKind {
         room_name: String,
     },
     /// A participant leaves a room.
-    ParticipantLeave {
-        participant_name: String,
-    },
+    ParticipantLeave { participant_name: String },
     /// A track is published.
     TrackPublish {
         participant_name: String,
@@ -36,9 +34,7 @@ pub enum SimEventKind {
         track_label: String,
     },
     /// A track is unpublished.
-    TrackUnpublish {
-        track_label: String,
-    },
+    TrackUnpublish { track_label: String },
     /// A subscription is created.
     Subscribe {
         subscriber_name: String,
@@ -62,24 +58,13 @@ pub enum SimEventKind {
         packet_data: Vec<u8>,
     },
     /// Fault injection: network partition.
-    NetworkPartition {
-        node_a: String,
-        node_b: String,
-    },
+    NetworkPartition { node_a: String, node_b: String },
     /// Fault injection: heal partition.
-    NetworkHeal {
-        node_a: String,
-        node_b: String,
-    },
+    NetworkHeal { node_a: String, node_b: String },
     /// Fault injection: actor crash.
-    ActorCrash {
-        actor_label: String,
-    },
+    ActorCrash { actor_label: String },
     /// Fault injection: packet loss burst.
-    PacketLossBurst {
-        duration_ms: u64,
-        loss_rate: f64,
-    },
+    PacketLossBurst { duration_ms: u64, loss_rate: f64 },
     /// CRDT gossip round.
     GossipRound,
     /// BWE feedback event.
@@ -268,18 +253,9 @@ mod tests {
         assert_eq!(e3.insertion_order, 2);
 
         // Verify the kinds match insertion order
-        assert_eq!(
-            e1.kind,
-            make_join("first", "room")
-        );
-        assert_eq!(
-            e2.kind,
-            make_join("second", "room")
-        );
-        assert_eq!(
-            e3.kind,
-            make_join("third", "room")
-        );
+        assert_eq!(e1.kind, make_join("first", "room"));
+        assert_eq!(e2.kind, make_join("second", "room"));
+        assert_eq!(e3.kind, make_join("third", "room"));
     }
 
     #[test]
@@ -381,64 +357,103 @@ mod tests {
     fn all_event_kinds_can_be_scheduled() {
         let mut el = EventLoop::new();
 
-        el.schedule(1, SimEventKind::ParticipantJoin {
-            participant_name: "alice".into(),
-            room_name: "room1".into(),
-        });
-        el.schedule(2, SimEventKind::ParticipantLeave {
-            participant_name: "alice".into(),
-        });
-        el.schedule(3, SimEventKind::TrackPublish {
-            participant_name: "alice".into(),
-            media_kind: MediaKind::Audio,
-            track_label: "audio1".into(),
-        });
-        el.schedule(4, SimEventKind::TrackUnpublish {
-            track_label: "audio1".into(),
-        });
-        el.schedule(5, SimEventKind::Subscribe {
-            subscriber_name: "bob".into(),
-            track_label: "audio1".into(),
-        });
-        el.schedule(6, SimEventKind::Unsubscribe {
-            subscriber_name: "bob".into(),
-            track_label: "audio1".into(),
-        });
-        el.schedule(7, SimEventKind::PacketSend {
-            track_label: "audio1".into(),
-            payload_size: 160,
-            seq_num: 1,
-        });
-        el.schedule(8, SimEventKind::PacketDeliver {
-            track_label: "audio1".into(),
-            subscriber_name: "bob".into(),
-            packet_data: vec![1, 2, 3],
-        });
-        el.schedule(9, SimEventKind::NetworkPartition {
-            node_a: "a".into(),
-            node_b: "b".into(),
-        });
-        el.schedule(10, SimEventKind::NetworkHeal {
-            node_a: "a".into(),
-            node_b: "b".into(),
-        });
-        el.schedule(11, SimEventKind::ActorCrash {
-            actor_label: "track1".into(),
-        });
-        el.schedule(12, SimEventKind::PacketLossBurst {
-            duration_ms: 500,
-            loss_rate: 0.5,
-        });
+        el.schedule(
+            1,
+            SimEventKind::ParticipantJoin {
+                participant_name: "alice".into(),
+                room_name: "room1".into(),
+            },
+        );
+        el.schedule(
+            2,
+            SimEventKind::ParticipantLeave {
+                participant_name: "alice".into(),
+            },
+        );
+        el.schedule(
+            3,
+            SimEventKind::TrackPublish {
+                participant_name: "alice".into(),
+                media_kind: MediaKind::Audio,
+                track_label: "audio1".into(),
+            },
+        );
+        el.schedule(
+            4,
+            SimEventKind::TrackUnpublish {
+                track_label: "audio1".into(),
+            },
+        );
+        el.schedule(
+            5,
+            SimEventKind::Subscribe {
+                subscriber_name: "bob".into(),
+                track_label: "audio1".into(),
+            },
+        );
+        el.schedule(
+            6,
+            SimEventKind::Unsubscribe {
+                subscriber_name: "bob".into(),
+                track_label: "audio1".into(),
+            },
+        );
+        el.schedule(
+            7,
+            SimEventKind::PacketSend {
+                track_label: "audio1".into(),
+                payload_size: 160,
+                seq_num: 1,
+            },
+        );
+        el.schedule(
+            8,
+            SimEventKind::PacketDeliver {
+                track_label: "audio1".into(),
+                subscriber_name: "bob".into(),
+                packet_data: vec![1, 2, 3],
+            },
+        );
+        el.schedule(
+            9,
+            SimEventKind::NetworkPartition {
+                node_a: "a".into(),
+                node_b: "b".into(),
+            },
+        );
+        el.schedule(
+            10,
+            SimEventKind::NetworkHeal {
+                node_a: "a".into(),
+                node_b: "b".into(),
+            },
+        );
+        el.schedule(
+            11,
+            SimEventKind::ActorCrash {
+                actor_label: "track1".into(),
+            },
+        );
+        el.schedule(
+            12,
+            SimEventKind::PacketLossBurst {
+                duration_ms: 500,
+                loss_rate: 0.5,
+            },
+        );
         el.schedule(13, SimEventKind::GossipRound);
-        el.schedule(14, SimEventKind::BweFeedback {
-            participant_name: "alice".into(),
-            packets: vec![PacketArrivalInfo {
-                sequence: 0,
-                send_time_ns: 500,
-                arrival_time_ns: 1000,
-                packet_size: 100,
-            }],
-        });
+        el.schedule(
+            14,
+            SimEventKind::BweFeedback {
+                participant_name: "alice".into(),
+                packets: vec![PacketArrivalInfo {
+                    sequence: 0,
+                    send_time_ns: 500,
+                    arrival_time_ns: 1000,
+                    packet_size: 100,
+                }],
+            },
+        );
         el.schedule(15, SimEventKind::InvariantCheck);
         el.schedule(16, SimEventKind::SimulationEnd);
 

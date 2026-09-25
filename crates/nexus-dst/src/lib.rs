@@ -2,12 +2,12 @@
 //
 // Modules will be enabled as they are implemented:
 pub mod clock;
-pub mod rng;
+pub mod engine;
 pub mod event_loop;
-pub mod network;
-pub mod scenario;
-pub mod report;
 pub mod fault;
 pub mod invariant;
-pub mod engine;
+pub mod network;
+pub mod report;
+pub mod rng;
+pub mod scenario;
 pub mod scenarios;

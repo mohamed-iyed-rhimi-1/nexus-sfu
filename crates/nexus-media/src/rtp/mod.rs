@@ -32,7 +32,4 @@ pub mod header;
 pub mod packet;
 
 pub use header::RtpHeader;
-pub use header::{
-    RTP_CSRC_SIZE_BYTES, RTP_HEADER_MIN_SIZE_BYTES,
-    RTP_MAX_CSRC_COUNT, RTP_VERSION,
-};
+pub use header::{RTP_CSRC_SIZE_BYTES, RTP_HEADER_MIN_SIZE_BYTES, RTP_MAX_CSRC_COUNT, RTP_VERSION};

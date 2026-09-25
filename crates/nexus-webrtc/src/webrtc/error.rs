@@ -7,88 +7,88 @@ use core::fmt;
 pub enum WebRtcError {
     /// Transport not initialized.
     NotInitialized,
-    
+
     /// Transport already started.
     AlreadyStarted,
-    
+
     /// Invalid transport state for operation.
     InvalidState,
-    
+
     /// ICE gathering failed.
     IceGatheringFailed,
-    
+
     /// ICE connection failed.
     IceConnectionFailed,
-    
+
     /// ICE connection timed out.
     IceTimeout,
-    
+
     /// No valid ICE candidate pair.
     NoValidCandidatePair,
-    
+
     /// DTLS handshake failed.
     DtlsHandshakeFailed,
-    
+
     /// DTLS handshake timed out.
     DtlsTimeout,
-    
+
     /// DTLS certificate verification failed.
     DtlsCertificateInvalid,
-    
+
     /// DTLS fingerprint mismatch.
     DtlsFingerprintMismatch,
-    
+
     /// SRTP initialization failed.
     SrtpInitFailed,
-    
+
     /// SRTP protection failed.
     SrtpProtectFailed,
-    
+
     /// SRTP unprotection failed (auth/decrypt).
     SrtpUnprotectFailed,
-    
+
     /// Replay attack detected.
     ReplayDetected,
-    
+
     /// Packet too short.
     PacketTooShort,
-    
+
     /// Packet too large.
     PacketTooLarge,
-    
+
     /// Invalid packet format.
     InvalidPacket,
-    
+
     /// Unknown packet type.
     UnknownPacketType,
-    
+
     /// Buffer too small.
     BufferTooSmall,
-    
+
     /// Send failed.
     SendFailed,
-    
+
     /// Receive failed.
     ReceiveFailed,
-    
+
     /// Transport closed.
     Closed,
-    
+
     /// Maximum candidates exceeded.
     TooManyCandidates,
-    
+
     /// Maximum sessions exceeded.
     TooManySessions,
-    
+
     /// Address mismatch (source address doesn't match expected remote).
     AddressMismatch,
-    
+
     /// Malformed packet (failed validation).
     MalformedPacket,
-    
+
     /// Invalid configuration.
     InvalidConfig,
-    
+
     /// Internal error.
     Internal,
 }
@@ -179,9 +179,18 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        assert_eq!(WebRtcError::IceTimeout.to_string(), "ICE connection timeout");
-        assert_eq!(WebRtcError::DtlsHandshakeFailed.to_string(), "DTLS handshake failed");
-        assert_eq!(WebRtcError::ReplayDetected.to_string(), "replay attack detected");
+        assert_eq!(
+            WebRtcError::IceTimeout.to_string(),
+            "ICE connection timeout"
+        );
+        assert_eq!(
+            WebRtcError::DtlsHandshakeFailed.to_string(),
+            "DTLS handshake failed"
+        );
+        assert_eq!(
+            WebRtcError::ReplayDetected.to_string(),
+            "replay attack detected"
+        );
     }
 
     #[test]

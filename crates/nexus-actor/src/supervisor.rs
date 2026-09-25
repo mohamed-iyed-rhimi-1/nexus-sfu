@@ -305,7 +305,7 @@ mod tests {
 
         // Set a very short check interval for testing
         supervisor.set_check_interval(Duration::from_millis(1));
-        
+
         // Wait a bit longer than the interval
         std::thread::sleep(Duration::from_millis(5));
 

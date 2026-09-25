@@ -110,6 +110,29 @@ impl VideoGenerator {
         }
     }
 
+    /// Next frame sized like encoded video at `bitrate_bps`, for publishing.
+    ///
+    /// Raw I420 frames are ~50× larger than a real encoder's output at this
+    /// resolution, so sending them as VP8 overdrives the SFU with packets. The
+    /// payload is a prefix of the pattern frame; every `KEYFRAME_INTERVAL_SECS`
+    /// a keyframe is `KEYFRAME_SIZE_FACTOR`× larger, like a real stream.
+    pub fn next_encoded_frame(&mut self, bitrate_bps: u32) -> VideoFrame {
+        const KEYFRAME_INTERVAL_SECS: u64 = 2;
+        const KEYFRAME_SIZE_FACTOR: usize = 4;
+        assert!(bitrate_bps > 0, "bitrate must be positive");
+
+        let is_keyframe = self.frame_count % (KEYFRAME_INTERVAL_SECS * self.fps as u64) == 0;
+        let mut frame = self.next_frame();
+        let delta_bytes = (bitrate_bps as usize / 8 / self.fps as usize).max(1);
+        let target = if is_keyframe {
+            delta_bytes * KEYFRAME_SIZE_FACTOR
+        } else {
+            delta_bytes
+        };
+        frame.data.truncate(target.min(frame.data.len()));
+        frame
+    }
+
     fn generate_color_bars(&self, data: &mut [u8]) {
         let y_size = (self.width * self.height) as usize;
         let bar_width = self.width / 8;
@@ -184,12 +207,13 @@ impl AudioGenerator {
 
         match self.pattern {
             AudioPattern::Tone(freq) => {
-                let phase_increment = 2.0 * std::f64::consts::PI * freq as f64 / self.sample_rate as f64;
-                
+                let phase_increment =
+                    2.0 * std::f64::consts::PI * freq as f64 / self.sample_rate as f64;
+
                 for i in 0..count {
                     let phase = (self.sample_count + i as u64) as f64 * phase_increment;
                     let sample = (phase.sin() * 16384.0) as i16; // -16384 to 16384 range
-                    
+
                     // Fill all channels with the same sample
                     for ch in 0..self.channels as usize {
                         samples[i * self.channels as usize + ch] = sample;
@@ -221,5 +245,26 @@ impl AudioGenerator {
     /// Get the number of channels
     pub fn channels(&self) -> u8 {
         self.channels
+    }
+}
+
+#[cfg(test)]
+mod encoded_frame_tests {
+    use super::*;
+
+    #[test]
+    fn test_encoded_frames_follow_bitrate() {
+        let mut gen = VideoGenerator::new(320, 240, 15, VideoPattern::ColorBars);
+        let bitrate = 500_000;
+        // 2 seconds at 15 fps: one keyframe, then delta frames
+        let sizes: Vec<usize> = (0..30)
+            .map(|_| gen.next_encoded_frame(bitrate).data.len())
+            .collect();
+        let delta = bitrate as usize / 8 / 15;
+        assert_eq!(sizes[0], delta * 4, "first frame is a keyframe");
+        assert!(sizes[1..].iter().all(|&s| s == delta));
+        // ~2 seconds of frames carry roughly 2 seconds of bitrate
+        let total_bits = sizes.iter().sum::<usize>() * 8;
+        assert!(total_bits < 2 * bitrate as usize * 13 / 10);
     }
 }

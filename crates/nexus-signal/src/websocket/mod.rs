@@ -1,22 +1,19 @@
-pub mod server;
 pub mod handler;
+pub mod server;
 
-pub use server::{WebSocketServer, OrchestratorEvent};
 pub use handler::{
-    SignalingHandler, SignalingHandlerError, SessionTicket,
-    ClientStats, JoinResponse, MessageType, TrackEntry,
-    MessageHandler, MessageHandlerTable,
-    MAX_SESSION_TICKETS, TICKET_LIFETIME_SECS,
-    MAX_PARTICIPANT_NAME_LEN, MAX_STATS_PAYLOAD_SIZE, MAX_TRACKS_IN_RESPONSE,
-    error_codes as handler_error_codes,
+    error_codes as handler_error_codes, ClientStats, JoinResponse, MessageType, SessionTicket,
+    SignalingHandler, SignalingHandlerError, TrackEntry, MAX_PARTICIPANT_NAME_LEN,
+    MAX_SESSION_TICKETS, MAX_STATS_PAYLOAD_SIZE, MAX_TRACKS_IN_RESPONSE, TICKET_LIFETIME_SECS,
 };
+pub use server::{OrchestratorEvent, WebSocketServer};
 
 // ============================================================================
 // Shared Signaling Connections Registry
 // ============================================================================
 
-use std::sync::Arc;
 use dashmap::DashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::protocol::SignalMessage;
@@ -27,7 +24,7 @@ pub const MAX_CONNECTIONS: u32 = 10_000;
 /// Sender handle for a signaling connection.
 pub struct SignalingConnectionHandle {
     /// Channel sender for outbound messages to this participant.
-    pub sender: mpsc::UnboundedSender<SignalMessage>,
+    pub sender: mpsc::Sender<SignalMessage>,
 }
 
 /// Get the global signaling connections registry.
@@ -38,7 +35,7 @@ pub fn signaling_connections() -> &'static Arc<DashMap<u64, SignalingConnectionH
 }
 
 /// Register a signaling connection for a participant.
-pub fn register_signaling_connection(participant_id: u64, sender: mpsc::UnboundedSender<SignalMessage>) {
+pub fn register_signaling_connection(participant_id: u64, sender: mpsc::Sender<SignalMessage>) {
     signaling_connections().insert(participant_id, SignalingConnectionHandle { sender });
 }
 

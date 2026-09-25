@@ -6,9 +6,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::{
-    CHANNEL_NUMBER_MIN, CHANNEL_NUMBER_MAX,
-    MAX_PERMISSIONS, MAX_CHANNEL_BINDINGS,
-    PERMISSION_LIFETIME, CHANNEL_BINDING_LIFETIME,
+    CHANNEL_BINDING_LIFETIME, CHANNEL_NUMBER_MAX, CHANNEL_NUMBER_MIN, MAX_CHANNEL_BINDINGS,
+    MAX_PERMISSIONS, PERMISSION_LIFETIME,
 };
 
 // ============================================================================
@@ -31,7 +30,7 @@ impl TransportProtocol {
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
-    
+
     /// Try to create from protocol number.
     #[inline]
     pub const fn from_u8(value: u8) -> Option<Self> {
@@ -83,18 +82,18 @@ impl TurnCredentials {
             realm: [0u8; 128],
             realm_len: 0,
         };
-        
+
         let u_len = username.len().min(128);
         let p_len = password.len().min(128);
-        
+
         creds.username[..u_len].copy_from_slice(username.as_bytes());
         creds.username_len = u_len as u8;
         creds.password[..p_len].copy_from_slice(password.as_bytes());
         creds.password_len = p_len as u8;
-        
+
         creds
     }
-    
+
     /// Set realm for long-term credentials.
     pub fn with_realm(mut self, realm: &str) -> Self {
         let len = realm.len().min(128);
@@ -102,44 +101,44 @@ impl TurnCredentials {
         self.realm_len = len as u8;
         self
     }
-    
+
     /// Get username as slice.
     #[inline]
     pub fn username(&self) -> &[u8] {
         &self.username[..self.username_len as usize]
     }
-    
+
     /// Get password as slice.
     #[inline]
     pub fn password(&self) -> &[u8] {
         &self.password[..self.password_len as usize]
     }
-    
+
     /// Get realm as slice.
     #[inline]
     pub fn realm(&self) -> &[u8] {
         &self.realm[..self.realm_len as usize]
     }
-    
+
     /// Check if this uses long-term credentials (has realm).
     #[inline]
     pub fn is_long_term(&self) -> bool {
         self.realm_len > 0
     }
-    
+
     /// Compute key for long-term credentials.
     ///
     /// key = MD5(username ":" realm ":" password)
     pub fn compute_key(&self) -> [u8; 16] {
-        use md5::{Md5, Digest};
-        
+        use md5::{Digest, Md5};
+
         let mut hasher = Md5::new();
         hasher.update(self.username());
         hasher.update(b":");
         hasher.update(self.realm());
         hasher.update(b":");
         hasher.update(self.password());
-        
+
         let result = hasher.finalize();
         let mut key = [0u8; 16];
         key.copy_from_slice(&result);
@@ -184,7 +183,7 @@ impl TurnServerInfo {
             credentials,
         }
     }
-    
+
     /// Use TCP transport.
     pub fn with_tcp(mut self) -> Self {
         self.transport = TransportProtocol::Tcp;
@@ -219,13 +218,13 @@ impl RelayedAddress {
             obtained_at: Instant::now(),
         }
     }
-    
+
     /// Check if allocation has expired.
     #[inline]
     pub fn is_expired(&self) -> bool {
         self.obtained_at.elapsed() >= Duration::from_secs(self.lifetime as u64)
     }
-    
+
     /// Get remaining lifetime.
     #[inline]
     pub fn remaining_lifetime(&self) -> Duration {
@@ -233,7 +232,7 @@ impl RelayedAddress {
         let total = Duration::from_secs(self.lifetime as u64);
         total.saturating_sub(elapsed)
     }
-    
+
     /// Check if refresh is needed.
     #[inline]
     pub fn needs_refresh(&self, margin_secs: u32) -> bool {
@@ -270,18 +269,26 @@ impl Permission {
             active: true,
         }
     }
-    
+
     /// Check if permission has expired.
     #[inline]
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed() >= Duration::from_secs(self.lifetime as u64)
     }
-    
+
     /// Refresh permission (reset timer).
     pub fn refresh(&mut self) {
         self.created_at = Instant::now();
     }
-    
+
+    /// Check if permission needs proactive refresh (RFC 5766 §9.2).
+    ///
+    /// Returns true when remaining lifetime drops below `margin`.
+    #[inline]
+    pub fn needs_refresh(&self, margin: Duration) -> bool {
+        self.remaining_lifetime() < margin && !self.is_expired()
+    }
+
     /// Get remaining lifetime.
     #[inline]
     pub fn remaining_lifetime(&self) -> Duration {
@@ -319,7 +326,7 @@ impl ChannelBinding {
         if channel < CHANNEL_NUMBER_MIN || channel > CHANNEL_NUMBER_MAX {
             return None;
         }
-        
+
         Some(Self {
             channel,
             peer_addr,
@@ -328,24 +335,32 @@ impl ChannelBinding {
             active: true,
         })
     }
-    
+
     /// Check if channel number is valid.
     #[inline]
     pub const fn is_valid_channel(channel: u16) -> bool {
         channel >= CHANNEL_NUMBER_MIN && channel <= CHANNEL_NUMBER_MAX
     }
-    
+
     /// Check if binding has expired.
     #[inline]
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed() >= Duration::from_secs(self.lifetime as u64)
     }
-    
+
     /// Refresh binding (reset timer).
     pub fn refresh(&mut self) {
         self.created_at = Instant::now();
     }
-    
+
+    /// Check if binding needs proactive refresh (RFC 5766 §11.3).
+    ///
+    /// Returns true when remaining lifetime drops below `margin`.
+    #[inline]
+    pub fn needs_refresh(&self, margin: Duration) -> bool {
+        self.remaining_lifetime() < margin && !self.is_expired()
+    }
+
     /// Get remaining lifetime.
     #[inline]
     pub fn remaining_lifetime(&self) -> Duration {
@@ -376,7 +391,7 @@ impl PermissionTable {
             count: 0,
         }
     }
-    
+
     /// Add or refresh permission.
     pub fn add(&mut self, peer_addr: SocketAddr) -> Result<(), super::TurnError> {
         // Check if already exists
@@ -386,7 +401,7 @@ impl PermissionTable {
                 return Ok(());
             }
         }
-        
+
         // Find empty slot
         for slot in self.permissions.iter_mut() {
             if slot.is_none() {
@@ -395,20 +410,21 @@ impl PermissionTable {
                 return Ok(());
             }
         }
-        
+
         Err(super::TurnError::MaxPermissionsReached {
             count: self.count as u32,
             max: MAX_PERMISSIONS as u32,
         })
     }
-    
+
     /// Check if permission exists for peer.
     pub fn has_permission(&self, peer_addr: &SocketAddr) -> bool {
-        self.permissions.iter().flatten().any(|p| {
-            p.active && !p.is_expired() && p.peer_addr.ip() == peer_addr.ip()
-        })
+        self.permissions
+            .iter()
+            .flatten()
+            .any(|p| p.active && !p.is_expired() && p.peer_addr.ip() == peer_addr.ip())
     }
-    
+
     /// Remove expired permissions.
     pub fn cleanup_expired(&mut self) -> u8 {
         let mut removed = 0u8;
@@ -423,17 +439,27 @@ impl PermissionTable {
         }
         removed
     }
-    
+
     /// Get permission count.
     #[inline]
     pub const fn count(&self) -> u8 {
         self.count
     }
-    
+
     /// Iterator over active permissions.
     #[allow(dead_code)] // Reserved for permission enumeration in TURN relay
     pub fn iter(&self) -> impl Iterator<Item = &Permission> {
         self.permissions.iter().filter_map(|p| p.as_ref())
+    }
+
+    /// Get peer addresses of permissions needing refresh (RFC 5766 §9.2).
+    pub fn needing_refresh(&self, margin: Duration) -> Vec<SocketAddr> {
+        self.permissions
+            .iter()
+            .filter_map(|p| p.as_ref())
+            .filter(|p| p.needs_refresh(margin))
+            .map(|p| p.peer_addr)
+            .collect()
     }
 }
 
@@ -467,43 +493,43 @@ impl ChannelBindingTable {
             next_channel: CHANNEL_NUMBER_MIN,
         }
     }
-    
+
     /// Allocate next available channel number.
     pub fn allocate_channel(&mut self) -> Option<u16> {
         if self.count as usize >= MAX_CHANNEL_BINDINGS {
             return None;
         }
-        
+
         let channel = self.next_channel;
         self.next_channel = if self.next_channel >= CHANNEL_NUMBER_MAX {
             CHANNEL_NUMBER_MIN
         } else {
             self.next_channel + 1
         };
-        
+
         Some(channel)
     }
-    
+
     /// Add channel binding.
     pub fn add(&mut self, channel: u16, peer_addr: SocketAddr) -> Result<(), super::TurnError> {
         // Validate channel number
         if !ChannelBinding::is_valid_channel(channel) {
             return Err(super::TurnError::InvalidChannelNumber { channel });
         }
-        
+
         // Check if channel already bound
         for binding in self.bindings.iter().flatten() {
             if binding.channel == channel && binding.peer_addr != peer_addr {
                 return Err(super::TurnError::ChannelAlreadyBound { channel });
             }
             if binding.peer_addr == peer_addr && binding.channel != channel {
-                return Err(super::TurnError::PeerAlreadyBound { 
-                    peer: peer_addr, 
+                return Err(super::TurnError::PeerAlreadyBound {
+                    peer: peer_addr,
                     channel: binding.channel,
                 });
             }
         }
-        
+
         // Check if already exists (refresh)
         for binding in self.bindings.iter_mut().flatten() {
             if binding.channel == channel && binding.peer_addr == peer_addr {
@@ -511,7 +537,7 @@ impl ChannelBindingTable {
                 return Ok(());
             }
         }
-        
+
         // Find empty slot
         for slot in self.bindings.iter_mut() {
             if slot.is_none() {
@@ -520,27 +546,31 @@ impl ChannelBindingTable {
                 return Ok(());
             }
         }
-        
+
         Err(super::TurnError::MaxChannelBindingsReached {
             count: self.count as u32,
             max: MAX_CHANNEL_BINDINGS as u32,
         })
     }
-    
+
     /// Find channel for peer.
     pub fn find_channel(&self, peer_addr: &SocketAddr) -> Option<u16> {
-        self.bindings.iter().flatten()
+        self.bindings
+            .iter()
+            .flatten()
             .find(|b| b.active && !b.is_expired() && b.peer_addr == *peer_addr)
             .map(|b| b.channel)
     }
-    
+
     /// Find peer for channel.
     pub fn find_peer(&self, channel: u16) -> Option<SocketAddr> {
-        self.bindings.iter().flatten()
+        self.bindings
+            .iter()
+            .flatten()
             .find(|b| b.active && !b.is_expired() && b.channel == channel)
             .map(|b| b.peer_addr)
     }
-    
+
     /// Remove expired bindings.
     pub fn cleanup_expired(&mut self) -> u8 {
         let mut removed = 0u8;
@@ -555,17 +585,27 @@ impl ChannelBindingTable {
         }
         removed
     }
-    
+
     /// Get binding count.
     #[inline]
     pub const fn count(&self) -> u8 {
         self.count
     }
-    
+
     /// Iterator over active bindings.
     #[allow(dead_code)] // Reserved for channel binding enumeration in TURN relay
     pub fn iter(&self) -> impl Iterator<Item = &ChannelBinding> {
         self.bindings.iter().filter_map(|b| b.as_ref())
+    }
+
+    /// Get peer addresses of bindings needing refresh (RFC 5766 §11.3).
+    pub fn needing_refresh(&self, margin: Duration) -> Vec<SocketAddr> {
+        self.bindings
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .filter(|b| b.needs_refresh(margin))
+            .map(|b| b.peer_addr)
+            .collect()
     }
 }
 
@@ -598,9 +638,8 @@ mod tests {
 
     #[test]
     fn test_credentials() {
-        let creds = TurnCredentials::new("user", "pass")
-            .with_realm("example.com");
-        
+        let creds = TurnCredentials::new("user", "pass").with_realm("example.com");
+
         assert_eq!(creds.username(), b"user");
         assert_eq!(creds.password(), b"pass");
         assert_eq!(creds.realm(), b"example.com");
@@ -609,9 +648,8 @@ mod tests {
 
     #[test]
     fn test_credentials_key() {
-        let creds = TurnCredentials::new("user", "pass")
-            .with_realm("realm");
-        
+        let creds = TurnCredentials::new("user", "pass").with_realm("realm");
+
         let key = creds.compute_key();
         assert_eq!(key.len(), 16);
         // MD5("user:realm:pass") - verify it's computed
@@ -628,10 +666,10 @@ mod tests {
     #[test]
     fn test_permission_table() {
         let mut table = PermissionTable::new();
-        
+
         table.add(test_addr(5000)).unwrap();
         table.add(test_addr(5001)).unwrap();
-        
+
         assert_eq!(table.count(), 2);
         assert!(table.has_permission(&test_addr(5000)));
         assert!(table.has_permission(&test_addr(5001)));
@@ -641,10 +679,10 @@ mod tests {
     #[test]
     fn test_permission_table_refresh() {
         let mut table = PermissionTable::new();
-        
+
         table.add(test_addr(5000)).unwrap();
         assert_eq!(table.count(), 1);
-        
+
         // Adding same IP should refresh, not add new
         table.add(test_addr(5000)).unwrap();
         assert_eq!(table.count(), 1);
@@ -655,7 +693,7 @@ mod tests {
         let binding = ChannelBinding::new(0x4000, test_addr(5000)).unwrap();
         assert_eq!(binding.channel, 0x4000);
         assert!(!binding.is_expired());
-        
+
         // Invalid channel
         assert!(ChannelBinding::new(0x1000, test_addr(5000)).is_none());
         assert!(ChannelBinding::new(0x8000, test_addr(5000)).is_none());
@@ -664,12 +702,12 @@ mod tests {
     #[test]
     fn test_channel_binding_table() {
         let mut table = ChannelBindingTable::new();
-        
+
         let channel = table.allocate_channel().unwrap();
         assert_eq!(channel, CHANNEL_NUMBER_MIN);
-        
+
         table.add(channel, test_addr(5000)).unwrap();
-        
+
         assert_eq!(table.find_channel(&test_addr(5000)), Some(channel));
         assert_eq!(table.find_peer(channel), Some(test_addr(5000)));
     }
@@ -677,23 +715,29 @@ mod tests {
     #[test]
     fn test_channel_binding_conflicts() {
         let mut table = ChannelBindingTable::new();
-        
+
         table.add(0x4000, test_addr(5000)).unwrap();
-        
+
         // Same channel, different peer - should fail
         let err = table.add(0x4000, test_addr(5001)).unwrap_err();
-        assert!(matches!(err, super::super::TurnError::ChannelAlreadyBound { .. }));
-        
+        assert!(matches!(
+            err,
+            super::super::TurnError::ChannelAlreadyBound { .. }
+        ));
+
         // Same peer, different channel - should fail
         let err = table.add(0x4001, test_addr(5000)).unwrap_err();
-        assert!(matches!(err, super::super::TurnError::PeerAlreadyBound { .. }));
+        assert!(matches!(
+            err,
+            super::super::TurnError::PeerAlreadyBound { .. }
+        ));
     }
 
     #[test]
     fn test_relayed_address() {
         let relay = test_addr(3478);
         let mapped = test_addr(12345);
-        
+
         let addr = RelayedAddress::new(relay, mapped, 600);
         assert_eq!(addr.relay, relay);
         assert_eq!(addr.mapped, mapped);

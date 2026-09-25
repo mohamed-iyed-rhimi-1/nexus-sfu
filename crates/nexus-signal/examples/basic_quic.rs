@@ -14,10 +14,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_ticket_ttl_secs: 3600, // 1 hour
         max_bi_streams: 50,
         max_uni_streams: 50,
-        stream_recv_window_bytes: 512 * 1024, // 512KB
+        stream_recv_window_bytes: 512 * 1024,          // 512KB
         connection_recv_window_bytes: 4 * 1024 * 1024, // 4MB
-        keep_alive_interval_ms: 15_000, // 15 seconds
-        idle_timeout_ms: 30_000, // 30 seconds
+        keep_alive_interval_ms: 15_000,                // 15 seconds
+        idle_timeout_ms: 30_000,                       // 30 seconds
         enable_0rtt: true,
         cert_path: "/tmp/cert.pem".to_string(),
         key_path: "/tmp/key.pem".to_string(),

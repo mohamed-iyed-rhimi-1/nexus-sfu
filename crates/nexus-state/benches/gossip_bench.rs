@@ -10,8 +10,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use std::net::SocketAddr;
 
 use nexus_state::gossip::{
-    GossipConfig, GossipMessage, GossipTransport, MembershipList,
-    StateUpdate, SwimProtocol, MAX_PIGGYBACK_UPDATES,
+    GossipConfig, GossipMessage, GossipTransport, MembershipList, StateUpdate, SwimProtocol,
+    MAX_PIGGYBACK_UPDATES,
 };
 use nexus_state::types::Dot;
 
@@ -39,7 +39,7 @@ fn bench_message_encode(c: &mut Criterion) {
             let dot = Dot::new(1, (i + 1) as u64);
             piggyback.push(StateUpdate::ParticipantAdded {
                 room_id: 1,
-                participant_id: i as u32,
+                participant_id: i as u64,
                 dot,
             });
         }
@@ -67,6 +67,7 @@ fn bench_message_encode(c: &mut Criterion) {
             from: 1,
             target: 5,
             target_addr: "192.168.1.1:7946".parse().unwrap(),
+            requester_addr: "192.168.1.2:7946".parse().unwrap(),
         };
         b.iter(|| black_box(msg.encode()))
     });
@@ -105,7 +106,7 @@ fn bench_message_decode(c: &mut Criterion) {
         let dot = Dot::new(1, (i + 1) as u64);
         piggyback.push(StateUpdate::ParticipantAdded {
             room_id: 1,
-            participant_id: i as u32,
+            participant_id: i as u64,
             dot,
         });
     }
@@ -164,7 +165,8 @@ fn bench_membership_add_peer(c: &mut Criterion) {
             || MembershipList::new(0),
             |mut list| {
                 let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap();
-                black_box(list.add_peer(1, addr).unwrap())
+                list.add_peer(1, addr).unwrap();
+                black_box(())
             },
             criterion::BatchSize::SmallInput,
         )

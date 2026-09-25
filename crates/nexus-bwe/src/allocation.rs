@@ -189,7 +189,6 @@ impl TrackAllocation {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,11 +243,11 @@ mod tests {
     #[test]
     fn test_track_allocation_add_layers() {
         let mut allocation = TrackAllocation::new(1, TrackPriority::Normal, 2_000_000);
-        
+
         allocation.add_layer(SimulcastLayer::new(0, 100_000, 320, 240));
         allocation.add_layer(SimulcastLayer::new(1, 500_000, 640, 480));
         allocation.add_layer(SimulcastLayer::new(2, 1_500_000, 1280, 720));
-        
+
         assert_eq!(allocation.layer_count, 3);
         assert_eq!(allocation.get_layer(0).unwrap().bitrate_bps, 100_000);
         assert_eq!(allocation.get_layer(1).unwrap().bitrate_bps, 500_000);
@@ -259,7 +258,7 @@ mod tests {
     #[should_panic(expected = "Layer bitrate")]
     fn test_track_allocation_layers_not_increasing() {
         let mut allocation = TrackAllocation::new(1, TrackPriority::Normal, 2_000_000);
-        
+
         allocation.add_layer(SimulcastLayer::new(0, 500_000, 640, 480));
         allocation.add_layer(SimulcastLayer::new(1, 100_000, 320, 240));
     }
@@ -267,21 +266,21 @@ mod tests {
     #[test]
     fn test_track_allocation_select_layer() {
         let mut allocation = TrackAllocation::new(1, TrackPriority::Normal, 2_000_000);
-        
+
         allocation.add_layer(SimulcastLayer::new(0, 100_000, 320, 240));
         allocation.add_layer(SimulcastLayer::new(1, 500_000, 640, 480));
         allocation.add_layer(SimulcastLayer::new(2, 1_500_000, 1280, 720));
-        
+
         // Select with enough for middle layer
         allocation.allocated_bitrate_bps = 600_000;
         allocation.select_layer();
         assert_eq!(allocation.selected_layer, 1);
-        
+
         // Select with enough for highest layer
         allocation.allocated_bitrate_bps = 2_000_000;
         allocation.select_layer();
         assert_eq!(allocation.selected_layer, 2);
-        
+
         // Select with only enough for lowest layer
         allocation.allocated_bitrate_bps = 150_000;
         allocation.select_layer();
@@ -291,10 +290,10 @@ mod tests {
     #[test]
     fn test_track_allocation_verify() {
         let mut allocation = TrackAllocation::new(1, TrackPriority::Normal, 1_000_000);
-        
+
         allocation.add_layer(SimulcastLayer::new(0, 100_000, 320, 240));
         allocation.add_layer(SimulcastLayer::new(1, 500_000, 640, 480));
-        
+
         allocation.allocated_bitrate_bps = 500_000;
         allocation.verify();
     }
@@ -310,15 +309,15 @@ mod tests {
     #[test]
     fn test_track_allocation_min_layer_bitrate() {
         let mut allocation = TrackAllocation::new(1, TrackPriority::Normal, 2_000_000);
-        
+
         // No layers
         assert_eq!(allocation.min_layer_bitrate(), 0);
-        
+
         // Add layers
         allocation.add_layer(SimulcastLayer::new(0, 100_000, 320, 240));
         allocation.add_layer(SimulcastLayer::new(1, 500_000, 640, 480));
         allocation.add_layer(SimulcastLayer::new(2, 1_500_000, 1280, 720));
-        
+
         // Should return lowest layer bitrate
         assert_eq!(allocation.min_layer_bitrate(), 100_000);
     }

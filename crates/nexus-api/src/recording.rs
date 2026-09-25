@@ -60,26 +60,14 @@ pub struct RecordingActionResponse {
 /// Mount this under the main API router with `.merge()` or `.nest()`.
 pub fn recording_routes(mgr: SharedRecordingManager) -> Router {
     Router::new()
-        .route(
-            "/rooms/:id/recording/start",
-            post(start_recording_handler),
-        )
-        .route(
-            "/rooms/:id/recording/pause",
-            post(pause_recording_handler),
-        )
+        .route("/rooms/:id/recording/start", post(start_recording_handler))
+        .route("/rooms/:id/recording/pause", post(pause_recording_handler))
         .route(
             "/rooms/:id/recording/resume",
             post(resume_recording_handler),
         )
-        .route(
-            "/rooms/:id/recording/stop",
-            post(stop_recording_handler),
-        )
-        .route(
-            "/rooms/:id/recording",
-            get(get_recording_handler),
-        )
+        .route("/rooms/:id/recording/stop", post(stop_recording_handler))
+        .route("/rooms/:id/recording", get(get_recording_handler))
         .route("/recordings", get(list_recordings_handler))
         .with_state(mgr)
 }

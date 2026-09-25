@@ -22,12 +22,30 @@ pub use nexus_state::DistributedState;
 /// Actor error types
 #[derive(Debug)]
 pub enum ActorError {
-    NotFound { actor_type: ActorType, id: u64 },
-    AlreadyExists { actor_type: ActorType, id: u64 },
-    CapacityExceeded { actor_type: ActorType, max: usize },
-    MessageQueueFull { actor_type: ActorType, id: u64 },
-    WorkerNotFound { worker_id: u32 },
-    MessageSendFailed { actor_type: ActorType, id: u64, reason: String },
+    NotFound {
+        actor_type: ActorType,
+        id: u64,
+    },
+    AlreadyExists {
+        actor_type: ActorType,
+        id: u64,
+    },
+    CapacityExceeded {
+        actor_type: ActorType,
+        max: usize,
+    },
+    MessageQueueFull {
+        actor_type: ActorType,
+        id: u64,
+    },
+    WorkerNotFound {
+        worker_id: u32,
+    },
+    MessageSendFailed {
+        actor_type: ActorType,
+        id: u64,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ActorError {
@@ -48,8 +66,16 @@ impl std::fmt::Display for ActorError {
             ActorError::WorkerNotFound { worker_id } => {
                 write!(f, "Worker {} not found", worker_id)
             }
-            ActorError::MessageSendFailed { actor_type, id, reason } => {
-                write!(f, "{:?} actor {} message send failed: {}", actor_type, id, reason)
+            ActorError::MessageSendFailed {
+                actor_type,
+                id,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "{:?} actor {} message send failed: {}",
+                    actor_type, id, reason
+                )
             }
         }
     }
@@ -80,7 +106,8 @@ pub struct ActorManager {
     rooms: RwLock<HashMap<RoomId, (RoomActor, Sender<RoomActorMessage>)>>,
 
     /// Participant actors (pre-allocated slots)
-    participants: RwLock<HashMap<ParticipantId, (ParticipantActor, Sender<ParticipantActorMessage>)>>,
+    participants:
+        RwLock<HashMap<ParticipantId, (ParticipantActor, Sender<ParticipantActorMessage>)>>,
 
     /// Track actors (pre-allocated slots)
     tracks: RwLock<HashMap<TrackId, (TrackActor, Sender<TrackActorMessage>)>>,
@@ -164,7 +191,9 @@ impl ActorManager {
             pre_allocated: false,
             health_timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
             max_restart_retries: DEFAULT_MAX_RESTART_RETRIES,
-            restart_counts: RwLock::new(HashMap::with_capacity(max_rooms + max_participants + max_tracks)),
+            restart_counts: RwLock::new(HashMap::with_capacity(
+                max_rooms + max_participants + max_tracks,
+            )),
             last_supervision_stats: RwLock::new(SupervisionStats::default()),
         }
     }
@@ -321,17 +350,20 @@ impl ActorManager {
         self.registry.register_room(id, worker_id);
 
         // Create room in distributed state
-        if let Err(e) = self.distributed_state.create_room(id as u32, name, max_participants) {
+        if let Err(e) = self
+            .distributed_state
+            .create_room(id as u32, name, max_participants)
+        {
             // Log error but don't fail - room actor is created
-            eprintln!("Warning: Failed to create room in distributed state: {:?}", e);
+            eprintln!(
+                "Warning: Failed to create room in distributed state: {:?}",
+                e
+            );
         }
 
         // Create supervisor
-        let supervisor = ActorSupervisor::new(
-            ActorId::room(id),
-            RestartPolicy::Limited(3),
-            worker_id,
-        );
+        let supervisor =
+            ActorSupervisor::new(ActorId::room(id), RestartPolicy::Limited(3), worker_id);
         self.room_supervisors.write().insert(id, supervisor);
 
         rooms.insert(id, (actor, tx));
@@ -357,11 +389,7 @@ impl ActorManager {
     }
 
     /// Send message to room
-    pub fn send_to_room(
-        &self,
-        room_id: RoomId,
-        msg: RoomActorMessage,
-    ) -> Result<(), ActorError> {
+    pub fn send_to_room(&self, room_id: RoomId, msg: RoomActorMessage) -> Result<(), ActorError> {
         let rooms = self.rooms.read();
 
         if let Some((_actor, tx)) = rooms.get(&room_id) {
@@ -431,8 +459,14 @@ impl ActorManager {
         self.registry.register_participant(id, room_id, worker_id);
 
         // Add participant to distributed state
-        if let Err(e) = self.distributed_state.add_participant(room_id as u32, id as u64) {
-            eprintln!("Warning: Failed to add participant to distributed state: {:?}", e);
+        if let Err(e) = self
+            .distributed_state
+            .add_participant(room_id as u32, id as u64)
+        {
+            eprintln!(
+                "Warning: Failed to add participant to distributed state: {:?}",
+                e
+            );
         }
 
         // Create supervisor
@@ -533,20 +567,17 @@ impl ActorManager {
                 MediaKind::Video => 1,
             },
             content_type: 0,
-            codec: 0, // Default codec
+            codec: 0,        // Default codec
             bitrate_kbps: 0, // Default bitrate
-            owner_node: 0, // Set by orchestrator when node ID is known
+            owner_node: 0,   // Set by orchestrator when node ID is known
         };
         if let Err(e) = self.distributed_state.add_track(id as u64, track_info) {
             eprintln!("Warning: Failed to add track to distributed state: {:?}", e);
         }
 
         // Create supervisor
-        let supervisor = ActorSupervisor::new(
-            ActorId::track(id),
-            RestartPolicy::Limited(3),
-            worker_id,
-        );
+        let supervisor =
+            ActorSupervisor::new(ActorId::track(id), RestartPolicy::Limited(3), worker_id);
         self.track_supervisors.write().insert(id, supervisor);
 
         tracks.insert(id, (actor, tx));
@@ -624,10 +655,10 @@ impl ActorManager {
                 if checks_performed >= MAX_HEALTH_CHECKS_PER_ITERATION as u32 {
                     break;
                 }
-                
+
                 // Send health check message
                 let _ = self.send_to_room(room_id, RoomActorMessage::HealthCheck);
-                
+
                 // Check last health check timestamp
                 let last_check_ns = actor.last_health_check_ns();
                 if now_ns.saturating_sub(last_check_ns) > timeout_ns {
@@ -644,10 +675,11 @@ impl ActorManager {
                 if checks_performed >= MAX_HEALTH_CHECKS_PER_ITERATION as u32 {
                     break;
                 }
-                
+
                 // Send health check message
-                let _ = self.send_to_participant(participant_id, ParticipantActorMessage::HealthCheck);
-                
+                let _ =
+                    self.send_to_participant(participant_id, ParticipantActorMessage::HealthCheck);
+
                 // Check last health check timestamp
                 let last_check_ns = actor.last_health_check_ns();
                 if now_ns.saturating_sub(last_check_ns) > timeout_ns {
@@ -664,10 +696,10 @@ impl ActorManager {
                 if checks_performed >= MAX_HEALTH_CHECKS_PER_ITERATION as u32 {
                     break;
                 }
-                
+
                 // Send health check message
                 let _ = self.send_to_track(track_id, TrackActorMessage::HealthCheck);
-                
+
                 // Check last health check timestamp
                 let last_check_ns = actor.last_health_check_ns();
                 if now_ns.saturating_sub(last_check_ns) > timeout_ns {
@@ -681,7 +713,7 @@ impl ActorManager {
         for room_id in unhealthy_rooms {
             let actor_id = ActorId::room(room_id);
             restarts_attempted += 1;
-            
+
             if self.attempt_restart_room(room_id) {
                 restarts_succeeded += 1;
                 // Reset restart count on success
@@ -691,7 +723,7 @@ impl ActorManager {
                 let mut counts = self.restart_counts.write();
                 let count = counts.entry(actor_id).or_insert(0);
                 *count += 1;
-                
+
                 if *count >= self.max_restart_retries {
                     // Max retries exceeded, remove actor
                     eprintln!(
@@ -709,7 +741,7 @@ impl ActorManager {
         for participant_id in unhealthy_participants {
             let actor_id = ActorId::participant(participant_id);
             restarts_attempted += 1;
-            
+
             if self.attempt_restart_participant(participant_id) {
                 restarts_succeeded += 1;
                 self.restart_counts.write().remove(&actor_id);
@@ -717,7 +749,7 @@ impl ActorManager {
                 let mut counts = self.restart_counts.write();
                 let count = counts.entry(actor_id).or_insert(0);
                 *count += 1;
-                
+
                 if *count >= self.max_restart_retries {
                     eprintln!(
                         "Participant {} failed to restart after {} attempts, removing from registry",
@@ -734,7 +766,7 @@ impl ActorManager {
         for track_id in unhealthy_tracks {
             let actor_id = ActorId::track(track_id);
             restarts_attempted += 1;
-            
+
             if self.attempt_restart_track(track_id) {
                 restarts_succeeded += 1;
                 self.restart_counts.write().remove(&actor_id);
@@ -742,7 +774,7 @@ impl ActorManager {
                 let mut counts = self.restart_counts.write();
                 let count = counts.entry(actor_id).or_insert(0);
                 *count += 1;
-                
+
                 if *count >= self.max_restart_retries {
                     eprintln!(
                         "Track {} failed to restart after {} attempts, removing from registry",
@@ -776,7 +808,11 @@ impl ActorManager {
         let (name, max_participants, worker_id) = {
             let rooms = self.rooms.read();
             if let Some((actor, _)) = rooms.get(&room_id) {
-                (actor.name().to_string(), actor.max_participants(), actor.worker_id())
+                (
+                    actor.name().to_string(),
+                    actor.max_participants(),
+                    actor.worker_id(),
+                )
             } else {
                 return false;
             }
@@ -788,7 +824,8 @@ impl ActorManager {
         }
 
         // Spawn a new actor with the same configuration
-        self.spawn_room(room_id, name, max_participants, worker_id).is_ok()
+        self.spawn_room(room_id, name, max_participants, worker_id)
+            .is_ok()
     }
 
     /// Attempt to restart a participant actor
@@ -800,7 +837,12 @@ impl ActorManager {
         let (room_id, name, connection_id, worker_id) = {
             let participants = self.participants.read();
             if let Some((actor, _)) = participants.get(&participant_id) {
-                (actor.room_id(), actor.name().to_string(), actor.connection_id(), actor.worker_id())
+                (
+                    actor.room_id(),
+                    actor.name().to_string(),
+                    actor.connection_id(),
+                    actor.worker_id(),
+                )
             } else {
                 return false;
             }
@@ -812,7 +854,8 @@ impl ActorManager {
         }
 
         // Spawn a new actor with the same configuration
-        self.spawn_participant(participant_id, room_id, name, connection_id, worker_id).is_ok()
+        self.spawn_participant(participant_id, room_id, name, connection_id, worker_id)
+            .is_ok()
     }
 
     /// Attempt to restart a track actor
@@ -824,7 +867,12 @@ impl ActorManager {
         let (participant_id, ssrc, kind, worker_id) = {
             let tracks = self.tracks.read();
             if let Some((actor, _)) = tracks.get(&track_id) {
-                (actor.participant_id(), actor.ssrc(), actor.kind(), actor.worker_id())
+                (
+                    actor.participant_id(),
+                    actor.ssrc(),
+                    actor.kind(),
+                    actor.worker_id(),
+                )
             } else {
                 return false;
             }
@@ -836,7 +884,8 @@ impl ActorManager {
         }
 
         // Spawn a new actor with the same configuration
-        self.spawn_track(track_id, participant_id, ssrc, kind, worker_id).is_ok()
+        self.spawn_track(track_id, participant_id, ssrc, kind, worker_id)
+            .is_ok()
     }
 
     /// Get last supervision statistics
@@ -856,7 +905,11 @@ impl ActorManager {
 
     /// Get restart count for an actor
     pub fn restart_count(&self, actor_id: ActorId) -> u32 {
-        self.restart_counts.read().get(&actor_id).copied().unwrap_or(0)
+        self.restart_counts
+            .read()
+            .get(&actor_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     // === High-Level Operations (for RoomManager compatibility) ===
@@ -865,10 +918,10 @@ impl ActorManager {
     pub fn create_room(&self, name: String, max_participants: u32) -> Result<RoomId, ActorError> {
         // Generate unique room ID
         let room_id = self.generate_room_id();
-        
+
         // Spawn room actor on worker 0 (default)
         self.spawn_room(room_id, name, max_participants, 0)?;
-        
+
         Ok(room_id)
     }
 
@@ -876,7 +929,7 @@ impl ActorManager {
     pub fn remove_room(&self, room_id: RoomId) -> Result<(), ActorError> {
         // Remove room from distributed state (returns bool)
         let _removed = self.distributed_state.remove_room(room_id as u32);
-        
+
         self.terminate_room(room_id)
     }
 
@@ -891,7 +944,7 @@ impl ActorManager {
     }
 
     /// Get room by name (convenience method)
-    /// 
+    ///
     /// Searches through distributed state to find a room by name.
     /// Returns the room ID if found.
     pub fn get_room_by_name(&self, name: &str) -> Option<RoomId> {
@@ -925,13 +978,13 @@ impl ActorManager {
     ) -> Result<ParticipantId, ActorError> {
         // Generate unique participant ID
         let participant_id = self.generate_participant_id();
-        
+
         // Generate connection ID (for now, use participant_id)
         let connection_id = participant_id;
-        
+
         // Spawn participant actor on worker 0 (default)
         self.spawn_participant(participant_id, room_id, name.clone(), connection_id, 0)?;
-        
+
         // Notify room actor
         self.send_to_room(
             room_id,
@@ -941,7 +994,7 @@ impl ActorManager {
                 connection_id,
             },
         )?;
-        
+
         Ok(participant_id)
     }
 
@@ -964,16 +1017,18 @@ impl ActorManager {
                 });
             }
         };
-        
+
         // Notify room actor first
         self.send_to_room(
             room_id,
             RoomActorMessage::RemoveParticipant { participant_id },
         )?;
-        
+
         // Remove from distributed state (returns Result<Dot, CrdtError>)
-        let _ = self.distributed_state.remove_participant(room_id as u32, participant_id as u64);
-        
+        let _ = self
+            .distributed_state
+            .remove_participant(room_id as u32, participant_id as u64);
+
         // Terminate participant actor
         self.terminate_participant(participant_id)
     }
@@ -987,10 +1042,10 @@ impl ActorManager {
     ) -> Result<ParticipantId, ActorError> {
         // Generate unique participant ID
         let participant_id = self.generate_participant_id();
-        
+
         // Spawn participant actor on worker 0 (default)
         self.spawn_participant(participant_id, room_id, name.clone(), connection_id, 0)?;
-        
+
         // Notify room actor
         self.send_to_room(
             room_id,
@@ -1000,7 +1055,7 @@ impl ActorManager {
                 connection_id,
             },
         )?;
-        
+
         Ok(participant_id)
     }
 
@@ -1015,7 +1070,7 @@ impl ActorManager {
             room_id,
             RoomActorMessage::RemoveParticipant { participant_id },
         )?;
-        
+
         // Terminate participant actor
         self.terminate_participant(participant_id)
     }
@@ -1040,10 +1095,10 @@ impl ActorManager {
     ) -> Result<TrackId, ActorError> {
         // Generate unique track ID
         let track_id = self.generate_track_id();
-        
+
         // Call 4-arg version
         self.publish_track_with_id(participant_id, track_id, ssrc, kind)?;
-        
+
         Ok(track_id)
     }
 
@@ -1059,13 +1114,17 @@ impl ActorManager {
     ) -> Result<(), ActorError> {
         // Spawn track actor on worker 0 (default)
         self.spawn_track(track_id, participant_id, ssrc, kind, 0)?;
-        
+
         // Notify participant actor
         self.send_to_participant(
             participant_id,
-            ParticipantActorMessage::PublishTrack { track_id, ssrc, kind },
+            ParticipantActorMessage::PublishTrack {
+                track_id,
+                ssrc,
+                kind,
+            },
         )?;
-        
+
         Ok(())
     }
 
@@ -1094,13 +1153,16 @@ impl ActorManager {
     ) -> Result<u32, ActorError> {
         // Precondition: validate destination address
         assert!(dest_addr.port() > 0, "destination port must be valid (> 0)");
-        
+
         // Verify track exists and get worker ID
-        let worker_id = self.registry.lookup_track(track_id).ok_or(ActorError::NotFound {
-            actor_type: ActorType::Track,
-            id: track_id,
-        })?;
-        
+        let worker_id = self
+            .registry
+            .lookup_track(track_id)
+            .ok_or(ActorError::NotFound {
+                actor_type: ActorType::Track,
+                id: track_id,
+            })?;
+
         // Send subscribe message to participant actor
         self.send_to_participant(
             subscriber_id,
@@ -1109,10 +1171,12 @@ impl ActorManager {
                 target_layer: 0, // Default to base layer
             },
         )?;
-        
+
         // Update distributed state (returns Result<Dot, CrdtError>)
-        let _ = self.distributed_state.add_subscription(track_id as u64, subscriber_id as u64);
-        
+        let _ = self
+            .distributed_state
+            .add_subscription(track_id as u64, subscriber_id as u64);
+
         // Return worker_id so caller can send ActorSubscribe message
         Ok(worker_id)
     }
@@ -1128,10 +1192,10 @@ impl ActorManager {
             participant_id,
             ParticipantActorMessage::UnpublishTrack { track_id },
         )?;
-        
+
         // Remove from distributed state (returns bool)
         let _removed = self.distributed_state.remove_track(track_id as u64);
-        
+
         // Terminate track actor
         self.terminate_track(track_id)
     }
@@ -1182,9 +1246,11 @@ impl ActorManager {
     /// - participant_id != 0
     pub fn get_participant_name(&self, participant_id: ParticipantId) -> Option<String> {
         assert!(participant_id != 0, "participant_id must not be 0");
-        
+
         let participants = self.participants.read();
-        participants.get(&participant_id).map(|(actor, _)| actor.name().to_string())
+        participants
+            .get(&participant_id)
+            .map(|(actor, _)| actor.name().to_string())
     }
 
     /// Get participant info (name and room_id) by ID
@@ -1199,11 +1265,11 @@ impl ActorManager {
     /// - participant_id != 0
     pub fn get_participant_info(&self, participant_id: ParticipantId) -> Option<(String, RoomId)> {
         assert!(participant_id != 0, "participant_id must not be 0");
-        
+
         let participants = self.participants.read();
-        participants.get(&participant_id).map(|(actor, _)| {
-            (actor.name().to_string(), actor.room_id())
-        })
+        participants
+            .get(&participant_id)
+            .map(|(actor, _)| (actor.name().to_string(), actor.room_id()))
     }
 
     /// Get all tracks published by a participant
@@ -1218,7 +1284,7 @@ impl ActorManager {
     /// - participant_id != 0
     pub fn get_participant_tracks(&self, participant_id: ParticipantId) -> Vec<TrackId> {
         assert!(participant_id != 0, "participant_id must not be 0");
-        
+
         let participants = self.participants.read();
         if let Some((actor, _)) = participants.get(&participant_id) {
             actor.published_tracks().to_vec()
@@ -1241,12 +1307,12 @@ impl ActorManager {
     /// - room_id != 0
     pub fn get_room_tracks(&self, room_id: RoomId) -> Vec<(TrackId, ParticipantId, MediaKind)> {
         assert!(room_id != 0, "room_id must not be 0");
-        
+
         let mut result = Vec::new();
-        
+
         // Get all participants in the room from registry
         let participant_ids = self.registry.participants_in_room(room_id);
-        
+
         // For each participant, get their published tracks
         let tracks = self.tracks.read();
         for pid in participant_ids {
@@ -1257,7 +1323,7 @@ impl ActorManager {
                 }
             }
         }
-        
+
         result
     }
 }
@@ -1337,7 +1403,9 @@ mod tests {
 
         // Spawn room and participant first
         manager.spawn_room(1, "Test".to_string(), 100, 0).unwrap();
-        manager.spawn_participant(10, 1, "Alice".to_string(), 1000, 0).unwrap();
+        manager
+            .spawn_participant(10, 1, "Alice".to_string(), 1000, 0)
+            .unwrap();
 
         let result = manager.spawn_track(100, 10, 12345, MediaKind::Video, 0);
         assert!(result.is_ok());
@@ -1458,7 +1526,7 @@ mod tests {
     fn test_supervision_config() {
         let state = create_test_distributed_state();
         let manager = ActorManager::with_supervision_config(10, 100, 1000, state, 3000, 5);
-        
+
         assert_eq!(manager.health_timeout_ms(), 3000);
         assert_eq!(manager.max_restart_retries(), 5);
     }
@@ -1467,7 +1535,7 @@ mod tests {
     fn test_supervision_default_config() {
         let state = create_test_distributed_state();
         let manager = ActorManager::new(10, 100, 1000, state);
-        
+
         assert_eq!(manager.health_timeout_ms(), DEFAULT_HEALTH_TIMEOUT_MS);
         assert_eq!(manager.max_restart_retries(), DEFAULT_MAX_RESTART_RETRIES);
     }
@@ -1476,14 +1544,14 @@ mod tests {
     fn test_supervise_healthy_actors() {
         let state = create_test_distributed_state();
         let manager = ActorManager::new(10, 100, 1000, state);
-        
+
         // Spawn some actors
         manager.spawn_room(1, "Room1".to_string(), 100, 0).unwrap();
         manager.spawn_room(2, "Room2".to_string(), 100, 0).unwrap();
-        
+
         // Run supervision - should check actors but not restart any
         let stats = manager.supervise();
-        
+
         assert_eq!(stats.checks_performed, 2);
         assert_eq!(stats.restarts_attempted, 0);
         assert_eq!(stats.restarts_succeeded, 0);
@@ -1493,15 +1561,15 @@ mod tests {
     fn test_supervise_bounded_checks() {
         let state = create_test_distributed_state();
         let manager = ActorManager::new(200, 1000, 10000, state);
-        
+
         // Spawn more actors than MAX_HEALTH_CHECKS_PER_ITERATION
         for i in 1..=150 {
             manager.spawn_room(i, format!("Room{}", i), 100, 0).unwrap();
         }
-        
+
         // Run supervision - should be bounded
         let stats = manager.supervise();
-        
+
         // Should check at most MAX_HEALTH_CHECKS_PER_ITERATION actors
         assert!(stats.checks_performed <= MAX_HEALTH_CHECKS_PER_ITERATION as u32);
     }
@@ -1510,9 +1578,9 @@ mod tests {
     fn test_restart_count_tracking() {
         let state = create_test_distributed_state();
         let manager = ActorManager::new(10, 100, 1000, state);
-        
+
         manager.spawn_room(1, "Room1".to_string(), 100, 0).unwrap();
-        
+
         // Initially no restart count
         let actor_id = ActorId::room(1);
         assert_eq!(manager.restart_count(actor_id), 0);
@@ -1522,12 +1590,12 @@ mod tests {
     fn test_last_supervision_stats() {
         let state = create_test_distributed_state();
         let manager = ActorManager::new(10, 100, 1000, state);
-        
+
         manager.spawn_room(1, "Room1".to_string(), 100, 0).unwrap();
-        
+
         // Run supervision
         let stats = manager.supervise();
-        
+
         // Verify last stats are stored
         let last_stats = manager.last_supervision_stats();
         assert_eq!(last_stats.checks_performed, stats.checks_performed);

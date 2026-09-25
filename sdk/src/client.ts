@@ -1,10 +1,15 @@
-import { SignalingTransport } from './signaling';
-import { SignalMessage, TrackInfo } from './messages';
+import { SignalingTransport, TokenSource } from './signaling';
+import { OfferTrack, SignalMessage, TrackInfo } from './messages';
 import { EventEmitter } from './events';
 import { NexusError } from './errors';
 
 export interface NexusClientConfig {
   url: string;
+  /**
+   * JWT sent in the auth handshake the SFU requires on connect.
+   * Pass a function to fetch a fresh token on every (re)connect.
+   */
+  token?: TokenSource;
 }
 
 export class NexusClient extends EventEmitter {
@@ -14,12 +19,16 @@ export class NexusClient extends EventEmitter {
   private roomId: number | null = null;
   private localTracks = new Map<string, MediaStreamTrack>();
   private remoteTracks = new Map<number, MediaStream>();
+  /** Which subscribed track each receiving m-line carries, from the SFU's offers. */
+  private trackIdByMid = new Map<string, number>();
   private offerPending = false;
+  /** Local tracks waiting for the SFU's offer to give them an m-line. */
+  private unattachedTracks: MediaStreamTrack[] = [];
   private pendingActions: (() => void)[] = [];
 
   constructor(config: NexusClientConfig) {
     super();
-    this.signaling = new SignalingTransport(config.url);
+    this.signaling = new SignalingTransport(config.url, config.token);
     this.setupSignaling();
   }
 
@@ -93,18 +102,13 @@ export class NexusClient extends EventEmitter {
       this.setupPeerConnection();
     }
 
-    // Add track to PC
-    this.pc.addTrack(track);
+    // No addTrack here: it would reuse a receive-only transceiver left by an
+    // existing subscription. The SFU's offer adds a recvonly m-line for this
+    // track, and handleOffer attaches the track to it.
+    this.unattachedTracks.push(track);
 
-    // Send Publish intent → SFU will send Offer
-    const kinds: string[] = [];
-    const contents: string[] = [];
-    this.localTracks.forEach((t) => {
-      kinds.push(t.kind);
-      contents.push(content); // Simplified: use same content for all
-    });
-
-    this.signaling.send({ type: 'Publish', kinds, contents });
+    // Declare only the new track; the SFU keeps earlier m-lines as negotiated
+    this.signaling.send({ type: 'Publish', kinds: [kind], contents: [content] });
     this.offerPending = true;
   }
 
@@ -174,9 +178,14 @@ export class NexusClient extends EventEmitter {
     };
 
     this.pc.ontrack = (event) => {
-      const stream = event.streams[0];
-      // Extract track_id from stream or transceiver (simplified)
-      const trackId = Date.now(); // TODO: proper track_id mapping
+      // The SFU's offer may carry no msid, leaving event.streams empty
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
+      const mid = event.transceiver.mid;
+      const trackId = mid === null ? undefined : this.trackIdByMid.get(mid);
+      if (trackId === undefined) {
+        console.warn(`Received media on m-line ${mid} with no subscribed track`);
+        return;
+      }
       this.remoteTracks.set(trackId, stream);
       this.emit('trackSubscribed', { trackId, track: event.track, stream });
     };
@@ -189,6 +198,7 @@ export class NexusClient extends EventEmitter {
   private async handleMessage(msg: SignalMessage): Promise<void> {
     switch (msg.type) {
       case 'Offer':
+        this.updateTrackMids(msg.tracks ?? []);
         await this.handleOffer(msg.sdp);
         break;
       case 'IceCandidate':
@@ -203,6 +213,7 @@ export class NexusClient extends EventEmitter {
         });
         break;
       case 'TrackUnpublished':
+        this.remoteTracks.delete(msg.track_id);
         this.emit('trackUnpublished', { trackId: msg.track_id });
         break;
       case 'ParticipantJoined':
@@ -220,6 +231,19 @@ export class NexusClient extends EventEmitter {
     }
   }
 
+  /**
+   * Record which track each m-line carries. Runs before the offer is applied
+   * because `track` events fire during setRemoteDescription.
+   */
+  private updateTrackMids(tracks: OfferTrack[]): void {
+    const next = new Map(tracks.map((t) => [t.mid, t.track_id] as [string, number]));
+    // An m-line that stopped carrying a track (unsubscribed or reassigned)
+    for (const [mid, trackId] of this.trackIdByMid) {
+      if (next.get(mid) !== trackId) this.remoteTracks.delete(trackId);
+    }
+    this.trackIdByMid = next;
+  }
+
   private async handleOffer(sdp: string): Promise<void> {
     if (!this.pc) {
       this.pc = new RTCPeerConnection({
@@ -229,6 +253,7 @@ export class NexusClient extends EventEmitter {
     }
 
     await this.pc.setRemoteDescription({ type: 'offer', sdp });
+    await this.attachPendingTracks(sdp);
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     
@@ -239,6 +264,29 @@ export class NexusClient extends EventEmitter {
     while (this.pendingActions.length > 0) {
       const action = this.pendingActions.shift()!;
       action();
+    }
+  }
+
+  /**
+   * Send each pending local track on a transceiver the offer created for one of
+   * the SFU's recvonly (publish) m-lines, matching by kind.
+   */
+  private async attachPendingTracks(offerSdp: string): Promise<void> {
+    if (!this.pc || this.unattachedTracks.length === 0) return;
+
+    const publishMids = new Set<string>();
+    for (const section of offerSdp.split(/\r?\nm=/).slice(1)) {
+      const mid = /\r?\na=mid:(\S+)/.exec(section)?.[1];
+      if (mid && /\r?\na=recvonly/.test(section)) publishMids.add(mid);
+    }
+
+    for (const transceiver of this.pc.getTransceivers()) {
+      if (!transceiver.mid || !publishMids.has(transceiver.mid) || transceiver.sender.track) continue;
+      const i = this.unattachedTracks.findIndex((t) => t.kind === transceiver.receiver.track.kind);
+      if (i < 0) continue;
+      const [track] = this.unattachedTracks.splice(i, 1);
+      transceiver.direction = 'sendonly';
+      await transceiver.sender.replaceTrack(track);
     }
   }
 

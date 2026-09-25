@@ -82,7 +82,10 @@ impl PrometheusServer {
     pub async fn start(&mut self, port: u16) -> Result<(), crate::error::LoadTestError> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-        info!("Starting Prometheus metrics server on http://{}/metrics", addr);
+        info!(
+            "Starting Prometheus metrics server on http://{}/metrics",
+            addr
+        );
 
         // Create the router with the metrics endpoint
         let state = Arc::clone(&self.state);

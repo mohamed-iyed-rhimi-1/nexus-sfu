@@ -83,10 +83,7 @@ impl SimulcastLayer {
             _ => unreachable!(),
         };
 
-        assert_eq!(
-            layer.index(), index,
-            "from_index round-trip failed"
-        );
+        assert_eq!(layer.index(), index, "from_index round-trip failed");
         layer
     }
 
@@ -145,23 +142,21 @@ impl SimulcastLayerConfig {
     /// # Assertions
     /// - bitrate_bps must be > 0
     /// - width and height must be > 0
-    pub fn new(
-        layer: SimulcastLayer,
-        bitrate_bps: u64,
-        width: u16,
-        height: u16,
-    ) -> Self {
-        assert!(
-            bitrate_bps > 0,
-            "layer bitrate must be positive, got 0"
-        );
+    pub fn new(layer: SimulcastLayer, bitrate_bps: u64, width: u16, height: u16) -> Self {
+        assert!(bitrate_bps > 0, "layer bitrate must be positive, got 0");
         assert!(
             width > 0 && height > 0,
             "layer resolution must be positive: {}x{}",
-            width, height
+            width,
+            height
         );
 
-        Self { layer, bitrate_bps, width, height }
+        Self {
+            layer,
+            bitrate_bps,
+            width,
+            height,
+        }
     }
 
     /// Total pixels in this layer's resolution.
@@ -267,10 +262,7 @@ impl LayerSelector {
     ///
     /// # Assertions
     /// - layer_count <= MAX_LAYERS
-    pub fn get_config(
-        &self,
-        layer: SimulcastLayer,
-    ) -> Option<&SimulcastLayerConfig> {
+    pub fn get_config(&self, layer: SimulcastLayer) -> Option<&SimulcastLayerConfig> {
         assert!(
             self.layer_count as usize <= MAX_LAYERS,
             "layer_count invariant violated"
@@ -300,10 +292,7 @@ impl LayerSelector {
     ///   (unless only one layer exists and bandwidth is
     ///   below it — then we still select the lowest layer
     ///   to avoid sending nothing)
-    pub fn select_layer(
-        &mut self,
-        available_bps: u64,
-    ) -> SimulcastLayer {
+    pub fn select_layer(&mut self, available_bps: u64) -> SimulcastLayer {
         assert!(
             self.layer_count > 0,
             "cannot select layer with 0 configured layers"
@@ -377,14 +366,8 @@ impl Default for LayerSelector {
 /// # Assertions
 /// - layers must not be empty
 /// - layers must be in increasing bitrate order
-pub fn select_layer(
-    available_bps: u64,
-    layers: &[SimulcastLayerConfig],
-) -> SimulcastLayer {
-    assert!(
-        !layers.is_empty(),
-        "layers must not be empty"
-    );
+pub fn select_layer(available_bps: u64, layers: &[SimulcastLayerConfig]) -> SimulcastLayer {
+    assert!(!layers.is_empty(), "layers must not be empty");
     assert!(
         layers.len() <= MAX_LAYERS,
         "too many layers: {}, max {}",
@@ -436,13 +419,13 @@ pub fn standard_layers() -> [SimulcastLayerConfig; MAX_LAYERS] {
     let layers = [
         SimulcastLayerConfig::new(
             SimulcastLayer::Low,
-            150_000,  // 150 kbps
+            150_000, // 150 kbps
             320,
             240,
         ),
         SimulcastLayerConfig::new(
             SimulcastLayer::Medium,
-            500_000,  // 500 kbps
+            500_000, // 500 kbps
             640,
             480,
         ),
@@ -519,12 +502,7 @@ mod tests {
 
     #[test]
     fn test_layer_config_creation() {
-        let cfg = SimulcastLayerConfig::new(
-            SimulcastLayer::Low,
-            100_000,
-            320,
-            240,
-        );
+        let cfg = SimulcastLayerConfig::new(SimulcastLayer::Low, 100_000, 320, 240);
         assert_eq!(cfg.layer, SimulcastLayer::Low);
         assert_eq!(cfg.bitrate_bps, 100_000);
         assert_eq!(cfg.width, 320);
@@ -540,19 +518,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "layer resolution must be positive")]
     fn test_layer_config_zero_width() {
-        SimulcastLayerConfig::new(
-            SimulcastLayer::Low, 100_000, 0, 240,
-        );
+        SimulcastLayerConfig::new(SimulcastLayer::Low, 100_000, 0, 240);
     }
 
     #[test]
     fn test_layer_config_pixel_count() {
-        let cfg = SimulcastLayerConfig::new(
-            SimulcastLayer::High,
-            1_500_000,
-            1280,
-            720,
-        );
+        let cfg = SimulcastLayerConfig::new(SimulcastLayer::High, 1_500_000, 1280, 720);
         assert_eq!(cfg.pixel_count(), 1280 * 720);
     }
 
@@ -763,18 +734,8 @@ mod tests {
     #[should_panic(expected = "layers must be in increasing bitrate")]
     fn test_free_select_layer_wrong_order() {
         let layers = [
-            SimulcastLayerConfig::new(
-                SimulcastLayer::High,
-                1_500_000,
-                1280,
-                720,
-            ),
-            SimulcastLayerConfig::new(
-                SimulcastLayer::Low,
-                100_000,
-                320,
-                240,
-            ),
+            SimulcastLayerConfig::new(SimulcastLayer::High, 1_500_000, 1280, 720),
+            SimulcastLayerConfig::new(SimulcastLayer::Low, 100_000, 320, 240),
         ];
         select_layer(500_000, &layers);
     }

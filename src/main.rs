@@ -397,7 +397,7 @@ async fn run(config: NexusConfig) -> ExitCode {
         ws_addr: config.transport.signaling_bind_addr,
         tls_cert_path: config.transport.tls_cert_path.clone(),
         tls_key_path: config.transport.tls_key_path.clone(),
-        jwt_secret: config.api.jwt_secret.clone(),
+        jwt_secret: config.security.jwt_secret.clone(),
         max_connections: config.transport.max_webrtc_sessions,
         quic_config: config.quic.clone(),
     };
@@ -425,16 +425,15 @@ async fn run(config: NexusConfig) -> ExitCode {
     info!("Signaling server started (QUIC-first with WebSocket fallback)");
 
     // Shared SSRC resolver: orchestrator registers tracks by MID, packet loop resolves SSRCs
-    let _ssrc_resolver = std::sync::Arc::new(
-        nexus_sfu::track_registry::SsrcResolver::new()
-    );
+    let _ssrc_resolver = std::sync::Arc::new(nexus_sfu::track_registry::SsrcResolver::new());
 
     // Create cold-path channel (packet loop → orchestrator for STUN/DTLS)
     let (connection_tx, connection_rx) =
         tokio::sync::mpsc::channel::<nexus_sfu::orchestrator::events::ColdPathPacket>(4096);
 
     // Create PacketSender for ConnectionMonitor
-    let media_socket = sfu.media_socket_for_sender()
+    let media_socket = sfu
+        .media_socket_for_sender()
         .expect("Media socket must be available for PacketSender");
     let packet_sender = nexus_sfu::orchestrator::connection::PacketSender::new(media_socket);
 
@@ -476,7 +475,7 @@ async fn run(config: NexusConfig) -> ExitCode {
         // Use with_distributed_state to enable room synchronization between API and orchestrator
         let api_server = nexus_sfu::nexus_api::ApiServer::with_distributed_state(
             api_addr,
-            &config.api.jwt_secret,
+            &config.security.jwt_secret,
             sfu.metrics().cloned(),
             sfu.distributed_state().clone(),
         );
@@ -510,9 +509,18 @@ async fn run(config: NexusConfig) -> ExitCode {
     // Run SFU packet processing loop
     let result = sfu.run_with_signals().await;
 
-    // Cleanup
-    signaling_handle.abort();
-    orchestrator_handle.abort();
+    // Graceful shutdown: wait briefly for tasks to finish, then abort if needed.
+    let shutdown_timeout = tokio::time::Duration::from_secs(5);
+    let mut api_handle = api_handle;
+    let _ = tokio::time::timeout(shutdown_timeout, async {
+        let _ = signaling_handle.await;
+        let _ = orchestrator_handle.await;
+        if let Some(handle) = api_handle.take() {
+            let _ = handle.await;
+        }
+    })
+    .await;
+    // Abort any still-running tasks after timeout.
     if let Some(handle) = api_handle {
         handle.abort();
     }

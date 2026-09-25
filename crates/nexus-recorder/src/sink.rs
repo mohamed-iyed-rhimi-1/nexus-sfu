@@ -57,13 +57,12 @@ impl<'a> RecordingSink<'a> {
     /// Returns `true` if queued, `false` if dropped.
     ///
     /// # TigerStyle: ≥2 assertions, bounded copy
-    pub fn record_packet(
-        &mut self,
-        current_time_ns: u64,
-        data: &[u8],
-    ) -> bool {
+    pub fn record_packet(&mut self, current_time_ns: u64, data: &[u8]) -> bool {
         assert!(!data.is_empty(), "packet data must be non-empty");
-        assert!(current_time_ns >= self.start_time_ns, "time must not go backwards");
+        assert!(
+            current_time_ns >= self.start_time_ns,
+            "time must not go backwards"
+        );
 
         let len = data.len();
         if len > MAX_RECORD_PAYLOAD {

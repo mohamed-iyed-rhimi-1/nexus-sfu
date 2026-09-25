@@ -35,41 +35,29 @@ impl BatchSenderStats {
 
     /// Record a successful batch send.
     #[inline(always)]
-    pub fn record_batch(
-        &self, batch_size: u32,
-        packets_sent: u32, packets_failed: u32,
-    ) {
+    pub fn record_batch(&self, batch_size: u32, packets_sent: u32, packets_failed: u32) {
         self.batches_sent.fetch_add(1, Ordering::Relaxed);
-        self.packets_sent.fetch_add(
-            packets_sent as u64, Ordering::Relaxed,
-        );
-        self.packets_failed.fetch_add(
-            packets_failed as u64, Ordering::Relaxed,
-        );
-        let current_avg = self.avg_batch_size_scaled
-            .load(Ordering::Relaxed);
-        let new_avg =
-            (current_avg * 90 / 100) + (batch_size * 10);
-        self.avg_batch_size_scaled
-            .store(new_avg, Ordering::Relaxed);
+        self.packets_sent
+            .fetch_add(packets_sent as u64, Ordering::Relaxed);
+        self.packets_failed
+            .fetch_add(packets_failed as u64, Ordering::Relaxed);
+        let current_avg = self.avg_batch_size_scaled.load(Ordering::Relaxed);
+        let new_avg = (current_avg * 90 / 100) + (batch_size * 10);
+        self.avg_batch_size_scaled.store(new_avg, Ordering::Relaxed);
     }
 
     /// Get the average batch size.
     #[inline(always)]
     pub fn avg_batch_size(&self) -> f32 {
-        self.avg_batch_size_scaled
-            .load(Ordering::Relaxed) as f32 / 100.0
+        self.avg_batch_size_scaled.load(Ordering::Relaxed) as f32 / 100.0
     }
 
     /// Get snapshot of current statistics.
     pub fn snapshot(&self) -> BatchSenderStatsSnapshot {
         BatchSenderStatsSnapshot {
-            batches_sent: self.batches_sent
-                .load(Ordering::Relaxed),
-            packets_sent: self.packets_sent
-                .load(Ordering::Relaxed),
-            packets_failed: self.packets_failed
-                .load(Ordering::Relaxed),
+            batches_sent: self.batches_sent.load(Ordering::Relaxed),
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_failed: self.packets_failed.load(Ordering::Relaxed),
             avg_batch_size: self.avg_batch_size(),
         }
     }
@@ -79,8 +67,7 @@ impl BatchSenderStats {
         self.batches_sent.store(0, Ordering::Relaxed);
         self.packets_sent.store(0, Ordering::Relaxed);
         self.packets_failed.store(0, Ordering::Relaxed);
-        self.avg_batch_size_scaled
-            .store(0, Ordering::Relaxed);
+        self.avg_batch_size_scaled.store(0, Ordering::Relaxed);
     }
 }
 
@@ -130,15 +117,8 @@ impl BatchSender {
     }
 
     /// Create a new batch sender for the given socket.
-    pub fn new(
-        socket_fd: RawFd,
-        max_batch_size: u32,
-        flush_interval_us: u32,
-    ) -> Self {
-        assert!(
-            max_batch_size > 0,
-            "max_batch_size must be > 0"
-        );
+    pub fn new(socket_fd: RawFd, max_batch_size: u32, flush_interval_us: u32) -> Self {
+        assert!(max_batch_size > 0, "max_batch_size must be > 0");
         assert!(
             max_batch_size <= MAX_BATCH_SIZE_LIMIT,
             "max_batch_size must be <= {}",
@@ -149,9 +129,7 @@ impl BatchSender {
             batches: HashMap::new(),
             max_batch_size,
             flush_interval_us,
-            last_flush_ns: AtomicU64::new(
-                Self::current_time_ns(),
-            ),
+            last_flush_ns: AtomicU64::new(Self::current_time_ns()),
             pending_count: 0,
             stats: BatchSenderStats::new(),
             #[cfg(feature = "sim")]
@@ -179,30 +157,19 @@ impl BatchSender {
 
     /// Create with default settings.
     pub fn with_defaults(socket_fd: RawFd) -> Self {
-        Self::new(
-            socket_fd,
-            DEFAULT_BATCH_SIZE,
-            DEFAULT_FLUSH_INTERVAL_US,
-        )
+        Self::new(socket_fd, DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL_US)
     }
 
     /// Queue a packet for sending.
-    pub fn queue(
-        &mut self, dest: SocketAddr, packet: PacketSlot,
-    ) {
-        assert!(
-            packet.len() > 0,
-            "packet data_len_bytes must be > 0"
-        );
+    pub fn queue(&mut self, dest: SocketAddr, packet: PacketSlot) {
+        assert!(packet.len() > 0, "packet data_len_bytes must be > 0");
         #[cfg(feature = "sim")]
         if self.simulated {
             self.captured.push((dest, packet));
             self.pending_count += 1;
             return;
         }
-        let batch = self.batches
-            .entry(dest)
-            .or_insert_with(Vec::new);
+        let batch = self.batches.entry(dest).or_insert_with(Vec::new);
         batch.push(packet);
         self.pending_count += 1;
     }
@@ -213,10 +180,8 @@ impl BatchSender {
             return true;
         }
         let now_ns = Self::current_time_ns();
-        let last_flush =
-            self.last_flush_ns.load(Ordering::Relaxed);
-        let elapsed_us =
-            (now_ns.saturating_sub(last_flush)) / 1000;
+        let last_flush = self.last_flush_ns.load(Ordering::Relaxed);
+        let elapsed_us = (now_ns.saturating_sub(last_flush)) / 1000;
         elapsed_us >= self.flush_interval_us as u64
     }
 
@@ -234,10 +199,7 @@ impl BatchSender {
             return (sent, 0);
         }
 
-        assert!(
-            self.socket_fd >= 0,
-            "socket_fd must be valid (>= 0)"
-        );
+        assert!(self.socket_fd >= 0, "socket_fd must be valid (>= 0)");
         let total_packets = self.pending_count;
 
         #[cfg(target_os = "linux")]
@@ -246,14 +208,11 @@ impl BatchSender {
         #[cfg(not(target_os = "linux"))]
         let (sent, failed) = self.flush_sendto();
 
-        self.stats.record_batch(
-            total_packets, sent, failed,
-        );
+        self.stats.record_batch(total_packets, sent, failed);
         self.batches.clear();
         self.pending_count = 0;
-        self.last_flush_ns.store(
-            Self::current_time_ns(), Ordering::Relaxed,
-        );
+        self.last_flush_ns
+            .store(Self::current_time_ns(), Ordering::Relaxed);
         (sent, failed)
     }
 
@@ -272,19 +231,14 @@ impl BatchSender {
             return (0, 0);
         }
         let num_packets = packets.len();
-        let mut iovecs: Vec<libc::iovec> =
-            Vec::with_capacity(num_packets);
-        let mut msghdrs: Vec<libc::mmsghdr> =
-            Vec::with_capacity(num_packets);
-        let mut sockaddrs: Vec<libc::sockaddr_storage> =
-            Vec::with_capacity(num_packets);
-        let mut sockaddr_lens: Vec<libc::socklen_t> =
-            Vec::with_capacity(num_packets);
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(num_packets);
+        let mut msghdrs: Vec<libc::mmsghdr> = Vec::with_capacity(num_packets);
+        let mut sockaddrs: Vec<libc::sockaddr_storage> = Vec::with_capacity(num_packets);
+        let mut sockaddr_lens: Vec<libc::socklen_t> = Vec::with_capacity(num_packets);
 
         for (packet, dest) in &packets {
             let iov = libc::iovec {
-                iov_base: packet.data().as_ptr()
-                    as *mut libc::c_void,
+                iov_base: packet.data().as_ptr() as *mut libc::c_void,
                 iov_len: packet.len() as usize,
             };
             iovecs.push(iov);
@@ -292,35 +246,24 @@ impl BatchSender {
                 unsafe { MaybeUninit::zeroed().assume_init() };
             let sockaddr_len = match dest {
                 SocketAddr::V4(addr) => {
-                    let sa = &mut storage as *mut _
-                        as *mut libc::sockaddr_in;
+                    let sa = &mut storage as *mut _ as *mut libc::sockaddr_in;
                     unsafe {
-                        (*sa).sin_family =
-                            libc::AF_INET as libc::sa_family_t;
+                        (*sa).sin_family = libc::AF_INET as libc::sa_family_t;
                         (*sa).sin_port = addr.port().to_be();
-                        (*sa).sin_addr.s_addr =
-                            u32::from_ne_bytes(
-                                addr.ip().octets(),
-                            );
+                        (*sa).sin_addr.s_addr = u32::from_ne_bytes(addr.ip().octets());
                     }
-                    std::mem::size_of::<libc::sockaddr_in>()
-                        as libc::socklen_t
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
                 }
                 SocketAddr::V6(addr) => {
-                    let sa = &mut storage as *mut _
-                        as *mut libc::sockaddr_in6;
+                    let sa = &mut storage as *mut _ as *mut libc::sockaddr_in6;
                     unsafe {
-                        (*sa).sin6_family =
-                            libc::AF_INET6
-                                as libc::sa_family_t;
+                        (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                         (*sa).sin6_port = addr.port().to_be();
                         (*sa).sin6_flowinfo = addr.flowinfo();
-                        (*sa).sin6_addr.s6_addr =
-                            addr.ip().octets();
+                        (*sa).sin6_addr.s6_addr = addr.ip().octets();
                         (*sa).sin6_scope_id = addr.scope_id();
                     }
-                    std::mem::size_of::<libc::sockaddr_in6>()
-                        as libc::socklen_t
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
                 }
             };
             sockaddrs.push(storage);
@@ -328,10 +271,8 @@ impl BatchSender {
         }
 
         for i in 0..iovecs.len() {
-            let mut msghdr: libc::msghdr =
-                unsafe { MaybeUninit::zeroed().assume_init() };
-            msghdr.msg_name = &mut sockaddrs[i] as *mut _
-                as *mut libc::c_void;
+            let mut msghdr: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
+            msghdr.msg_name = &mut sockaddrs[i] as *mut _ as *mut libc::c_void;
             msghdr.msg_namelen = sockaddr_lens[i];
             msghdr.msg_iov = &mut iovecs[i];
             msghdr.msg_iovlen = 1;
@@ -375,39 +316,29 @@ impl BatchSender {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn send_single(
-        &self, data: &[u8], dest: SocketAddr,
-    ) -> bool {
+    fn send_single(&self, data: &[u8], dest: SocketAddr) -> bool {
         use std::mem::MaybeUninit;
         match dest {
             SocketAddr::V4(addr) => {
-                let mut sa: libc::sockaddr_in =
-                    unsafe { MaybeUninit::zeroed().assume_init() };
-                sa.sin_family =
-                    libc::AF_INET as libc::sa_family_t;
+                let mut sa: libc::sockaddr_in = unsafe { MaybeUninit::zeroed().assume_init() };
+                sa.sin_family = libc::AF_INET as libc::sa_family_t;
                 sa.sin_port = addr.port().to_be();
-                sa.sin_addr.s_addr =
-                    u32::from_ne_bytes(addr.ip().octets());
+                sa.sin_addr.s_addr = u32::from_ne_bytes(addr.ip().octets());
                 let result = unsafe {
                     libc::sendto(
                         self.socket_fd,
-                        data.as_ptr()
-                            as *const libc::c_void,
-                        data.len(), 0,
-                        &sa as *const _
-                            as *const libc::sockaddr,
-                        std::mem::size_of::<
-                            libc::sockaddr_in,
-                        >() as libc::socklen_t,
+                        data.as_ptr() as *const libc::c_void,
+                        data.len(),
+                        0,
+                        &sa as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                     )
                 };
                 result >= 0
             }
             SocketAddr::V6(addr) => {
-                let mut sa: libc::sockaddr_in6 =
-                    unsafe { MaybeUninit::zeroed().assume_init() };
-                sa.sin6_family =
-                    libc::AF_INET6 as libc::sa_family_t;
+                let mut sa: libc::sockaddr_in6 = unsafe { MaybeUninit::zeroed().assume_init() };
+                sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 sa.sin6_port = addr.port().to_be();
                 sa.sin6_flowinfo = addr.flowinfo();
                 sa.sin6_addr.s6_addr = addr.ip().octets();
@@ -415,14 +346,11 @@ impl BatchSender {
                 let result = unsafe {
                     libc::sendto(
                         self.socket_fd,
-                        data.as_ptr()
-                            as *const libc::c_void,
-                        data.len(), 0,
-                        &sa as *const _
-                            as *const libc::sockaddr,
-                        std::mem::size_of::<
-                            libc::sockaddr_in6,
-                        >() as libc::socklen_t,
+                        data.as_ptr() as *const libc::c_void,
+                        data.len(),
+                        0,
+                        &sa as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
                     )
                 };
                 result >= 0
@@ -510,8 +438,7 @@ mod tests {
         let mut slot = arena.alloc().unwrap();
         slot.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
         slot.set_len(4);
-        let dest: SocketAddr =
-            "192.168.1.1:5000".parse().unwrap();
+        let dest: SocketAddr = "192.168.1.1:5000".parse().unwrap();
         sender.queue(dest, slot);
         assert_eq!(sender.pending_count(), 1);
         assert_eq!(sender.destination_count(), 1);
@@ -521,19 +448,25 @@ mod tests {
     fn test_is_batch_send_available() {
         // Verify is_batch_send_available returns expected value for current platform
         let available = BatchSender::is_batch_send_available();
-        
+
         #[cfg(target_os = "linux")]
-        assert!(available, "is_batch_send_available should return true on Linux");
-        
+        assert!(
+            available,
+            "is_batch_send_available should return true on Linux"
+        );
+
         #[cfg(not(target_os = "linux"))]
-        assert!(!available, "is_batch_send_available should return false on non-Linux");
+        assert!(
+            !available,
+            "is_batch_send_available should return false on non-Linux"
+        );
     }
 
     #[test]
     fn test_is_batch_send_available_is_const() {
         // Verify the function can be used in const context
         const BATCH_AVAILABLE: bool = BatchSender::is_batch_send_available();
-        
+
         // The value should match runtime check
         assert_eq!(BATCH_AVAILABLE, BatchSender::is_batch_send_available());
     }

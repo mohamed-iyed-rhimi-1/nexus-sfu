@@ -120,27 +120,65 @@ pub struct PerformanceBenchmarks {
     pub target_pps_per_core_pct: f64,
 }
 
+/// Counters the engine gathers at the end of a simulation run.
+#[derive(Debug, Clone, Copy)]
+pub struct SimulationCounts {
+    /// Participants in the scenario
+    pub participants: u32,
+    /// Rooms created
+    pub rooms: u32,
+    /// Tracks published
+    pub tracks: u32,
+    /// Subscriptions made
+    pub subscriptions: u32,
+    /// Largest subscriber count on a single track
+    pub max_subs_per_track: u32,
+    /// Forwarding operations performed
+    pub forward_ops: u64,
+    /// Peak arena slots in use
+    pub arena_peak: u64,
+    /// Arena capacity in slots
+    pub arena_capacity: u64,
+    /// Final BWE estimate (bps)
+    pub bwe_estimate: u64,
+    /// Gossip rounds executed
+    pub gossip_rounds: u64,
+    /// CRDT operations applied
+    pub crdt_ops: u64,
+    /// Time until CRDT convergence (ns)
+    pub convergence_time_ns: u64,
+    /// Simulated CPU cores
+    pub simulated_cores: u32,
+}
+
 impl PerformanceBenchmarks {
     /// Create benchmarks from simulation data
     pub fn from_simulation(
         stats: &SimulationStats,
         latencies_us: &[f64],
-        participants: u32,
-        rooms: u32,
-        tracks: u32,
-        subscriptions: u32,
-        max_subs_per_track: u32,
-        forward_ops: u64,
-        arena_peak: u64,
-        arena_capacity: u64,
-        bwe_estimate: u64,
-        gossip_rounds: u64,
-        crdt_ops: u64,
-        convergence_time_ns: u64,
-        simulated_cores: u32,
+        counts: &SimulationCounts,
     ) -> Self {
+        let SimulationCounts {
+            participants,
+            rooms,
+            tracks,
+            subscriptions,
+            max_subs_per_track,
+            forward_ops,
+            arena_peak,
+            arena_capacity,
+            bwe_estimate,
+            gossip_rounds,
+            crdt_ops,
+            convergence_time_ns,
+            simulated_cores,
+        } = *counts;
         let duration_secs = stats.simulation_duration_ns as f64 / 1_000_000_000.0;
-        let duration_secs = if duration_secs > 0.0 { duration_secs } else { 1.0 };
+        let duration_secs = if duration_secs > 0.0 {
+            duration_secs
+        } else {
+            1.0
+        };
 
         // Calculate throughput
         let pps = stats.total_packets_sent as f64 / duration_secs;
@@ -252,12 +290,20 @@ impl PerformanceBenchmarks {
     pub fn to_benchmark_report(&self) -> String {
         let mut out = String::new();
 
-        out.push_str("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-        out.push_str("║                    NEXUS SFU PERFORMANCE BENCHMARKS                          ║\n");
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╔══════════════════════════════════════════════════════════════════════════════╗\n",
+        );
+        out.push_str(
+            "║                    NEXUS SFU PERFORMANCE BENCHMARKS                          ║\n",
+        );
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // Scale section
-        out.push_str("║ SCALE                                                                        ║\n");
+        out.push_str(
+            "║ SCALE                                                                        ║\n",
+        );
         out.push_str(&format!(
             "║   Participants: {:>6}    Rooms: {:>4}    Tracks: {:>5}    Subscriptions: {:>6} ║\n",
             self.total_participants, self.total_rooms, self.total_tracks, self.total_subscriptions
@@ -266,10 +312,14 @@ impl PerformanceBenchmarks {
             "║   Max subs/track: {:>4}    Avg subs/track: {:>6.1}                                ║\n",
             self.max_subscribers_per_track, self.avg_subscribers_per_track
         ));
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // Throughput section
-        out.push_str("║ THROUGHPUT                                                                   ║\n");
+        out.push_str(
+            "║ THROUGHPUT                                                                   ║\n",
+        );
         out.push_str(&format!(
             "║   Packets/sec:        {:>12.0}                                            ║\n",
             self.packets_per_second
@@ -286,12 +336,24 @@ impl PerformanceBenchmarks {
             "║   Forward ops/sec:    {:>12.0}    (Total: {:>12})                   ║\n",
             self.forward_ops_per_second, self.total_forward_operations
         ));
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // Latency section
-        let p50_status = if self.target_latency_p50_met { "✓" } else { "✗" };
-        let p99_status = if self.target_latency_p99_met { "✓" } else { "✗" };
-        out.push_str("║ LATENCY (microseconds)                                                       ║\n");
+        let p50_status = if self.target_latency_p50_met {
+            "✓"
+        } else {
+            "✗"
+        };
+        let p99_status = if self.target_latency_p99_met {
+            "✓"
+        } else {
+            "✗"
+        };
+        out.push_str(
+            "║ LATENCY (microseconds)                                                       ║\n",
+        );
         out.push_str(&format!(
             "║   Average:  {:>10.1}μs                                                      ║\n",
             self.latency_avg_us
@@ -312,11 +374,19 @@ impl PerformanceBenchmarks {
             "║   Max:      {:>10.1}μs                                                      ║\n",
             self.latency_max_us
         ));
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // Memory section
-        let mem_status = if self.target_memory_per_participant_met { "✓" } else { "✗" };
-        out.push_str("║ MEMORY                                                                       ║\n");
+        let mem_status = if self.target_memory_per_participant_met {
+            "✓"
+        } else {
+            "✗"
+        };
+        out.push_str(
+            "║ MEMORY                                                                       ║\n",
+        );
         out.push_str(&format!(
             "║   Peak total:         {:>10} bytes ({:>6.2} MB)                           ║\n",
             self.peak_memory_bytes,
@@ -334,10 +404,14 @@ impl PerformanceBenchmarks {
             "║   Arena peak slots:   {:>10}          Utilization: {:>5.1}%                 ║\n",
             self.arena_slots_peak, self.arena_utilization_pct
         ));
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // BWE section
-        out.push_str("║ BANDWIDTH ESTIMATION                                                         ║\n");
+        out.push_str(
+            "║ BANDWIDTH ESTIMATION                                                         ║\n",
+        );
         out.push_str(&format!(
             "║   Final estimate:     {:>10} bps ({:>6.2} Mbps)                           ║\n",
             self.final_bandwidth_estimate_bps,
@@ -347,10 +421,14 @@ impl PerformanceBenchmarks {
             "║   Utilization:        {:>10.1}%                                             ║\n",
             self.bandwidth_utilization_pct
         ));
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // CRDT section
-        out.push_str("║ CRDT DISTRIBUTED STATE                                                       ║\n");
+        out.push_str(
+            "║ CRDT DISTRIBUTED STATE                                                       ║\n",
+        );
         out.push_str(&format!(
             "║   Gossip rounds:      {:>10}                                              ║\n",
             self.gossip_rounds
@@ -364,7 +442,9 @@ impl PerformanceBenchmarks {
             self.crdt_convergence_time_ns,
             self.crdt_convergence_time_ns as f64 / 1_000_000.0
         ));
-        out.push_str("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+        out.push_str(
+            "╠══════════════════════════════════════════════════════════════════════════════╣\n",
+        );
 
         // Summary
         let all_targets_met = self.target_latency_p50_met
@@ -375,11 +455,10 @@ impl PerformanceBenchmarks {
         } else {
             "SOME TARGETS NOT MET ✗"
         };
-        out.push_str(&format!(
-            "║ STATUS: {:^68} ║\n",
-            status
-        ));
-        out.push_str("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+        out.push_str(&format!("║ STATUS: {:^68} ║\n", status));
+        out.push_str(
+            "╚══════════════════════════════════════════════════════════════════════════════╝\n",
+        );
 
         out
     }
@@ -463,7 +542,7 @@ impl SimulationReport {
 
         // Performance benchmarks (if available)
         if let Some(ref benchmarks) = self.benchmarks {
-            out.push_str("\n");
+            out.push('\n');
             out.push_str(&benchmarks.to_benchmark_report());
         }
 

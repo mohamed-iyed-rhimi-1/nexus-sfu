@@ -1,6 +1,6 @@
 use rand::RngCore;
-use rand_chacha::ChaCha8Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 /// A deterministic random number generator wrapping `ChaCha8Rng`.
 ///

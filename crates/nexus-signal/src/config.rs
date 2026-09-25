@@ -147,9 +147,10 @@ mod tests {
 
     #[test]
     fn test_validation_max_connections() {
-        let mut config = QuicConfig::default();
-
-        config.max_connections = 0;
+        let mut config = QuicConfig {
+            max_connections: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         config.max_connections = 100_001;
@@ -173,9 +174,10 @@ mod tests {
 
     #[test]
     fn test_validation_session_ticket_ttl() {
-        let mut config = QuicConfig::default();
-
-        config.session_ticket_ttl_secs = 3599;
+        let mut config = QuicConfig {
+            session_ticket_ttl_secs: 3599,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         config.session_ticket_ttl_secs = 3600;

@@ -1,4 +1,5 @@
 export { NexusClient } from './client';
 export type { NexusClientConfig } from './client';
+export type { TokenSource } from './signaling';
 export { NexusError } from './errors';
-export type { SignalMessage, ParticipantInfo, TrackInfo } from './messages';
+export type { SignalMessage, OfferTrack, ParticipantInfo, TrackInfo } from './messages';

@@ -1,9 +1,3 @@
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::declare_interior_mutable_const)]
-
 //! # nexus-state
 //!
 //! CRDT-based distributed state management for Nexus SFU.
@@ -123,8 +117,20 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
+// Crate-level opt-outs must come after the pedantic group, or it re-enables them.
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::missing_errors_doc)]
+// TigerStyle asserts invariants in nearly every function; a `# Panics`
+// section on each would only restate them.
+#![allow(clippy::missing_panics_doc)]
+// Gossip handlers and platform-specific send paths keep uniform `Result`
+// signatures for dispatch, even where one variant can't currently fail.
+#![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::declare_interior_mutable_const)]
 
 pub mod crdt;
 pub mod distributed_state;
@@ -136,9 +142,13 @@ pub mod types;
 pub use crdt::{GCounter, LWWReg, Orswot};
 pub use distributed_state::{
     DistributedState, DistributedStateConfig, RoomMetadata, RoomRegistry,
-    MAX_ROOMS, MAX_TRACKS, MAX_SUBSCRIPTIONS, MAX_PARTICIPANTS_PER_ROOM,
+    MAX_PARTICIPANTS_PER_ROOM, MAX_ROOMS, MAX_SUBSCRIPTIONS, MAX_TRACKS,
 };
 pub use error::{CrdtError, CrdtResult, GossipError};
-pub use gossip::{GossipConfig, PeerInfo, SeedPeer, StateUpdate, MAX_PIGGYBACK_UPDATES, MAX_SEED_PEERS};
 pub use gossip::SwimProtocol;
-pub use types::{ActorId, Dot, VectorClock, VersionVector, MAX_ACTORS, MAX_ELEMENTS, MAX_TOMBSTONES};
+pub use gossip::{
+    GossipConfig, PeerInfo, SeedPeer, StateUpdate, MAX_PIGGYBACK_UPDATES, MAX_SEED_PEERS,
+};
+pub use types::{
+    ActorId, Dot, VectorClock, VersionVector, MAX_ACTORS, MAX_ELEMENTS, MAX_TOMBSTONES,
+};

@@ -62,7 +62,8 @@ impl WorkerMetrics {
     pub fn set_cpu_usage_percent(&self, percent: f32) {
         assert!(percent <= 100.0, "cpu percent must be <= 100.0");
         let scaled = (percent * 100.0) as u32;
-        self.cpu_usage_percent_scaled.store(scaled, Ordering::Relaxed);
+        self.cpu_usage_percent_scaled
+            .store(scaled, Ordering::Relaxed);
     }
 
     /// Get CPU usage percentage
@@ -158,7 +159,10 @@ impl WorkerPoolMetrics {
 
     /// Get total packets processed across all workers
     pub fn total_packets_processed(&self) -> u64 {
-        self.workers.iter().map(|w| w.packets_processed_total()).sum()
+        self.workers
+            .iter()
+            .map(|w| w.packets_processed_total())
+            .sum()
     }
 
     /// Get total track count across all workers

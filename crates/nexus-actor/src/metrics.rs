@@ -56,8 +56,7 @@ impl MigrationMetrics {
         self.migrations_completed.fetch_add(1, Ordering::Relaxed);
         self.migration_latency_sum_nanos
             .fetch_add(latency_nanos, Ordering::Relaxed);
-        self.migration_latency_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.migration_latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record migration failure
@@ -84,15 +83,12 @@ impl MigrationMetrics {
 
     /// Record sequence gap
     pub fn record_sequence_gap(&self) {
-        self.sequence_gaps_detected
-            .fetch_add(1, Ordering::Relaxed);
+        self.sequence_gaps_detected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get average migration latency (nanos)
     pub fn average_latency_nanos(&self) -> u64 {
-        let sum = self
-            .migration_latency_sum_nanos
-            .load(Ordering::Relaxed);
+        let sum = self.migration_latency_sum_nanos.load(Ordering::Relaxed);
         let count = self.migration_latency_count.load(Ordering::Relaxed);
         if count == 0 {
             return 0;
@@ -161,7 +157,7 @@ impl ForwardingMetrics {
     /// Record layer switch
     pub fn record_layer_switch(&self, old_layer: u8, new_layer: u8) {
         self.layer_switches.fetch_add(1, Ordering::Relaxed);
-        
+
         if new_layer > old_layer {
             self.layer_upgrades.fetch_add(1, Ordering::Relaxed);
         } else if new_layer < old_layer {
@@ -174,9 +170,10 @@ impl ForwardingMetrics {
     /// # Assertions
     /// - utilization_percent_x100 <= 10000 (100% × 100)
     pub fn update_bandwidth(&self, allocated: u64, used: u64) {
-        self.allocated_bandwidth_bps.store(allocated, Ordering::Relaxed);
+        self.allocated_bandwidth_bps
+            .store(allocated, Ordering::Relaxed);
         self.used_bandwidth_bps.store(used, Ordering::Relaxed);
-        
+
         if allocated > 0 {
             let utilization = (used * 10000) / allocated;
             assert!(
@@ -184,7 +181,8 @@ impl ForwardingMetrics {
                 "Utilization exceeds 100%: {}",
                 utilization
             );
-            self.utilization_percent_x100.store(utilization, Ordering::Relaxed);
+            self.utilization_percent_x100
+                .store(utilization, Ordering::Relaxed);
         } else {
             self.utilization_percent_x100.store(0, Ordering::Relaxed);
         }
@@ -200,10 +198,10 @@ impl ForwardingMetrics {
         if max_layer == 0 {
             return 0;
         }
-        
+
         let score = ((current_layer as u32) * 100) / (max_layer as u32);
         assert!(score <= 100, "Quality score exceeds 100: {}", score);
-        
+
         self.quality_score.store(score as u64, Ordering::Relaxed);
         score
     }

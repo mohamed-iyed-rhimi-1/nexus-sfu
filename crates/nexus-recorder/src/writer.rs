@@ -23,8 +23,7 @@ use tracing::{debug, error, info, warn};
 use nexus_core::{MediaKind, RoomId, Ssrc, TrackId};
 
 use crate::format::{
-    FileHeader, PacketRecordHeader, FILE_HEADER_SIZE, MAX_RECORD_PAYLOAD,
-    PACKET_RECORD_HEADER_SIZE,
+    FileHeader, PacketRecordHeader, FILE_HEADER_SIZE, MAX_RECORD_PAYLOAD, PACKET_RECORD_HEADER_SIZE,
 };
 
 // ============================================================================
@@ -66,18 +65,24 @@ pub struct WriteCommand {
     pub data: [u8; MAX_RECORD_PAYLOAD],
 }
 
+/// Parameters for opening a track file.
+pub struct OpenTrackCmd {
+    pub track_id: TrackId,
+    pub room_id: RoomId,
+    pub ssrc: Ssrc,
+    pub kind: MediaKind,
+    pub start_time_ns: u64,
+}
+
 /// Control commands for the writer thread.
+// Packet stays inline (~1.5 KB): boxing it would heap-allocate per recorded
+// packet on the forwarding hot path (see sink.rs).
+#[allow(clippy::large_enum_variant)]
 pub enum WriterCommand {
     /// Write a packet to the track's file.
     Packet(WriteCommand),
     /// Open a new track file.
-    OpenTrack {
-        track_id: TrackId,
-        room_id: RoomId,
-        ssrc: Ssrc,
-        kind: MediaKind,
-        start_time_ns: u64,
-    },
+    OpenTrack(OpenTrackCmd),
     /// Close a track file (track removed or room ended).
     CloseTrack { track_id: TrackId },
     /// Flush all buffers and shut down.
@@ -113,7 +118,7 @@ impl DiskWriter {
     /// # TigerStyle: ≥2 assertions
     pub fn spawn(output_dir: PathBuf) -> Result<Self, std::io::Error> {
         assert!(
-            output_dir.as_os_str().len() > 0,
+            !output_dir.as_os_str().is_empty(),
             "output_dir must be non-empty"
         );
 
@@ -152,13 +157,13 @@ impl DiskWriter {
         assert!(start_time_ns > 0, "start_time_ns must be positive");
 
         self.tx
-            .try_send(WriterCommand::OpenTrack {
+            .try_send(WriterCommand::OpenTrack(OpenTrackCmd {
                 track_id,
                 room_id,
                 ssrc,
                 kind,
                 start_time_ns,
-            })
+            }))
             .is_ok()
     }
 
@@ -236,34 +241,14 @@ fn writer_loop(rx: Receiver<WriterCommand>, output_dir: &Path) -> WriterStats {
     let mut stats = WriterStats::default();
 
     // NASA Rule 2: main loop bounded by channel lifetime (sender drop = exit).
-    loop {
-        let cmd = match rx.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => break, // Channel closed.
-        };
-
+    while let Ok(cmd) = rx.recv() {
         match cmd {
             WriterCommand::Shutdown => {
                 flush_all(&mut files, &mut stats);
                 break;
             }
-            WriterCommand::OpenTrack {
-                track_id,
-                room_id,
-                ssrc,
-                kind,
-                start_time_ns,
-            } => {
-                handle_open_track(
-                    &mut files,
-                    &mut stats,
-                    output_dir,
-                    track_id,
-                    room_id,
-                    ssrc,
-                    kind,
-                    start_time_ns,
-                );
+            WriterCommand::OpenTrack(open) => {
+                handle_open_track(&mut files, &mut stats, output_dir, open);
             }
             WriterCommand::CloseTrack { track_id } => {
                 handle_close_track(&mut files, &mut stats, track_id);
@@ -281,23 +266,8 @@ fn writer_loop(rx: Receiver<WriterCommand>, output_dir: &Path) -> WriterStats {
                     flush_all(&mut files, &mut stats);
                     return stats;
                 }
-                Ok(WriterCommand::OpenTrack {
-                    track_id,
-                    room_id,
-                    ssrc,
-                    kind,
-                    start_time_ns,
-                }) => {
-                    handle_open_track(
-                        &mut files,
-                        &mut stats,
-                        output_dir,
-                        track_id,
-                        room_id,
-                        ssrc,
-                        kind,
-                        start_time_ns,
-                    );
+                Ok(WriterCommand::OpenTrack(open)) => {
+                    handle_open_track(&mut files, &mut stats, output_dir, open);
                 }
                 Ok(WriterCommand::CloseTrack { track_id }) => {
                     handle_close_track(&mut files, &mut stats, track_id);
@@ -321,12 +291,15 @@ fn handle_open_track(
     files: &mut Vec<(TrackId, TrackFile)>,
     stats: &mut WriterStats,
     output_dir: &Path,
-    track_id: TrackId,
-    room_id: RoomId,
-    ssrc: Ssrc,
-    kind: MediaKind,
-    start_time_ns: u64,
+    open: OpenTrackCmd,
 ) {
+    let OpenTrackCmd {
+        track_id,
+        room_id,
+        ssrc,
+        kind,
+        start_time_ns,
+    } = open;
     if files.len() >= MAX_TRACK_FILES {
         error!(track_id, "max track files reached, cannot open");
         return;
@@ -338,10 +311,7 @@ fn handle_open_track(
         return;
     }
 
-    let filename = format!(
-        "room{}_track{}_{}.nrec",
-        room_id, track_id, start_time_ns
-    );
+    let filename = format!("room{}_track{}_{}.nrec", room_id, track_id, start_time_ns);
     let path = output_dir.join(&filename);
 
     let file = match File::create(&path) {
@@ -362,11 +332,14 @@ fn handle_open_track(
         return;
     }
 
-    files.push((track_id, TrackFile {
-        writer,
-        packets_written: 0,
-        bytes_written: FILE_HEADER_SIZE as u64,
-    }));
+    files.push((
+        track_id,
+        TrackFile {
+            writer,
+            packets_written: 0,
+            bytes_written: FILE_HEADER_SIZE as u64,
+        },
+    ));
     stats.tracks_recorded += 1;
 
     debug!(track_id, path = %path.display(), "track recording started");
@@ -392,11 +365,7 @@ fn handle_close_track(
     }
 }
 
-fn handle_packet(
-    files: &mut Vec<(TrackId, TrackFile)>,
-    stats: &mut WriterStats,
-    pkt: WriteCommand,
-) {
+fn handle_packet(files: &mut [(TrackId, TrackFile)], stats: &mut WriterStats, pkt: WriteCommand) {
     let tf = match files.iter_mut().find(|(id, _)| *id == pkt.track_id) {
         Some((_, tf)) => tf,
         None => return, // Track not being recorded — silently skip.

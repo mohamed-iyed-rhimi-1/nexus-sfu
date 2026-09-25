@@ -114,8 +114,7 @@ impl NetworkSimulator {
         } else {
             0
         };
-        let delivery_time_ns =
-            current_time_ns + config.latency_ms * 1_000_000 + jitter * 1_000_000;
+        let delivery_time_ns = current_time_ns + config.latency_ms * 1_000_000 + jitter * 1_000_000;
 
         self.metrics.packets_delivered += 1;
         Some(delivery_time_ns)

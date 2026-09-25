@@ -36,7 +36,7 @@
 // =============================================================================
 // The transport module re-exports from nexus_transport and includes local af_xdp.
 
-pub mod transport;    // → nexus_transport + local af_xdp
+pub mod transport; // → nexus_transport + local af_xdp
 
 // =============================================================================
 // Application modules (unique to binary crate)
@@ -44,8 +44,8 @@ pub mod transport;    // → nexus_transport + local af_xdp
 // These modules contain application-level orchestration code specific to the
 // Nexus SFU binary. They are not part of the library crates.
 
-pub mod config;
 pub mod clock;
+pub mod config;
 pub mod error;
 pub mod forward;
 pub mod orchestrator;
@@ -55,8 +55,8 @@ pub mod sfu;
 pub mod signal;
 pub mod spin;
 pub mod state;
-pub mod track_registry;
 pub mod tracing;
+pub mod track_registry;
 pub mod types;
 pub mod worker;
 
@@ -71,11 +71,9 @@ pub mod worker;
 // -----------------------------------------------------------------------------
 pub use nexus_actor;
 pub use nexus_actor::{
-    ActorManager, RoomActor, ParticipantActor, TrackActor,
-    ActorRegistry, ActorSupervisor, ActorState, ActorHealth,
-    RestartPolicy, TrackActorMessage, TrackActorResponse,
-    PacketSlot as ActorPacketSlot,
-    WorkerId as ActorWorkerId, MediaKind as ActorMediaKind,
+    ActorHealth, ActorManager, ActorRegistry, ActorState, ActorSupervisor,
+    MediaKind as ActorMediaKind, PacketSlot as ActorPacketSlot, ParticipantActor, RestartPolicy,
+    RoomActor, TrackActor, TrackActorMessage, TrackActorResponse, WorkerId as ActorWorkerId,
 };
 
 // -----------------------------------------------------------------------------
@@ -92,20 +90,18 @@ pub use nexus_media;
 // nexus-state: Distributed state (CRDTs, SWIM protocol)
 // -----------------------------------------------------------------------------
 pub use nexus_state;
-pub use nexus_state::{
-    DistributedState, DistributedStateConfig,
-    Orswot, LWWReg, GCounter,
-    GossipConfig, SeedPeer,
-};
 pub use nexus_state::SwimProtocol;
+pub use nexus_state::{
+    DistributedState, DistributedStateConfig, GCounter, GossipConfig, LWWReg, Orswot, SeedPeer,
+};
 
 // -----------------------------------------------------------------------------
 // nexus-signal: QUIC signaling with WebSocket fallback
 // -----------------------------------------------------------------------------
 pub use nexus_signal;
 pub use nexus_signal::{
-    QuicSignaling, QuicConfig, WebSocketServer as NexusWebSocketServer,
-    SignalMessage as QuicSignalMessage,
+    QuicConfig, QuicSignaling, SignalMessage as QuicSignalMessage,
+    WebSocketServer as NexusWebSocketServer,
 };
 
 // -----------------------------------------------------------------------------
@@ -113,10 +109,8 @@ pub use nexus_signal::{
 // -----------------------------------------------------------------------------
 pub use nexus_bwe;
 pub use nexus_bwe::{
-    CongestionController, GccStats, GccStatsSnapshot,
-    TrackAllocation, TrackPriority, SimulcastLayer,
-    DelayBasedBweDetector,
-    RttEstimator, ProbeController,
+    CongestionController, DelayBasedBweDetector, GccStats, GccStatsSnapshot, ProbeController,
+    RttEstimator, SimulcastLayer, TrackAllocation, TrackPriority,
 };
 
 // -----------------------------------------------------------------------------
@@ -141,18 +135,15 @@ pub use nexus_webrtc;
 // -----------------------------------------------------------------------------
 pub use nexus_transport::arena::{PacketArena, PacketSlot, SLOT_SIZE_BYTES};
 pub use nexus_transport::ice::{
-    IceAgent, IceConfig, IceRole, IceCredentials, IceConnectionState, IceGatheringState,
-    Candidate, CandidateType, CandidatePair, CandidatePairState,
-    CandidateGatherer, Checklist, ChecklistState,
-    StunMessage, StunAttribute, StunClass, StunMethod, IceError,
+    Candidate, CandidateGatherer, CandidatePair, CandidatePairState, CandidateType, Checklist,
+    ChecklistState, IceAgent, IceConfig, IceConnectionState, IceCredentials, IceError,
+    IceGatheringState, IceRole, StunAttribute, StunClass, StunMessage, StunMethod,
 };
 pub use nexus_transport::turn::{
-    TurnClient, TurnClientConfig, TurnError,
-    Allocation, AllocationState,
-    TurnCredentials, TurnServerInfo, Permission, ChannelBinding,
-    RelayedAddress, TransportProtocol,
-    CHANNEL_NUMBER_MIN, CHANNEL_NUMBER_MAX, DEFAULT_ALLOCATION_LIFETIME,
-    PERMISSION_LIFETIME, CHANNEL_BINDING_LIFETIME,
+    Allocation, AllocationState, ChannelBinding, Permission, RelayedAddress, TransportProtocol,
+    TurnClient, TurnClientConfig, TurnCredentials, TurnError, TurnServerInfo,
+    CHANNEL_BINDING_LIFETIME, CHANNEL_NUMBER_MAX, CHANNEL_NUMBER_MIN, DEFAULT_ALLOCATION_LIFETIME,
+    PERMISSION_LIFETIME,
 };
 
 // -----------------------------------------------------------------------------
@@ -165,36 +156,52 @@ pub use nexus_media::rtp::RtpHeader;
 // Application modules: config, error, forward, sfu, worker, etc.
 // -----------------------------------------------------------------------------
 pub use config::{
-    NexusConfig, MemoryConfig, WorkerConfig, RoomConfig, BweConfig,
-    SecurityConfig, LoggingConfig, ActorConfig, MetricsConfig, ApiConfig, XdpConfig,
+    ActorConfig,
+    ApiConfig,
+    BweConfig,
     ConfigError,
-    TransportConfig,  // Application-level transport config (distinct from UdpTransportConfig)
+    LoggingConfig,
+    MemoryConfig,
+    MetricsConfig,
+    NexusConfig,
+    RoomConfig,
+    SecurityConfig,
+    TransportConfig, // Application-level transport config (distinct from UdpTransportConfig)
+    WorkerConfig,
+    XdpConfig,
 };
 pub use error::{
-    ArenaError, ParseError, RoomError, RtcpError, RtpError, SfuError,
-    SignalingError, TransportError, WorkerError, ApiError, signaling_error_codes,
+    signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
+    SfuError, SignalingError, TransportError, WorkerError,
 };
 pub use forward::{
-    SsrcError, SsrcRouter,
-    Subscriber, SubscriberList, SubscriberListStats, SubscriberListStatsSnapshot,
-    ViewportFilter, DEFAULT_COLD_TIMEOUT_NS, MAX_SUBSCRIBERS_PER_TRACK,
-    PacketType, PacketHandler,
+    PacketHandler, PacketType, SsrcError, SsrcRouter, Subscriber, SubscriberList,
+    SubscriberListStats, SubscriberListStatsSnapshot, ViewportFilter, DEFAULT_COLD_TIMEOUT_NS,
+    MAX_SUBSCRIBERS_PER_TRACK,
 };
-pub use sfu::{Sfu, SfuStats, DrainState};
+pub use sfu::{DrainState, Sfu, SfuStats};
 pub use spin::SpinLoop;
 pub use state::{ForwardEntry, ForwardTable, XdpError};
 pub use tracing::{
-    init_tracing, init_tracing_extended, ExtendedLoggingConfig, TracingError,
-    HotPathMetrics, HotPathMetricsSnapshot, LatencyGuard, LatencyKind,
-    HOT_PATH_METRICS,
+    init_tracing, init_tracing_extended, ExtendedLoggingConfig, HotPathMetrics,
+    HotPathMetricsSnapshot, LatencyGuard, LatencyKind, TracingError, HOT_PATH_METRICS,
 };
 pub use transport::{
-    BatchSender, BatchSenderStats, BatchSenderStatsSnapshot,
-    RecvPacket, TransportStats, TransportStatsSnapshot, UdpTransport,
-    TransportConfig as UdpTransportConfig,  // Low-level UDP transport config
+    BatchSender,
+    BatchSenderStats,
+    BatchSenderStatsSnapshot,
+    RecvPacket,
+    TransportConfig as UdpTransportConfig, // Low-level UDP transport config
+    TransportStats,
+    TransportStatsSnapshot,
+    UdpTransport,
 };
-pub use types::{BandwidthBps, ConnectionId, MediaKind, ParticipantId, RoomId, Ssrc, TimestampNs, TrackId};
-pub use worker::{ConsistentHash, MediaWorker, WorkerHandle, WorkerMessage, WorkerPool, WorkerStats};
+pub use types::{
+    BandwidthBps, ConnectionId, MediaKind, ParticipantId, RoomId, Ssrc, TimestampNs, TrackId,
+};
+pub use worker::{
+    ConsistentHash, MediaWorker, WorkerHandle, WorkerMessage, WorkerPool, WorkerStats,
+};
 
 /// Nexus SFU MVP version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -232,13 +239,18 @@ mod tests {
 
     #[test]
     fn test_version() {
-        assert!(!VERSION.is_empty());
+        // VERSION comes from CARGO_PKG_VERSION; check it's a semver triple
+        assert_eq!(
+            VERSION.split('.').count(),
+            3,
+            "unexpected version {VERSION}"
+        );
     }
 
     #[test]
     fn test_tier_info() {
         assert!(tier::CURRENT.contains("MVP"));
-        assert!(tier::metrics::PACKETS_PER_SEC_PER_CORE >= 500_000);
+        const { assert!(tier::metrics::PACKETS_PER_SEC_PER_CORE >= 500_000) };
     }
 
     #[test]

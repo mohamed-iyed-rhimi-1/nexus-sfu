@@ -1,5 +1,5 @@
+use nexus_bwe::{DelayBasedBweDetector, DelayBasedBweState, KalmanFilter};
 use proptest::prelude::*;
-use nexus_bwe::{KalmanFilter, DelayBasedBweDetector, DelayBasedBweState};
 
 proptest! {
     #[test]

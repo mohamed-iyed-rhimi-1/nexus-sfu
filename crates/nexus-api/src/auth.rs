@@ -8,7 +8,7 @@
 //! - Explicit error handling with ApiError::Unauthorized
 
 use crate::error::ApiError;
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
 /// Minimum required secret length for security (256 bits)
@@ -95,20 +95,31 @@ impl JwtValidator {
     /// - `Ok(Claims)` if token is valid and not expired
     /// - `Err(ApiError::Unauthorized)` if token is invalid or expired
     ///
-    /// # Assertions
-    ///
-    /// - token.len() > 0
+    /// The token comes from untrusted clients, so malformed input (including an
+    /// empty token or empty subject) is rejected with an error, never a panic.
     pub fn validate(&self, token: &str) -> Result<Claims, ApiError> {
-        // TigerStyle: Precondition assertion
+        if token.is_empty() {
+            return Err(ApiError::Unauthorized {
+                reason: "empty token".to_string(),
+            });
+        }
+        // TigerStyle: Precondition assertion (guaranteed by the check above)
         assert!(!token.is_empty(), "Token must not be empty");
 
         // Decode and validate token
-        let token_data = decode::<Claims>(token, &self.decoding_key, &self.validation)
-            .map_err(|e| ApiError::Unauthorized {
-                reason: format!("invalid token: {}", e),
+        let token_data =
+            decode::<Claims>(token, &self.decoding_key, &self.validation).map_err(|e| {
+                ApiError::Unauthorized {
+                    reason: format!("invalid token: {}", e),
+                }
             })?;
 
-        // TigerStyle: Postcondition assertion
+        if token_data.claims.sub.is_empty() {
+            return Err(ApiError::Unauthorized {
+                reason: "token has empty subject".to_string(),
+            });
+        }
+        // TigerStyle: Postcondition assertion (guaranteed by the check above)
         assert!(
             !token_data.claims.sub.is_empty(),
             "Claims must have non-empty subject"
@@ -153,6 +164,36 @@ mod tests {
         let validator = JwtValidator::new(&secret);
         // Validator should be created successfully
         assert!(validator.validation.validate_exp);
+    }
+
+    #[test]
+    fn test_validate_empty_token_is_rejected_not_panic() {
+        let validator = JwtValidator::new("test-secret-that-is-at-least-32-chars-long");
+        assert!(matches!(
+            validator.validate(""),
+            Err(ApiError::Unauthorized { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_empty_subject_is_rejected_not_panic() {
+        let secret = "test-secret-that-is-at-least-32-chars-long";
+        let validator = JwtValidator::new(secret);
+        let claims = Claims {
+            sub: String::new(),
+            exp: u64::MAX / 2,
+            iat: 0,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        assert!(matches!(
+            validator.validate(&token),
+            Err(ApiError::Unauthorized { .. })
+        ));
     }
 
     #[test]

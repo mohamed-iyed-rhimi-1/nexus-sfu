@@ -253,7 +253,8 @@ impl MetricsCollector {
 
     /// Get the elapsed time since test start
     pub fn elapsed(&self) -> Duration {
-        self.test_duration.unwrap_or_else(|| self.start_time.elapsed())
+        self.test_duration
+            .unwrap_or_else(|| self.start_time.elapsed())
     }
 
     /// Get access to client metrics
@@ -363,14 +364,20 @@ mod tests {
     #[test]
     fn test_percentile_single_element() {
         let samples = [Duration::from_millis(100)];
-        assert_eq!(calculate_percentile(&samples, 50.0), Duration::from_millis(100));
-        assert_eq!(calculate_percentile(&samples, 99.0), Duration::from_millis(100));
+        assert_eq!(
+            calculate_percentile(&samples, 50.0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            calculate_percentile(&samples, 99.0),
+            Duration::from_millis(100)
+        );
     }
 
     #[test]
     fn test_percentile_multiple_elements() {
         // 10 elements: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ms
-        let samples: Vec<Duration> = (1..=10).map(|i| Duration::from_millis(i)).collect();
+        let samples: Vec<Duration> = (1..=10).map(Duration::from_millis).collect();
 
         // P50 should be >= 50% of samples (index 4 = 5ms)
         let p50 = calculate_percentile(&samples, 50.0);

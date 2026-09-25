@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// RTT estimator with exponential smoothing following RFC 6298.
-/// 
+///
 /// Maintains smoothed RTT (SRTT) and RTT variance (RTTVAR) for timeout
 /// calculation and congestion control. Uses lock-free atomics for thread-safe
 /// updates without allocation.
@@ -76,10 +76,12 @@ impl RttEstimator {
         } else {
             current_srtt - rtt_sample_us
         };
-        let new_rttvar = ((1.0 - self.beta) * current_rttvar as f64 + self.beta * abs_diff as f64) as u64;
+        let new_rttvar =
+            ((1.0 - self.beta) * current_rttvar as f64 + self.beta * abs_diff as f64) as u64;
 
         // SRTT = (1 - alpha) * SRTT + alpha * R
-        let new_srtt = ((1.0 - self.alpha) * current_srtt as f64 + self.alpha * rtt_sample_us as f64) as u64;
+        let new_srtt =
+            ((1.0 - self.alpha) * current_srtt as f64 + self.alpha * rtt_sample_us as f64) as u64;
 
         // Clamp to bounds
         let new_srtt = new_srtt.clamp(Self::MIN_RTT_US, Self::MAX_RTT_US);
@@ -168,9 +170,12 @@ mod tests {
     fn test_rtt_estimator_update() {
         let estimator = RttEstimator::new(50_000);
         estimator.update(60_000);
-        
+
         let srtt = estimator.srtt_us();
-        assert!(srtt > 50_000 && srtt < 60_000, "SRTT should be between old and new");
+        assert!(
+            srtt > 50_000 && srtt < 60_000,
+            "SRTT should be between old and new"
+        );
         assert_eq!(estimator.min_rtt_us(), 50_000);
         assert_eq!(estimator.max_rtt_us(), 60_000);
     }
@@ -178,28 +183,31 @@ mod tests {
     #[test]
     fn test_rtt_estimator_smoothing() {
         let estimator = RttEstimator::new(50_000);
-        
+
         // Add samples with variance
         for _ in 0..10 {
             estimator.update(55_000);
         }
-        
+
         let srtt = estimator.srtt_us();
-        assert!(srtt > 50_000 && srtt <= 55_000, "SRTT should converge toward samples");
+        assert!(
+            srtt > 50_000 && srtt <= 55_000,
+            "SRTT should converge toward samples"
+        );
     }
 
     #[test]
     fn test_rtt_estimator_bounds() {
         let estimator = RttEstimator::new(50_000);
-        
+
         // Update with min bound
         estimator.update(RttEstimator::MIN_RTT_US);
         assert_eq!(estimator.min_rtt_us(), RttEstimator::MIN_RTT_US);
-        
+
         // Update with max bound
         estimator.update(RttEstimator::MAX_RTT_US);
         assert_eq!(estimator.max_rtt_us(), RttEstimator::MAX_RTT_US);
-        
+
         let srtt = estimator.srtt_us();
         assert!(srtt >= estimator.min_rtt_us());
         assert!(srtt <= estimator.max_rtt_us());
@@ -209,7 +217,7 @@ mod tests {
     fn test_rtt_estimator_rto_calculation() {
         let estimator = RttEstimator::new(50_000);
         let rto = estimator.rto_us();
-        
+
         assert!(rto >= RttEstimator::MIN_RTO_US);
         assert!(rto <= RttEstimator::MAX_RTO_US);
         assert!(rto >= estimator.srtt_us());

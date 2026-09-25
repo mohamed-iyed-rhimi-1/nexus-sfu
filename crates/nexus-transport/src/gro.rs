@@ -90,7 +90,6 @@ impl GroSplitter {
         self.segment_size > 0
     }
 
-
     /// Split a GRO-coalesced buffer into individual packets.
     ///
     /// If segment_size is 0 or >= data.len(), returns the entire buffer
@@ -126,7 +125,11 @@ impl GroSplitter {
     #[inline]
     pub fn packet_count(&self, data_len: usize) -> usize {
         if self.segment_size == 0 || data_len == 0 {
-            if data_len > 0 { 1 } else { 0 }
+            if data_len > 0 {
+                1
+            } else {
+                0
+            }
         } else {
             let seg = self.segment_size as usize;
             data_len.div_ceil(seg)
@@ -184,7 +187,6 @@ impl<'a> Iterator for GroPacketIterator<'a> {
 
 impl<'a> ExactSizeIterator for GroPacketIterator<'a> {}
 
-
 /// Parse GRO segment size from cmsg data.
 ///
 /// When receiving with recvmsg(), the kernel provides the GRO segment
@@ -222,10 +224,8 @@ pub fn parse_gro_size_from_cmsg(cmsg_data: &[u8]) -> u16 {
             // Data follows header
             let data_offset = offset + std::mem::size_of::<libc::cmsghdr>();
             if data_offset + 2 <= cmsg_data.len() {
-                let segment_size = u16::from_ne_bytes([
-                    cmsg_data[data_offset],
-                    cmsg_data[data_offset + 1],
-                ]);
+                let segment_size =
+                    u16::from_ne_bytes([cmsg_data[data_offset], cmsg_data[data_offset + 1]]);
                 // Assertion: segment size should be reasonable
                 if segment_size >= MIN_GRO_SEGMENT_SIZE && segment_size <= MAX_GRO_SEGMENT_SIZE {
                     return segment_size;

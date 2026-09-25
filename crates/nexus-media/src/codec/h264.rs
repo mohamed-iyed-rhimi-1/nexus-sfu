@@ -61,9 +61,7 @@ impl NalUnitType {
     fn is_idr_or_param_set(self) -> bool {
         matches!(
             self,
-            NalUnitType::SliceIdr
-                | NalUnitType::Sps
-                | NalUnitType::Pps
+            NalUnitType::SliceIdr | NalUnitType::Sps | NalUnitType::Pps
         )
     }
 }
@@ -133,8 +131,7 @@ impl H264PayloadHeader {
                 fu_start = (fu_header & 0x80) != 0;
                 fu_end = (fu_header & 0x40) != 0;
                 let fu_type = fu_header & 0x1F;
-                fu_nal_type =
-                    Some(NalUnitType::from_raw(fu_type));
+                fu_nal_type = Some(NalUnitType::from_raw(fu_type));
                 header_len_bytes = 2;
             }
             NalUnitType::FuB => {
@@ -149,8 +146,7 @@ impl H264PayloadHeader {
                 fu_start = (fu_header & 0x80) != 0;
                 fu_end = (fu_header & 0x40) != 0;
                 let fu_type = fu_header & 0x1F;
-                fu_nal_type =
-                    Some(NalUnitType::from_raw(fu_type));
+                fu_nal_type = Some(NalUnitType::from_raw(fu_type));
                 // 1 (indicator) + 1 (FU header) + 2 (DON)
                 header_len_bytes = 4;
             }
@@ -159,21 +155,15 @@ impl H264PayloadHeader {
                 // Check each NAL type for IDR/SPS/PPS.
                 let mut offset: usize = 1;
                 let mut nalu_count: usize = 0;
-                while offset + 2 <= data.len()
-                    && nalu_count < MAX_STAP_A_NALUS
-                {
-                    let nalu_size = u16::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                    ]) as usize;
+                while offset + 2 <= data.len() && nalu_count < MAX_STAP_A_NALUS {
+                    let nalu_size = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
                     offset += 2;
 
                     if nalu_size == 0 || offset + nalu_size > data.len() {
                         break;
                     }
 
-                    let nalu_type =
-                        NalUnitType::from_raw(data[offset] & 0x1F);
+                    let nalu_type = NalUnitType::from_raw(data[offset] & 0x1F);
                     if nalu_type.is_idr_or_param_set() {
                         stap_a_has_idr = true;
                     }
@@ -213,9 +203,7 @@ impl H264PayloadHeader {
             NalUnitType::Sps | NalUnitType::Pps => true,
             NalUnitType::StapA => self.stap_a_has_idr,
             NalUnitType::FuA | NalUnitType::FuB => {
-                self.fu_start
-                    && self.fu_nal_type
-                        == Some(NalUnitType::SliceIdr)
+                self.fu_start && self.fu_nal_type == Some(NalUnitType::SliceIdr)
             }
             _ => false,
         }
@@ -325,7 +313,7 @@ mod tests {
         let data: &[u8] = &[
             0x78, // STAP-A indicator
             0x00, 0x03, 0x67, 0x42, 0x00, // SPS: size=3, [0x67, 0x42, 0x00]
-            0x00, 0x02, 0x68, 0xCE,       // PPS: size=2, [0x68, 0xCE]
+            0x00, 0x02, 0x68, 0xCE, // PPS: size=2, [0x68, 0xCE]
             0x00, 0x04, 0x65, 0x88, 0x00, 0x01, // IDR: size=4
         ];
         let hdr = H264PayloadHeader::parse(data).unwrap();

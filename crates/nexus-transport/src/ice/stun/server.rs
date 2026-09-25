@@ -5,9 +5,11 @@
 
 use std::net::SocketAddr;
 
-use super::attributes::{StunAttribute, ATTR_MESSAGE_INTEGRITY, ATTR_FINGERPRINT};
+use super::attributes::{StunAttribute, ATTR_FINGERPRINT, ATTR_MESSAGE_INTEGRITY};
 use super::integrity::{sign_message, IntegrityContext};
-use super::message::{StunMessage, StunClass, StunMethod, STUN_HEADER_SIZE, STUN_MAGIC_COOKIE, STUN_BUFFER_SIZE};
+use super::message::{
+    StunClass, StunMessage, StunMethod, STUN_BUFFER_SIZE, STUN_HEADER_SIZE, STUN_MAGIC_COOKIE,
+};
 use crate::ice::error::IceError;
 use crate::ice::types::IceCredentials;
 
@@ -19,10 +21,10 @@ pub const MAX_STUN_RESPONSE_SIZE: usize = STUN_BUFFER_SIZE;
 pub struct StunServerConfig {
     /// Require MESSAGE-INTEGRITY for binding requests.
     pub require_integrity: bool,
-    
+
     /// Require FINGERPRINT for binding requests.
     pub require_fingerprint: bool,
-    
+
     /// Software identifier to include in responses.
     pub software: Option<&'static str>,
 }
@@ -40,7 +42,7 @@ impl Default for StunServerConfig {
 /// STUN server state.
 pub struct StunServer {
     config: StunServerConfig,
-    
+
     /// Pre-allocated response buffer.
     response_buf: [u8; MAX_STUN_RESPONSE_SIZE],
 }
@@ -53,12 +55,12 @@ impl StunServer {
             response_buf: [0u8; MAX_STUN_RESPONSE_SIZE],
         }
     }
-    
+
     /// Create with default config.
     pub fn with_defaults() -> Self {
         Self::new(StunServerConfig::default())
     }
-    
+
     /// Handle incoming STUN request.
     ///
     /// # Arguments
@@ -86,48 +88,59 @@ impl StunServer {
         if data.is_empty() {
             return Ok(None);
         }
-        
+
         // Check if this is a STUN message
         if !StunMessage::is_stun(data) {
             return Ok(None);
         }
-        
+
         // is_stun already checks header size, so this should hold
-        debug_assert!(data.len() >= STUN_HEADER_SIZE,
-            "STUN message must be at least {} bytes", STUN_HEADER_SIZE);
-        
+        debug_assert!(
+            data.len() >= STUN_HEADER_SIZE,
+            "STUN message must be at least {} bytes",
+            STUN_HEADER_SIZE
+        );
+
         // Parse the message
         let (msg, integrity_ctx) = self.parse_with_integrity(data)?;
-        
+
         // Only handle binding requests
         if msg.method != StunMethod::Binding || msg.class != StunClass::Request {
             return Ok(None);
         }
-        
+
         // Validate request using helper method (now includes USERNAME validation)
         let validation_result = self.validate_request(data, &msg, credentials, &integrity_ctx);
-        
+
         if let Err(error_response) = validation_result {
             if let Some((code, reason)) = error_response {
                 let len = self.build_error_response(&msg, code, reason, credentials)?;
                 // Postcondition: response within buffer (TigerStyle Phase 4.10)
-                assert!(len <= MAX_STUN_RESPONSE_SIZE,
-                    "Response size {} exceeds maximum {}", len, MAX_STUN_RESPONSE_SIZE);
+                assert!(
+                    len <= MAX_STUN_RESPONSE_SIZE,
+                    "Response size {} exceeds maximum {}",
+                    len,
+                    MAX_STUN_RESPONSE_SIZE
+                );
                 return Ok(Some(&self.response_buf[..len]));
             }
             return Ok(None);
         }
-        
+
         // Build binding success response
         let len = self.build_binding_response(&msg, source, credentials)?;
-        
+
         // Postcondition: response within buffer (TigerStyle Phase 4.10)
-        assert!(len <= MAX_STUN_RESPONSE_SIZE,
-            "Response size {} exceeds maximum {}", len, MAX_STUN_RESPONSE_SIZE);
-        
+        assert!(
+            len <= MAX_STUN_RESPONSE_SIZE,
+            "Response size {} exceeds maximum {}",
+            len,
+            MAX_STUN_RESPONSE_SIZE
+        );
+
         Ok(Some(&self.response_buf[..len]))
     }
-    
+
     /// Validate STUN request: USERNAME, MESSAGE-INTEGRITY, FINGERPRINT.
     ///
     /// Returns Ok(username_str) on success, Err with optional error code on failure.
@@ -145,8 +158,11 @@ impl StunServer {
         integrity_ctx: &IntegrityContext,
     ) -> Result<String, Option<(u16, &'static str)>> {
         // Precondition: data must be at least a STUN header
-        assert!(data.len() >= STUN_HEADER_SIZE,
-            "validate_request requires at least {} bytes", STUN_HEADER_SIZE);
+        assert!(
+            data.len() >= STUN_HEADER_SIZE,
+            "validate_request requires at least {} bytes",
+            STUN_HEADER_SIZE
+        );
 
         // 1. Extract USERNAME attribute from parsed message
         let username = match msg.get_username() {
@@ -162,8 +178,10 @@ impl StunServer {
         let local_ufrag = &username[..colon_pos];
 
         // Postcondition: local_ufrag extracted from USERNAME must be non-empty
-        assert!(!local_ufrag.is_empty(),
-            "local_ufrag parsed from USERNAME must not be empty");
+        assert!(
+            !local_ufrag.is_empty(),
+            "local_ufrag parsed from USERNAME must not be empty"
+        );
 
         // 3. Validate local_ufrag matches our credentials
         if local_ufrag != credentials.local_ufrag {
@@ -190,29 +208,29 @@ impl StunServer {
 
         Ok(username.to_string())
     }
-    
+
     /// Parse STUN message with integrity context.
     fn parse_with_integrity(
         &self,
         data: &[u8],
     ) -> Result<(StunMessage, IntegrityContext), IceError> {
         let msg = StunMessage::parse(data)?;
-        
+
         let mut ctx = IntegrityContext::empty();
-        
+
         // Find MESSAGE-INTEGRITY and FINGERPRINT positions
         let mut offset = STUN_HEADER_SIZE;
         let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
         let end = STUN_HEADER_SIZE + msg_len;
-        
+
         while offset + 4 <= end {
             let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
-            
+
             if offset + 4 + attr_len > data.len() {
                 break;
             }
-            
+
             match attr_type {
                 ATTR_MESSAGE_INTEGRITY => {
                     if attr_len == 20 {
@@ -236,15 +254,15 @@ impl StunServer {
                 }
                 _ => {}
             }
-            
+
             // Move to next attribute (4-byte aligned)
             let padded_len = (attr_len + 3) & !3;
             offset += 4 + padded_len;
         }
-        
+
         Ok((msg, ctx))
     }
-    
+
     /// Build binding success response.
     fn build_binding_response(
         &mut self,
@@ -253,32 +271,32 @@ impl StunServer {
         credentials: &IceCredentials,
     ) -> Result<usize, IceError> {
         let buf = &mut self.response_buf;
-        
+
         // Header
         let msg_type = StunMessage::encode_type(StunClass::SuccessResponse, StunMethod::Binding);
         buf[0..2].copy_from_slice(&msg_type.to_be_bytes());
         // Length will be filled in later
         buf[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         buf[8..20].copy_from_slice(&request.transaction_id);
-        
+
         let mut offset = STUN_HEADER_SIZE;
-        
+
         // Add XOR-MAPPED-ADDRESS
         let xor_addr = StunAttribute::XorMappedAddress(source);
         let attr_len = xor_addr.encode(&mut buf[offset..], &request.transaction_id);
         offset += attr_len;
-        
+
         // Update message length (before integrity)
         let attr_section_len = (offset - STUN_HEADER_SIZE) as u16;
         buf[2..4].copy_from_slice(&attr_section_len.to_be_bytes());
-        
+
         // Sign with MESSAGE-INTEGRITY and FINGERPRINT
         let key = credentials.local_pwd.as_bytes();
         let final_len = sign_message(buf, offset, key);
-        
+
         Ok(final_len)
     }
-    
+
     /// Build error response.
     fn build_error_response(
         &mut self,
@@ -288,20 +306,20 @@ impl StunServer {
         credentials: &IceCredentials,
     ) -> Result<usize, IceError> {
         let buf = &mut self.response_buf;
-        
+
         // Header
         let msg_type = StunMessage::encode_type(StunClass::ErrorResponse, StunMethod::Binding);
         buf[0..2].copy_from_slice(&msg_type.to_be_bytes());
         buf[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         buf[8..20].copy_from_slice(&request.transaction_id);
-        
+
         let mut offset = STUN_HEADER_SIZE;
-        
+
         // Add ERROR-CODE attribute
         let mut reason_buf = [0u8; 128];
         let reason_len = reason.len().min(128);
         reason_buf[..reason_len].copy_from_slice(&reason.as_bytes()[..reason_len]);
-        
+
         let error = StunAttribute::ErrorCode {
             code,
             reason: reason_buf,
@@ -309,15 +327,15 @@ impl StunServer {
         };
         let attr_len = error.encode(&mut buf[offset..], &request.transaction_id);
         offset += attr_len;
-        
+
         // Update message length
         let attr_section_len = (offset - STUN_HEADER_SIZE) as u16;
         buf[2..4].copy_from_slice(&attr_section_len.to_be_bytes());
-        
+
         // Sign response
         let key = credentials.local_pwd.as_bytes();
         let final_len = sign_message(buf, offset, key);
-        
+
         Ok(final_len)
     }
 }
@@ -330,15 +348,15 @@ pub fn is_binding_indication(data: &[u8]) -> bool {
     if data.len() < STUN_HEADER_SIZE {
         return false;
     }
-    
+
     if !StunMessage::is_stun(data) {
         return false;
     }
-    
+
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     let class = (msg_type >> 4) & 0x01 | (msg_type >> 7) & 0x02;
     let method = (msg_type & 0x000F) | ((msg_type >> 1) & 0x0070) | ((msg_type >> 2) & 0x0F80);
-    
+
     class == 0x01 && method == 0x0001 // Indication + Binding
 }
 
@@ -390,31 +408,34 @@ pub fn create_binding_request(
 ) -> usize {
     // Precondition: buffer size (TigerStyle Phase 4.11)
     assert!(buf.len() >= 128, "buffer too small: {} < 128", buf.len());
-    
+
     // Precondition: username length bounded
-    assert!(username.len() <= 128,
-        "Username length {} exceeds maximum 128", username.len());
-    
+    assert!(
+        username.len() <= 128,
+        "Username length {} exceeds maximum 128",
+        username.len()
+    );
+
     // Precondition: password not empty
     assert!(!password.is_empty(), "Password cannot be empty");
-    
+
     // Header
     let msg_type = StunMessage::encode_type(StunClass::Request, StunMethod::Binding);
     buf[0..2].copy_from_slice(&msg_type.to_be_bytes());
     // Length filled in later
     buf[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
     buf[8..20].copy_from_slice(transaction_id);
-    
+
     let mut offset = STUN_HEADER_SIZE;
-    
+
     // USERNAME
     let username_attr = StunAttribute::username(username);
     offset += username_attr.encode(&mut buf[offset..], transaction_id);
-    
+
     // PRIORITY
     let priority_attr = StunAttribute::Priority(priority);
     offset += priority_attr.encode(&mut buf[offset..], transaction_id);
-    
+
     // ICE-CONTROLLING or ICE-CONTROLLED
     if ice_controlling {
         let ctrl = StunAttribute::IceControlling(tie_breaker);
@@ -423,35 +444,41 @@ pub fn create_binding_request(
         let ctrl = StunAttribute::IceControlled(tie_breaker);
         offset += ctrl.encode(&mut buf[offset..], transaction_id);
     }
-    
+
     // USE-CANDIDATE (only for controlling agent)
     if use_candidate && ice_controlling {
         let uc = StunAttribute::UseCandidate;
         offset += uc.encode(&mut buf[offset..], transaction_id);
     }
-    
+
     // Update length before signing
     let attr_len = (offset - STUN_HEADER_SIZE) as u16;
     buf[2..4].copy_from_slice(&attr_len.to_be_bytes());
-    
+
     // Add MESSAGE-INTEGRITY and FINGERPRINT
     let final_len = sign_message(buf, offset, password.as_bytes());
-    
+
     // Postcondition: output within buffer bounds (TigerStyle Phase 4.11)
-    assert!(final_len <= buf.len(),
-        "Final message length {} exceeds buffer size {}", final_len, buf.len());
-    
+    assert!(
+        final_len <= buf.len(),
+        "Final message length {} exceeds buffer size {}",
+        final_len,
+        buf.len()
+    );
+
     // Postcondition: minimum valid message size
-    assert!(final_len >= STUN_HEADER_SIZE,
-        "Final message must include full header");
-    
+    assert!(
+        final_len >= STUN_HEADER_SIZE,
+        "Final message must include full header"
+    );
+
     final_len
 }
 
 /// Generate a random transaction ID.
 pub fn generate_transaction_id() -> [u8; 12] {
     let mut id = [0u8; 12];
-    
+
     // Use thread-local RNG for performance
     use std::cell::RefCell;
     thread_local! {
@@ -462,7 +489,7 @@ pub fn generate_transaction_id() -> [u8; 12] {
                 .as_nanos() as u64
         );
     }
-    
+
     RNG.with(|rng| {
         let mut state = rng.borrow_mut();
         for chunk in id.chunks_exact_mut(8) {
@@ -478,7 +505,7 @@ pub fn generate_transaction_id() -> [u8; 12] {
         *state ^= *state << 17;
         id[8..12].copy_from_slice(&(*state as u32).to_ne_bytes());
     });
-    
+
     id
 }
 
@@ -490,10 +517,10 @@ mod tests {
     fn test_generate_transaction_id() {
         let id1 = generate_transaction_id();
         let id2 = generate_transaction_id();
-        
+
         // Should be different
         assert_ne!(id1, id2);
-        
+
         // Should be 12 bytes
         assert_eq!(id1.len(), 12);
     }
@@ -502,7 +529,7 @@ mod tests {
     fn test_create_binding_request() {
         let mut buf = [0u8; STUN_BUFFER_SIZE];
         let tid = [1u8; 12];
-        
+
         let len = create_binding_request(
             &mut buf,
             &tid,
@@ -513,13 +540,13 @@ mod tests {
             false,
             "password",
         );
-        
+
         assert!(len > STUN_HEADER_SIZE);
         assert!(len < 128);
-        
+
         // Verify it's a valid STUN message
         assert!(StunMessage::is_stun(&buf[..len]));
-        
+
         // Parse it back
         let msg = StunMessage::parse(&buf[..len]).unwrap();
         assert_eq!(msg.class, StunClass::Request);
@@ -531,15 +558,15 @@ mod tests {
     fn test_binding_indication_detection() {
         // Create a binding indication (class 0x01, method 0x001)
         let mut data = [0u8; 20];
-        
+
         // Message type for Binding Indication: 0x0011
         data[0..2].copy_from_slice(&0x0011u16.to_be_bytes());
         data[2..4].copy_from_slice(&0u16.to_be_bytes()); // Length 0
         data[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         data[8..20].copy_from_slice(&[0u8; 12]); // Transaction ID
-        
+
         assert!(is_binding_indication(&data));
-        
+
         // Binding request should return false
         data[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
         assert!(!is_binding_indication(&data));
@@ -548,12 +575,12 @@ mod tests {
     #[test]
     fn test_stun_server_binding_response() {
         let mut server = StunServer::with_defaults();
-        
+
         // Create a binding request
         let mut request = [0u8; 128];
         let tid = [5u8; 12];
         let credentials = IceCredentials::generate();
-        
+
         let username = format!("{}:{}", credentials.local_ufrag, credentials.local_ufrag);
         let req_len = create_binding_request(
             &mut request,
@@ -565,23 +592,19 @@ mod tests {
             false,
             &credentials.local_pwd,
         );
-        
+
         let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
-        
-        let result = server.handle_request(
-            &request[..req_len],
-            source,
-            &credentials,
-        );
-        
+
+        let result = server.handle_request(&request[..req_len], source, &credentials);
+
         // Should get a response
         assert!(result.is_ok());
         let response = result.unwrap();
         assert!(response.is_some());
-        
+
         let response_data = response.unwrap();
         assert!(StunMessage::is_stun(response_data));
-        
+
         let resp_msg = StunMessage::parse(response_data).unwrap();
         assert_eq!(resp_msg.class, StunClass::SuccessResponse);
         assert_eq!(resp_msg.method, StunMethod::Binding);

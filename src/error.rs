@@ -20,17 +20,8 @@
 // Re-export all sub-error types from nexus-core.
 // These are the single source of truth for error definitions.
 pub use nexus_core::error::{
-    TransportError,
-    ParseError,
-    RtpError,
-    RtcpError,
-    ArenaError,
-    WorkerError,
-    SignalingError,
-    RoomError,
-    SsrcError,
-    ApiError,
-    signaling_error_codes,
+    signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
+    SignalingError, SsrcError, TransportError, WorkerError,
 };
 
 // Re-export the core SfuError for crates that only need
@@ -125,14 +116,10 @@ mod tests {
 
     #[test]
     fn test_transport_error_display() {
-        let addr: SocketAddr =
-            "127.0.0.1:8080".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let err = TransportError::BindFailed {
             addr,
-            source: io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "address in use",
-            ),
+            source: io::Error::new(io::ErrorKind::AddrInUse, "address in use"),
         };
         assert!(err.to_string().contains("127.0.0.1:8080"));
     }
@@ -166,10 +153,7 @@ mod tests {
         let rtp_err = RtpError::InvalidVersion { version: 1 };
         let parse_err: ParseError = rtp_err.into();
         let sfu_err: SfuError = parse_err.into();
-        assert!(matches!(
-            sfu_err,
-            SfuError::Parse(ParseError::Rtp(_))
-        ));
+        assert!(matches!(sfu_err, SfuError::Parse(ParseError::Rtp(_))));
     }
 
     #[test]
@@ -365,9 +349,7 @@ mod tests {
     #[test]
     fn test_core_sfu_error_conversion() {
         // Verify CoreSfuError can be converted to root SfuError
-        let core_err = CoreSfuError::Arena(
-            ArenaError::Exhausted { capacity_slots: 42 },
-        );
+        let core_err = CoreSfuError::Arena(ArenaError::Exhausted { capacity_slots: 42 });
         let root_err: SfuError = core_err.into();
         assert!(matches!(root_err, SfuError::Arena(_)));
     }
@@ -377,10 +359,8 @@ mod tests {
         // Verify serde_json::Error converts to ParseError::Json
         // via the helper function
         let json_str = "not valid json";
-        let json_err: Result<serde_json::Value, _> =
-            serde_json::from_str(json_str);
-        let parse_err =
-            super::json_parse_error(json_err.unwrap_err());
+        let json_err: Result<serde_json::Value, _> = serde_json::from_str(json_str);
+        let parse_err = super::json_parse_error(json_err.unwrap_err());
         assert!(matches!(parse_err, ParseError::Json(_)));
     }
 }

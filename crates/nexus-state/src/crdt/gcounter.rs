@@ -71,12 +71,16 @@ impl GCounter {
         // We use array initialization with const to avoid allocation
         const INIT: AtomicU64 = AtomicU64::new(0);
         let counters = [INIT; MAX_ACTORS];
-        
+
         let result = Self { counters };
-        
+
         // Postcondition: initial value is zero
-        debug_assert_eq!(result.value(), 0, "Postcondition: new counter must have value 0");
-        
+        debug_assert_eq!(
+            result.value(),
+            0,
+            "Postcondition: new counter must have value 0"
+        );
+
         result
     }
 
@@ -114,13 +118,13 @@ impl GCounter {
         );
 
         let index = actor_id as usize;
-        
+
         // Get old value for postcondition check
         let old_value = self.counters[index].load(Ordering::Acquire);
-        
+
         // Atomic increment with Release ordering for visibility
         let new_value = self.counters[index].fetch_add(delta, Ordering::Release) + delta;
-        
+
         // Postcondition: value increased by delta (monotonic increase)
         debug_assert!(
             new_value >= old_value,
@@ -130,7 +134,7 @@ impl GCounter {
             new_value == old_value.wrapping_add(delta),
             "Postcondition: counter must increase by exactly delta"
         );
-        
+
         new_value
     }
 
@@ -165,7 +169,7 @@ impl GCounter {
 
         let index = actor_id as usize;
         let old_value = self.counters[index].load(Ordering::Acquire);
-        
+
         // Check for overflow before increment
         if old_value.checked_add(delta).is_none() {
             return Err(CrdtError::Overflow);
@@ -195,13 +199,13 @@ impl GCounter {
     #[inline]
     pub fn value(&self) -> u64 {
         let mut sum: u64 = 0;
-        
+
         // Bounded loop over all actors
         for i in 0..MAX_ACTORS {
             let counter_value = self.counters[i].load(Ordering::Acquire);
             sum = sum.saturating_add(counter_value);
         }
-        
+
         sum
     }
 
@@ -261,7 +265,7 @@ impl GCounter {
         // Bounded loop over all actors
         for i in 0..MAX_ACTORS {
             let other_value = other.counters[i].load(Ordering::Acquire);
-            
+
             if other_value > 0 {
                 // Use fetch_max for atomic maximum update
                 // This is lock-free and handles concurrent merges correctly
@@ -290,8 +294,8 @@ impl GCounter {
     #[inline]
     pub fn snapshot(&self) -> GCounterSnapshot {
         let mut values = [0u64; MAX_ACTORS];
-        for i in 0..MAX_ACTORS {
-            values[i] = self.counters[i].load(Ordering::Acquire);
+        for (value, counter) in values.iter_mut().zip(self.counters.iter()) {
+            *value = counter.load(Ordering::Acquire);
         }
         GCounterSnapshot { values }
     }
@@ -364,7 +368,7 @@ mod tests {
         let counter = GCounter::new();
         assert_eq!(counter.value(), 0);
         assert!(counter.is_empty());
-        
+
         for i in 0..MAX_ACTORS as u64 {
             assert_eq!(counter.actor_value(i), 0);
         }
@@ -373,12 +377,12 @@ mod tests {
     #[test]
     fn test_gcounter_increment() {
         let counter = GCounter::new();
-        
+
         let new_val = counter.increment(0, 5);
         assert_eq!(new_val, 5);
         assert_eq!(counter.actor_value(0), 5);
         assert_eq!(counter.value(), 5);
-        
+
         let new_val = counter.increment(0, 3);
         assert_eq!(new_val, 8);
         assert_eq!(counter.actor_value(0), 8);
@@ -388,11 +392,11 @@ mod tests {
     #[test]
     fn test_gcounter_multi_actor() {
         let counter = GCounter::new();
-        
+
         counter.increment(0, 10);
         counter.increment(1, 20);
         counter.increment(2, 30);
-        
+
         assert_eq!(counter.actor_value(0), 10);
         assert_eq!(counter.actor_value(1), 20);
         assert_eq!(counter.actor_value(2), 30);
@@ -404,28 +408,28 @@ mod tests {
         let a = GCounter::new();
         a.increment(0, 5);
         a.increment(1, 10);
-        
+
         let b = GCounter::new();
         b.increment(0, 3);
         b.increment(2, 15);
-        
+
         // Merge a <- b
         let a1 = GCounter::new();
         a1.increment(0, 5);
         a1.increment(1, 10);
         a1.merge(&b);
-        
+
         // Merge b <- a
         let b1 = GCounter::new();
         b1.increment(0, 3);
         b1.increment(2, 15);
         b1.merge(&a);
-        
+
         // Assert commutativity: merge(a, b) == merge(b, a)
         assert_eq!(a1.snapshot(), b1.snapshot());
-        
+
         // Verify expected values
-        assert_eq!(a1.actor_value(0), 5);  // max(5, 3)
+        assert_eq!(a1.actor_value(0), 5); // max(5, 3)
         assert_eq!(a1.actor_value(1), 10); // max(10, 0)
         assert_eq!(a1.actor_value(2), 15); // max(0, 15)
     }
@@ -435,14 +439,14 @@ mod tests {
         let a = GCounter::new();
         a.increment(0, 5);
         a.increment(1, 10);
-        
+
         let before = a.snapshot();
-        
+
         // Merge with self
         a.merge(&a);
-        
+
         let after = a.snapshot();
-        
+
         // Assert idempotence: merge(a, a) == a
         assert_eq!(before, after);
     }
@@ -451,28 +455,28 @@ mod tests {
     fn test_gcounter_merge_associative() {
         let a = GCounter::new();
         a.increment(0, 5);
-        
+
         let b = GCounter::new();
         b.increment(1, 10);
-        
+
         let c = GCounter::new();
         c.increment(2, 15);
-        
+
         // (a merge b) merge c
         let ab_c = GCounter::new();
         ab_c.increment(0, 5);
         ab_c.merge(&b);
         ab_c.merge(&c);
-        
+
         // a merge (b merge c)
         let bc = GCounter::new();
         bc.increment(1, 10);
         bc.merge(&c);
-        
+
         let a_bc = GCounter::new();
         a_bc.increment(0, 5);
         a_bc.merge(&bc);
-        
+
         // Assert associativity
         assert_eq!(ab_c.snapshot(), a_bc.snapshot());
     }
@@ -480,12 +484,12 @@ mod tests {
     #[test]
     fn test_gcounter_monotonic() {
         let counter = GCounter::new();
-        
+
         let mut prev_value = 0u64;
         for i in 0..100 {
             let actor = (i % MAX_ACTORS) as u64;
             counter.increment(actor, 1);
-            
+
             let current_value = counter.value();
             assert!(
                 current_value >= prev_value,
@@ -498,10 +502,10 @@ mod tests {
     #[test]
     fn test_gcounter_overflow_detection() {
         let counter = GCounter::new();
-        
+
         // Set a high value
         counter.increment(0, u64::MAX - 10);
-        
+
         // Try to increment beyond max
         let result = counter.try_increment(0, 20);
         assert!(matches!(result, Err(CrdtError::Overflow)));
@@ -533,7 +537,7 @@ mod tests {
         let counter = GCounter::new();
         counter.increment(0, 5);
         counter.increment(1, 10);
-        
+
         let snap = counter.snapshot();
         assert_eq!(snap.value(), 15);
         assert_eq!(snap.actor_value(0), 5);
@@ -544,7 +548,7 @@ mod tests {
     fn test_gcounter_is_empty() {
         let counter = GCounter::new();
         assert!(counter.is_empty());
-        
+
         counter.increment(0, 1);
         assert!(!counter.is_empty());
     }
@@ -553,10 +557,10 @@ mod tests {
     fn test_gcounter_debug() {
         let counter = GCounter::new();
         counter.increment(0, 5);
-        
+
         let debug_str = format!("{:?}", counter);
         assert!(debug_str.contains("GCounter"));
-        assert!(debug_str.contains("5"));
+        assert!(debug_str.contains('5'));
     }
 }
 
@@ -590,27 +594,27 @@ mod proptests {
             for (actor, delta) in &ops_a {
                 a.increment(*actor, *delta);
             }
-            
+
             // Create counter B with ops_b
             let b = GCounter::new();
             for (actor, delta) in &ops_b {
                 b.increment(*actor, *delta);
             }
-            
+
             // merge(A, B)
             let ab = GCounter::new();
             for (actor, delta) in &ops_a {
                 ab.increment(*actor, *delta);
             }
             ab.merge(&b);
-            
+
             // merge(B, A)
             let ba = GCounter::new();
             for (actor, delta) in &ops_b {
                 ba.increment(*actor, *delta);
             }
             ba.merge(&a);
-            
+
             // Assert commutativity
             prop_assert_eq!(ab.snapshot(), ba.snapshot());
         }
@@ -625,17 +629,17 @@ mod proptests {
             for (actor, delta) in &ops_a {
                 a.increment(*actor, *delta);
             }
-            
+
             let b = GCounter::new();
             for (actor, delta) in &ops_b {
                 b.increment(*actor, *delta);
             }
-            
+
             let c = GCounter::new();
             for (actor, delta) in &ops_c {
                 c.increment(*actor, *delta);
             }
-            
+
             // (A merge B) merge C
             let ab_c = GCounter::new();
             for (actor, delta) in &ops_a {
@@ -643,20 +647,20 @@ mod proptests {
             }
             ab_c.merge(&b);
             ab_c.merge(&c);
-            
+
             // A merge (B merge C)
             let bc = GCounter::new();
             for (actor, delta) in &ops_b {
                 bc.increment(*actor, *delta);
             }
             bc.merge(&c);
-            
+
             let a_bc = GCounter::new();
             for (actor, delta) in &ops_a {
                 a_bc.increment(*actor, *delta);
             }
             a_bc.merge(&bc);
-            
+
             // Assert associativity
             prop_assert_eq!(ab_c.snapshot(), a_bc.snapshot());
         }
@@ -669,11 +673,11 @@ mod proptests {
             for (actor, delta) in &ops {
                 counter.increment(*actor, *delta);
             }
-            
+
             let before = counter.snapshot();
             counter.merge(&counter);
             let after = counter.snapshot();
-            
+
             // Assert idempotence
             prop_assert_eq!(before, after);
         }
@@ -684,11 +688,11 @@ mod proptests {
         ) {
             let counter = GCounter::new();
             let mut prev = 0u64;
-            
+
             for (actor, delta) in ops {
                 counter.increment(actor, delta);
                 let curr = counter.value();
-                
+
                 // Assert monotonicity
                 prop_assert!(curr >= prev, "Counter decreased from {} to {}", prev, curr);
                 prev = curr;

@@ -10,7 +10,7 @@ export type SignalMessage =
   | { type: 'ParticipantLeft'; participant_id: number }
   | { type: 'Publish'; kinds: string[]; contents: string[] }
   | { type: 'Unpublish'; track_ids: number[] }
-  | { type: 'Offer'; sdp: string }
+  | { type: 'Offer'; sdp: string; tracks?: OfferTrack[] }
   | { type: 'Answer'; sdp: string }
   | { type: 'IceCandidate'; candidate: string; sdp_mid?: string; sdp_mline_index?: number }
   | { type: 'EndOfCandidates' }
@@ -29,6 +29,12 @@ export type SignalMessage =
   | { type: 'Stats'; tracks_count: number; packets_sent: number; packets_received: number; bytes_sent: number; bytes_received: number }
   | { type: 'Error'; code: string; message: string }
   | { type: 'ServerShutdown'; reason: string; drain_seconds: number };
+
+/** A subscribed track and the m-line (mid) that carries it in an Offer. */
+export interface OfferTrack {
+  track_id: number;
+  mid: string;
+}
 
 export interface ParticipantInfo {
   id: number;

@@ -9,64 +9,64 @@ use core::fmt;
 pub enum SrtpError {
     /// Packet too short to be valid RTP/RTCP.
     PacketTooShort,
-    
+
     /// Packet exceeds maximum allowed size.
     PacketTooLarge,
-    
+
     /// Invalid RTP header.
     InvalidRtpHeader,
-    
+
     /// Invalid RTCP header.
     InvalidRtcpHeader,
-    
+
     /// Authentication failed (tag mismatch).
     AuthenticationFailed,
-    
+
     /// Encryption failed.
     EncryptionFailed,
-    
+
     /// Decryption failed.
     DecryptionFailed,
-    
+
     /// Replay attack detected.
     ReplayDetected,
-    
+
     /// Key derivation failed.
     KeyDerivationFailed,
-    
+
     /// Invalid key material.
     InvalidKeyMaterial,
-    
+
     /// Context not initialized.
     NotInitialized,
-    
+
     /// Buffer too small for output.
     BufferTooSmall,
-    
+
     /// Invalid SSRC.
     InvalidSsrc,
-    
+
     /// Rollover counter overflow.
     RocOverflow,
-    
+
     /// SRTCP index overflow.
     SrtcpIndexOverflow,
-    
+
     /// Unsupported cipher suite.
     UnsupportedCipherSuite,
-    
+
     /// Invalid protection profile.
     InvalidProfile,
-    
+
     /// Session pool at capacity.
     SessionLimitReached,
-    
+
     /// Duplicate session for SSRC.
     DuplicateSession,
-    
+
     /// Invalid buffer length.
     InvalidBufferLength,
-    
+
     /// Nonce generation failed.
     NonceGenerationFailed,
 }
@@ -112,7 +112,10 @@ mod tests {
     #[test]
     fn test_error_display() {
         assert_eq!(SrtpError::PacketTooShort.to_string(), "packet too short");
-        assert_eq!(SrtpError::AuthenticationFailed.to_string(), "authentication failed");
+        assert_eq!(
+            SrtpError::AuthenticationFailed.to_string(),
+            "authentication failed"
+        );
         assert_eq!(SrtpError::ReplayDetected.to_string(), "replay detected");
     }
 

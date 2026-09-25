@@ -165,6 +165,7 @@ a=recvonly
     
     let offer_msg = SignalMessage::Offer {
         sdp: offer_sdp.to_string(),
+        tracks: Vec::new(),
     };
     let offer_json = offer_msg.to_json().expect("JSON serialization failed");
     ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(offer_json))
@@ -278,6 +279,7 @@ a=recvonly
     
     let offer_msg = SignalMessage::Offer {
         sdp: offer_sdp.to_string(),
+        tracks: Vec::new(),
     };
     let offer_json = offer_msg.to_json().expect("JSON serialization failed");
     ws_sink2.send(tokio_tungstenite::tungstenite::Message::Text(offer_json))

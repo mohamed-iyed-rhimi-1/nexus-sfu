@@ -18,7 +18,7 @@
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │  state: Arc<DistributedState>                                   │
 //! │  session_tickets: [Option<SessionTicket>; MAX_SESSION_TICKETS]  │
-//! │  handlers: MessageHandlerTable                                  │
+//! │  participant_names: Vec<(ParticipantId, String)>                │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
@@ -427,54 +427,6 @@ pub struct JoinResponse {
 }
 
 // =============================================================================
-// Message Handler Table
-// =============================================================================
-
-/// Handler function type for message dispatch
-pub type MessageHandler =
-    fn(&mut SignalingHandler, &[u8]) -> Result<Vec<u8>, SignalingHandlerError>;
-
-/// Message handler lookup table (fixed-size array)
-pub struct MessageHandlerTable {
-    /// Handlers indexed by MessageType
-    handlers: [Option<MessageHandler>; 10],
-}
-
-impl MessageHandlerTable {
-    /// Creates a new handler table with default handlers.
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            handlers: [None; 10],
-        }
-    }
-
-    /// Registers a handler for a message type.
-    #[inline]
-    pub fn register(&mut self, msg_type: MessageType, handler: MessageHandler) {
-        let idx = msg_type as usize;
-        assert!(idx < 10, "message type index out of bounds");
-        self.handlers[idx] = Some(handler);
-    }
-
-    /// Gets the handler for a message type.
-    #[inline]
-    pub fn get(&self, msg_type: MessageType) -> Option<MessageHandler> {
-        let idx = msg_type as usize;
-        if idx < 10 {
-            self.handlers[idx]
-        } else {
-            None
-        }
-    }
-}
-
-impl Default for MessageHandlerTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // =============================================================================
 // SignalingHandler
 // =============================================================================
@@ -491,8 +443,6 @@ pub struct SignalingHandler {
     session_tickets: Vec<Option<SessionTicket>>,
     /// Current ticket count
     ticket_count: u32,
-    /// Message handlers by type
-    handlers: MessageHandlerTable,
     /// Participant names (participant_id -> name)
     /// Using a simple fixed-size approach for TigerStyle compliance
     participant_names: Vec<(ParticipantId, String)>,
@@ -532,7 +482,6 @@ impl SignalingHandler {
             state,
             session_tickets,
             ticket_count: 0,
-            handlers: MessageHandlerTable::new(),
             participant_names,
         }
     }
@@ -557,88 +506,6 @@ impl SignalingHandler {
     #[inline]
     pub fn ticket_count(&self) -> u32 {
         self.ticket_count
-    }
-
-    /// Dispatches a WebSocket message to the appropriate handler.
-    ///
-    /// # TigerStyle
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    ///
-    /// # Arguments
-    ///
-    /// * `msg_type` - The message type
-    /// * `payload` - The message payload
-    ///
-    /// # Returns
-    ///
-    /// Response bytes on success, or error if dispatch fails.
-    pub fn dispatch_message(
-        &mut self,
-        msg_type: MessageType,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, SignalingHandlerError> {
-        // Precondition: payload must not exceed reasonable size
-        assert!(payload.len() <= 65536, "payload too large");
-
-        // Look up handler
-        if let Some(handler) = self.handlers.get(msg_type) {
-            handler(self, payload)
-        } else {
-            // Default handling for messages without registered handlers
-            match msg_type {
-                MessageType::Ping => {
-                    // Return pong response
-                    Ok(vec![MessageType::Pong as u8])
-                }
-                MessageType::Pong => {
-                    // Pong is a no-op response
-                    Ok(Vec::new())
-                }
-                _ => {
-                    // No handler registered
-                    Err(SignalingHandlerError::InvalidMessageType {
-                        msg_type: msg_type as u8,
-                    })
-                }
-            }
-        }
-    }
-
-    /// Dispatches a raw message by parsing the type from the first byte.
-    ///
-    /// # TigerStyle
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - Raw message data (first byte is type)
-    ///
-    /// # Returns
-    ///
-    /// Response bytes on success, or error if dispatch fails.
-    pub fn dispatch_raw(&mut self, data: &[u8]) -> Result<Vec<u8>, SignalingHandlerError> {
-        // Precondition: data must have at least type byte
-        assert!(!data.is_empty(), "message data must not be empty");
-
-        let msg_type_byte = data[0];
-        let msg_type = MessageType::from_u8(msg_type_byte).ok_or(
-            SignalingHandlerError::InvalidMessageType {
-                msg_type: msg_type_byte,
-            },
-        )?;
-
-        let payload = if data.len() > 1 { &data[1..] } else { &[] };
-
-        // Postcondition: dispatch with parsed type
-        self.dispatch_message(msg_type, payload)
-    }
-
-    /// Registers a message handler.
-    #[inline]
-    pub fn register_handler(&mut self, msg_type: MessageType, handler: MessageHandler) {
-        self.handlers.register(msg_type, handler);
     }
 
     // =========================================================================
@@ -790,8 +657,14 @@ impl SignalingHandler {
             }
         }
 
-        // If not found, add new entry
+        // If not found, add new entry (with capacity bound)
         if !found {
+            if self.participant_names.len() >= 10_000 {
+                return Err(SignalingHandlerError::NameTooLong {
+                    len: name.len(),
+                    max_len: MAX_PARTICIPANT_NAME_LEN,
+                });
+            }
             self.participant_names
                 .push((participant_id, name.to_string()));
         }
@@ -818,6 +691,22 @@ impl SignalingHandler {
             }
         }
         None
+    }
+
+    /// Removes a participant's stored name.
+    ///
+    /// # Arguments
+    ///
+    /// * `participant_id` - The participant's ID to remove
+    ///
+    /// # Returns
+    ///
+    /// `true` if the name was found and removed, `false` otherwise.
+    pub fn remove_participant_name(&mut self, participant_id: ParticipantId) -> bool {
+        let before = self.participant_names.len();
+        self.participant_names
+            .retain(|(pid, _)| *pid != participant_id);
+        self.participant_names.len() < before
     }
 
     /// Parses binary client statistics data into `ClientStats`.
@@ -1002,7 +891,19 @@ impl SignalingHandler {
             }
         }
 
-        // No empty or expired slots found
+        // No empty or expired slots found — try cleaning up expired tickets first
+        self.cleanup_expired_tickets();
+
+        // Retry: find an empty slot after cleanup
+        for idx in 0..MAX_SESSION_TICKETS {
+            if self.session_tickets[idx].is_none() {
+                self.ticket_count += 1;
+                self.session_tickets[idx] = Some(ticket);
+                return Ok(());
+            }
+        }
+
+        // Still full after cleanup
         Err(SignalingHandlerError::TicketStoreFull {
             capacity: MAX_SESSION_TICKETS,
         })
@@ -1100,39 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_ping_pong() {
-        let mut handler = SignalingHandler::with_new_state(1);
-
-        // Dispatch ping
-        let response = handler.dispatch_message(MessageType::Ping, &[]).unwrap();
-        assert_eq!(response, vec![MessageType::Pong as u8]);
-
-        // Dispatch pong (no-op)
-        let response = handler.dispatch_message(MessageType::Pong, &[]).unwrap();
-        assert!(response.is_empty());
-    }
-
-    #[test]
-    fn test_dispatch_raw() {
-        let mut handler = SignalingHandler::with_new_state(1);
-
-        // Raw ping message
-        let response = handler.dispatch_raw(&[MessageType::Ping as u8]).unwrap();
-        assert_eq!(response, vec![MessageType::Pong as u8]);
-    }
-
-    #[test]
-    fn test_dispatch_invalid_type() {
-        let mut handler = SignalingHandler::with_new_state(1);
-
-        let result = handler.dispatch_raw(&[255]);
-        assert!(matches!(
-            result,
-            Err(SignalingHandlerError::InvalidMessageType { msg_type: 255 })
-        ));
-    }
-
-    #[test]
     fn test_error_codes() {
         assert_eq!(
             SignalingHandlerError::TicketNotFound.code(),
@@ -1146,22 +1014,6 @@ mod tests {
             .code(),
             error_codes::TICKET_EXPIRED
         );
-    }
-
-    #[test]
-    fn test_message_handler_table() {
-        let mut table = MessageHandlerTable::new();
-
-        fn test_handler(
-            _handler: &mut SignalingHandler,
-            _payload: &[u8],
-        ) -> Result<Vec<u8>, SignalingHandlerError> {
-            Ok(vec![42])
-        }
-
-        table.register(MessageType::Join, test_handler);
-        assert!(table.get(MessageType::Join).is_some());
-        assert!(table.get(MessageType::Leave).is_none());
     }
 
     #[test]

@@ -5,10 +5,13 @@ async fn test_quic_connection() {
     // Skip test if certificates are not available (CI/dev environment)
     let config = QuicConfig::default();
     if !std::path::Path::new(&config.cert_path).exists() {
-        eprintln!("Skipping test_quic_connection: certificates not found at {}", config.cert_path);
+        eprintln!(
+            "Skipping test_quic_connection: certificates not found at {}",
+            config.cert_path
+        );
         return;
     }
-    
+
     let _server = QuicSignaling::new("127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();

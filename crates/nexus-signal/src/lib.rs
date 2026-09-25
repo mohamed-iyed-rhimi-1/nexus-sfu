@@ -32,20 +32,29 @@ pub mod websocket;
 pub use config::QuicConfig;
 pub use error::SignalError;
 pub use metrics::SignalMetrics;
-pub use protocol::{SignalMessage, ParticipantInfo, TrackInfo, TrackKind};
+pub use protocol::{OfferTrack, ParticipantInfo, SignalMessage, TrackInfo, TrackKind};
 pub use quic::{QuicConnection, QuicSignaling, SessionStore, SessionTicket};
 
 // WebSocket server types (moved from src/signal/)
 pub use websocket::{
-    WebSocketServer, OrchestratorEvent,
-    SignalingHandler, SignalingHandlerError,
-    ClientStats, JoinResponse, MessageType, TrackEntry,
-    MessageHandler, MessageHandlerTable,
-    MAX_SESSION_TICKETS, TICKET_LIFETIME_SECS,
-    MAX_PARTICIPANT_NAME_LEN, MAX_STATS_PAYLOAD_SIZE, MAX_TRACKS_IN_RESPONSE,
     handler_error_codes,
+    register_signaling_connection,
+    signaling_connections,
+    unregister_signaling_connection,
+    ClientStats,
+    JoinResponse,
+    MessageType,
+    OrchestratorEvent,
     // Connection registry
     SignalingConnectionHandle,
-    signaling_connections, register_signaling_connection, unregister_signaling_connection,
+    SignalingHandler,
+    SignalingHandlerError,
+    TrackEntry,
+    WebSocketServer,
     MAX_CONNECTIONS,
+    MAX_PARTICIPANT_NAME_LEN,
+    MAX_SESSION_TICKETS,
+    MAX_STATS_PAYLOAD_SIZE,
+    MAX_TRACKS_IN_RESPONSE,
+    TICKET_LIFETIME_SECS,
 };

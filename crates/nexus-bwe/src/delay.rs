@@ -4,14 +4,21 @@
 
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
-use crate::feedback::{TransportFeedback, PacketArrivalInfo};
+use crate::feedback::{PacketArrivalInfo, TransportFeedback};
 use crate::types::BweState;
 
-/// Default delay gradient threshold for overuse detection (dimensionless, ms/ms).
-/// A gradient of 0.0125 means delay increases by 12.5ms per second.
+/// Default delay gradient threshold for overuse detection.
+///
+/// Unit: dimensionless (ms/ms). A gradient of 0.0125 means the
+/// inter-packet delay increases by 12.5 µs per ms of send spacing,
+/// equivalent to 12.5 ms/s. This matches RFC 8698 §5 recommended
+/// default threshold of 12.5 ms.
 pub const DEFAULT_DELAY_GRADIENT_THRESHOLD: f64 = 0.0125;
 
-/// Default overuse time threshold (milliseconds).
+/// Default overuse time threshold in milliseconds (RFC 8698 §5).
+///
+/// The detector must observe overuse for at least this duration
+/// before transitioning to the Overuse state.
 pub const DEFAULT_OVERUSE_TIME_THRESHOLD_MS: f64 = 10.0;
 
 /// Maximum delay samples in trendline window.
@@ -343,7 +350,9 @@ impl DelayBasedBweDetector {
         // Compute elapsed time since last update using actual inter-packet intervals.
         // Use default 20.0ms only for the first packet (when prev_update_recv_time_us == 0).
         let elapsed_ms = if self.prev_update_recv_time_us > 0 {
-            let delta_us = self.last_recv_time_us.saturating_sub(self.prev_update_recv_time_us);
+            let delta_us = self
+                .last_recv_time_us
+                .saturating_sub(self.prev_update_recv_time_us);
             (delta_us as f64) / 1000.0
         } else {
             20.0 // First packet — use default
@@ -381,9 +390,7 @@ impl DelayBasedBweDetector {
 
         // Track state transitions
         if self.state != prev_state {
-            self.stats
-                .state_transitions
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.state_transitions.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -471,7 +478,7 @@ pub struct DelayBweStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feedback::{TransportFeedback, PacketArrivalInfo};
+    use crate::feedback::{PacketArrivalInfo, TransportFeedback};
 
     #[test]
     fn test_kalman_filter_initialization() {
@@ -575,10 +582,7 @@ mod tests {
     fn test_delay_detector_state_transitions() {
         let mut detector = DelayBasedBweDetector::with_defaults();
 
-        let initial_transitions = detector
-            .stats()
-            .state_transitions
-            .load(Ordering::Relaxed);
+        let initial_transitions = detector.stats().state_transitions.load(Ordering::Relaxed);
 
         // Trigger state change
         let mut feedback = TransportFeedback::new(12345, 100);
@@ -595,10 +599,7 @@ mod tests {
 
         detector.on_feedback(&feedback);
 
-        let final_transitions = detector
-            .stats()
-            .state_transitions
-            .load(Ordering::Relaxed);
+        let final_transitions = detector.stats().state_transitions.load(Ordering::Relaxed);
         assert!(final_transitions >= initial_transitions);
     }
 

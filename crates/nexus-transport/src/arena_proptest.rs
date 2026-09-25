@@ -10,7 +10,7 @@
 
 use proptest::prelude::*;
 
-use crate::arena::{PacketArena, create_partitions};
+use crate::arena::{create_partitions, PacketArena};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]

@@ -69,7 +69,8 @@ impl ActorMetrics {
 
     /// Set total message queue depth
     pub fn set_message_queue_depth(&self, depth: u64) {
-        self.total_message_queue_depth.store(depth, Ordering::Relaxed);
+        self.total_message_queue_depth
+            .store(depth, Ordering::Relaxed);
     }
 
     pub fn message_queue_depth(&self) -> u64 {
@@ -79,7 +80,8 @@ impl ActorMetrics {
     /// Record message processed
     #[inline(always)]
     pub fn record_message_processed(&self) {
-        self.messages_processed_total.fetch_add(1, Ordering::Relaxed);
+        self.messages_processed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn messages_processed_total(&self) -> u64 {

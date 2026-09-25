@@ -11,7 +11,10 @@ pub const MAX_FEEDBACK_PACKETS: usize = 256;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FeedbackError {
     #[error("Packet too short: {actual_bytes} bytes, need {min_bytes}")]
-    TooShort { actual_bytes: usize, min_bytes: usize },
+    TooShort {
+        actual_bytes: usize,
+        min_bytes: usize,
+    },
 
     #[error("Invalid packet count: {count}")]
     InvalidPacketCount { count: usize },

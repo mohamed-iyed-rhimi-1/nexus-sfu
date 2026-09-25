@@ -63,10 +63,7 @@ fn compile_protobuf_schemas() -> Result<()> {
     config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
 
     // Generate code for api.proto and metrics.proto
-    config.compile_protos(
-        &["proto/api.proto", "proto/metrics.proto"],
-        &["proto/"],
-    )?;
+    config.compile_protos(&["proto/api.proto", "proto/metrics.proto"], &["proto/"])?;
 
     // Tell Cargo to rerun if proto files change
     println!("cargo:rerun-if-changed=proto/api.proto");

@@ -136,7 +136,10 @@ pub enum TrackActorMessage {
     Unsubscribe { subscriber_id: u32 },
 
     /// Update quality/layer for subscriber
-    UpdateQuality { subscriber_id: u32, target_layer: u8 },
+    UpdateQuality {
+        subscriber_id: u32,
+        target_layer: u8,
+    },
 
     /// Promote cold subscriber to hot
     PromoteSubscriber { subscriber_id: u32 },
@@ -204,7 +207,10 @@ pub enum TrackActorResponse {
     },
 
     /// Migration response
-    MigrationReady { track_id: TrackId, worker_id: WorkerId },
+    MigrationReady {
+        track_id: TrackId,
+        worker_id: WorkerId,
+    },
 }
 
 /// Connection state for participant
@@ -228,20 +234,13 @@ pub enum ParticipantActorMessage {
     },
 
     /// Unpublish a track
-    UnpublishTrack {
-        track_id: TrackId,
-    },
+    UnpublishTrack { track_id: TrackId },
 
     /// Subscribe to a track from another participant
-    SubscribeToTrack {
-        track_id: TrackId,
-        target_layer: u8,
-    },
+    SubscribeToTrack { track_id: TrackId, target_layer: u8 },
 
     /// Unsubscribe from a track
-    UnsubscribeFromTrack {
-        track_id: TrackId,
-    },
+    UnsubscribeFromTrack { track_id: TrackId },
 
     /// Update connection state (ICE/DTLS)
     UpdateConnectionState {
@@ -250,9 +249,7 @@ pub enum ParticipantActorMessage {
     },
 
     /// Set participant metadata (name, etc.)
-    UpdateMetadata {
-        name: String,
-    },
+    UpdateMetadata { name: String },
 
     /// Terminate participant gracefully
     Terminate,
@@ -272,9 +269,7 @@ pub enum RoomActorMessage {
     },
 
     /// Remove participant from room
-    RemoveParticipant {
-        participant_id: ParticipantId,
-    },
+    RemoveParticipant { participant_id: ParticipantId },
 
     /// Announce track to all participants
     AnnounceTrack {
@@ -284,14 +279,10 @@ pub enum RoomActorMessage {
     },
 
     /// Remove track announcement
-    RemoveTrackAnnouncement {
-        track_id: TrackId,
-    },
+    RemoveTrackAnnouncement { track_id: TrackId },
 
     /// Get room statistics with response channel
-    GetStats {
-        response_tx: Sender<RoomStats>,
-    },
+    GetStats { response_tx: Sender<RoomStats> },
 
     /// Terminate room gracefully
     Terminate,
@@ -304,7 +295,7 @@ pub enum RoomActorMessage {
 const _: () = {
     // Ensure PacketSlot is reasonably sized
     assert!(std::mem::size_of::<PacketSlot>() <= 24);
-    
+
     // Ensure migration messages are reasonably sized
     assert!(std::mem::size_of::<MigrationSnapshot>() <= 1024);
     assert!(std::mem::size_of::<SubscriberSnapshot>() <= 64);

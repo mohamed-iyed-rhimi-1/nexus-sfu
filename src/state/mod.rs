@@ -37,11 +37,11 @@
 pub mod forward_table;
 
 #[cfg(all(target_os = "linux", feature = "xdp"))]
-pub use forward_table::{ForwardTable, ForwardEntry, XdpError};
+pub use forward_table::{ForwardEntry, ForwardTable, XdpError};
 
 // Provide stub types when XDP is not available
 #[cfg(not(all(target_os = "linux", feature = "xdp")))]
 mod forward_table_stub;
 
 #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-pub use forward_table_stub::{ForwardTable, ForwardEntry, XdpError};
+pub use forward_table_stub::{ForwardEntry, ForwardTable, XdpError};

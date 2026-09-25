@@ -15,10 +15,7 @@ use thiserror::Error;
 pub enum DtlsError {
     /// Record too short.
     #[error("record too short: {actual} bytes, minimum {min}")]
-    RecordTooShort {
-        actual: usize,
-        min: usize,
-    },
+    RecordTooShort { actual: usize, min: usize },
 
     /// Invalid record type.
     #[error("invalid record content type: {0}")]
@@ -42,7 +39,7 @@ pub enum DtlsError {
         expected: &'static str,
         actual: &'static str,
     },
-    
+
     /// Invalid state for operation.
     #[error("invalid state: {0}")]
     InvalidState(String),
@@ -50,7 +47,7 @@ pub enum DtlsError {
     /// Invalid certificate.
     #[error("invalid certificate: {0}")]
     InvalidCertificate(String),
-    
+
     /// Signature verification failed.
     #[error("signature verification failed: {0}")]
     SignatureVerificationFailed(String),
@@ -75,6 +72,10 @@ pub enum DtlsError {
     #[error("unsupported SRTP profile: 0x{0:04X}")]
     UnsupportedSrtpProfile(u16),
 
+    /// SRTP profile not negotiated (RFC 5764 §4.1 — use_srtp extension required).
+    #[error("SRTP profile not negotiated: use_srtp extension missing from peer")]
+    SrtpNotNegotiated,
+
     /// Session not established.
     #[error("session not established")]
     NotEstablished,
@@ -82,17 +83,14 @@ pub enum DtlsError {
     /// Session expired.
     #[error("session expired")]
     Expired,
-    
+
     /// Handshake timeout (30 seconds exceeded).
     #[error("handshake timeout: exceeded 30 seconds")]
     HandshakeTimeout,
 
     /// Buffer too small.
     #[error("buffer too small: need {needed} bytes, have {available}")]
-    BufferTooSmall {
-        needed: usize,
-        available: usize,
-    },
+    BufferTooSmall { needed: usize, available: usize },
 
     /// Sequence number overflow.
     #[error("sequence number overflow")]
@@ -104,10 +102,7 @@ pub enum DtlsError {
 
     /// Alert received.
     #[error("alert received: level={level}, description={description}")]
-    AlertReceived {
-        level: u8,
-        description: u8,
-    },
+    AlertReceived { level: u8, description: u8 },
 
     /// IO error.
     #[error("IO error: {0}")]
@@ -132,19 +127,19 @@ impl DtlsError {
     pub fn verification_failed(msg: impl Into<String>) -> Self {
         Self::VerificationFailed(msg.into())
     }
-    
+
     /// Create invalid state error.
     #[inline]
     pub fn invalid_state(msg: impl Into<String>) -> Self {
         Self::InvalidState(msg.into())
     }
-    
+
     /// Create signature verification failed error.
     #[inline]
     pub fn signature_verification_failed(msg: impl Into<String>) -> Self {
         Self::SignatureVerificationFailed(msg.into())
     }
-    
+
     /// Returns true if this is a fatal error (session should be terminated).
     #[inline]
     pub const fn is_fatal(&self) -> bool {
@@ -155,16 +150,16 @@ impl DtlsError {
                 | Self::DecryptionFailed
                 | Self::SignatureVerificationFailed(_)
                 | Self::InvalidCertificate(_)
+                | Self::SrtpNotNegotiated
         )
     }
-    
+
     /// Returns true if this error is recoverable (can retry).
     #[inline]
     pub const fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::RecordTooShort { .. }
-                | Self::BufferTooSmall { .. }
+            Self::RecordTooShort { .. } | Self::BufferTooSmall { .. }
         )
     }
 }

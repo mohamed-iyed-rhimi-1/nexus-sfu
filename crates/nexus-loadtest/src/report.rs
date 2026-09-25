@@ -92,16 +92,12 @@ impl TestReport {
         let mut output = String::new();
 
         // Header
-        output.push_str(&format!(
-            "\n╔══════════════════════════════════════════════════════════════╗\n"
-        ));
+        output.push_str("\n╔══════════════════════════════════════════════════════════════╗\n");
         output.push_str(&format!(
             "║  NEXUS LOAD TEST REPORT - {}                              \n",
             self.scenario.to_uppercase()
         ));
-        output.push_str(&format!(
-            "╚══════════════════════════════════════════════════════════════╝\n\n"
-        ));
+        output.push_str("╚══════════════════════════════════════════════════════════════╝\n\n");
 
         // Test info
         output.push_str(&format!("SFU URL:    {}\n", self.sfu_url));
@@ -176,14 +172,14 @@ impl TestReport {
         }
 
         // Overall result
-        let result_str = if self.passed { "PASSED ✓" } else { "FAILED ✗" };
-        output.push_str(&format!(
-            "═══════════════════════════════════════════════════════════════\n"
-        ));
+        let result_str = if self.passed {
+            "PASSED ✓"
+        } else {
+            "FAILED ✗"
+        };
+        output.push_str("═══════════════════════════════════════════════════════════════\n");
         output.push_str(&format!("  RESULT: {}\n", result_str));
-        output.push_str(&format!(
-            "═══════════════════════════════════════════════════════════════\n"
-        ));
+        output.push_str("═══════════════════════════════════════════════════════════════\n");
 
         output
     }
@@ -267,9 +263,7 @@ impl TestReport {
             self.scenario, self.metrics.total_clients
         ));
 
-        output.push_str(
-            "# HELP nexus_loadtest_successful_clients Number of successful clients\n",
-        );
+        output.push_str("# HELP nexus_loadtest_successful_clients Number of successful clients\n");
         output.push_str("# TYPE nexus_loadtest_successful_clients gauge\n");
         output.push_str(&format!(
             "nexus_loadtest_successful_clients{{scenario=\"{}\"}} {}\n",
@@ -378,8 +372,7 @@ impl ReportGenerator {
 
         // Requirement 8.3: Participant count validation
         // Target is met if total successful clients >= minimum participants
-        let participants_passed =
-            metrics.successful_clients >= self.targets.min_participants;
+        let participants_passed = metrics.successful_clients >= self.targets.min_participants;
         validations.push(TargetValidation {
             name: "Participant Count".to_string(),
             target: format!("≥ {}", self.targets.min_participants),
@@ -408,9 +401,9 @@ impl ReportGenerator {
     ) -> Result<(), crate::error::LoadTestError> {
         let output = match self.format {
             OutputFormat::Console => report.to_console(),
-            OutputFormat::Json => report.to_json().map_err(|e| {
-                crate::error::LoadTestError::ReportError(e.to_string())
-            })?,
+            OutputFormat::Json => report
+                .to_json()
+                .map_err(|e| crate::error::LoadTestError::ReportError(e.to_string()))?,
             OutputFormat::Prometheus => report.to_prometheus(),
         };
 
@@ -441,7 +434,6 @@ fn chrono_now_iso8601() -> String {
     "2024-01-01T00:00:00Z".to_string()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +448,7 @@ mod tests {
             connection_timeout: Duration::from_secs(30),
             verbose: false,
             prometheus_port: 9090,
+            connection: Default::default(),
         }
     }
 
@@ -481,27 +474,24 @@ mod tests {
     fn create_failing_metrics() -> AggregatedMetrics {
         // Metrics that fail all default targets
         AggregatedMetrics {
-            latency_p50: Duration::from_millis(10),  // > 5ms target
+            latency_p50: Duration::from_millis(10), // > 5ms target
             latency_p95: Duration::from_millis(20),
-            latency_p99: Duration::from_millis(25),  // > 15ms target
+            latency_p99: Duration::from_millis(25), // > 15ms target
             packet_loss_rate: 0.05,
             jitter_avg: Duration::from_millis(5),
-            throughput_pps: 100_000.0,  // < 500K target
+            throughput_pps: 100_000.0, // < 500K target
             throughput_bps: 500_000.0,
             connection_success_rate: 0.80,
             avg_time_to_first_frame: Duration::from_millis(100),
             total_clients: 500,
-            successful_clients: 400,  // < 1000 target
+            successful_clients: 400, // < 1000 target
             failed_clients: 100,
         }
     }
 
     #[test]
     fn test_target_validation_all_pass() {
-        let generator = ReportGenerator::new(
-            OutputFormat::Console,
-            PerformanceTargets::default(),
-        );
+        let generator = ReportGenerator::new(OutputFormat::Console, PerformanceTargets::default());
         let config = create_test_config();
         let metrics = create_passing_metrics();
 
@@ -522,17 +512,17 @@ mod tests {
 
     #[test]
     fn test_target_validation_all_fail() {
-        let generator = ReportGenerator::new(
-            OutputFormat::Console,
-            PerformanceTargets::default(),
-        );
+        let generator = ReportGenerator::new(OutputFormat::Console, PerformanceTargets::default());
         let config = create_test_config();
         let metrics = create_failing_metrics();
 
         let report = generator.generate("conference", &config, metrics);
 
         // Overall should fail
-        assert!(!report.passed, "Report should fail when targets are not met");
+        assert!(
+            !report.passed,
+            "Report should fail when targets are not met"
+        );
         assert_eq!(report.target_validations.len(), 4);
 
         // All individual targets should fail
@@ -557,7 +547,9 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.latency_p50 = Duration::from_millis(5);
         let report = generator.generate("test", &config, metrics);
-        let p50_validation = report.target_validations.iter()
+        let p50_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "P50 Latency")
             .unwrap();
         assert!(p50_validation.passed, "P50 at exactly 5ms should pass");
@@ -566,7 +558,9 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.latency_p50 = Duration::from_millis(6);
         let report = generator.generate("test", &config, metrics);
-        let p50_validation = report.target_validations.iter()
+        let p50_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "P50 Latency")
             .unwrap();
         assert!(!p50_validation.passed, "P50 at 6ms should fail");
@@ -584,7 +578,9 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.latency_p99 = Duration::from_millis(15);
         let report = generator.generate("test", &config, metrics);
-        let p99_validation = report.target_validations.iter()
+        let p99_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "P99 Latency")
             .unwrap();
         assert!(p99_validation.passed, "P99 at exactly 15ms should pass");
@@ -593,7 +589,9 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.latency_p99 = Duration::from_millis(16);
         let report = generator.generate("test", &config, metrics);
-        let p99_validation = report.target_validations.iter()
+        let p99_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "P99 Latency")
             .unwrap();
         assert!(!p99_validation.passed, "P99 at 16ms should fail");
@@ -611,19 +609,29 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.successful_clients = 1000;
         let report = generator.generate("test", &config, metrics);
-        let participant_validation = report.target_validations.iter()
+        let participant_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "Participant Count")
             .unwrap();
-        assert!(participant_validation.passed, "1000 participants should pass");
+        assert!(
+            participant_validation.passed,
+            "1000 participants should pass"
+        );
 
         // Test failing case: 999 participants (below target)
         let mut metrics = create_passing_metrics();
         metrics.successful_clients = 999;
         let report = generator.generate("test", &config, metrics);
-        let participant_validation = report.target_validations.iter()
+        let participant_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "Participant Count")
             .unwrap();
-        assert!(!participant_validation.passed, "999 participants should fail");
+        assert!(
+            !participant_validation.passed,
+            "999 participants should fail"
+        );
     }
 
     #[test]
@@ -638,7 +646,9 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.throughput_pps = 500_000.0;
         let report = generator.generate("test", &config, metrics);
-        let throughput_validation = report.target_validations.iter()
+        let throughput_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "Throughput")
             .unwrap();
         assert!(throughput_validation.passed, "500K pps should pass");
@@ -647,7 +657,9 @@ mod tests {
         let mut metrics = create_passing_metrics();
         metrics.throughput_pps = 499_999.0;
         let report = generator.generate("test", &config, metrics);
-        let throughput_validation = report.target_validations.iter()
+        let throughput_validation = report
+            .target_validations
+            .iter()
             .find(|v| v.name == "Throughput")
             .unwrap();
         assert!(!throughput_validation.passed, "499K pps should fail");
@@ -656,10 +668,7 @@ mod tests {
     #[test]
     fn test_target_validation_partial_failure() {
         // Test that if ANY target fails, the overall report fails (Requirement 8.5)
-        let generator = ReportGenerator::new(
-            OutputFormat::Console,
-            PerformanceTargets::default(),
-        );
+        let generator = ReportGenerator::new(OutputFormat::Console, PerformanceTargets::default());
         let config = create_test_config();
 
         // All targets pass except P50 latency
@@ -672,8 +681,16 @@ mod tests {
         assert!(!report.passed, "Report should fail when any target fails");
 
         // Count passed/failed validations
-        let passed_count = report.target_validations.iter().filter(|v| v.passed).count();
-        let failed_count = report.target_validations.iter().filter(|v| !v.passed).count();
+        let passed_count = report
+            .target_validations
+            .iter()
+            .filter(|v| v.passed)
+            .count();
+        let failed_count = report
+            .target_validations
+            .iter()
+            .filter(|v| !v.passed)
+            .count();
 
         assert_eq!(passed_count, 3, "3 targets should pass");
         assert_eq!(failed_count, 1, "1 target should fail");
@@ -693,17 +710,17 @@ mod tests {
 
         // Metrics that would fail default targets but pass custom targets
         let metrics = AggregatedMetrics {
-            latency_p50: Duration::from_millis(8),   // < 10ms custom target
+            latency_p50: Duration::from_millis(8), // < 10ms custom target
             latency_p95: Duration::from_millis(20),
-            latency_p99: Duration::from_millis(25),  // < 30ms custom target
+            latency_p99: Duration::from_millis(25), // < 30ms custom target
             packet_loss_rate: 0.02,
             jitter_avg: Duration::from_millis(2),
-            throughput_pps: 150_000.0,  // > 100K custom target
+            throughput_pps: 150_000.0, // > 100K custom target
             throughput_bps: 500_000.0,
             connection_success_rate: 0.90,
             avg_time_to_first_frame: Duration::from_millis(75),
             total_clients: 600,
-            successful_clients: 550,  // > 500 custom target
+            successful_clients: 550, // > 500 custom target
             failed_clients: 50,
         };
 
@@ -721,32 +738,40 @@ mod tests {
 
     #[test]
     fn test_report_contains_all_validations() {
-        let generator = ReportGenerator::new(
-            OutputFormat::Console,
-            PerformanceTargets::default(),
-        );
+        let generator = ReportGenerator::new(OutputFormat::Console, PerformanceTargets::default());
         let config = create_test_config();
         let metrics = create_passing_metrics();
 
         let report = generator.generate("webinar", &config, metrics);
 
         // Verify all 4 target validations are present
-        let validation_names: Vec<&str> = report.target_validations.iter()
+        let validation_names: Vec<&str> = report
+            .target_validations
+            .iter()
             .map(|v| v.name.as_str())
             .collect();
 
-        assert!(validation_names.contains(&"P50 Latency"), "Should have P50 Latency validation");
-        assert!(validation_names.contains(&"P99 Latency"), "Should have P99 Latency validation");
-        assert!(validation_names.contains(&"Participant Count"), "Should have Participant Count validation");
-        assert!(validation_names.contains(&"Throughput"), "Should have Throughput validation");
+        assert!(
+            validation_names.contains(&"P50 Latency"),
+            "Should have P50 Latency validation"
+        );
+        assert!(
+            validation_names.contains(&"P99 Latency"),
+            "Should have P99 Latency validation"
+        );
+        assert!(
+            validation_names.contains(&"Participant Count"),
+            "Should have Participant Count validation"
+        );
+        assert!(
+            validation_names.contains(&"Throughput"),
+            "Should have Throughput validation"
+        );
     }
 
     #[test]
     fn test_report_metadata() {
-        let generator = ReportGenerator::new(
-            OutputFormat::Console,
-            PerformanceTargets::default(),
-        );
+        let generator = ReportGenerator::new(OutputFormat::Console, PerformanceTargets::default());
         let config = TestConfig {
             sfu_url: "wss://sfu.example.com:8443".to_string(),
             duration: Duration::from_secs(120),

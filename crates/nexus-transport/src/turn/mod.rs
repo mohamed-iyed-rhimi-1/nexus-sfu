@@ -50,8 +50,7 @@ pub use allocation::{Allocation, AllocationState};
 pub use client::{TurnClient, TurnClientConfig};
 pub use error::TurnError;
 pub use types::{
-    TurnCredentials, TurnServerInfo, Permission, ChannelBinding,
-    RelayedAddress, TransportProtocol,
+    ChannelBinding, Permission, RelayedAddress, TransportProtocol, TurnCredentials, TurnServerInfo,
 };
 
 // ============================================================================
@@ -124,17 +123,17 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!(DEFAULT_ALLOCATION_LIFETIME <= MAX_ALLOCATION_LIFETIME);
-        assert!(CHANNEL_NUMBER_MIN < CHANNEL_NUMBER_MAX);
+        const { assert!(DEFAULT_ALLOCATION_LIFETIME <= MAX_ALLOCATION_LIFETIME) };
+        const { assert!(CHANNEL_NUMBER_MIN < CHANNEL_NUMBER_MAX) };
         assert_eq!(TRANSPORT_UDP, 17);
     }
 
     #[test]
     fn test_channel_number_range() {
         // Valid channel numbers
-        assert!(CHANNEL_NUMBER_MIN >= 0x4000);
-        assert!(CHANNEL_NUMBER_MAX <= 0x7FFF);
-        
+        const { assert!(CHANNEL_NUMBER_MIN >= 0x4000) };
+        const { assert!(CHANNEL_NUMBER_MAX <= 0x7FFF) };
+
         // Ensure we have a good range
         let range = CHANNEL_NUMBER_MAX - CHANNEL_NUMBER_MIN;
         assert!(range > 1000, "should have many channel numbers available");

@@ -41,6 +41,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Maximum number of visible participants (TigerStyle: fixed bound).
 pub const MAX_VISIBLE_PARTICIPANTS: usize = 1000;
 
+/// Maximum number of pinned participants (TigerStyle: fixed bound).
+pub const MAX_PINNED_PARTICIPANTS: usize = 100;
+
 /// Maximum priority level for participants.
 pub const MAX_PRIORITY: u8 = 10;
 
@@ -80,14 +83,16 @@ impl ViewportFilterStats {
     /// Record a packet forwarded due to pinned status.
     #[inline(always)]
     pub fn record_forwarded_pinned(&self) {
-        self.packets_forwarded_pinned.fetch_add(1, Ordering::Relaxed);
+        self.packets_forwarded_pinned
+            .fetch_add(1, Ordering::Relaxed);
         self.packets_forwarded.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a packet forwarded due to visible status.
     #[inline(always)]
     pub fn record_forwarded_visible(&self) {
-        self.packets_forwarded_visible.fetch_add(1, Ordering::Relaxed);
+        self.packets_forwarded_visible
+            .fetch_add(1, Ordering::Relaxed);
         self.packets_forwarded.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -125,8 +130,12 @@ impl Clone for ViewportFilterStats {
         Self {
             packets_forwarded: AtomicU64::new(self.packets_forwarded.load(Ordering::Relaxed)),
             packets_filtered: AtomicU64::new(self.packets_filtered.load(Ordering::Relaxed)),
-            packets_forwarded_pinned: AtomicU64::new(self.packets_forwarded_pinned.load(Ordering::Relaxed)),
-            packets_forwarded_visible: AtomicU64::new(self.packets_forwarded_visible.load(Ordering::Relaxed)),
+            packets_forwarded_pinned: AtomicU64::new(
+                self.packets_forwarded_pinned.load(Ordering::Relaxed),
+            ),
+            packets_forwarded_visible: AtomicU64::new(
+                self.packets_forwarded_visible.load(Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -222,7 +231,8 @@ impl ViewportFilter {
         );
 
         self.visible_participants.clear();
-        self.visible_participants.extend(participants.iter().copied());
+        self.visible_participants
+            .extend(participants.iter().copied());
     }
 
     /// Pin a participant (always forward their packets).
@@ -237,6 +247,12 @@ impl ViewportFilter {
     /// # Requirements
     /// - Requirement 9.5: Always forward pinned participants
     pub fn pin(&mut self, participant_id: u32) {
+        assert!(
+            self.pinned_participants.len() < MAX_PINNED_PARTICIPANTS,
+            "pinned participants must not exceed {}, got {}",
+            MAX_PINNED_PARTICIPANTS,
+            self.pinned_participants.len()
+        );
         self.pinned_participants.insert(participant_id);
     }
 
@@ -460,7 +476,7 @@ mod tests {
         let stats = ViewportFilterStats::new();
         stats.record_forwarded();
         stats.record_forwarded();
-        
+
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.packets_forwarded, 2);
     }
@@ -469,7 +485,7 @@ mod tests {
     fn test_stats_record_filtered() {
         let stats = ViewportFilterStats::new();
         stats.record_filtered();
-        
+
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.packets_filtered, 1);
     }
@@ -478,7 +494,7 @@ mod tests {
     fn test_stats_record_forwarded_pinned() {
         let stats = ViewportFilterStats::new();
         stats.record_forwarded_pinned();
-        
+
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.packets_forwarded, 1);
         assert_eq!(snapshot.packets_forwarded_pinned, 1);
@@ -488,7 +504,7 @@ mod tests {
     fn test_stats_record_forwarded_visible() {
         let stats = ViewportFilterStats::new();
         stats.record_forwarded_visible();
-        
+
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.packets_forwarded, 1);
         assert_eq!(snapshot.packets_forwarded_visible, 1);
@@ -500,9 +516,9 @@ mod tests {
         stats.record_forwarded();
         stats.record_filtered();
         stats.record_forwarded_pinned();
-        
+
         stats.reset();
-        
+
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.packets_forwarded, 0);
         assert_eq!(snapshot.packets_filtered, 0);
@@ -572,7 +588,7 @@ mod tests {
     #[test]
     fn test_viewport_filter_pin() {
         let mut filter = ViewportFilter::new();
-        
+
         filter.pin(100);
         assert!(filter.is_pinned(100));
         assert_eq!(filter.pinned_count(), 1);
@@ -585,7 +601,7 @@ mod tests {
     #[test]
     fn test_viewport_filter_unpin() {
         let mut filter = ViewportFilter::new();
-        
+
         filter.pin(100);
         filter.pin(200);
         assert_eq!(filter.pinned_count(), 2);
@@ -606,7 +622,7 @@ mod tests {
     #[test]
     fn test_viewport_filter_set_priority() {
         let mut filter = ViewportFilter::new();
-        
+
         filter.set_priority(1, 5);
         assert_eq!(filter.get_priority(1), 5);
         assert_eq!(filter.priority_count(), 1);
@@ -619,7 +635,7 @@ mod tests {
     #[test]
     fn test_viewport_filter_set_priority_zero_removes() {
         let mut filter = ViewportFilter::new();
-        
+
         filter.set_priority(1, 5);
         assert_eq!(filter.priority_count(), 1);
 
@@ -817,7 +833,7 @@ mod tests {
     #[test]
     fn test_viewport_filter_complex_scenario() {
         let mut filter = ViewportFilter::new();
-        
+
         // Set up a realistic scenario
         filter.set_visible(&[1, 2, 3, 4, 5]); // 5 visible participants
         filter.pin(100); // Speaker is pinned
@@ -825,7 +841,7 @@ mod tests {
         filter.set_priority(1, 5); // Some visible participant has medium priority
 
         // Test forwarding decisions
-        assert!(filter.should_forward(1));   // Visible
+        assert!(filter.should_forward(1)); // Visible
         assert!(filter.should_forward(100)); // Pinned
         assert!(!filter.should_forward(50)); // Not visible, not pinned
 

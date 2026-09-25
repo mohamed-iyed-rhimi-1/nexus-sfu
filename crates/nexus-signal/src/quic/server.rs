@@ -304,10 +304,7 @@ impl QuicSignaling {
                 );
                 self.metrics.record_zero_rtt_replay_attempt();
                 // Close the connection - replay detected
-                connection.close(
-                    quinn::VarInt::from_u32(1),
-                    b"0-RTT replay detected",
-                );
+                connection.close(quinn::VarInt::from_u32(1), b"0-RTT replay detected");
                 return Err(SignalError::ZeroRttValidationFailed(
                     "Replay attack detected".into(),
                 ));
@@ -379,9 +376,13 @@ impl QuicSignaling {
     }
 
     /// Compute a nonce for replay protection from connection data.
-    fn compute_connection_nonce(&self, connection: &quinn::Connection, remote_addr: SocketAddr) -> u64 {
-        use std::hash::{Hash, Hasher};
+    fn compute_connection_nonce(
+        &self,
+        connection: &quinn::Connection,
+        remote_addr: SocketAddr,
+    ) -> u64 {
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         connection.stable_id().hash(&mut hasher);
@@ -395,7 +396,11 @@ impl QuicSignaling {
     /// Validate 0-RTT application context.
     ///
     /// Returns true if the 0-RTT data should be accepted.
-    fn validate_0rtt_context(&self, connection: &quinn::Connection, remote_addr: SocketAddr) -> bool {
+    fn validate_0rtt_context(
+        &self,
+        connection: &quinn::Connection,
+        remote_addr: SocketAddr,
+    ) -> bool {
         // Validation checks:
         // 1. Connection is from a known/valid source
         // 2. Rate limiting check

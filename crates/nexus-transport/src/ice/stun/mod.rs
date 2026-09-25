@@ -31,24 +31,35 @@
 //! - Comprehensive assertions on all inputs
 //! - SIMD-friendly data layout
 
-pub mod message;
 pub mod attributes;
 pub mod integrity;
+pub mod message;
 pub mod server;
 
-pub use message::{StunMessage, StunClass, StunMethod, STUN_HEADER_SIZE, STUN_MAGIC_COOKIE};
 pub use attributes::{
     StunAttribute,
+    ATTR_CHANNEL_NUMBER,
+    ATTR_DATA,
+    ATTR_ERROR_CODE,
+    ATTR_FINGERPRINT,
+    ATTR_ICE_CONTROLLED,
+    ATTR_ICE_CONTROLLING,
     // TURN-specific attribute constants needed by turn/client.rs
-    ATTR_LIFETIME, ATTR_CHANNEL_NUMBER, ATTR_XOR_PEER_ADDRESS, ATTR_DATA,
-    ATTR_XOR_RELAYED_ADDRESS, ATTR_REQUESTED_TRANSPORT,
+    ATTR_LIFETIME,
     // Core attribute constants
-    ATTR_MAPPED_ADDRESS, ATTR_USERNAME, ATTR_MESSAGE_INTEGRITY, ATTR_ERROR_CODE,
-    ATTR_XOR_MAPPED_ADDRESS, ATTR_PRIORITY, ATTR_USE_CANDIDATE, ATTR_FINGERPRINT,
-    ATTR_ICE_CONTROLLED, ATTR_ICE_CONTROLLING,
+    ATTR_MAPPED_ADDRESS,
+    ATTR_MESSAGE_INTEGRITY,
+    ATTR_PRIORITY,
+    ATTR_REQUESTED_TRANSPORT,
+    ATTR_USERNAME,
+    ATTR_USE_CANDIDATE,
+    ATTR_XOR_MAPPED_ADDRESS,
+    ATTR_XOR_PEER_ADDRESS,
+    ATTR_XOR_RELAYED_ADDRESS,
 };
 pub use integrity::{compute_message_integrity, verify_message_integrity};
-pub use server::{StunServer, create_binding_indication};
+pub use message::{StunClass, StunMessage, StunMethod, STUN_HEADER_SIZE, STUN_MAGIC_COOKIE};
+pub use server::{create_binding_indication, StunServer};
 
 /// Maximum STUN message size (from RFC 5389).
 pub const STUN_MAX_MESSAGE_SIZE: u32 = 548;
@@ -117,12 +128,12 @@ pub fn is_rtcp(data: &[u8]) -> bool {
     if data.len() < 2 {
         return false;
     }
-    
+
     // Check version (must be 2)
     if (data[0] >> 6) != 2 {
         return false;
     }
-    
+
     // Check payload type
     let pt = data[1];
     matches!(pt, 200..=210)
@@ -139,8 +150,7 @@ mod tests {
             0x00, 0x01, 0x00, 0x00, // Type + Length
             0x21, 0x12, 0xA4, 0x42, // Magic Cookie
             0x00, 0x00, 0x00, 0x00, // Transaction ID
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert!(is_stun(&valid));
 
@@ -149,21 +159,15 @@ mod tests {
 
         // Wrong magic cookie
         let wrong_cookie = [
-            0x00, 0x01, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, // Wrong cookie
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Wrong cookie
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert!(!is_stun(&wrong_cookie));
 
         // First two bits not 0 (looks like RTP)
         let rtp_like = [
-            0x80, 0x01, 0x00, 0x00,
-            0x21, 0x12, 0xA4, 0x42,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x80, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert!(!is_stun(&rtp_like));
     }
@@ -172,24 +176,24 @@ mod tests {
     fn test_is_dtls() {
         // DTLS ClientHello (content type 22)
         assert!(is_dtls(&[22, 0xFE, 0xFD]));
-        
+
         // DTLS ChangeCipherSpec (content type 20)
         assert!(is_dtls(&[20, 0xFE, 0xFD]));
-        
+
         // Not DTLS
         assert!(!is_dtls(&[0x80])); // RTP
         assert!(!is_dtls(&[0x00])); // STUN
-        assert!(!is_dtls(&[]));     // Empty
+        assert!(!is_dtls(&[])); // Empty
     }
 
     #[test]
     fn test_is_rtp() {
         // RTP v2 packet
         assert!(is_rtp(&[0x80, 0x60, 0x00, 0x01]));
-        
+
         // Not RTP (STUN)
         assert!(!is_rtp(&[0x00, 0x01]));
-        
+
         // Empty
         assert!(!is_rtp(&[]));
     }
@@ -198,10 +202,10 @@ mod tests {
     fn test_is_rtcp() {
         // RTCP Sender Report (PT=200)
         assert!(is_rtcp(&[0x80, 200]));
-        
+
         // RTCP Receiver Report (PT=201)
         assert!(is_rtcp(&[0x80, 201]));
-        
+
         // Not RTCP
         assert!(!is_rtcp(&[0x80, 96])); // RTP with dynamic PT
         assert!(!is_rtcp(&[]));

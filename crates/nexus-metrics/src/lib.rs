@@ -66,12 +66,8 @@ impl MetricsCollector {
     /// Export metrics in Prometheus text format
     pub fn export_prometheus(&self) -> Result<String, Box<dyn std::error::Error>> {
         // Update Prometheus metrics from internal collectors
-        self.exporter.update(
-            &self.sfu,
-            &self.workers,
-            &self.crdt,
-            &self.actors,
-        );
+        self.exporter
+            .update(&self.sfu, &self.workers, &self.crdt, &self.actors);
 
         self.exporter.render()
     }

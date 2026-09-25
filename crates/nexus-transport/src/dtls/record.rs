@@ -47,13 +47,13 @@ const _: () = assert!(MAX_FRAGMENTS == 8);
 pub enum ContentType {
     /// Change cipher spec.
     ChangeCipherSpec = 20,
-    
+
     /// Alert.
     Alert = 21,
-    
+
     /// Handshake.
     Handshake = 22,
-    
+
     /// Application data.
     ApplicationData = 23,
 }
@@ -70,13 +70,13 @@ impl ContentType {
             _ => None,
         }
     }
-    
+
     /// Returns true if this is handshake content.
     #[inline]
     pub const fn is_handshake(self) -> bool {
         matches!(self, Self::Handshake)
     }
-    
+
     /// Returns true if this is application data.
     #[inline]
     pub const fn is_application_data(self) -> bool {
@@ -91,7 +91,7 @@ impl ContentType {
 pub enum AlertLevel {
     /// Warning (connection may continue).
     Warning = 1,
-    
+
     /// Fatal (connection terminated).
     Fatal = 2,
 }
@@ -132,16 +132,16 @@ pub enum AlertDescription {
 pub struct Record<'a> {
     /// Content type.
     pub content_type: ContentType,
-    
+
     /// Protocol version.
     pub version: u16,
-    
+
     /// Epoch.
     pub epoch: u16,
-    
+
     /// Sequence number.
     pub sequence_number: u64,
-    
+
     /// Record payload.
     pub payload: &'a [u8],
 }
@@ -156,18 +156,18 @@ impl<'a> Record<'a> {
                 min: RecordHeader::SIZE,
             });
         }
-        
+
         let header = RecordHeader::parse(data).unwrap();
-        
+
         // Validate content type
         let content_type = ContentType::from_u8(header.content_type)
             .ok_or(DtlsError::InvalidContentType(header.content_type))?;
-        
+
         // Validate version
         if header.version != DTLS_VERSION_1_2 && header.version != DTLS_VERSION_1_0 {
             return Err(DtlsError::InvalidVersion(header.version));
         }
-        
+
         // Validate length
         let total_len = RecordHeader::SIZE + header.length as usize;
         if data.len() < total_len {
@@ -176,16 +176,16 @@ impl<'a> Record<'a> {
                 min: total_len,
             });
         }
-        
+
         if header.length as usize > MAX_DTLS_RECORD_SIZE {
             return Err(DtlsError::RecordTooShort {
                 actual: MAX_DTLS_RECORD_SIZE,
                 min: header.length as usize,
             });
         }
-        
+
         let payload = &data[RecordHeader::SIZE..total_len];
-        
+
         Ok((
             Self {
                 content_type,
@@ -204,16 +204,16 @@ impl<'a> Record<'a> {
 pub struct RecordLayer {
     /// Current epoch (incremented on cipher change).
     epoch: u16,
-    
+
     /// Sequence number for current epoch.
     sequence_number: u64,
-    
+
     /// Read sequence number.
     read_sequence_number: u64,
-    
+
     /// Read epoch.
     read_epoch: u16,
-    
+
     /// Write buffer.
     #[allow(dead_code)] // Reserved for record layer write operations
     write_buf: [u8; 16384],
@@ -230,31 +230,31 @@ impl RecordLayer {
             write_buf: [0u8; 16384],
         }
     }
-    
+
     /// Get current write epoch.
     #[inline]
     pub const fn epoch(&self) -> u16 {
         self.epoch
     }
-    
+
     /// Get current write sequence number.
     #[inline]
     pub const fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
-    
+
     /// Increment epoch (cipher change).
     pub fn increment_epoch(&mut self) {
         self.epoch += 1;
         self.sequence_number = 0;
     }
-    
+
     /// Increment read epoch.
     pub fn increment_read_epoch(&mut self) {
         self.read_epoch += 1;
         self.read_sequence_number = 0;
     }
-    
+
     /// Build a record (unencrypted).
     ///
     /// Returns the number of bytes written.
@@ -265,7 +265,7 @@ impl RecordLayer {
         buf: &mut [u8],
     ) -> Result<usize, DtlsError> {
         assert!(payload.len() <= MAX_DTLS_RECORD_SIZE, "payload too large");
-        
+
         let total_len = RecordHeader::SIZE + payload.len();
         if buf.len() < total_len {
             return Err(DtlsError::BufferTooSmall {
@@ -273,12 +273,12 @@ impl RecordLayer {
                 available: buf.len(),
             });
         }
-        
+
         // Check sequence number overflow
         if self.sequence_number >= (1u64 << 48) {
             return Err(DtlsError::SequenceOverflow);
         }
-        
+
         let header = RecordHeader {
             content_type: content_type as u8,
             version: DTLS_VERSION_1_2,
@@ -286,19 +286,19 @@ impl RecordLayer {
             sequence_number: self.sequence_number,
             length: payload.len() as u16,
         };
-        
+
         header.encode(buf);
         buf[RecordHeader::SIZE..total_len].copy_from_slice(payload);
-        
+
         self.sequence_number += 1;
-        
+
         Ok(total_len)
     }
-    
+
     /// Parse incoming record.
     pub fn parse_record<'a>(&mut self, data: &'a [u8]) -> Result<(Record<'a>, usize), DtlsError> {
         let (record, consumed) = Record::parse(data)?;
-        
+
         // Update read state
         if record.epoch == self.read_epoch {
             if record.sequence_number > self.read_sequence_number {
@@ -308,28 +308,28 @@ impl RecordLayer {
             self.read_epoch = record.epoch;
             self.read_sequence_number = record.sequence_number;
         }
-        
+
         Ok((record, consumed))
     }
-    
+
     /// Check if this looks like a DTLS record.
     pub fn is_dtls(data: &[u8]) -> bool {
         if data.len() < RecordHeader::SIZE {
             return false;
         }
-        
+
         // Check content type (20-23)
         let content_type = data[0];
         if content_type < 20 || content_type > 23 {
             return false;
         }
-        
+
         // Check version (DTLS 1.0 or 1.2)
         let version = u16::from_be_bytes([data[1], data[2]]);
         if version != DTLS_VERSION_1_2 && version != DTLS_VERSION_1_0 {
             return false;
         }
-        
+
         true
     }
 }
@@ -358,25 +358,25 @@ impl Default for RecordLayer {
 pub struct FragmentAssembler {
     /// Fragment data storage (8 fragments × 1400 bytes).
     fragments: [[u8; 1400]; 8],
-    
+
     /// Length of each fragment.
     fragment_lengths: [u16; 8],
-    
+
     /// Offset of each fragment in the original message.
     fragment_offsets: [u32; 8],
-    
+
     /// Number of fragments received.
     fragment_count: u8,
-    
+
     /// Total expected message length.
     total_length: u32,
-    
+
     /// Message sequence number being assembled.
     message_seq: u16,
-    
+
     /// Handshake message type.
     msg_type: u8,
-    
+
     /// Whether assembly is in progress.
     in_progress: bool,
 }
@@ -384,10 +384,10 @@ pub struct FragmentAssembler {
 impl FragmentAssembler {
     /// Maximum fragments allowed.
     pub const MAX_FRAGMENTS: u8 = MAX_FRAGMENTS;
-    
+
     /// Maximum bytes per fragment.
     pub const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_SIZE;
-    
+
     /// Create new empty fragment assembler.
     ///
     /// # TigerStyle
@@ -404,7 +404,7 @@ impl FragmentAssembler {
             in_progress: false,
         }
     }
-    
+
     /// Add a fragment to the assembler.
     ///
     /// # Returns
@@ -425,24 +425,29 @@ impl FragmentAssembler {
     ) -> Result<bool, DtlsError> {
         // Precondition: fragment size bounded
         assert!(fragment_data.len() <= Self::MAX_FRAGMENT_SIZE);
-        
+
         // Precondition: offset + length <= total
         assert!(fragment_offset + fragment_data.len() as u32 <= total_length);
-        
+
         // Validate total length fits in max handshake message size (4KB)
         // This prevents buffer overflow and keeps handshake messages bounded
         if total_length > MAX_HANDSHAKE_SIZE as u32 {
-            return Err(DtlsError::handshake_failed("handshake message too large (exceeds 4KB limit)"));
+            return Err(DtlsError::handshake_failed(
+                "handshake message too large (exceeds 4KB limit)",
+            ));
         }
-        
+
         // Postcondition: total length is bounded to 4KB
-        assert!(total_length <= MAX_HANDSHAKE_SIZE as u32, "total_length must not exceed MAX_HANDSHAKE_SIZE");
-        
+        assert!(
+            total_length <= MAX_HANDSHAKE_SIZE as u32,
+            "total_length must not exceed MAX_HANDSHAKE_SIZE"
+        );
+
         // Check fragment count
         if self.fragment_count >= Self::MAX_FRAGMENTS {
             return Err(DtlsError::handshake_failed("too many fragments"));
         }
-        
+
         // Initialize or validate message identity
         if !self.in_progress {
             self.msg_type = msg_type;
@@ -457,23 +462,23 @@ impl FragmentAssembler {
             self.total_length = total_length;
             self.in_progress = true;
         }
-        
+
         // Store fragment
         let idx = self.fragment_count as usize;
         self.fragments[idx][..fragment_data.len()].copy_from_slice(fragment_data);
         self.fragment_lengths[idx] = fragment_data.len() as u16;
         self.fragment_offsets[idx] = fragment_offset;
         self.fragment_count += 1;
-        
+
         // Check if complete
         let is_complete = self.is_complete();
-        
+
         // Postcondition: fragment count bounded
         assert!(self.fragment_count <= Self::MAX_FRAGMENTS);
-        
+
         Ok(is_complete)
     }
-    
+
     /// Check if all fragments have been received.
     ///
     /// Verifies complete coverage from offset 0 to total_length.
@@ -484,13 +489,13 @@ impl FragmentAssembler {
         if !self.in_progress || self.fragment_count == 0 || self.total_length == 0 {
             return false;
         }
-        
+
         // Check for full coverage using sorted offsets
         let mut sorted: [(u32, u16); 8] = [(0, 0); 8];
         for i in 0..self.fragment_count as usize {
             sorted[i] = (self.fragment_offsets[i], self.fragment_lengths[i]);
         }
-        
+
         // Bubble sort (bounded: max 8 elements, 28 comparisons max)
         for i in 0..self.fragment_count as usize {
             for j in (i + 1)..self.fragment_count as usize {
@@ -499,27 +504,27 @@ impl FragmentAssembler {
                 }
             }
         }
-        
+
         // Check coverage (bounded loop)
         let mut coverage = 0u32;
         for i in 0..self.fragment_count as usize {
             let (offset, length) = sorted[i];
-            
+
             // Gap detection
             if offset > coverage {
                 return false;
             }
-            
+
             // Extend coverage
             let end = offset + length as u32;
             if end > coverage {
                 coverage = end;
             }
         }
-        
+
         coverage >= self.total_length
     }
-    
+
     /// Assemble complete message into output buffer.
     ///
     /// # Preconditions
@@ -534,7 +539,7 @@ impl FragmentAssembler {
         if !self.is_complete() {
             return Err(DtlsError::handshake_failed("message incomplete"));
         }
-        
+
         // Precondition: output buffer must be large enough
         if output.len() < self.total_length as usize {
             return Err(DtlsError::BufferTooSmall {
@@ -542,37 +547,36 @@ impl FragmentAssembler {
                 available: output.len(),
             });
         }
-        
+
         // Copy fragments to output (bounded loop)
         for i in 0..self.fragment_count as usize {
             let offset = self.fragment_offsets[i] as usize;
             let length = self.fragment_lengths[i] as usize;
-            
+
             // Bounds check
             if offset + length <= output.len() {
-                output[offset..offset + length]
-                    .copy_from_slice(&self.fragments[i][..length]);
+                output[offset..offset + length].copy_from_slice(&self.fragments[i][..length]);
             }
         }
-        
+
         // Postcondition: return total length
         assert!(self.total_length <= MAX_DTLS_RECORD_SIZE as u32);
-        
+
         Ok(self.total_length as usize)
     }
-    
+
     /// Get the message type being assembled.
     #[inline]
     pub fn msg_type(&self) -> u8 {
         self.msg_type
     }
-    
+
     /// Get the message sequence being assembled.
     #[inline]
     pub fn message_seq(&self) -> u16 {
         self.message_seq
     }
-    
+
     /// Reset the assembler for a new message.
     pub fn reset(&mut self) {
         self.fragment_count = 0;
@@ -608,10 +612,12 @@ mod tests {
     fn test_record_layer_build() {
         let mut layer = RecordLayer::new();
         let mut buf = [0u8; 256];
-        
+
         let payload = b"Hello, DTLS!";
-        let len = layer.build_record(ContentType::ApplicationData, payload, &mut buf).unwrap();
-        
+        let len = layer
+            .build_record(ContentType::ApplicationData, payload, &mut buf)
+            .unwrap();
+
         assert_eq!(len, RecordHeader::SIZE + payload.len());
         assert_eq!(buf[0], 23); // ApplicationData
         assert_eq!(layer.sequence_number, 1);
@@ -620,7 +626,7 @@ mod tests {
     #[test]
     fn test_record_parse() {
         let mut buf = [0u8; 256];
-        
+
         // Build a record
         let header = RecordHeader {
             content_type: 22, // Handshake
@@ -631,7 +637,7 @@ mod tests {
         };
         header.encode(&mut buf);
         buf[RecordHeader::SIZE..RecordHeader::SIZE + 5].copy_from_slice(b"hello");
-        
+
         let (record, consumed) = Record::parse(&buf).unwrap();
         assert_eq!(record.content_type, ContentType::Handshake);
         assert_eq!(record.epoch, 0);
@@ -647,12 +653,12 @@ mod tests {
         valid[1] = 0xFE;
         valid[2] = 0xFD; // DTLS 1.2
         assert!(RecordLayer::is_dtls(&valid));
-        
+
         // Invalid content type
         let mut invalid = valid;
         invalid[0] = 19;
         assert!(!RecordLayer::is_dtls(&invalid));
-        
+
         // Too short
         assert!(!RecordLayer::is_dtls(&[22, 0xFE]));
     }
@@ -663,8 +669,10 @@ mod tests {
 
     #[test]
     fn test_max_dtls_record_size_constant() {
-        assert_eq!(MAX_DTLS_RECORD_SIZE, 16384, 
-            "MAX_DTLS_RECORD_SIZE should be 16KB per RFC 6347");
+        assert_eq!(
+            MAX_DTLS_RECORD_SIZE, 16384,
+            "MAX_DTLS_RECORD_SIZE should be 16KB per RFC 6347"
+        );
     }
 
     #[test]
@@ -680,11 +688,14 @@ mod tests {
 
     #[test]
     fn test_content_type_from_u8() {
-        assert_eq!(ContentType::from_u8(20), Some(ContentType::ChangeCipherSpec));
+        assert_eq!(
+            ContentType::from_u8(20),
+            Some(ContentType::ChangeCipherSpec)
+        );
         assert_eq!(ContentType::from_u8(21), Some(ContentType::Alert));
         assert_eq!(ContentType::from_u8(22), Some(ContentType::Handshake));
         assert_eq!(ContentType::from_u8(23), Some(ContentType::ApplicationData));
-        
+
         // Invalid types
         assert_eq!(ContentType::from_u8(19), None);
         assert_eq!(ContentType::from_u8(24), None);
@@ -715,7 +726,7 @@ mod tests {
     #[test]
     fn test_record_epoch_in_header() {
         let mut buf = [0u8; 256];
-        
+
         let header = RecordHeader {
             content_type: 22,
             version: DTLS_VERSION_1_2,
@@ -724,7 +735,7 @@ mod tests {
             length: 0,
         };
         header.encode(&mut buf);
-        
+
         let (record, _) = Record::parse(&buf).unwrap();
         assert_eq!(record.epoch, 1);
     }
@@ -736,16 +747,16 @@ mod tests {
     #[test]
     fn test_record_layer_sequence_increment() {
         let mut layer = RecordLayer::new();
-        
+
         assert_eq!(layer.sequence_number, 0);
-        
+
         let mut buf = [0u8; 256];
         let _ = layer.build_record(ContentType::Handshake, b"test", &mut buf);
-        
+
         assert_eq!(layer.sequence_number, 1);
-        
+
         let _ = layer.build_record(ContentType::Handshake, b"test2", &mut buf);
-        
+
         assert_eq!(layer.sequence_number, 2);
     }
 
@@ -757,14 +768,20 @@ mod tests {
     fn test_valid_content_type_range() {
         // Valid content types are 20-23
         for ct in 20u8..=23 {
-            assert!(ContentType::from_u8(ct).is_some(), 
-                "Content type {} should be valid", ct);
+            assert!(
+                ContentType::from_u8(ct).is_some(),
+                "Content type {} should be valid",
+                ct
+            );
         }
-        
+
         // 24-26 are reserved but not used
         for ct in 24u8..=26 {
-            assert!(ContentType::from_u8(ct).is_none(), 
-                "Content type {} should be invalid", ct);
+            assert!(
+                ContentType::from_u8(ct).is_none(),
+                "Content type {} should be invalid",
+                ct
+            );
         }
     }
 
@@ -774,7 +791,11 @@ mod tests {
 
     #[test]
     fn test_record_header_size_constant() {
-        assert_eq!(RecordHeader::SIZE, 13, "DTLS record header should be 13 bytes");
+        assert_eq!(
+            RecordHeader::SIZE,
+            13,
+            "DTLS record header should be 13 bytes"
+        );
     }
 
     // ========================================================================
@@ -784,7 +805,7 @@ mod tests {
     #[test]
     fn test_fragment_assembler_new() {
         let assembler = FragmentAssembler::new();
-        
+
         assert_eq!(assembler.fragment_count, 0);
         assert_eq!(assembler.total_length, 0);
         assert!(!assembler.in_progress);
@@ -793,14 +814,14 @@ mod tests {
     #[test]
     fn test_fragment_assembler_reset() {
         let mut assembler = FragmentAssembler::new();
-        
+
         // Simulate some state
         assembler.fragment_count = 3;
         assembler.total_length = 1000;
         assembler.in_progress = true;
-        
+
         assembler.reset();
-        
+
         assert_eq!(assembler.fragment_count, 0);
         assert_eq!(assembler.total_length, 0);
         assert!(!assembler.in_progress);
@@ -815,7 +836,7 @@ mod tests {
     #[test]
     fn test_fragment_assembler_default() {
         let assembler = FragmentAssembler::default();
-        
+
         assert_eq!(assembler.fragment_count, 0);
         assert!(!assembler.in_progress);
     }
@@ -826,8 +847,10 @@ mod tests {
 
     #[test]
     fn test_max_fragment_size_constant() {
-        assert_eq!(MAX_FRAGMENT_SIZE, 1400, 
-            "MAX_FRAGMENT_SIZE should be 1400 for MTU compliance");
+        assert_eq!(
+            MAX_FRAGMENT_SIZE, 1400,
+            "MAX_FRAGMENT_SIZE should be 1400 for MTU compliance"
+        );
     }
 
     #[test]
@@ -859,14 +882,20 @@ mod tests {
 
     #[test]
     fn test_dtls_version_constants() {
-        assert_eq!(DTLS_VERSION_1_2, 0xFEFD, "DTLS 1.2 version should be 0xFEFD");
-        assert_eq!(DTLS_VERSION_1_0, 0xFEFF, "DTLS 1.0 version should be 0xFEFF");
+        assert_eq!(
+            DTLS_VERSION_1_2, 0xFEFD,
+            "DTLS 1.2 version should be 0xFEFD"
+        );
+        assert_eq!(
+            DTLS_VERSION_1_0, 0xFEFF,
+            "DTLS 1.0 version should be 0xFEFF"
+        );
     }
 
     #[test]
     fn test_record_accepts_valid_versions() {
         let mut buf = [0u8; 20];
-        
+
         // Test DTLS 1.2
         let header12 = RecordHeader {
             content_type: 22,
@@ -876,10 +905,10 @@ mod tests {
             length: 0,
         };
         header12.encode(&mut buf);
-        
+
         let result = Record::parse(&buf);
         assert!(result.is_ok());
-        
+
         // Test DTLS 1.0
         let header10 = RecordHeader {
             content_type: 22,
@@ -889,7 +918,7 @@ mod tests {
             length: 0,
         };
         header10.encode(&mut buf);
-        
+
         let result = Record::parse(&buf);
         assert!(result.is_ok());
     }
@@ -901,7 +930,7 @@ mod tests {
     #[test]
     fn test_record_layer_initial_state() {
         let layer = RecordLayer::new();
-        
+
         assert_eq!(layer.epoch, 0);
         assert_eq!(layer.sequence_number, 0);
     }
@@ -909,11 +938,11 @@ mod tests {
     #[test]
     fn test_record_layer_epoch_increment() {
         let mut layer = RecordLayer::new();
-        
+
         assert_eq!(layer.epoch, 0);
-        
+
         layer.increment_epoch();
-        
+
         assert_eq!(layer.epoch, 1);
         assert_eq!(layer.sequence_number, 0); // Should reset on epoch change
     }

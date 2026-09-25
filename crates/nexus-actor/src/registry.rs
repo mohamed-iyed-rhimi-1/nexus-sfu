@@ -239,7 +239,9 @@ impl ActorRegistry {
 
         // Update participant-track relationship
         let mut participant_tracks = self.participant_tracks.write();
-        let tracks_vec = participant_tracks.entry(participant_id).or_insert_with(Vec::new);
+        let tracks_vec = participant_tracks
+            .entry(participant_id)
+            .or_insert_with(Vec::new);
         if !tracks_vec.contains(&track_id) {
             tracks_vec.push(track_id);
         }
@@ -359,10 +361,7 @@ impl ActorRegistry {
         assert!(room_id != 0, "room_id must not be 0");
 
         let room_participants = self.room_participants.read();
-        room_participants
-            .get(&room_id)
-            .cloned()
-            .unwrap_or_default()
+        room_participants.get(&room_id).cloned().unwrap_or_default()
     }
 
     /// Get all tracks for a participant

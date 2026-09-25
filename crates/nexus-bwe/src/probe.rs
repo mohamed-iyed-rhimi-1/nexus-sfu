@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Probe controller for bandwidth discovery.
-/// 
+///
 /// Implements periodic probing to discover available network capacity by
 /// temporarily increasing send rate and monitoring loss/delay feedback.
 pub struct ProbeController {
@@ -68,7 +68,8 @@ impl ProbeController {
     pub fn new(probe_duration_us: u64, probe_interval_us: u64) -> Self {
         assert!(probe_duration_us > 0, "Probe duration must be positive");
         assert!(
-            (Self::MIN_PROBE_DURATION_US..=Self::MAX_PROBE_DURATION_US).contains(&probe_duration_us),
+            (Self::MIN_PROBE_DURATION_US..=Self::MAX_PROBE_DURATION_US)
+                .contains(&probe_duration_us),
             "Probe duration must be within [{}, {}], got {}",
             Self::MIN_PROBE_DURATION_US,
             Self::MAX_PROBE_DURATION_US,
@@ -81,7 +82,8 @@ impl ProbeController {
             probe_duration_us
         );
         assert!(
-            (Self::MIN_PROBE_INTERVAL_US..=Self::MAX_PROBE_INTERVAL_US).contains(&probe_interval_us),
+            (Self::MIN_PROBE_INTERVAL_US..=Self::MAX_PROBE_INTERVAL_US)
+                .contains(&probe_interval_us),
             "Probe interval must be within [{}, {}], got {}",
             Self::MIN_PROBE_INTERVAL_US,
             Self::MAX_PROBE_INTERVAL_US,
@@ -119,7 +121,7 @@ impl ProbeController {
 
         let last_probe = self.last_probe_us.load(Ordering::Relaxed);
         let elapsed = timestamp_us.saturating_sub(last_probe);
-        
+
         elapsed >= self.probe_interval_us && current_estimate_bps > 0
     }
 
@@ -130,7 +132,10 @@ impl ProbeController {
             "Cannot start probe in state {:?}",
             self.state
         );
-        assert!(current_estimate_bps > 0, "Current estimate must be positive");
+        assert!(
+            current_estimate_bps > 0,
+            "Current estimate must be positive"
+        );
 
         // Calculate probe bitrate: 1.5x current, capped at 2x
         let probe_bitrate = (current_estimate_bps as f64 * Self::PROBE_MULTIPLIER) as u64;
@@ -144,7 +149,8 @@ impl ProbeController {
             current_estimate_bps
         );
 
-        self.probe_bitrate_bps.store(probe_bitrate, Ordering::Relaxed);
+        self.probe_bitrate_bps
+            .store(probe_bitrate, Ordering::Relaxed);
         self.probe_start_us.store(timestamp_us, Ordering::Relaxed);
         self.last_probe_us.store(timestamp_us, Ordering::Relaxed);
         self.state = ProbeState::Probing;
@@ -157,7 +163,11 @@ impl ProbeController {
             return ProbeResult::Continue;
         }
 
-        assert!(loss_percent <= 100, "Loss percent must be <= 100, got {}", loss_percent);
+        assert!(
+            loss_percent <= 100,
+            "Loss percent must be <= 100, got {}",
+            loss_percent
+        );
 
         let probe_start = self.probe_start_us.load(Ordering::Relaxed);
         let elapsed = timestamp_us.saturating_sub(probe_start);
@@ -246,10 +256,10 @@ mod tests {
     #[test]
     fn test_probe_controller_should_probe() {
         let controller = ProbeController::default();
-        
+
         // Should not probe immediately
         assert!(!controller.should_probe(1_000_000, 0));
-        
+
         // Should probe after interval
         assert!(controller.should_probe(1_000_000, 6_000_000));
     }
@@ -258,9 +268,9 @@ mod tests {
     fn test_probe_controller_start_probe() {
         let mut controller = ProbeController::default();
         let current_estimate = 1_000_000;
-        
+
         controller.start_probe(current_estimate, 0);
-        
+
         assert_eq!(controller.state(), ProbeState::Probing);
         let probe_bitrate = controller.probe_bitrate_bps().unwrap();
         assert!(probe_bitrate > current_estimate);
@@ -271,16 +281,16 @@ mod tests {
     fn test_probe_controller_success() {
         let mut controller = ProbeController::default();
         controller.start_probe(1_000_000, 0);
-        
+
         // Low loss during probe
         let result = controller.on_feedback(1, 100_000);
         assert_eq!(result, ProbeResult::Continue);
-        
+
         // Low loss after duration
         let result = controller.on_feedback(1, 600_000);
         assert_eq!(result, ProbeResult::Success);
         assert_eq!(controller.state(), ProbeState::Success);
-        
+
         let (attempts, successes, failures) = controller.stats();
         assert_eq!(attempts, 1);
         assert_eq!(successes, 1);
@@ -291,12 +301,12 @@ mod tests {
     fn test_probe_controller_failure() {
         let mut controller = ProbeController::default();
         controller.start_probe(1_000_000, 0);
-        
+
         // High loss during probe
         let result = controller.on_feedback(10, 100_000);
         assert_eq!(result, ProbeResult::Failed);
         assert_eq!(controller.state(), ProbeState::Failed);
-        
+
         let (attempts, successes, failures) = controller.stats();
         assert_eq!(attempts, 1);
         assert_eq!(successes, 0);
@@ -307,7 +317,7 @@ mod tests {
     fn test_probe_controller_reset() {
         let mut controller = ProbeController::default();
         controller.start_probe(1_000_000, 0);
-        
+
         controller.reset();
         assert_eq!(controller.state(), ProbeState::Idle);
         assert_eq!(controller.probe_bitrate_bps(), None);

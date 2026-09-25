@@ -268,8 +268,8 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             id: TransportId(1),
-            ice_role: IceRole::Controlled,  // SFU sends offer, so it's controlled (RFC 8445 §6.1.1)
-            dtls_role: DtlsRole::Server,    // SFU sends offer with setup:actpass, acts as server (RFC 8842)
+            ice_role: IceRole::Controlled, // SFU sends offer, so it's controlled (RFC 8445 §6.1.1)
+            dtls_role: DtlsRole::Server, // SFU sends offer with setup:actpass, acts as server (RFC 8842)
             remote_addr: None,
             srtp_profile: ProtectionProfile::AeadAes128Gcm,
             ice_gathering_timeout_ms: ICE_GATHERING_TIMEOUT_MS,
@@ -551,13 +551,17 @@ impl WebRtcSession {
         // its fingerprint at session creation so it is available for SDP
         // offer/answer before the DTLS handshake begins.  The OpenSSL engine
         // is stored and reused later by init_dtls / start_dtls_handshake.
-        let (openssl_dtls, dtls_fingerprint_cache) = match OpenSslDtlsEngine::new(config.dtls_role) {
+        let (openssl_dtls, dtls_fingerprint_cache) = match OpenSslDtlsEngine::new(config.dtls_role)
+        {
             Ok(engine) => {
                 let fp = *engine.fingerprint();
                 (Some(engine), fp)
             }
             Err(e) => {
-                tracing::warn!("OpenSSL DTLS init failed, deferring fingerprint to init_dtls: {}", e);
+                tracing::warn!(
+                    "OpenSSL DTLS init failed, deferring fingerprint to init_dtls: {}",
+                    e
+                );
                 (None, [0u8; 32])
             }
         };
@@ -749,7 +753,11 @@ impl WebRtcSession {
     /// - Assertions for preconditions
     pub fn get_srtp_key_material(
         &self,
-    ) -> Option<(nexus_transport::srtp::KeyMaterial, nexus_transport::srtp::SrtpPolicy, u64)> {
+    ) -> Option<(
+        nexus_transport::srtp::KeyMaterial,
+        nexus_transport::srtp::SrtpPolicy,
+        u64,
+    )> {
         // Check if DTLS is established
         let dtls = self.dtls_session.as_ref()?;
         if dtls.state() != nexus_transport::dtls::SessionState::Established {
@@ -772,10 +780,18 @@ impl WebRtcSession {
 
         // Map DTLS profile to SRTP ProtectionProfile
         let protection_profile = match srtp_keys.profile {
-            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_80 => nexus_transport::srtp::ProtectionProfile::Aes128CmHmacSha1_80,
-            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_32 => nexus_transport::srtp::ProtectionProfile::Aes128CmHmacSha1_32,
-            nexus_transport::dtls::SrtpProfile::AeadAes128Gcm => nexus_transport::srtp::ProtectionProfile::AeadAes128Gcm,
-            nexus_transport::dtls::SrtpProfile::AeadAes256Gcm => nexus_transport::srtp::ProtectionProfile::AeadAes256Gcm,
+            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_80 => {
+                nexus_transport::srtp::ProtectionProfile::Aes128CmHmacSha1_80
+            }
+            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_32 => {
+                nexus_transport::srtp::ProtectionProfile::Aes128CmHmacSha1_32
+            }
+            nexus_transport::dtls::SrtpProfile::AeadAes128Gcm => {
+                nexus_transport::srtp::ProtectionProfile::AeadAes128Gcm
+            }
+            nexus_transport::dtls::SrtpProfile::AeadAes256Gcm => {
+                nexus_transport::srtp::ProtectionProfile::AeadAes256Gcm
+            }
         };
 
         // Build key material using profile-aware constructor
@@ -783,7 +799,10 @@ impl WebRtcSession {
         export_material.extend_from_slice(key);
         export_material.extend_from_slice(salt);
 
-        let key_material = match nexus_transport::srtp::KeyMaterial::from_dtls_export(&export_material, protection_profile) {
+        let key_material = match nexus_transport::srtp::KeyMaterial::from_dtls_export(
+            &export_material,
+            protection_profile,
+        ) {
             Ok(km) => km,
             Err(e) => {
                 tracing::error!("Failed to create key material: {:?}", e);
@@ -809,11 +828,6 @@ impl WebRtcSession {
         self.dtls_generation
     }
 
-    /// Set remote ICE credentials.
-    ///
-    /// # TigerStyle
-    /// - Precondition: credentials must not be empty
-    /// - Precondition: credentials bounded (ufrag ≤ 32, pwd ≤ 128)
     /// Get remote ICE ufrag if set.
     pub fn remote_ice_ufrag(&self) -> Option<&str> {
         self.remote_ice_ufrag.as_deref()
@@ -824,6 +838,11 @@ impl WebRtcSession {
         self.remote_ice_pwd.as_deref()
     }
 
+    /// Set remote ICE credentials.
+    ///
+    /// # TigerStyle
+    /// - Precondition: credentials must not be empty
+    /// - Precondition: credentials bounded (ufrag ≤ 32, pwd ≤ 128)
     pub fn set_remote_ice_credentials(&mut self, credentials: IceCredentials) {
         // Precondition: credentials must not be empty
         assert!(
@@ -1031,7 +1050,9 @@ impl WebRtcSession {
     ///
     /// # TigerStyle
     /// - Precondition: state must be New
-    #[deprecated(note = "Use add_local_candidate + mark_gathering_complete + start_connectivity_checks")]
+    #[deprecated(
+        note = "Use add_local_candidate + mark_gathering_complete + start_connectivity_checks"
+    )]
     pub fn gather_candidates(&mut self) -> Result<(), WebRtcError> {
         if self.state != SessionState::New {
             return Err(WebRtcError::InvalidState);
@@ -1051,8 +1072,15 @@ impl WebRtcSession {
 
         self.transition_state(SessionState::IceConnecting)?;
 
-        assert!(self.ice_agent.is_some(), "ICE agent must exist after gathering");
-        assert_eq!(self.state, SessionState::IceConnecting, "State must be IceConnecting after gather");
+        assert!(
+            self.ice_agent.is_some(),
+            "ICE agent must exist after gathering"
+        );
+        assert_eq!(
+            self.state,
+            SessionState::IceConnecting,
+            "State must be IceConnecting after gather"
+        );
 
         Ok(())
     }
@@ -1109,7 +1137,10 @@ impl WebRtcSession {
         // Already established or handshaking — ICE is done, trickle candidates
         // arriving late are harmless (RFC 8838 §10: candidates may arrive after
         // ICE completes). Return Ok to avoid spurious error logs.
-        if matches!(self.state, SessionState::DtlsHandshaking | SessionState::Established) {
+        if matches!(
+            self.state,
+            SessionState::DtlsHandshaking | SessionState::Established
+        ) {
             return Ok(());
         }
 
@@ -1147,7 +1178,7 @@ impl WebRtcSession {
         if let Some(ref mut agent) = self.ice_agent {
             let can_start = agent.remote_candidate_count() > 0
                 && agent.gathering_state() == IceGatheringState::Complete;
-            
+
             if can_start {
                 agent.start_checks()?;
                 // Only NOW transition to IceConnecting after checks started
@@ -1158,8 +1189,11 @@ impl WebRtcSession {
             }
         }
 
-        assert_eq!(self.state, SessionState::IceConnecting,
-            "start_connectivity_checks must result in IceConnecting state");
+        assert_eq!(
+            self.state,
+            SessionState::IceConnecting,
+            "start_connectivity_checks must result in IceConnecting state"
+        );
 
         Ok(())
     }
@@ -1193,8 +1227,15 @@ impl WebRtcSession {
         agent.add_remote_candidate(candidate)?;
 
         let count_after = agent.remote_candidate_count();
-        assert_eq!(count_after, count_before + 1, "Candidate count must increment by exactly 1");
-        assert!(count_after <= 32, "Remote candidate count must remain <= 32");
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "Candidate count must increment by exactly 1"
+        );
+        assert!(
+            count_after <= 32,
+            "Remote candidate count must remain <= 32"
+        );
 
         Ok(())
     }
@@ -1230,10 +1271,10 @@ impl WebRtcSession {
         if let Some(ref mut agent) = self.ice_agent {
             let already_checking = agent.connection_state() == IceConnectionState::Checking
                 || agent.connection_state() == IceConnectionState::Connected;
-            
-            if agent.remote_candidate_count() > 0 
-                && agent.gathering_state() == IceGatheringState::Complete 
-                && !already_checking 
+
+            if agent.remote_candidate_count() > 0
+                && agent.gathering_state() == IceGatheringState::Complete
+                && !already_checking
             {
                 if let Err(e) = agent.start_checks() {
                     tracing::warn!("Failed to start ICE checks: {:?}", e);
@@ -1241,17 +1282,18 @@ impl WebRtcSession {
             }
         }
 
-        assert_eq!(self.state, SessionState::IceConnecting,
-            "start_ice must result in IceConnecting state");
+        assert_eq!(
+            self.state,
+            SessionState::IceConnecting,
+            "start_ice must result in IceConnecting state"
+        );
 
         Ok(())
     }
-    
+
     /// Get local ICE candidates as SDP candidate strings.
     pub fn local_candidates_sdp(&self) -> Vec<String> {
-        self.local_candidates()
-            .map(|c| c.to_sdp_string())
-            .collect()
+        self.local_candidates().map(|c| c.to_sdp_string()).collect()
     }
 
     /// Legacy next_ice_check. Deprecated — use `poll_ice_outbound()`.
@@ -1387,9 +1429,16 @@ impl WebRtcSession {
                 tracing::warn!("DTLS handshake start failed: {}", e);
                 WebRtcError::DtlsHandshakeFailed
             })?;
-            if output.is_empty() { None } else { Some(output) }
+            if output.is_empty() {
+                None
+            } else {
+                Some(output)
+            }
         } else {
-            let dtls_session = self.dtls_session.as_mut().expect("DTLS session must exist after init_dtls");
+            let dtls_session = self
+                .dtls_session
+                .as_mut()
+                .expect("DTLS session must exist after init_dtls");
             let _ = dtls_session.start_handshake()?;
             None
         };
@@ -1504,8 +1553,12 @@ impl WebRtcSession {
 
         // Map DTLS SrtpProfile → SRTP ProtectionProfile (same u16 discriminants)
         let protection_profile = match negotiated_profile {
-            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_80 => ProtectionProfile::Aes128CmHmacSha1_80,
-            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_32 => ProtectionProfile::Aes128CmHmacSha1_32,
+            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_80 => {
+                ProtectionProfile::Aes128CmHmacSha1_80
+            }
+            nexus_transport::dtls::SrtpProfile::Aes128CmHmacSha1_32 => {
+                ProtectionProfile::Aes128CmHmacSha1_32
+            }
             nexus_transport::dtls::SrtpProfile::AeadAes128Gcm => ProtectionProfile::AeadAes128Gcm,
             nexus_transport::dtls::SrtpProfile::AeadAes256Gcm => ProtectionProfile::AeadAes256Gcm,
         };
@@ -1545,19 +1598,39 @@ impl WebRtcSession {
         let is_client = self.config.dtls_role == DtlsRole::Client;
         let (inbound_key, inbound_salt, outbound_key, outbound_salt) = if is_client {
             // We are DTLS client: inbound uses server keys, outbound uses client keys
-            (srtp_keys.server_key(), srtp_keys.server_salt(),
-             srtp_keys.client_key(), srtp_keys.client_salt())
+            (
+                srtp_keys.server_key(),
+                srtp_keys.server_salt(),
+                srtp_keys.client_key(),
+                srtp_keys.client_salt(),
+            )
         } else {
             // We are DTLS server: inbound uses client keys, outbound uses server keys
-            (srtp_keys.client_key(), srtp_keys.client_salt(),
-             srtp_keys.server_key(), srtp_keys.server_salt())
+            (
+                srtp_keys.client_key(),
+                srtp_keys.client_salt(),
+                srtp_keys.server_key(),
+                srtp_keys.server_salt(),
+            )
         };
 
         // Assert keys are not all zeros
-        assert!(inbound_key.iter().any(|&b| b != 0), "Inbound SRTP key must not be all zeros");
-        assert!(inbound_salt.iter().any(|&b| b != 0), "Inbound SRTP salt must not be all zeros");
-        assert!(outbound_key.iter().any(|&b| b != 0), "Outbound SRTP key must not be all zeros");
-        assert!(outbound_salt.iter().any(|&b| b != 0), "Outbound SRTP salt must not be all zeros");
+        assert!(
+            inbound_key.iter().any(|&b| b != 0),
+            "Inbound SRTP key must not be all zeros"
+        );
+        assert!(
+            inbound_salt.iter().any(|&b| b != 0),
+            "Inbound SRTP salt must not be all zeros"
+        );
+        assert!(
+            outbound_key.iter().any(|&b| b != 0),
+            "Outbound SRTP key must not be all zeros"
+        );
+        assert!(
+            outbound_salt.iter().any(|&b| b != 0),
+            "Outbound SRTP salt must not be all zeros"
+        );
 
         let policy = SrtpPolicy {
             profile: protection_profile,
@@ -1569,10 +1642,11 @@ impl WebRtcSession {
         inbound_material.extend_from_slice(inbound_key);
         inbound_material.extend_from_slice(inbound_salt);
 
-        let inbound_km = KeyMaterial::from_dtls_export(&inbound_material, protection_profile).map_err(|e| {
-            tracing::error!("Failed to create inbound SRTP key material: {:?}", e);
-            WebRtcError::SrtpInitFailed
-        })?;
+        let inbound_km = KeyMaterial::from_dtls_export(&inbound_material, protection_profile)
+            .map_err(|e| {
+                tracing::error!("Failed to create inbound SRTP key material: {:?}", e);
+                WebRtcError::SrtpInitFailed
+            })?;
 
         let inbound_ctx = SrtpContext::new(&inbound_km, policy).map_err(|e| {
             tracing::error!("Failed to create inbound SRTP context: {:?}", e);
@@ -1584,10 +1658,11 @@ impl WebRtcSession {
         outbound_material.extend_from_slice(outbound_key);
         outbound_material.extend_from_slice(outbound_salt);
 
-        let outbound_km = KeyMaterial::from_dtls_export(&outbound_material, protection_profile).map_err(|e| {
-            tracing::error!("Failed to create outbound SRTP key material: {:?}", e);
-            WebRtcError::SrtpInitFailed
-        })?;
+        let outbound_km = KeyMaterial::from_dtls_export(&outbound_material, protection_profile)
+            .map_err(|e| {
+                tracing::error!("Failed to create outbound SRTP key material: {:?}", e);
+                WebRtcError::SrtpInitFailed
+            })?;
 
         let outbound_ctx = SrtpContext::new(&outbound_km, policy).map_err(|e| {
             tracing::error!("Failed to create outbound SRTP context: {:?}", e);
@@ -1766,7 +1841,10 @@ impl WebRtcSession {
             "Media sections must be bounded to 10"
         );
 
-        tracing::info!(session_id = self.config.id.0, "Processing renegotiation answer");
+        tracing::info!(
+            session_id = self.config.id.0,
+            "Processing renegotiation answer"
+        );
 
         let mut added_mids = Vec::new();
         let mut removed_mids = Vec::new();
@@ -1847,7 +1925,10 @@ impl WebRtcSession {
         // and fed in via add_local_candidate + mark_gathering_complete,
         // just like the initial ICE flow.
 
-        tracing::info!(session_id = self.config.id.0, "ICE restart complete, awaiting candidate gathering");
+        tracing::info!(
+            session_id = self.config.id.0,
+            "ICE restart complete, awaiting candidate gathering"
+        );
 
         Ok(())
     }
@@ -2073,7 +2154,7 @@ impl WebRtcSession {
                     first_bytes = ?&data[..data.len().min(4)],
                     "Processing DTLS packet in OpenSSL engine"
                 );
-                
+
                 let output = engine.process(data).map_err(|e| {
                     tracing::error!(
                         error = %e,
@@ -2084,7 +2165,7 @@ impl WebRtcSession {
                         from = %from,
                         "DTLS process failed - detailed error"
                     );
-                    
+
                     // Log additional context for handshake failures
                     if data[0] == 21 {
                         let alert_level = if data.len() > 13 { data[13] } else { 0 };
@@ -2095,7 +2176,7 @@ impl WebRtcSession {
                             "DTLS Alert received (content_type=21). Level: 1=warning, 2=fatal. Common: 40=handshake_failure, 42=bad_certificate, 43=unsupported_certificate"
                         );
                     }
-                    
+
                     tracing::warn!("DTLS process failed: {}", e);
                     WebRtcError::DtlsHandshakeFailed
                 })?;
@@ -2123,7 +2204,8 @@ impl WebRtcSession {
                         );
 
                         assert_eq!(
-                            keys.client_salt().len(), expected_salt,
+                            keys.client_salt().len(),
+                            expected_salt,
                             "OpenSSL engine keys: client_salt len must match profile"
                         );
 
@@ -2165,7 +2247,12 @@ impl WebRtcSession {
     /// - Precondition: state is Established
     /// - Precondition: srtp_session exists
     /// - Buffer bleed protection
-    fn process_rtp(&mut self, data: &[u8], _from: SocketAddr, out: &mut [u8]) -> Result<IncomingData, WebRtcError> {
+    fn process_rtp(
+        &mut self,
+        data: &[u8],
+        _from: SocketAddr,
+        out: &mut [u8],
+    ) -> Result<IncomingData, WebRtcError> {
         // Precondition: session must be established
         if self.state != SessionState::Established {
             return Err(WebRtcError::InvalidState);
@@ -2728,6 +2815,50 @@ impl WebRtcSession {
 }
 
 // ============================================================================
+// Compile-Time Assertions (TigerStyle)
+// ============================================================================
+
+// Assert struct size bounds to prevent stack overflow
+const _: () = assert!(
+    std::mem::size_of::<SessionConfig>() < 1024,
+    "SessionConfig must be < 1KB"
+);
+
+// Assert work buffer size matches constant
+const _: () = assert!(
+    std::mem::size_of::<[u8; MAX_PACKET_SIZE]>() == MAX_PACKET_SIZE,
+    "Work buffer size must match MAX_PACKET_SIZE"
+);
+
+// Assert DTLS timeout is bounded
+const _: () = assert!(
+    DTLS_HANDSHAKE_TIMEOUT_MS >= 1000,
+    "DTLS timeout must be >= 1s"
+);
+const _: () = assert!(
+    DTLS_HANDSHAKE_TIMEOUT_MS <= 60000,
+    "DTLS timeout must be <= 60s"
+);
+
+// Assert packet size is sufficient for WebRTC
+const _: () = assert!(
+    MAX_PACKET_SIZE >= 1500,
+    "MAX_PACKET_SIZE must be at least Ethernet MTU"
+);
+const _: () = assert!(
+    MAX_PACKET_SIZE >= MIN_PACKET_SIZE_FOR_SRTP,
+    "MAX_PACKET_SIZE must accommodate SRTP overhead"
+);
+#[allow(dead_code)] // Used in compile-time assertion above
+const MIN_PACKET_SIZE_FOR_SRTP: usize = 12 + 4; // RTP header + smallest auth tag (HMAC-SHA1-32)
+
+// Assert SessionState fits in u8
+const _: () = assert!(
+    std::mem::size_of::<SessionState>() == 1,
+    "SessionState must fit in u8"
+);
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2762,8 +2893,8 @@ mod tests {
     #[test]
     fn test_session_config_default() {
         let config = SessionConfig::default();
-        assert_eq!(config.ice_role, IceRole::Controlling);
-        assert_eq!(config.dtls_role, DtlsRole::Client);
+        assert_eq!(config.ice_role, IceRole::Controlled);
+        assert_eq!(config.dtls_role, DtlsRole::Server);
         assert_eq!(config.srtp_profile, ProtectionProfile::AeadAes128Gcm);
         assert_eq!(config.ice_gathering_timeout_ms, ICE_GATHERING_TIMEOUT_MS);
         assert_eq!(config.dtls_handshake_timeout_ms, DTLS_HANDSHAKE_TIMEOUT_MS);
@@ -2775,8 +2906,10 @@ mod tests {
         assert!(config.validate().is_ok());
 
         // Invalid timeout
-        let mut bad_config = SessionConfig::default();
-        bad_config.ice_gathering_timeout_ms = 10; // Too short
+        let bad_config = SessionConfig {
+            ice_gathering_timeout_ms: 10, // Too short
+            ..Default::default()
+        };
         assert!(bad_config.validate().is_err());
     }
 
@@ -2906,47 +3039,3 @@ mod tests {
         assert_eq!(stats.bytes_received, 0);
     }
 }
-
-// ============================================================================
-// Compile-Time Assertions (TigerStyle)
-// ============================================================================
-
-// Assert struct size bounds to prevent stack overflow
-const _: () = assert!(
-    std::mem::size_of::<SessionConfig>() < 1024,
-    "SessionConfig must be < 1KB"
-);
-
-// Assert work buffer size matches constant
-const _: () = assert!(
-    std::mem::size_of::<[u8; MAX_PACKET_SIZE]>() == MAX_PACKET_SIZE,
-    "Work buffer size must match MAX_PACKET_SIZE"
-);
-
-// Assert DTLS timeout is bounded
-const _: () = assert!(
-    DTLS_HANDSHAKE_TIMEOUT_MS >= 1000,
-    "DTLS timeout must be >= 1s"
-);
-const _: () = assert!(
-    DTLS_HANDSHAKE_TIMEOUT_MS <= 60000,
-    "DTLS timeout must be <= 60s"
-);
-
-// Assert packet size is sufficient for WebRTC
-const _: () = assert!(
-    MAX_PACKET_SIZE >= 1500,
-    "MAX_PACKET_SIZE must be at least Ethernet MTU"
-);
-const _: () = assert!(
-    MAX_PACKET_SIZE >= MIN_PACKET_SIZE_FOR_SRTP,
-    "MAX_PACKET_SIZE must accommodate SRTP overhead"
-);
-#[allow(dead_code)] // Used in compile-time assertion above
-const MIN_PACKET_SIZE_FOR_SRTP: usize = 12 + 4; // RTP header + smallest auth tag (HMAC-SHA1-32)
-
-// Assert SessionState fits in u8
-const _: () = assert!(
-    std::mem::size_of::<SessionState>() == 1,
-    "SessionState must fit in u8"
-);

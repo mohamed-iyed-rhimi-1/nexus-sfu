@@ -105,6 +105,10 @@ pub struct HeadlessClient {
     metrics_sync_instant: Option<Instant>,
     /// Previous per-packet arrival interval for jitter computation
     last_per_packet_time: Option<Duration>,
+    /// Set once ICE reaches Connected/Completed
+    ice_connected: Arc<AtomicBool>,
+    /// Remote track IDs announced by the SFU (Joined + TrackPublished), not yet subscribed
+    announced_tracks: Vec<TrackId>,
 }
 
 impl HeadlessClient {
@@ -130,6 +134,8 @@ impl HeadlessClient {
             last_rx_count: 0,
             metrics_sync_instant: None,
             last_per_packet_time: None,
+            ice_connected: Arc::new(AtomicBool::new(false)),
+            announced_tracks: Vec::new(),
         })
     }
 
@@ -226,22 +232,29 @@ impl HeadlessClient {
     /// Connect to the SFU and join the room
     ///
     /// This method:
-    /// 1. Establishes signaling connection with timeout
+    /// 1. Establishes and authenticates the signaling connection with timeout
     /// 2. Joins the specified room
-    /// 3. Creates WebRTC peer connection
-    /// 4. Performs SDP offer/answer exchange
-    /// 5. Handles ICE candidate exchange
+    /// 3. Creates the WebRTC peer connection and its event handlers
+    ///
+    /// No SDP is exchanged here: the SFU is the sole offerer and sends an Offer
+    /// after `start_publishing()` (Publish) or `discover_and_subscribe()` (Subscribe).
     pub async fn connect(&mut self) -> Result<(), ClientError> {
         self.state = ClientState::Connecting;
         self.connection_start = Some(Instant::now());
 
+        let participant_name = format!("loadtest-{:?}-{}", self.config.role, rand_id());
+
         // Step 1: Establish signaling connection with timeout
         let signaling = SignalingConnection::connect_with_timeout(
             &self.config.sfu_url,
+            &self.config.connection,
+            &participant_name,
             self.config.connection_timeout,
         )
         .await
-        .map_err(|e| ClientError::PeerConnectionFailed(format!("Signaling connection failed: {}", e)))?;
+        .map_err(|e| {
+            ClientError::PeerConnectionFailed(format!("Signaling connection failed: {}", e))
+        })?;
 
         let signaling = Arc::new(Mutex::new(signaling));
         self.signaling = Some(signaling.clone());
@@ -263,11 +276,9 @@ impl HeadlessClient {
             hash
         });
 
-        let participant_name = format!("loadtest-{:?}-{}", self.config.role, rand_id());
-
         let join_response = {
             let mut sig = signaling.lock().await;
-            
+
             // Broadcaster creates the room; viewers just join.
             // If join fails with room_not_found, try creating first then re-join.
             match sig.join_room(room_id, &participant_name).await {
@@ -277,80 +288,62 @@ impl HeadlessClient {
                     let create_msg = nexus_signal::protocol::SignalMessage::Create {
                         room_name: Some(self.config.room.clone()),
                     };
-                    sig.send(create_msg).await
-                        .map_err(|e| ClientError::PeerConnectionFailed(format!("Failed to create room: {}", e)))?;
-                    
+                    sig.send(create_msg).await.map_err(|e| {
+                        ClientError::PeerConnectionFailed(format!("Failed to create room: {}", e))
+                    })?;
+
                     // Wait for Created response
                     loop {
-                        let msg = sig.recv().await
-                            .map_err(|e| ClientError::PeerConnectionFailed(format!("Failed to recv create response: {}", e)))?;
+                        let msg = sig.recv().await.map_err(|e| {
+                            ClientError::PeerConnectionFailed(format!(
+                                "Failed to recv create response: {}",
+                                e
+                            ))
+                        })?;
                         match msg {
-                            nexus_signal::protocol::SignalMessage::Created { room_id: created_id, .. } => {
+                            nexus_signal::protocol::SignalMessage::Created {
+                                room_id: created_id,
+                                ..
+                            } => {
                                 tracing::info!("Created room {}", created_id);
                                 room_id = created_id;
                                 break;
                             }
                             nexus_signal::protocol::SignalMessage::Error { code, message } => {
-                                return Err(ClientError::PeerConnectionFailed(
-                                    format!("Room creation failed: {} - {}", code, message)
-                                ));
+                                return Err(ClientError::PeerConnectionFailed(format!(
+                                    "Room creation failed: {} - {}",
+                                    code, message
+                                )));
                             }
                             _ => continue,
                         }
                     }
-                    
+
                     // Now join the created room
-                    sig.join_room(room_id, &participant_name).await
-                        .map_err(|e2| ClientError::PeerConnectionFailed(
-                            format!("Failed to join room after create: {} (original: {})", e2, e)
-                        ))?
+                    sig.join_room(room_id, &participant_name)
+                        .await
+                        .map_err(|e2| {
+                            ClientError::PeerConnectionFailed(format!(
+                                "Failed to join room after create: {} (original: {})",
+                                e2, e
+                            ))
+                        })?
                 }
             }
         };
 
         self.participant_id = Some(join_response.participant_id);
+        // Tracks published before we joined are only listed here, never re-announced
+        self.note_announced_tracks(
+            join_response
+                .tracks
+                .iter()
+                .map(|t| (t.track_id, t.publisher_id)),
+        );
 
         // Step 3: Create WebRTC peer connection
         let peer_connection = self.create_peer_connection().await?;
         self.peer_connection = Some(peer_connection.clone());
-
-        // Add transceivers so the SDP offer has media sections.
-        // The SFU requires at least one media section in the offer.
-        {
-            use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
-            use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
-
-            let direction = if self.config.role.can_publish() && !self.config.role.can_subscribe() {
-                // Broadcaster: sendonly (will be populated with actual tracks in start_publishing)
-                RTCRtpTransceiverDirection::Sendonly
-            } else if !self.config.role.can_publish() && self.config.role.can_subscribe() {
-                // Viewer: recvonly
-                RTCRtpTransceiverDirection::Recvonly
-            } else {
-                // Participant: sendrecv
-                RTCRtpTransceiverDirection::Sendrecv
-            };
-
-            // Add video transceiver
-            let video_init = RTCRtpTransceiverInit {
-                direction,
-                send_encodings: vec![],
-            };
-            peer_connection
-                .add_transceiver_from_kind(webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video, Some(video_init))
-                .await
-                .map_err(|e| ClientError::PeerConnectionFailed(format!("Failed to add video transceiver: {}", e)))?;
-
-            // Add audio transceiver
-            let audio_init = RTCRtpTransceiverInit {
-                direction,
-                send_encodings: vec![],
-            };
-            peer_connection
-                .add_transceiver_from_kind(webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio, Some(audio_init))
-                .await
-                .map_err(|e| ClientError::PeerConnectionFailed(format!("Failed to add audio transceiver: {}", e)))?;
-        }
 
         // Set up ICE candidate handler
         let signaling_for_ice = signaling.clone();
@@ -373,6 +366,16 @@ impl HeadlessClient {
                     let _ = sig.send(msg).await;
                 }
             })
+        }));
+
+        let ice_connected = Arc::clone(&self.ice_connected);
+        peer_connection.on_ice_connection_state_change(Box::new(move |state| {
+            if state == RTCIceConnectionState::Connected
+                || state == RTCIceConnectionState::Completed
+            {
+                ice_connected.store(true, Ordering::SeqCst);
+            }
+            Box::pin(async {})
         }));
 
         // Set up on_track handler to consume incoming RTP and track metrics
@@ -437,193 +440,126 @@ impl HeadlessClient {
         // Record when we start waiting for first frame (for TTFF)
         self.first_frame_start = Some(Instant::now());
 
-        // Step 4: Create and send SDP offer
-        let offer = peer_connection
-            .create_offer(None)
-            .await
-            .map_err(|e| ClientError::OfferFailed(e.to_string()))?;
-
-        // Set local description
-        peer_connection
-            .set_local_description(offer.clone())
-            .await
-            .map_err(|e| ClientError::OfferFailed(format!("Failed to set local description: {}", e)))?;
-
-        tracing::info!("Sending SDP offer:\n{}", offer.sdp);
-
-        // Send offer via signaling
-        {
-            let mut sig = signaling.lock().await;
-            sig.send(SignalMessage::Offer {
-                sdp: offer.sdp,
-            })
-            .await
-            .map_err(|e| ClientError::OfferFailed(format!("Failed to send offer: {}", e)))?;
-        }
-
-        // Step 5: Wait for answer and handle ICE candidates
-        self.handle_signaling_messages(&peer_connection, &signaling).await?;
-
-        // Record connection time
+        // Connected = authenticated and joined. ICE comes up with the first
+        // SFU offer, in start_publishing() or discover_and_subscribe().
         if let Some(start) = self.connection_start {
             self.metrics.connection_time = Some(start.elapsed());
         }
         self.metrics.connection_successful = true;
         self.state = ClientState::Connected;
 
-        // --- Diagnostic: dump transceiver state after initial connection ---
-        {
-            let transceivers = peer_connection.get_transceivers().await;
-            tracing::info!(
-                "[diag] After connect: {} transceivers, signaling_state={:?}, ice_state={:?}, conn_state={:?}",
-                transceivers.len(),
-                peer_connection.signaling_state(),
-                peer_connection.ice_connection_state(),
-                peer_connection.connection_state(),
-            );
-            for (i, t) in transceivers.iter().enumerate() {
-                let mid = t.mid();
-                let direction = t.direction();
-                let current_direction = t.current_direction();
-                let kind = t.kind();
-                tracing::info!(
-                    "[diag]   transceiver[{}]: mid={:?} kind={:?} direction={:?} current_direction={:?}",
-                    i, mid, kind, direction, current_direction,
-                );
-                {
-                    let receiver = t.receiver().await;
-                    let tracks = receiver.tracks().await;
-                    for track in &tracks {
-                        tracing::info!(
-                            "[diag]     receiver track: ssrc={} rid='{}' codec='{}'",
-                            track.ssrc(),
-                            track.rid(),
-                            track.codec().capability.mime_type,
-                        );
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 
-    /// Handle incoming signaling messages (answer and ICE candidates)
-    async fn handle_signaling_messages(
+    /// Record announced remote tracks, skipping our own and duplicates
+    fn note_announced_tracks(
         &mut self,
-        peer_connection: &Arc<RTCPeerConnection>,
-        signaling: &Arc<Mutex<SignalingConnection>>,
-    ) -> Result<(), ClientError> {
-        let mut answer_received = false;
-        let mut ice_connected = false;
-
-        // Set up connection state change handler
-        let ice_connected_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ice_flag_clone = ice_connected_flag.clone();
-
-        peer_connection.on_ice_connection_state_change(Box::new(move |state| {
-            if state == RTCIceConnectionState::Connected || state == RTCIceConnectionState::Completed {
-                ice_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracks: impl IntoIterator<Item = (TrackId, ParticipantId)>,
+    ) {
+        for (track_id, publisher_id) in tracks {
+            if Some(publisher_id) == self.participant_id
+                || self.announced_tracks.contains(&track_id)
+            {
+                continue;
             }
-            Box::pin(async {})
-        }));
+            self.announced_tracks.push(track_id);
+        }
+    }
 
-        // Process signaling messages until connected
-        let timeout = tokio::time::Instant::now() + self.config.connection_timeout;
+    /// Receive one signaling message (waiting at most `wait`) and handle what
+    /// every phase needs: answer SFU offers, add candidates, buffer announced
+    /// tracks, and fail on SFU errors. Returns `None` if nothing arrived.
+    async fn pump_signaling(&mut self, wait: Duration) -> Result<Option<Pumped>, ClientError> {
+        let not_connected = || ClientError::InvalidState {
+            expected: "Connected",
+            actual: "Disconnected",
+        };
+        let signaling = Arc::clone(self.signaling.as_ref().ok_or_else(not_connected)?);
+        let peer_connection = Arc::clone(self.peer_connection.as_ref().ok_or_else(not_connected)?);
 
-        while !answer_received || !ice_connected {
-            // Check timeout
-            if tokio::time::Instant::now() > timeout {
-                return Err(ClientError::PeerConnectionFailed(
-                    "Connection timeout waiting for SDP answer or ICE connection".to_string(),
-                ));
-            }
-
-            // Check if ICE connected via callback
-            if ice_connected_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                ice_connected = true;
-            }
-
-            // Also check peer connection state directly
-            let pc_state = peer_connection.connection_state();
-            if pc_state == RTCPeerConnectionState::Connected {
-                ice_connected = true;
-            }
-
-            // If we have answer and ICE is connected, we're done
-            if answer_received && ice_connected {
-                break;
-            }
-
-            // Try to receive a signaling message with a short timeout
-            let recv_result = {
-                let mut sig = signaling.lock().await;
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    sig.recv(),
-                )
-                .await
-            };
-
-            match recv_result {
-                Ok(Ok(msg)) => {
-                    match msg {
-                        SignalMessage::Answer { sdp, .. } | SignalMessage::AnswerReceived { sdp, .. } => {
-                            // Log the SDP answer for debugging
-                            tracing::info!("Received SDP answer:\n{}", sdp);
-
-                            // Set remote description
-                            let answer = RTCSessionDescription::answer(sdp)
-                                .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-
-                            peer_connection
-                                .set_remote_description(answer)
-                                .await
-                                .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-
-                            answer_received = true;
-                        }
-                        SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, .. } => {
-                            // Add ICE candidate
-                            let candidate_init = RTCIceCandidateInit {
-                                candidate,
-                                sdp_mid,
-                                sdp_mline_index: sdp_mline_index.map(|i| i as u16),
-                                username_fragment: None,
-                            };
-
-                            if let Err(e) = peer_connection.add_ice_candidate(candidate_init).await {
-                                // Log but don't fail - some candidates may be invalid
-                                tracing::debug!("Failed to add ICE candidate: {}", e);
-                            }
-                        }
-                        SignalMessage::Error { code, message } => {
-                            return Err(ClientError::PeerConnectionFailed(format!(
-                                "Signaling error: {} - {}",
-                                code, message
-                            )));
-                        }
-                        // Ignore other messages during connection
-                        _ => {}
-                    }
-                }
+        let msg = {
+            let mut sig = signaling.lock().await;
+            match tokio::time::timeout(wait, sig.recv()).await {
+                Err(_) => return Ok(None),
                 Ok(Err(e)) => {
-                    // Signaling error
                     return Err(ClientError::PeerConnectionFailed(format!(
                         "Signaling receive error: {}",
                         e
-                    )));
+                    )))
                 }
-                Err(_) => {
-                    // Timeout on recv, continue loop
-                }
+                Ok(Ok(msg)) => msg,
             }
+        };
 
-            // Small yield to prevent busy loop
-            tokio::task::yield_now().await;
+        match msg {
+            SignalMessage::Offer { sdp, .. } => {
+                answer_offer(&peer_connection, &signaling, sdp).await?;
+                Ok(Some(Pumped::Offer))
+            }
+            SignalMessage::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            } => {
+                add_remote_candidate(&peer_connection, candidate, sdp_mid, sdp_mline_index).await;
+                Ok(Some(Pumped::Other))
+            }
+            SignalMessage::TrackPublished {
+                track_id,
+                publisher_id,
+                ..
+            } => {
+                self.note_announced_tracks([(track_id, publisher_id)]);
+                Ok(Some(Pumped::Other))
+            }
+            SignalMessage::Subscribed { track_ids } => {
+                Ok(Some(Pumped::Subscribed(track_ids.len())))
+            }
+            SignalMessage::Error { code, message } => Err(ClientError::PeerConnectionFailed(
+                format!("Signaling error: {} - {}", code, message),
+            )),
+            other => {
+                tracing::debug!("Ignoring signaling message: {:?}", other);
+                Ok(Some(Pumped::Other))
+            }
         }
+    }
 
-        Ok(())
+    /// Handle signaling until an SFU offer has been answered
+    async fn wait_for_offer(&mut self, timeout: Duration) -> Result<(), ClientError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(Pumped::Offer) = self.pump_signaling(Duration::from_millis(100)).await? {
+                return Ok(());
+            }
+        }
+        Err(ClientError::OfferFailed(
+            "timed out waiting for SFU offer".to_string(),
+        ))
+    }
+
+    /// Handle signaling (trickled candidates) until ICE connects
+    async fn wait_for_ice(&mut self, timeout: Duration) -> Result<(), ClientError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if self.is_ice_connected() {
+                return Ok(());
+            }
+            self.pump_signaling(Duration::from_millis(100)).await?;
+        }
+        if self.is_ice_connected() {
+            Ok(())
+        } else {
+            Err(ClientError::IceConnectionFailed)
+        }
+    }
+
+    fn is_ice_connected(&self) -> bool {
+        self.ice_connected.load(Ordering::SeqCst)
+            || self
+                .peer_connection
+                .as_ref()
+                .is_some_and(|pc| pc.connection_state() == RTCPeerConnectionState::Connected)
     }
 
     /// Start publishing synthetic media (for Broadcaster/Participant roles)
@@ -632,7 +568,7 @@ impl HeadlessClient {
     /// 1. Creates VideoGenerator and AudioGenerator for synthetic media
     /// 2. Adds video and audio tracks to the peer connection
     /// 3. Starts a background task to feed synthetic frames/samples
-    /// 4. Sends Publish message via signaling (TrackPublished notification)
+    /// 4. Sends Publish, answers the SFU's offer, and waits for ICE
     pub async fn start_publishing(&mut self) -> Result<(), ClientError> {
         if !self.config.role.can_publish() {
             return Err(ClientError::InvalidState {
@@ -642,15 +578,17 @@ impl HeadlessClient {
         }
 
         // Ensure we're connected
-        let peer_connection = self.peer_connection.as_ref().ok_or(ClientError::InvalidState {
-            expected: "Connected",
-            actual: self.state.as_str(),
-        })?;
+        let peer_connection = Arc::clone(self.peer_connection.as_ref().ok_or(
+            ClientError::InvalidState {
+                expected: "Connected",
+                actual: self.state.as_str(),
+            },
+        )?);
 
-        let signaling = self.signaling.as_ref().ok_or(ClientError::InvalidState {
+        let signaling = Arc::clone(self.signaling.as_ref().ok_or(ClientError::InvalidState {
             expected: "Connected",
             actual: self.state.as_str(),
-        })?;
+        })?);
 
         // Create video track with VP8 codec
         let video_track = Arc::new(TrackLocalStaticSample::new(
@@ -697,57 +635,22 @@ impl HeadlessClient {
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.publishing_stop_flag = Some(Arc::clone(&stop_flag));
 
-        // Send TrackPublished notification via signaling for video
-        // Note: In a real implementation, the SFU would assign track IDs
-        // For load testing, we use a generated ID
-        let video_track_id = rand_id();
-        {
-            let mut sig = signaling.lock().await;
-            // The SFU typically sends TrackPublished as a notification,
-            // but we can send an Offer to renegotiate with the new tracks
-            let offer = peer_connection
-                .create_offer(None)
-                .await
-                .map_err(|e| ClientError::OfferFailed(e.to_string()))?;
-
-            peer_connection
-                .set_local_description(offer.clone())
-                .await
-                .map_err(|e| ClientError::OfferFailed(format!("Failed to set local description: {}", e)))?;
-
-            sig.send(SignalMessage::Offer {
-                sdp: offer.sdp,
+        // Declare intent to publish. The SFU replies with an Offer whose recvonly
+        // m-lines follow the order of `kinds`, matching the tracks added above.
+        signaling
+            .lock()
+            .await
+            .send(SignalMessage::Publish {
+                kinds: vec!["video".to_string(), "audio".to_string()],
+                contents: vec!["camera".to_string(), "audio".to_string()],
             })
             .await
-            .map_err(|e| ClientError::MediaError(format!("Failed to send offer: {}", e)))?;
+            .map_err(|e| ClientError::MediaError(format!("Failed to send publish: {}", e)))?;
 
-            // Wait for the SFU's answer to complete the renegotiation
-            let answer_timeout = tokio::time::Instant::now() + Duration::from_secs(5);
-            while tokio::time::Instant::now() < answer_timeout {
-                match tokio::time::timeout(Duration::from_millis(200), sig.recv()).await {
-                    Ok(Ok(msg)) => {
-                        match msg {
-                            SignalMessage::Answer { sdp, .. } | SignalMessage::AnswerReceived { sdp, .. } => {
-                                let answer = RTCSessionDescription::answer(sdp)
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                                peer_connection
-                                    .set_remote_description(answer)
-                                    .await
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                                tracing::debug!("Renegotiation complete after publishing");
-                                break;
-                            }
-                            _ => continue,
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Signaling error waiting for renegotiation answer: {}", e);
-                        break;
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
+        let timeout = self.config.connection_timeout;
+        self.wait_for_offer(timeout).await?;
+        self.wait_for_ice(timeout).await?;
+        tracing::debug!("Publish negotiation complete");
 
         // Start background media generation AFTER renegotiation is complete
         // so the track senders are fully bound and write_sample succeeds.
@@ -765,7 +668,7 @@ impl HeadlessClient {
             while !stop_flag_clone.load(Ordering::Relaxed) {
                 let frame_start = Instant::now();
 
-                let video_frame = video_gen.next_frame();
+                let video_frame = video_gen.next_encoded_frame(VIDEO_BITRATE_BPS);
                 let video_sample = Sample {
                     data: video_frame.data.into(),
                     duration: frame_duration,
@@ -776,10 +679,8 @@ impl HeadlessClient {
                 }
 
                 let audio_samples = audio_gen.next_samples(audio_samples_per_frame as usize);
-                let audio_bytes: Vec<u8> = audio_samples
-                    .iter()
-                    .flat_map(|s| s.to_le_bytes())
-                    .collect();
+                let audio_bytes: Vec<u8> =
+                    audio_samples.iter().flat_map(|s| s.to_le_bytes()).collect();
                 let audio_sample = Sample {
                     data: audio_bytes.into(),
                     duration: frame_duration,
@@ -801,21 +702,27 @@ impl HeadlessClient {
 
         self.state = ClientState::Publishing;
         tracing::debug!(
-            "Client {} started publishing video track {}",
-            self.participant_id.unwrap_or(0),
-            video_track_id
+            "Client {} started publishing",
+            self.participant_id.unwrap_or(0)
         );
 
         Ok(())
     }
 
     /// Subscribe to a track
-    ///
-    /// This method:
-    /// 1. Sends Subscribe message via signaling
-    /// 2. Sets up track handler to receive media
-    /// 3. Tracks time to first frame in metrics
     pub async fn subscribe(&mut self, track_id: TrackId) -> Result<(), ClientError> {
+        self.subscribe_batch(&[track_id]).await
+    }
+
+    /// Subscribe to several tracks with one Subscribe message
+    ///
+    /// The SFU confirms with Subscribed and renegotiates once for the whole
+    /// batch; the resulting Offer is answered by `pump_signaling`.
+    /// Also starts the time-to-first-frame clock.
+    pub async fn subscribe_batch(&mut self, track_ids: &[TrackId]) -> Result<(), ClientError> {
+        if track_ids.is_empty() {
+            return Ok(());
+        }
         if !self.config.role.can_subscribe() {
             return Err(ClientError::InvalidState {
                 expected: "Viewer or Participant",
@@ -829,10 +736,13 @@ impl HeadlessClient {
             actual: self.state.as_str(),
         })?;
 
-        let peer_connection = self.peer_connection.as_ref().ok_or(ClientError::InvalidState {
-            expected: "Connected",
-            actual: self.state.as_str(),
-        })?;
+        let peer_connection = self
+            .peer_connection
+            .as_ref()
+            .ok_or(ClientError::InvalidState {
+                expected: "Connected",
+                actual: self.state.as_str(),
+            })?;
 
         // Record subscription start time for time-to-first-frame tracking
         self.subscription_start = Some(Instant::now());
@@ -846,8 +756,8 @@ impl HeadlessClient {
         {
             let transceivers = peer_connection.get_transceivers().await;
             tracing::info!(
-                "[diag] Before subscribe(track_id={}): {} transceivers, signaling_state={:?}, conn_state={:?}",
-                track_id,
+                "[diag] Before subscribe(track_ids={:?}): {} transceivers, signaling_state={:?}, conn_state={:?}",
+                track_ids,
                 transceivers.len(),
                 peer_connection.signaling_state(),
                 peer_connection.connection_state(),
@@ -881,29 +791,36 @@ impl HeadlessClient {
                 tracing::info!("[diag]   remote_description type={:?}", rd.sdp_type);
                 // Log the m= lines from the remote SDP to see what the SFU sent
                 for line in rd.sdp.lines() {
-                    if line.starts_with("m=") || line.starts_with("a=ssrc:") || line.starts_with("a=mid:") || line.starts_with("a=msid:") {
+                    if line.starts_with("m=")
+                        || line.starts_with("a=ssrc:")
+                        || line.starts_with("a=mid:")
+                        || line.starts_with("a=msid:")
+                    {
                         tracing::info!("[diag]   remote SDP: {}", line);
                     }
                 }
             } else {
-                tracing::warn!("[diag]   NO remote description set");
+                // Expected for subscribe-only clients: the first SFU offer follows Subscribe
+                tracing::info!("[diag]   no remote description yet");
             }
         }
 
         // Send subscribe message via signaling
         {
             let mut sig = signaling.lock().await;
-            tracing::info!("[diag] Sending Subscribe {{ track_id: {} }}", track_id);
-            sig.send(SignalMessage::Subscribe { track_id })
-                .await
-                .map_err(|_| ClientError::SubscriptionFailed(track_id))?;
+            tracing::info!("[diag] Sending Subscribe {{ track_ids: {:?} }}", track_ids);
+            sig.send(SignalMessage::Subscribe {
+                track_ids: track_ids.to_vec(),
+            })
+            .await
+            .map_err(|_| ClientError::SubscriptionFailed(track_ids[0]))?;
         }
 
         self.state = ClientState::Subscribing;
         tracing::info!(
-            "Client {} subscribed to track {}",
+            "Client {} subscribed to tracks {:?}",
             self.participant_id.unwrap_or(0),
-            track_id
+            track_ids
         );
 
         Ok(())
@@ -914,10 +831,7 @@ impl HeadlessClient {
     /// This is a convenience method for Viewer/Participant roles to subscribe
     /// to all tracks that were present when joining the room.
     pub async fn subscribe_to_all(&mut self, track_ids: &[TrackId]) -> Result<(), ClientError> {
-        for &track_id in track_ids {
-            self.subscribe(track_id).await?;
-        }
-        Ok(())
+        self.subscribe_batch(track_ids).await
     }
 
     /// Update metrics from track handlers
@@ -988,230 +902,73 @@ impl HeadlessClient {
     ///
     /// This should be called on viewer/subscriber clients after the broadcaster
     /// has started publishing, to pick up TrackPublished notifications and subscribe.
-    pub async fn discover_and_subscribe(&mut self, timeout: Duration) -> Result<Vec<TrackId>, ClientError> {
+    pub async fn discover_and_subscribe(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Vec<TrackId>, ClientError> {
         if !self.config.role.can_subscribe() {
             return Ok(Vec::new());
         }
 
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut discovered_tracks: Vec<TrackId> = Vec::new();
-
-        // Phase 1: Drain signaling messages looking for TrackPublished notifications
-        {
-            let signaling = self.signaling.as_ref().ok_or(ClientError::InvalidState {
+        if self.signaling.is_none() || self.peer_connection.is_none() {
+            return Err(ClientError::InvalidState {
                 expected: "Connected",
                 actual: self.state.as_str(),
-            })?;
-
-            let peer_connection = self.peer_connection.as_ref().ok_or(ClientError::InvalidState {
-                expected: "Connected",
-                actual: self.state.as_str(),
-            })?;
-
-            tracing::info!("Waiting for TrackPublished notifications (timeout: {:?})", timeout);
-
-            while tokio::time::Instant::now() < deadline {
-                let recv_result = {
-                    let mut sig = signaling.lock().await;
-                    tokio::time::timeout(Duration::from_millis(200), sig.recv()).await
-                };
-
-                match recv_result {
-                    Ok(Ok(msg)) => {
-                        tracing::info!("discover_and_subscribe received signaling message: {:?}", msg);
-                        match msg {
-                            SignalMessage::TrackPublished { track_id, kind, publisher_id, .. } => {
-                                tracing::debug!(
-                                    "Discovered track {} ({}) from publisher {}",
-                                    track_id, kind, publisher_id
-                                );
-                                discovered_tracks.push(track_id);
-                            }
-                            SignalMessage::Answer { sdp, .. } | SignalMessage::AnswerReceived { sdp, .. } => {
-                                let answer = RTCSessionDescription::answer(sdp)
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                                peer_connection
-                                    .set_remote_description(answer)
-                                    .await
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                            }
-                            SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, .. } => {
-                                let candidate_init = RTCIceCandidateInit {
-                                    candidate,
-                                    sdp_mid,
-                                    sdp_mline_index: sdp_mline_index.map(|i| i as u16),
-                                    username_fragment: None,
-                                };
-                                let _ = peer_connection.add_ice_candidate(candidate_init).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        if !discovered_tracks.is_empty() {
-                            break;
-                        }
-                        tracing::debug!("No signaling message received (timeout), still waiting...");
-                    }
-                }
-            }
-        } // drop borrows of signaling/peer_connection
-
-        // Phase 2: Subscribe to all discovered tracks (needs &mut self)
-        for &track_id in &discovered_tracks {
-            self.subscribe(track_id).await?;
+            });
         }
 
-        let mut got_renegotiation_offer = false;
+        // Phase 1: Collect TrackPublished notifications (tracks listed in Joined
+        // are already buffered). Stop once announcements go quiet.
+        tracing::info!(
+            "Waiting for TrackPublished notifications (timeout: {:?})",
+            timeout
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            let pumped = self.pump_signaling(Duration::from_millis(200)).await?;
+            if pumped.is_none() && !self.announced_tracks.is_empty() {
+                break;
+            }
+        }
+        let discovered_tracks = std::mem::take(&mut self.announced_tracks);
 
-        // Phase 3: Wait for Subscribed confirmations AND the SFU's renegotiation
+        // Phase 2: One batched Subscribe, so the SFU renegotiates once
+        self.subscribe_batch(&discovered_tracks).await?;
+
+        // Phase 3: Wait for the Subscribed confirmation AND the SFU's renegotiation
         // offer with SSRC information. Both are needed before media can flow.
-        {
-            let signaling = self.signaling.as_ref().ok_or(ClientError::InvalidState {
-                expected: "Connected",
-                actual: self.state.as_str(),
-            })?;
-
-            let peer_connection = self.peer_connection.as_ref().ok_or(ClientError::InvalidState {
-                expected: "Connected",
-                actual: self.state.as_str(),
-            })?;
-
-            tracing::info!("Phase 3: Waiting for Subscribed confirmations and renegotiation offer...");
+        let mut got_renegotiation_offer = false;
+        if !discovered_tracks.is_empty() {
+            tracing::info!(
+                "Phase 3: Waiting for Subscribed confirmation and renegotiation offer..."
+            );
 
             let mut confirmed_count = 0usize;
             let expected_count = discovered_tracks.len();
             let renegotiation_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
-            // Keep looping until we have both confirmations AND the renegotiation offer
-            while tokio::time::Instant::now() < renegotiation_deadline {
-                // Exit early if we have everything
-                if confirmed_count >= expected_count && got_renegotiation_offer {
-                    break;
-                }
-
-                let recv_result = {
-                    let mut sig = signaling.lock().await;
-                    tokio::time::timeout(Duration::from_millis(200), sig.recv()).await
-                };
-
-                match recv_result {
-                    Ok(Ok(msg)) => {
-                        tracing::info!("Phase 3 received signaling message: {:?}", msg);
-                        match msg {
-                            SignalMessage::Subscribed { track_id, .. } => {
-                                confirmed_count += 1;
-                                tracing::info!(
-                                    "Subscription confirmed for track {} ({}/{})",
-                                    track_id, confirmed_count, expected_count
-                                );
-                            }
-                            SignalMessage::OfferReceived { sdp, .. } => {
-                                got_renegotiation_offer = true;
-                                tracing::info!("Received SFU renegotiation offer (OfferReceived), SDP length={}", sdp.len());
-                                // Log m= lines and ssrc lines from the offer
-                                for line in sdp.lines() {
-                                    if line.starts_with("m=") || line.starts_with("a=ssrc:") || line.starts_with("a=mid:") || line.starts_with("a=msid:") || line.starts_with("a=sendonly") || line.starts_with("a=recvonly") || line.starts_with("a=sendrecv") || line.starts_with("a=inactive") {
-                                        tracing::info!("[diag] renegotiation offer SDP: {}", line);
-                                    }
-                                }
-                                let offer = RTCSessionDescription::offer(sdp)
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                                peer_connection
-                                    .set_remote_description(offer)
-                                    .await
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-
-                                let answer = peer_connection
-                                    .create_answer(None)
-                                    .await
-                                    .map_err(|e| ClientError::OfferFailed(e.to_string()))?;
-
-                                tracing::info!("Sending renegotiation answer:\n{}", answer.sdp);
-
-                                peer_connection
-                                    .set_local_description(answer.clone())
-                                    .await
-                                    .map_err(|e| ClientError::OfferFailed(e.to_string()))?;
-
-                                let mut sig = signaling.lock().await;
-                                sig.send(SignalMessage::Answer {
-                                    sdp: answer.sdp,
-                                })
-                                .await
-                                .map_err(|e| ClientError::OfferFailed(format!("Failed to send answer: {}", e)))?;
-                            }
-                            SignalMessage::Answer { sdp, .. } | SignalMessage::AnswerReceived { sdp, .. } => {
-                                let answer = RTCSessionDescription::answer(sdp)
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                                peer_connection
-                                    .set_remote_description(answer)
-                                    .await
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                            }
-                            SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, .. } => {
-                                let candidate_init = RTCIceCandidateInit {
-                                    candidate,
-                                    sdp_mid,
-                                    sdp_mline_index: sdp_mline_index.map(|i| i as u16),
-                                    username_fragment: None,
-                                };
-                                let _ = peer_connection.add_ice_candidate(candidate_init).await;
-                            }
-                            SignalMessage::Offer { sdp, .. } => {
-                                got_renegotiation_offer = true;
-                                tracing::info!("Phase 3 received Offer (not OfferReceived), SDP length={}", sdp.len());
-                                for line in sdp.lines() {
-                                    if line.starts_with("m=") || line.starts_with("a=ssrc:") || line.starts_with("a=mid:") || line.starts_with("a=msid:") || line.starts_with("a=sendonly") || line.starts_with("a=recvonly") || line.starts_with("a=sendrecv") || line.starts_with("a=inactive") {
-                                        tracing::info!("[diag] renegotiation offer SDP: {}", line);
-                                    }
-                                }
-                                let offer = RTCSessionDescription::offer(sdp)
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-                                peer_connection
-                                    .set_remote_description(offer)
-                                    .await
-                                    .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-
-                                let answer = peer_connection
-                                    .create_answer(None)
-                                    .await
-                                    .map_err(|e| ClientError::OfferFailed(e.to_string()))?;
-
-                                tracing::info!("Sending renegotiation answer for Offer:\n{}", answer.sdp);
-
-                                peer_connection
-                                    .set_local_description(answer.clone())
-                                    .await
-                                    .map_err(|e| ClientError::OfferFailed(e.to_string()))?;
-
-                                let mut sig = signaling.lock().await;
-                                sig.send(SignalMessage::Answer {
-                                    sdp: answer.sdp,
-                                })
-                                .await
-                                .map_err(|e| ClientError::OfferFailed(format!("Failed to send answer: {}", e)))?;
-                            }
-                            other => {
-                                tracing::info!("Phase 3 ignoring message: {:?}", other);
-                            }
-                        }
+            while tokio::time::Instant::now() < renegotiation_deadline
+                && !(confirmed_count >= expected_count && got_renegotiation_offer)
+            {
+                match self.pump_signaling(Duration::from_millis(200)).await? {
+                    Some(Pumped::Subscribed(count)) => {
+                        confirmed_count += count;
+                        tracing::info!(
+                            "Subscription confirmed ({}/{})",
+                            confirmed_count,
+                            expected_count
+                        );
                     }
-                    Ok(Err(_)) => {
-                        tracing::warn!("Phase 3: signaling error, breaking");
-                        break;
-                    }
-                    Err(_) => {
-                        // recv timeout — keep waiting
-                        continue;
-                    }
+                    Some(Pumped::Offer) => got_renegotiation_offer = true,
+                    _ => {}
                 }
             }
 
             tracing::info!(
                 "Phase 3 done: {}/{} confirmed, got_renegotiation_offer={}",
-                confirmed_count, expected_count, got_renegotiation_offer
+                confirmed_count,
+                expected_count,
+                got_renegotiation_offer
             );
             if !got_renegotiation_offer {
                 tracing::warn!("Phase 3: timed out waiting for renegotiation offer from SFU");
@@ -1263,7 +1020,15 @@ impl HeadlessClient {
             if let Some(rd) = peer_connection.remote_description().await {
                 tracing::info!("[diag]   remote_description type={:?}", rd.sdp_type);
                 for line in rd.sdp.lines() {
-                    if line.starts_with("m=") || line.starts_with("a=ssrc:") || line.starts_with("a=mid:") || line.starts_with("a=msid:") || line.starts_with("a=sendonly") || line.starts_with("a=recvonly") || line.starts_with("a=sendrecv") || line.starts_with("a=inactive") {
+                    if line.starts_with("m=")
+                        || line.starts_with("a=ssrc:")
+                        || line.starts_with("a=mid:")
+                        || line.starts_with("a=msid:")
+                        || line.starts_with("a=sendonly")
+                        || line.starts_with("a=recvonly")
+                        || line.starts_with("a=sendrecv")
+                        || line.starts_with("a=inactive")
+                    {
                         tracing::info!("[diag]   remote SDP: {}", line);
                     }
                 }
@@ -1297,54 +1062,36 @@ impl HeadlessClient {
 
                     match recv_result {
                         Ok(Ok(msg)) => {
-                            tracing::info!("[bg-signaling] Received message: {:?}", std::mem::discriminant(&msg));
+                            tracing::info!(
+                                "[bg-signaling] Received message: {:?}",
+                                std::mem::discriminant(&msg)
+                            );
                             match msg {
-                                SignalMessage::OfferReceived { sdp, .. } | SignalMessage::Offer { sdp, .. } => {
+                                SignalMessage::Offer { sdp, .. } => {
                                     tracing::info!("[bg-signaling] Received renegotiation offer");
-                                    let offer = match RTCSessionDescription::offer(sdp) {
-                                        Ok(o) => o,
-                                        Err(e) => {
-                                            tracing::warn!("[bg-signaling] Failed to parse offer: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    if let Err(e) = peer_connection.set_remote_description(offer).await {
-                                        tracing::warn!("[bg-signaling] Failed to set remote description: {}", e);
-                                        continue;
+                                    match answer_offer(&peer_connection, &signaling, sdp).await {
+                                        Ok(()) => tracing::info!(
+                                            "[bg-signaling] Renegotiation answer sent"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            "[bg-signaling] Renegotiation failed: {}",
+                                            e
+                                        ),
                                     }
-                                    let answer = match peer_connection.create_answer(None).await {
-                                        Ok(a) => a,
-                                        Err(e) => {
-                                            tracing::warn!("[bg-signaling] Failed to create answer: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    if let Err(e) = peer_connection.set_local_description(answer.clone()).await {
-                                        tracing::warn!("[bg-signaling] Failed to set local description: {}", e);
-                                        continue;
-                                    }
-                                    let mut sig = signaling.lock().await;
-                                    let _ = sig.send(SignalMessage::Answer {
-                                        sdp: answer.sdp,
-                                    }).await;
-                                    tracing::info!("[bg-signaling] Renegotiation answer sent");
                                 }
-                                SignalMessage::Answer { sdp, .. } | SignalMessage::AnswerReceived { sdp, .. } => {
-                                    let answer = match RTCSessionDescription::answer(sdp) {
-                                        Ok(a) => a,
-                                        Err(_) => continue,
-                                    };
-                                    let _ = peer_connection.set_remote_description(answer).await;
-                                }
-                                SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index, .. } => {
+                                SignalMessage::IceCandidate {
+                                    candidate,
+                                    sdp_mid,
+                                    sdp_mline_index,
+                                } => {
                                     tracing::info!("[bg-signaling] Received ICE candidate");
-                                    let candidate_init = RTCIceCandidateInit {
+                                    add_remote_candidate(
+                                        &peer_connection,
                                         candidate,
                                         sdp_mid,
-                                        sdp_mline_index: sdp_mline_index.map(|i| i as u16),
-                                        username_fragment: None,
-                                    };
-                                    let _ = peer_connection.add_ice_candidate(candidate_init).await;
+                                        sdp_mline_index,
+                                    )
+                                    .await;
                                 }
                                 other => {
                                     tracing::info!("[bg-signaling] Ignoring message: {:?}", other);
@@ -1391,6 +1138,69 @@ impl HeadlessClient {
         Ok(())
     }
 }
+
+/// What `HeadlessClient::pump_signaling` received
+enum Pumped {
+    /// An SFU offer, now answered
+    Offer,
+    /// Subscribed confirmation for this many tracks
+    Subscribed(usize),
+    /// Anything else (candidates, notifications)
+    Other,
+}
+
+/// Apply an SFU offer and reply with our answer (the SFU is the sole offerer)
+async fn answer_offer(
+    peer_connection: &RTCPeerConnection,
+    signaling: &Mutex<SignalingConnection>,
+    sdp: String,
+) -> Result<(), ClientError> {
+    tracing::debug!("Received SFU offer:\n{}", sdp);
+    let offer = RTCSessionDescription::offer(sdp)
+        .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
+    peer_connection
+        .set_remote_description(offer)
+        .await
+        .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
+
+    let answer = peer_connection
+        .create_answer(None)
+        .await
+        .map_err(|e| ClientError::OfferFailed(format!("Failed to create answer: {}", e)))?;
+    peer_connection
+        .set_local_description(answer.clone())
+        .await
+        .map_err(|e| ClientError::OfferFailed(format!("Failed to set local description: {}", e)))?;
+
+    signaling
+        .lock()
+        .await
+        .send(SignalMessage::Answer { sdp: answer.sdp })
+        .await
+        .map_err(|e| ClientError::OfferFailed(format!("Failed to send answer: {}", e)))
+}
+
+/// Add a trickled ICE candidate from the SFU; invalid ones are logged, not fatal
+async fn add_remote_candidate(
+    peer_connection: &RTCPeerConnection,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u32>,
+) {
+    let candidate_init = RTCIceCandidateInit {
+        candidate,
+        sdp_mid,
+        sdp_mline_index: sdp_mline_index.map(|i| i as u16),
+        username_fragment: None,
+    };
+    if let Err(e) = peer_connection.add_ice_candidate(candidate_init).await {
+        tracing::debug!("Failed to add ICE candidate: {}", e);
+    }
+}
+
+/// Synthetic video bitrate: typical for 320x240@15fps VP8 (a raw I420 frame
+/// per tick would be ~14 Mbit/s and ~1,400 packets/s per track)
+const VIDEO_BITRATE_BPS: u32 = 500_000;
 
 /// Generate a random ID for participant names
 fn rand_id() -> u64 {

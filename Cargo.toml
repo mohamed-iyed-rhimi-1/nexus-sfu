@@ -147,6 +147,29 @@ harness = false
 name = "nexus-sfu"
 path = "src/main.rs"
 
+# SRTP runs on every forwarded packet; unoptimized crypto makes dev builds drop
+# packets under modest load. Optimize just these crates, keep ours debuggable.
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.sha1]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.polyval]
+opt-level = 3
+# Generic cipher code (ctr over aes) is instantiated in nexus-transport, so it
+# needs optimizing too. opt-level 1 keeps debug info and readable backtraces.
+[profile.dev.package.nexus-transport]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = "fat"

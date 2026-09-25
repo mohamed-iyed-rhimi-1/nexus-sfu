@@ -171,13 +171,20 @@ impl ParticipantActor {
         use ParticipantActorMessage::*;
 
         match msg {
-            PublishTrack { track_id, ssrc, kind } => {
+            PublishTrack {
+                track_id,
+                ssrc,
+                kind,
+            } => {
                 self.handle_publish_track(track_id, ssrc, kind);
             }
             UnpublishTrack { track_id } => {
                 self.handle_unpublish_track(track_id);
             }
-            SubscribeToTrack { track_id, target_layer } => {
+            SubscribeToTrack {
+                track_id,
+                target_layer,
+            } => {
                 self.handle_subscribe_to_track(track_id, target_layer);
             }
             UnsubscribeFromTrack { track_id } => {
@@ -238,7 +245,10 @@ impl ParticipantActor {
             bitrate_kbps: 0,
             owner_node: 0, // Set by orchestrator when node ID is known
         };
-        if let Err(e) = self.distributed_state.add_track(track_id as u64, track_info) {
+        if let Err(e) = self
+            .distributed_state
+            .add_track(track_id as u64, track_info)
+        {
             eprintln!("Warning: Failed to add track to distributed state: {:?}", e);
         }
     }
@@ -276,8 +286,14 @@ impl ParticipantActor {
             self.tracks_subscribed.fetch_add(1, Ordering::Relaxed);
 
             // Add subscription to distributed state
-            if let Err(e) = self.distributed_state.add_subscription(track_id as u64, self.id as u64) {
-                eprintln!("Warning: Failed to add subscription to distributed state: {:?}", e);
+            if let Err(e) = self
+                .distributed_state
+                .add_subscription(track_id as u64, self.id as u64)
+            {
+                eprintln!(
+                    "Warning: Failed to add subscription to distributed state: {:?}",
+                    e
+                );
             }
         }
     }
@@ -292,8 +308,14 @@ impl ParticipantActor {
             self.subscriptions.store(Arc::new(subs));
 
             // Remove subscription from distributed state
-            if let Err(e) = self.distributed_state.remove_subscription(track_id as u64, self.id as u64) {
-                eprintln!("Warning: Failed to remove subscription from distributed state: {:?}", e);
+            if let Err(e) = self
+                .distributed_state
+                .remove_subscription(track_id as u64, self.id as u64)
+            {
+                eprintln!(
+                    "Warning: Failed to remove subscription from distributed state: {:?}",
+                    e
+                );
             }
         }
     }
@@ -473,20 +495,44 @@ mod tests {
     #[test]
     #[should_panic(expected = "participant id must not be 0")]
     fn test_spawn_zero_id() {
-        let _ = ParticipantActor::spawn(0, 100, "Alice".to_string(), 1000, 0, now_ns(), test_distributed_state());
+        let _ = ParticipantActor::spawn(
+            0,
+            100,
+            "Alice".to_string(),
+            1000,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
     }
 
     #[test]
     #[should_panic(expected = "room id must not be 0")]
     fn test_spawn_zero_room_id() {
-        let _ = ParticipantActor::spawn(1, 0, "Alice".to_string(), 1000, 0, now_ns(), test_distributed_state());
+        let _ = ParticipantActor::spawn(
+            1,
+            0,
+            "Alice".to_string(),
+            1000,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
     }
 
     #[test]
     #[should_panic(expected = "name too long")]
     fn test_spawn_long_name() {
         let long_name = "a".repeat(257);
-        let _ = ParticipantActor::spawn(1, 100, long_name, 1000, 0, now_ns(), test_distributed_state());
+        let _ = ParticipantActor::spawn(
+            1,
+            100,
+            long_name,
+            1000,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
     }
 
     #[test]

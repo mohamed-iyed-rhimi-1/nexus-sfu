@@ -30,6 +30,17 @@ impl ClientRole {
     }
 }
 
+/// How clients authenticate to and verify the SFU signaling endpoint
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionOptions {
+    /// Pre-issued JWT sent in the auth handshake. Takes precedence over `jwt_secret`.
+    pub auth_token: Option<String>,
+    /// HS256 secret used to mint a per-client JWT when no token is given
+    pub jwt_secret: Option<String>,
+    /// Skip TLS certificate verification for wss:// (self-signed dev certs only)
+    pub insecure_tls: bool,
+}
+
 /// Configuration for a headless client
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -43,6 +54,8 @@ pub struct ClientConfig {
     pub connection_timeout: Duration,
     /// ICE server URLs (STUN/TURN). Defaults to Google public STUN servers when empty.
     pub ice_servers: Vec<String>,
+    /// Signaling auth and TLS options
+    pub connection: ConnectionOptions,
 }
 
 impl Default for ClientConfig {
@@ -53,6 +66,7 @@ impl Default for ClientConfig {
             role: ClientRole::Viewer,
             connection_timeout: Duration::from_secs(60),
             ice_servers: Vec::new(),
+            connection: ConnectionOptions::default(),
         }
     }
 }
@@ -74,6 +88,8 @@ pub struct TestConfig {
     pub verbose: bool,
     /// Port for Prometheus metrics HTTP endpoint (only used with prometheus output)
     pub prometheus_port: u16,
+    /// Signaling auth and TLS options applied to every client
+    pub connection: ConnectionOptions,
 }
 
 impl Default for TestConfig {
@@ -86,6 +102,7 @@ impl Default for TestConfig {
             connection_timeout: Duration::from_secs(30),
             verbose: false,
             prometheus_port: 9090,
+            connection: ConnectionOptions::default(),
         }
     }
 }

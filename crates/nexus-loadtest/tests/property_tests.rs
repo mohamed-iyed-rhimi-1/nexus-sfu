@@ -201,7 +201,7 @@ mod packet_loss_rate_calculation {
             let rate = calculate_packet_loss_rate(received, lost);
 
             prop_assert!(
-                rate >= 0.0 && rate <= 1.0,
+                (0.0..=1.0).contains(&rate),
                 "Packet loss rate should be in [0.0, 1.0], got {}",
                 rate
             );
@@ -441,7 +441,7 @@ mod connection_success_rate_calculation {
             let rate = calculate_connection_success_rate(successful, failed);
 
             prop_assert!(
-                rate >= 0.0 && rate <= 1.0,
+                (0.0..=1.0).contains(&rate),
                 "Connection success rate should be in [0.0, 1.0], got {}",
                 rate
             );
@@ -493,7 +493,6 @@ mod connection_success_rate_calculation {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 12: Report JSON Round-Trip
 /// **Validates: Requirements 7.2, 7.5**
 ///
@@ -507,18 +506,18 @@ mod report_json_roundtrip {
     /// Strategy to generate valid SerializableMetrics
     fn metrics_strategy() -> impl Strategy<Value = SerializableMetrics> {
         (
-            0.0f64..1000.0,    // latency_p50_ms
-            0.0f64..1000.0,    // latency_p95_ms
-            0.0f64..1000.0,    // latency_p99_ms
-            0.0f64..1.0,       // packet_loss_rate
-            0.0f64..100.0,     // jitter_avg_ms
-            0.0f64..1_000_000.0, // throughput_pps
+            0.0f64..1000.0,          // latency_p50_ms
+            0.0f64..1000.0,          // latency_p95_ms
+            0.0f64..1000.0,          // latency_p99_ms
+            0.0f64..1.0,             // packet_loss_rate
+            0.0f64..100.0,           // jitter_avg_ms
+            0.0f64..1_000_000.0,     // throughput_pps
             0.0f64..1_000_000_000.0, // throughput_bps
-            0.0f64..1.0,       // connection_success_rate
-            0.0f64..1000.0,    // avg_time_to_first_frame_ms
-            0u32..10000,       // total_clients
-            0u32..10000,       // successful_clients
-            0u32..10000,       // failed_clients
+            0.0f64..1.0,             // connection_success_rate
+            0.0f64..1000.0,          // avg_time_to_first_frame_ms
+            0u32..10000,             // total_clients
+            0u32..10000,             // successful_clients
+            0u32..10000,             // failed_clients
         )
             .prop_map(
                 |(
@@ -556,10 +555,10 @@ mod report_json_roundtrip {
     /// Strategy to generate valid TargetValidation
     fn target_validation_strategy() -> impl Strategy<Value = TargetValidation> {
         (
-            "[a-zA-Z0-9_]{1,20}",  // name
-            "[0-9.]+",             // target
-            "[0-9.]+",             // actual
-            any::<bool>(),         // passed
+            "[a-zA-Z0-9_]{1,20}", // name
+            "[0-9.]+",            // target
+            "[0-9.]+",            // actual
+            any::<bool>(),        // passed
         )
             .prop_map(|(name, target, actual, passed)| TargetValidation {
                 name,
@@ -573,15 +572,23 @@ mod report_json_roundtrip {
     fn test_report_strategy() -> impl Strategy<Value = TestReport> {
         (
             prop::sample::select(vec!["webinar", "conference", "stress"]),
-            "wss://[a-z0-9.]+:[0-9]+",  // sfu_url
-            1u64..3600,                  // duration_secs
+            "wss://[a-z0-9.]+:[0-9]+", // sfu_url
+            1u64..3600,                // duration_secs
             "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", // timestamp
             metrics_strategy(),
             prop::collection::vec(target_validation_strategy(), 0..5),
             any::<bool>(),
         )
             .prop_map(
-                |(scenario, sfu_url, duration_secs, timestamp, metrics, target_validations, passed)| {
+                |(
+                    scenario,
+                    sfu_url,
+                    duration_secs,
+                    timestamp,
+                    metrics,
+                    target_validations,
+                    passed,
+                )| {
                     TestReport {
                         scenario: scenario.to_string(),
                         sfu_url,
@@ -714,7 +721,6 @@ mod report_json_roundtrip {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 14: Target Validation Correctness
 // Feature: nexus-loadtest, Property 15: Failed Target Exit Code
 /// **Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.5**
@@ -734,36 +740,38 @@ mod target_validation {
     /// Strategy to generate random performance targets
     fn performance_targets_strategy() -> impl Strategy<Value = PerformanceTargets> {
         (
-            1u64..100,      // latency_p50_ms (1-100ms)
-            1u64..200,      // latency_p99_ms (1-200ms)
-            1u32..10000,    // min_participants (1-10000)
+            1u64..100,       // latency_p50_ms (1-100ms)
+            1u64..200,       // latency_p99_ms (1-200ms)
+            1u32..10000,     // min_participants (1-10000)
             1u64..1_000_000, // throughput_pps (1-1M)
         )
-            .prop_map(|(latency_p50_ms, latency_p99_ms, min_participants, throughput_pps)| {
-                PerformanceTargets {
-                    latency_p50_ms,
-                    latency_p99_ms,
-                    min_participants,
-                    throughput_pps,
-                }
-            })
+            .prop_map(
+                |(latency_p50_ms, latency_p99_ms, min_participants, throughput_pps)| {
+                    PerformanceTargets {
+                        latency_p50_ms,
+                        latency_p99_ms,
+                        min_participants,
+                        throughput_pps,
+                    }
+                },
+            )
     }
 
     /// Strategy to generate random aggregated metrics
     fn aggregated_metrics_strategy() -> impl Strategy<Value = AggregatedMetrics> {
         (
-            0u64..200,       // latency_p50_ms
-            0u64..200,       // latency_p95_ms
-            0u64..300,       // latency_p99_ms
-            0.0f64..1.0,     // packet_loss_rate
-            0u64..50,        // jitter_avg_ms
-            0.0f64..2_000_000.0, // throughput_pps
+            0u64..200,               // latency_p50_ms
+            0u64..200,               // latency_p95_ms
+            0u64..300,               // latency_p99_ms
+            0.0f64..1.0,             // packet_loss_rate
+            0u64..50,                // jitter_avg_ms
+            0.0f64..2_000_000.0,     // throughput_pps
             0.0f64..1_000_000_000.0, // throughput_bps
-            0.0f64..1.0,     // connection_success_rate
-            0u64..500,       // avg_time_to_first_frame_ms
-            0u32..20000,     // total_clients
-            0u32..20000,     // successful_clients
-            0u32..20000,     // failed_clients
+            0.0f64..1.0,             // connection_success_rate
+            0u64..500,               // avg_time_to_first_frame_ms
+            0u32..20000,             // total_clients
+            0u32..20000,             // successful_clients
+            0u32..20000,             // failed_clients
         )
             .prop_map(
                 |(
@@ -808,6 +816,7 @@ mod target_validation {
             connection_timeout: Duration::from_secs(30),
             verbose: false,
             prometheus_port: 9090,
+            connection: Default::default(),
         }
     }
 
@@ -1169,7 +1178,6 @@ mod target_validation {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 16: URL Scheme Transport Selection
 /// **Validates: Requirements 9.4**
 ///
@@ -1285,7 +1293,6 @@ mod url_transport_selection {
         }
     }
 }
-
 
 // Feature: nexus-loadtest, Property 3: Client Role Determines Behavior
 /// **Validates: Requirements 2.4, 2.5, 2.6, 3.3, 4.2**
@@ -1417,7 +1424,6 @@ mod client_role_behavior {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 4: Webinar Scenario Client Counts
 /// **Validates: Requirements 3.1, 3.2**
 ///
@@ -1439,6 +1445,7 @@ mod webinar_client_counts {
             role: ClientRole::Broadcaster,
             connection_timeout: config.base.connection_timeout,
             ice_servers: Vec::new(),
+            connection: config.base.connection.clone(),
         };
         client_configs.push(broadcaster_config);
 
@@ -1449,7 +1456,8 @@ mod webinar_client_counts {
                 room: config.room.clone(),
                 role: ClientRole::Viewer,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(viewer_config);
         }
@@ -1579,7 +1587,6 @@ mod webinar_client_counts {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 5: Conference Scenario Client Counts
 /// **Validates: Requirements 4.1, 4.3**
 ///
@@ -1601,7 +1608,8 @@ mod conference_client_counts {
                 room: config.room.clone(),
                 role: ClientRole::Participant,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(participant_config);
         }
@@ -1758,7 +1766,6 @@ mod conference_client_counts {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 6: Stress Scenario Distribution
 /// **Validates: Requirements 5.1, 5.2**
 ///
@@ -1787,7 +1794,8 @@ mod stress_scenario_distribution {
                     room: room_name.clone(),
                     role: ClientRole::Participant,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(participant_config);
             }
@@ -1982,7 +1990,6 @@ mod stress_scenario_distribution {
     }
 }
 
-
 // Feature: nexus-loadtest, Property 7: Per-Room Metrics Independence
 /// **Validates: Requirements 5.3, 5.4**
 ///
@@ -1999,9 +2006,8 @@ mod per_room_metrics_independence {
 
     /// Strategy to generate random latency samples for a room
     fn room_latency_samples_strategy() -> impl Strategy<Value = Vec<Duration>> {
-        prop::collection::vec(1u64..1000, 1..20).prop_map(|millis| {
-            millis.into_iter().map(Duration::from_millis).collect()
-        })
+        prop::collection::vec(1u64..1000, 1..20)
+            .prop_map(|millis| millis.into_iter().map(Duration::from_millis).collect())
     }
 
     /// Strategy to generate random packet statistics
@@ -2341,7 +2347,6 @@ mod per_room_metrics_independence {
         }
     }
 }
-
 
 // Feature: nexus-loadtest, Property 17: Error Resilience
 /// **Validates: Requirements 5.5, 10.1, 10.5**
@@ -2749,8 +2754,6 @@ mod error_resilience {
     }
 }
 
-
-
 // Feature: nexus-loadtest, Property 1: CLI Parsing Round-Trip
 // Feature: nexus-loadtest, Property 2: Missing Required Parameter Rejection
 /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 10.4**
@@ -2771,13 +2774,11 @@ mod cli_parsing {
     /// Strategy to generate valid SFU URLs
     /// URLs must start with a valid scheme and contain valid host:port
     fn sfu_url_strategy() -> impl Strategy<Value = String> {
-        prop::sample::select(vec!["wss", "ws", "quic"])
-            .prop_flat_map(|scheme| {
-                // Host must start with a letter to be valid
-                ("[a-z][a-z0-9]{0,9}", 1u16..65535).prop_map(move |(host, port)| {
-                    format!("{}://{}:{}", scheme, host, port)
-                })
-            })
+        prop::sample::select(vec!["wss", "ws", "quic"]).prop_flat_map(|scheme| {
+            // Host must start with a letter to be valid
+            ("[a-z][a-z0-9]{0,9}", 1u16..65535)
+                .prop_map(move |(host, port)| format!("{}://{}:{}", scheme, host, port))
+        })
     }
 
     /// Strategy to generate valid room names

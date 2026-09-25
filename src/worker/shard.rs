@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn test_consistent_hash_single_worker() {
         let hasher = ConsistentHash::new(1);
-        
+
         // All SSRCs should map to worker 0
         assert_eq!(hasher.hash(1), 0);
         assert_eq!(hasher.hash(100), 0);
@@ -195,7 +195,7 @@ mod tests {
         // With 1000 SSRCs and 4 workers, expect ~250 each, allow 100-400 range
         for (i, &count) in counts.iter().enumerate() {
             assert!(
-                count >= 100 && count <= 400,
+                (100..=400).contains(&count),
                 "worker {} got {} assignments, expected ~250",
                 i,
                 count
@@ -257,8 +257,8 @@ mod tests {
         let hasher = ConsistentHash::new(8);
 
         // Test edge values
-        let _ = hasher.hash(1);           // Minimum valid SSRC
-        let _ = hasher.hash(u32::MAX);    // Maximum SSRC
+        let _ = hasher.hash(1); // Minimum valid SSRC
+        let _ = hasher.hash(u32::MAX); // Maximum SSRC
         let _ = hasher.hash(u32::MAX / 2); // Middle value
     }
 
@@ -278,7 +278,7 @@ mod tests {
         assert!(hash1 < 64);
         assert!(hash2 < 64);
         assert!(hash3 < 64);
-        
+
         // Log for debugging (won't fail test)
         if all_same {
             eprintln!("Note: consecutive SSRCs mapped to same worker (valid but unusual)");

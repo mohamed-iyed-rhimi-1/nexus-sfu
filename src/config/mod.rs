@@ -9,7 +9,9 @@ mod watcher;
 mod xdp;
 
 pub use api::ApiConfig;
-pub use ice::{IceServerConfig, TurnServerConfig, GOOGLE_STUN_SERVERS, MAX_STUN_SERVERS, MAX_TURN_SERVERS};
+pub use ice::{
+    IceServerConfig, TurnServerConfig, GOOGLE_STUN_SERVERS, MAX_STUN_SERVERS, MAX_TURN_SERVERS,
+};
 pub use loader::ConfigLoader;
 pub use validation::ConfigError;
 pub use watcher::ConfigWatcher;
@@ -17,17 +19,16 @@ pub use xdp::XdpConfig;
 
 // Import config structs from nexus-core (single source of truth)
 pub use nexus_core::config::{
-    TransportConfig, MemoryConfig, WorkerConfig, RoomConfig,
-    BweConfig, LoggingConfig, LogLevel, SecurityConfig,
-    ActorConfig, MetricsConfig, Validate,
+    ActorConfig, BweConfig, LogLevel, LoggingConfig, MemoryConfig, MetricsConfig, RoomConfig,
+    SecurityConfig, TransportConfig, Validate, WorkerConfig,
 };
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 // Re-export crate configs
-pub use nexus_state::gossip::GossipConfig;
 pub use nexus_signal::QuicConfig;
+pub use nexus_state::gossip::GossipConfig;
 
 /// Cluster configuration for multi-node deployment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,16 +84,10 @@ fn default_drain_timeout_ms() -> u32 {
 
 /// Helper to bridge nexus-core's `Validate` trait (`Result<(), Vec<String>>`)
 /// to the local `ConfigError` type.
-fn validate_core_config(
-    section: &str,
-    result: Result<(), Vec<String>>,
-) -> Result<(), ConfigError> {
+fn validate_core_config(section: &str, result: Result<(), Vec<String>>) -> Result<(), ConfigError> {
     match result {
         Ok(()) => Ok(()),
-        Err(errors) => Err(ConfigError::invalid(
-            section,
-            &errors.join("; "),
-        )),
+        Err(errors) => Err(ConfigError::invalid(section, &errors.join("; "))),
     }
 }
 
@@ -115,7 +110,9 @@ impl NexusConfig {
         validate_core_config("worker", self.worker.validate())?;
         validate_core_config("room", self.room.validate())?;
         validate_core_config("bwe", self.bwe.validate())?;
-        self.quic.validate().map_err(|e| ConfigError::invalid("quic", &e))?;
+        self.quic
+            .validate()
+            .map_err(|e| ConfigError::invalid("quic", &e))?;
         self.gossip.validate()?;
         validate_core_config("actor", self.actor.validate())?;
         validate_core_config("metrics", self.metrics.validate())?;
@@ -128,10 +125,7 @@ impl NexusConfig {
 
         // Validate drain_timeout_ms
         if self.drain_timeout_ms == 0 {
-            return Err(ConfigError::invalid(
-                "drain_timeout_ms",
-                "must be > 0",
-            ));
+            return Err(ConfigError::invalid("drain_timeout_ms", "must be > 0"));
         }
         // Maximum drain timeout: 5 minutes (300000ms)
         if self.drain_timeout_ms > 300_000 {

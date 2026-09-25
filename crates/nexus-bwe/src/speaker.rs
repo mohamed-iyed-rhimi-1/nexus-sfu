@@ -165,7 +165,7 @@ mod tests {
         // and last_packet_count is set to the current packet_count
         detector.update(1, 100, 1_500_000);
         assert_eq!(detector.get_packet_rate(1), Some(0));
-        
+
         // Next update within the new window should count new packets
         detector.update(1, 130, 1_600_000);
         assert_eq!(detector.get_packet_rate(1), Some(30)); // 130 - 100 = 30

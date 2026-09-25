@@ -47,10 +47,7 @@ pub type BandwidthBps = u64;
 /// Distinguishes between audio and video tracks for
 /// codec selection, forwarding priority, and bandwidth
 /// allocation decisions.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash,
-    Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MediaKind {
     /// Audio stream (typically Opus codec)
     Audio,
@@ -59,10 +56,7 @@ pub enum MediaKind {
 }
 
 impl std::fmt::Display for MediaKind {
-    fn fmt(
-        &self,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MediaKind::Audio => write!(f, "audio"),
             MediaKind::Video => write!(f, "video"),
@@ -90,7 +84,7 @@ mod tests {
     #[test]
     fn test_media_kind_clone_copy() {
         let kind = MediaKind::Audio;
-        let cloned = kind.clone();
+        let cloned = kind;
         let copied = kind;
         assert_eq!(kind, cloned);
         assert_eq!(kind, copied);
@@ -125,14 +119,12 @@ mod tests {
     fn test_media_kind_serde_roundtrip() {
         let audio = MediaKind::Audio;
         let json = serde_json::to_string(&audio).unwrap();
-        let deserialized: MediaKind =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: MediaKind = serde_json::from_str(&json).unwrap();
         assert_eq!(audio, deserialized);
 
         let video = MediaKind::Video;
         let json = serde_json::to_string(&video).unwrap();
-        let deserialized: MediaKind =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: MediaKind = serde_json::from_str(&json).unwrap();
         assert_eq!(video, deserialized);
     }
 }

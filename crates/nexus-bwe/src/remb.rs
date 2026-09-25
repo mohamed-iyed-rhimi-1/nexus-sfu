@@ -170,10 +170,10 @@ mod tests {
     #[test]
     fn test_bitrate_encoding_roundtrip() {
         let test_bitrates = vec![
-            100_000,   // 100 kbps
-            500_000,   // 500 kbps
-            1_000_000, // 1 Mbps
-            5_000_000, // 5 Mbps
+            100_000,    // 100 kbps
+            500_000,    // 500 kbps
+            1_000_000,  // 1 Mbps
+            5_000_000,  // 5 Mbps
             10_000_000, // 10 Mbps
         ];
 

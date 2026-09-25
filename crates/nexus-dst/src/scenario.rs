@@ -264,7 +264,6 @@ impl Scenario {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -544,9 +543,9 @@ links = []
             leave_at_ms: None,
         });
         let errs = scenario.validate().unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, ScenarioValidationError::DuplicateParticipantName(n) if n == "alice")));
+        assert!(errs.iter().any(
+            |e| matches!(e, ScenarioValidationError::DuplicateParticipantName(n) if n == "alice")
+        ));
     }
 
     #[test]
@@ -562,9 +561,9 @@ links = []
             packet_size: 160,
         });
         let errs = scenario.validate().unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, ScenarioValidationError::DuplicateTrackLabel(l) if l == "audio1")));
+        assert!(errs.iter().any(
+            |e| matches!(e, ScenarioValidationError::DuplicateTrackLabel(l) if l == "audio1")
+        ));
     }
 
     #[test]

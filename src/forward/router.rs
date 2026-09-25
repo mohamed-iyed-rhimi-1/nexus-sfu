@@ -111,8 +111,9 @@ impl SsrcRouter {
     /// - ssrc != 0
     #[inline(always)]
     pub fn lookup(&self, ssrc: Ssrc) -> Option<(TrackId, u32)> {
-        // TigerStyle: Assert preconditions
-        assert!(ssrc != 0, "ssrc must not be 0");
+        if ssrc == 0 {
+            return None;
+        }
 
         self.routes.get(&ssrc).map(|entry| *entry.value())
     }
@@ -192,16 +193,15 @@ impl SsrcRouter {
         assert!(ssrc != 0, "ssrc must not be 0");
         assert!(track_id != 0, "track_id must not be 0");
 
-        // Check for collision
-        if self.routes.contains_key(&ssrc) {
-            return Err(SsrcError::AlreadyExists { ssrc });
+        // Atomic check-and-insert via DashMap::entry() to avoid TOCTOU race
+        use dashmap::mapref::entry::Entry;
+        match self.routes.entry(ssrc) {
+            Entry::Occupied(_) => Err(SsrcError::AlreadyExists { ssrc }),
+            Entry::Vacant(vacant) => {
+                vacant.insert((track_id, worker_id));
+                Ok(())
+            }
         }
-
-        // Insert the mapping
-        // Note: There's a small race window here, but DashMap handles it gracefully
-        self.routes.insert(ssrc, (track_id, worker_id));
-
-        Ok(())
     }
 
     /// Register a new SSRC with auto-generated track ID.
@@ -222,18 +222,17 @@ impl SsrcRouter {
         // TigerStyle: Assert preconditions
         assert!(ssrc != 0, "ssrc must not be 0");
 
-        // Check for collision first
-        if self.routes.contains_key(&ssrc) {
-            return Err(SsrcError::AlreadyExists { ssrc });
+        // Atomic check-and-insert via DashMap::entry() to avoid TOCTOU race
+        use dashmap::mapref::entry::Entry;
+        match self.routes.entry(ssrc) {
+            Entry::Occupied(_) => Err(SsrcError::AlreadyExists { ssrc }),
+            Entry::Vacant(vacant) => {
+                // Generate track ID only after confirming no collision
+                let track_id = self.next_track_id.fetch_add(1, Ordering::Relaxed);
+                vacant.insert((track_id, worker_id));
+                Ok(track_id)
+            }
         }
-
-        // Generate track ID
-        let track_id = self.next_track_id.fetch_add(1, Ordering::Relaxed);
-
-        // Insert the mapping
-        self.routes.insert(ssrc, (track_id, worker_id));
-
-        Ok(track_id)
     }
 
     /// Unregister an SSRC mapping.
@@ -501,10 +500,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ssrc must not be 0")]
     fn test_ssrc_router_lookup_zero_ssrc() {
         let router = SsrcRouter::new();
-        let _ = router.lookup(0);
+        // Zero SSRC returns None (graceful early return, not panic)
+        assert!(router.lookup(0).is_none());
     }
 
     #[test]
@@ -545,7 +544,7 @@ mod tests {
         // Register SSRCs across multiple workers
         for i in 1..=100 {
             let ssrc = 10000 + i;
-            let worker_id = (i % 4) as u32;
+            let worker_id = i % 4;
             router.register(ssrc, i as u64, worker_id).unwrap();
         }
 
@@ -555,7 +554,7 @@ mod tests {
         for worker_id in 0..4 {
             let count = router.ssrcs_for_worker(worker_id).len();
             assert!(
-                count >= 20 && count <= 30,
+                (20..=30).contains(&count),
                 "worker {} has {} SSRCs",
                 worker_id,
                 count

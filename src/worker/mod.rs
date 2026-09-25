@@ -50,17 +50,20 @@ mod spsc_proptest;
 
 pub use pool::{MediaWorker, WorkerHandle, WorkerPool};
 pub use shard::ConsistentHash;
-pub use spsc::{SpscChannel, SpscSender, SpscReceiver, channel as spsc_channel};
+pub use spsc::{channel as spsc_channel, SpscChannel, SpscReceiver, SpscSender};
 
 use std::net::SocketAddr;
 
-use nexus_transport::arena::PacketSlot;
 use crate::types::{MediaKind, ParticipantId, Ssrc, TrackId};
+use nexus_transport::arena::PacketSlot;
 
 /// Messages sent to workers via SPSC channels.
 ///
 /// Workers receive these messages and process them in their run loop.
 /// This enables cross-worker communication without shared state.
+// TransportFeedback (~8 KB, fixed-size arrival array) sets the enum size.
+// Boxing it would heap-allocate per transport-cc packet on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum WorkerMessage {
     /// Assign a new track to this worker.
@@ -74,8 +77,8 @@ pub enum WorkerMessage {
     RemoveTrack { track_id: TrackId },
 
     /// Route a packet to a track owned by this worker.
-    Packet { 
-        track_id: TrackId, 
+    Packet {
+        track_id: TrackId,
         packet: PacketSlot,
         source_addr: SocketAddr,
     },
@@ -84,7 +87,6 @@ pub enum WorkerMessage {
     Shutdown,
 
     // === Actor System Messages ===
-
     /// Spawn a new TrackActor on this worker.
     SpawnActor {
         track_id: TrackId,
@@ -121,7 +123,6 @@ pub enum WorkerMessage {
     TerminateActor { track_id: TrackId },
 
     // === Migration Messages ===
-
     /// Prepare track for migration (freeze state).
     PrepareMigration {
         migration_id: u64,
@@ -148,7 +149,6 @@ pub enum WorkerMessage {
     },
 
     // === Bandwidth Allocation Messages ===
-
     /// Update bandwidth allocation for track.
     UpdateBandwidth {
         track_id: TrackId,
@@ -171,10 +171,7 @@ pub enum WorkerMessage {
     },
 
     /// Process RTCP PLI (Picture Loss Indication) feedback.
-    RtcpPli {
-        media_ssrc: u32,
-        sender_ssrc: u32,
-    },
+    RtcpPli { media_ssrc: u32, sender_ssrc: u32 },
 
     /// Process RTCP NACK (Negative Acknowledgement) feedback.
     RtcpNack {
@@ -224,10 +221,7 @@ pub enum WorkerMessage {
     },
 
     /// Bind an SSRC to a track actor created without one (unified SSRC binding).
-    SetSsrc {
-        track_id: TrackId,
-        ssrc: Ssrc,
-    },
+    SetSsrc { track_id: TrackId, ssrc: Ssrc },
 
     /// Set target simulcast layer for a subscriber.
     SetSubscriberLayer {
@@ -256,10 +250,7 @@ pub enum WorkerMessage {
 
     /// Set the transport-wide CC RTP header extension ID for a track.
     /// Enables TWCC feedback generation (RFC 8888) for this publisher.
-    SetTrackTwccExtId {
-        track_id: TrackId,
-        twcc_ext_id: u8,
-    },
+    SetTrackTwccExtId { track_id: TrackId, twcc_ext_id: u8 },
 
     /// Update viewport filter for a subscriber.
     /// Sent when a client sends a Viewport signaling message.
@@ -274,10 +265,7 @@ pub enum WorkerMessage {
 
     /// Set content type on a track actor (0=camera, 1=screen, 2=audio).
     /// Screen share tracks bypass viewport filtering.
-    SetContentType {
-        track_id: TrackId,
-        content_type: u8,
-    },
+    SetContentType { track_id: TrackId, content_type: u8 },
 
     /// Add a relay subscriber — forwards packets to a peer SFU node.
     /// No SRTP needed (inter-node traffic on private network).
@@ -289,9 +277,10 @@ pub enum WorkerMessage {
     },
 
     /// Inject a relay packet received from a peer node into the local pipeline.
+    /// Data is boxed to avoid bloating the enum size (1500 bytes → pointer).
     RelayPacket {
         track_id: TrackId,
-        data: [u8; 1500],
+        data: Box<[u8; 1500]>,
         len: u16,
     },
 }

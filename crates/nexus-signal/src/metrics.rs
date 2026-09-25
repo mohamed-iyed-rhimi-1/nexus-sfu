@@ -89,7 +89,8 @@ impl SignalMetrics {
     }
 
     pub fn record_zero_rtt_replay_attempt(&self) {
-        self.zero_rtt_replay_attempts.fetch_add(1, Ordering::Relaxed);
+        self.zero_rtt_replay_attempts
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record client stats from a stats report.
@@ -106,10 +107,14 @@ impl SignalMetrics {
         packets_lost: u32,
         jitter_us: u32,
     ) {
-        self.total_client_stats_reports.fetch_add(1, Ordering::Relaxed);
-        self.total_rtt_us.fetch_add(rtt_us as u64, Ordering::Relaxed);
-        self.total_packets_lost.fetch_add(packets_lost as u64, Ordering::Relaxed);
-        self.total_jitter_us.fetch_add(jitter_us as u64, Ordering::Relaxed);
+        self.total_client_stats_reports
+            .fetch_add(1, Ordering::Relaxed);
+        self.total_rtt_us
+            .fetch_add(rtt_us as u64, Ordering::Relaxed);
+        self.total_packets_lost
+            .fetch_add(packets_lost as u64, Ordering::Relaxed);
+        self.total_jitter_us
+            .fetch_add(jitter_us as u64, Ordering::Relaxed);
     }
 
     /// Get average RTT in microseconds across all client reports.

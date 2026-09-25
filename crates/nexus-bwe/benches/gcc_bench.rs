@@ -29,11 +29,7 @@ fn bench_gcc_on_receiver_report(c: &mut Criterion) {
 
     c.bench_function("gcc_on_receiver_report", |b| {
         b.iter(|| {
-            gcc.on_receiver_report(
-                black_box(10),
-                black_box(Some(50_000)),
-                black_box(1_000_000),
-            );
+            gcc.on_receiver_report(black_box(10), black_box(Some(50_000)), black_box(1_000_000));
         })
     });
 }

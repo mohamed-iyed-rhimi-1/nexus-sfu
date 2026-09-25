@@ -107,7 +107,7 @@ impl ForwardEntry {
     /// * `ifindex > 0` - Interface index must be valid
     pub fn new(dst_mac: [u8; 6], dst_ip: u32, dst_port: u16, ifindex: u32) -> Self {
         assert!(ifindex > 0, "ifindex must be > 0");
-        
+
         Self {
             dst_mac,
             _pad: 0,
@@ -126,19 +126,14 @@ impl ForwardEntry {
     /// * `ip_octets` - IPv4 address as [a, b, c, d]
     /// * `port` - Destination port (host byte order, will be converted)
     /// * `ifindex` - Output interface index
-    pub fn from_ipv4(
-        dst_mac: [u8; 6],
-        ip_octets: [u8; 4],
-        port: u16,
-        ifindex: u32,
-    ) -> Self {
+    pub fn from_ipv4(dst_mac: [u8; 6], ip_octets: [u8; 4], port: u16, ifindex: u32) -> Self {
         assert!(ifindex > 0, "ifindex must be > 0");
-        
+
         // Convert IP to network byte order (big-endian)
         let dst_ip = u32::from_be_bytes(ip_octets);
         // Convert port to network byte order
         let dst_port = port.to_be();
-        
+
         Self::new(dst_mac, dst_ip, dst_port, ifindex)
     }
 }
@@ -181,20 +176,20 @@ impl ForwardTable {
     /// Returns `XdpError::OpenFailed` if the file can't be opened.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, XdpError> {
         let path_ref = path.as_ref();
-        
+
         // Assertion: path must exist
         if !path_ref.exists() {
             return Err(XdpError::MapNotFound {
                 path: path_ref.display().to_string(),
             });
         }
-        
+
         let file = File::open(path_ref)?;
         let map_fd = file.as_raw_fd();
-        
+
         // Assertion: file descriptor must be valid
         assert!(map_fd >= 0, "BPF map file descriptor must be >= 0");
-        
+
         Ok(Self {
             map_fd,
             _file: file,
@@ -217,7 +212,7 @@ impl ForwardTable {
     pub fn from_fd(fd: RawFd, file: File, max_entries: u32) -> Self {
         assert!(fd >= 0, "BPF map file descriptor must be >= 0");
         assert!(max_entries > 0, "max_entries must be > 0");
-        
+
         Self {
             map_fd: fd,
             _file: file,
@@ -248,7 +243,7 @@ impl ForwardTable {
         if ssrc == 0 {
             return Err(XdpError::InvalidSsrc);
         }
-        
+
         // Assertion: table must not be full
         let count = self.entry_count.load(Ordering::Relaxed);
         if count >= self.max_entries {
@@ -257,13 +252,13 @@ impl ForwardTable {
                 max: self.max_entries,
             });
         }
-        
+
         // Perform BPF map update
         self.bpf_map_update(ssrc, &entry)?;
-        
+
         // Increment entry count
         self.entry_count.fetch_add(1, Ordering::Relaxed);
-        
+
         Ok(())
     }
 
@@ -283,17 +278,21 @@ impl ForwardTable {
         if ssrc == 0 {
             return Err(XdpError::InvalidSsrc);
         }
-        
+
         // Perform BPF map delete
         self.bpf_map_delete(ssrc)?;
-        
+
         // Decrement entry count (saturating to avoid underflow)
-        let _ = self.entry_count.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |x| if x > 0 { Some(x - 1) } else { Some(0) },
-        );
-        
+        let _ = self
+            .entry_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                if x > 0 {
+                    Some(x - 1)
+                } else {
+                    Some(0)
+                }
+            });
+
         Ok(())
     }
 
@@ -323,9 +322,9 @@ impl ForwardTable {
                 max: MAX_BATCH_SIZE,
             });
         }
-        
+
         let mut inserted = 0u32;
-        
+
         // Insert each entry individually
         // WHY: BPF batch operations require specific kernel support;
         // falling back to individual inserts ensures compatibility
@@ -334,20 +333,20 @@ impl ForwardTable {
             if *ssrc == 0 {
                 continue;
             }
-            
+
             // Check capacity
             let count = self.entry_count.load(Ordering::Relaxed);
             if count >= self.max_entries {
                 break;
             }
-            
+
             // Try to insert
             if self.bpf_map_update(*ssrc, entry).is_ok() {
                 self.entry_count.fetch_add(1, Ordering::Relaxed);
                 inserted += 1;
             }
         }
-        
+
         Ok(inserted)
     }
 
@@ -376,27 +375,31 @@ impl ForwardTable {
                 max: MAX_BATCH_SIZE,
             });
         }
-        
+
         let mut removed = 0u32;
-        
+
         // Remove each entry individually
         for ssrc in ssrcs {
             // Skip zero SSRCs
             if *ssrc == 0 {
                 continue;
             }
-            
+
             // Try to remove
             if self.bpf_map_delete(*ssrc).is_ok() {
-                let _ = self.entry_count.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |x| if x > 0 { Some(x - 1) } else { Some(0) },
-                );
+                let _ = self
+                    .entry_count
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                        if x > 0 {
+                            Some(x - 1)
+                        } else {
+                            Some(0)
+                        }
+                    });
                 removed += 1;
             }
         }
-        
+
         Ok(removed)
     }
 
@@ -430,7 +433,7 @@ impl ForwardTable {
         // BPF_MAP_UPDATE_ELEM = 2
         const BPF_MAP_UPDATE_ELEM: libc::c_int = 2;
         const BPF_ANY: u64 = 0;
-        
+
         #[repr(C)]
         struct BpfMapUpdateAttr {
             map_fd: u32,
@@ -438,14 +441,14 @@ impl ForwardTable {
             value: u64,
             flags: u64,
         }
-        
+
         let attr = BpfMapUpdateAttr {
             map_fd: self.map_fd as u32,
             key: &ssrc as *const u32 as u64,
             value: entry as *const ForwardEntry as u64,
             flags: BPF_ANY,
         };
-        
+
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_bpf,
@@ -454,7 +457,7 @@ impl ForwardTable {
                 std::mem::size_of::<BpfMapUpdateAttr>(),
             )
         };
-        
+
         if ret < 0 {
             let err = io::Error::last_os_error();
             return Err(XdpError::MapError(format!(
@@ -462,7 +465,7 @@ impl ForwardTable {
                 ssrc, err
             )));
         }
-        
+
         Ok(())
     }
 
@@ -470,7 +473,7 @@ impl ForwardTable {
     fn bpf_map_delete(&self, ssrc: u32) -> Result<(), XdpError> {
         // BPF_MAP_DELETE_ELEM = 3
         const BPF_MAP_DELETE_ELEM: libc::c_int = 3;
-        
+
         #[repr(C)]
         struct BpfMapDeleteAttr {
             map_fd: u32,
@@ -478,14 +481,14 @@ impl ForwardTable {
             _value: u64,
             _flags: u64,
         }
-        
+
         let attr = BpfMapDeleteAttr {
             map_fd: self.map_fd as u32,
             key: &ssrc as *const u32 as u64,
             _value: 0,
             _flags: 0,
         };
-        
+
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_bpf,
@@ -494,7 +497,7 @@ impl ForwardTable {
                 std::mem::size_of::<BpfMapDeleteAttr>(),
             )
         };
-        
+
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::ENOENT) {
@@ -505,7 +508,7 @@ impl ForwardTable {
                 ssrc, err
             )));
         }
-        
+
         Ok(())
     }
 }
@@ -518,7 +521,7 @@ mod tests {
     fn test_forward_entry_new() {
         let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let entry = ForwardEntry::new(mac, 0x0A000001, 5000u16.to_be(), 1);
-        
+
         assert_eq!(entry.dst_mac, mac);
         assert_eq!(entry.dst_ip, 0x0A000001);
         assert_eq!(entry.ifindex, 1);
@@ -528,7 +531,7 @@ mod tests {
     fn test_forward_entry_from_ipv4() {
         let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let entry = ForwardEntry::from_ipv4(mac, [10, 0, 0, 1], 5000, 1);
-        
+
         assert_eq!(entry.dst_mac, mac);
         // 10.0.0.1 in network byte order
         assert_eq!(entry.dst_ip, u32::from_be_bytes([10, 0, 0, 1]));
@@ -544,13 +547,19 @@ mod tests {
 
     #[test]
     fn test_xdp_error_display() {
-        let err = XdpError::TableFull { count: 100, max: 100 };
+        let err = XdpError::TableFull {
+            count: 100,
+            max: 100,
+        };
         assert!(err.to_string().contains("100"));
-        
+
         let err = XdpError::InvalidSsrc;
         assert!(err.to_string().contains("zero"));
-        
-        let err = XdpError::BatchTooLarge { size: 300, max: 256 };
+
+        let err = XdpError::BatchTooLarge {
+            size: 300,
+            max: 256,
+        };
         assert!(err.to_string().contains("300"));
         assert!(err.to_string().contains("256"));
     }

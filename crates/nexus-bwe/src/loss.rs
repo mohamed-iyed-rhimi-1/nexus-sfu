@@ -58,7 +58,6 @@ pub enum LossBasedBweState {
     AggressiveDecrease,
 }
 
-
 /// Loss-based bandwidth estimator.
 ///
 /// Uses AIMD (Additive Increase Multiplicative Decrease) based on
@@ -157,7 +156,6 @@ impl LossBasedBweDetector {
         }
     }
 
-
     /// Process receiver report loss feedback.
     ///
     /// Implements AIMD algorithm:
@@ -219,7 +217,7 @@ impl LossBasedBweDetector {
 
         // Clamp estimate to [min_bps, max_bps]
         self.estimate_bps = self.estimate_bps.clamp(self.min_bps, self.max_bps);
-        
+
         // Update last_update_us only if timestamp is advancing
         if timestamp_us > self.last_update_us {
             self.last_update_us = timestamp_us;
@@ -267,7 +265,6 @@ impl LossBasedBweDetector {
     pub fn history_count(&self) -> u32 {
         self.history_count
     }
-
 
     /// Add loss sample to sliding window.
     ///
@@ -372,11 +369,11 @@ mod tests {
     #[test]
     fn test_loss_increase_below_threshold() {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 1_000_000);
-        
+
         // 0% loss should trigger increase
         let state = detector.on_receiver_report(0, 1_000_000);
         assert_eq!(state, LossBasedBweState::Increase);
-        
+
         // With 1 second elapsed and 8000 bps increase rate, should increase by 8000
         let state = detector.on_receiver_report(0, 2_000_000);
         assert_eq!(state, LossBasedBweState::Increase);
@@ -386,7 +383,7 @@ mod tests {
     #[test]
     fn test_loss_decrease_above_threshold() {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 1_000_000);
-        
+
         // 5% loss (fraction_lost = 13 out of 255) should trigger decrease
         // 5% = 5 * 256 / 100 ≈ 13
         let fraction_5_percent = 13;
@@ -398,7 +395,7 @@ mod tests {
     #[test]
     fn test_aggressive_decrease_high_loss() {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 1_000_000);
-        
+
         // 15% loss (fraction_lost = 38 out of 255) should trigger aggressive decrease
         // 15% = 15 * 256 / 100 ≈ 38
         let fraction_15_percent = 38;
@@ -412,12 +409,12 @@ mod tests {
     #[test]
     fn test_minimum_bound_enforced() {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 200_000);
-        
+
         // Apply multiple high-loss reports to drive estimate down
         for i in 0..10 {
             let _ = detector.on_receiver_report(255, (i + 1) * 1_000_000);
         }
-        
+
         // Should not go below minimum
         assert!(detector.estimate_bps() >= 100_000);
     }
@@ -425,12 +422,12 @@ mod tests {
     #[test]
     fn test_maximum_bound_enforced() {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 9_000_000);
-        
+
         // Apply multiple low-loss reports to drive estimate up
         for i in 0..100 {
             let _ = detector.on_receiver_report(0, (i + 1) * 1_000_000);
         }
-        
+
         // Should not exceed maximum
         assert!(detector.estimate_bps() <= 10_000_000);
     }
@@ -438,21 +435,24 @@ mod tests {
     #[test]
     fn test_sliding_window_average() {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 1_000_000);
-        
+
         // Add samples with varying loss
         for i in 0..10 {
             let _ = detector.on_receiver_report(10, (i + 1) * 100_000);
         }
-        
+
         assert_eq!(detector.history_count(), 10);
-        
+
         // Fill the window
         for i in 10..25 {
             let _ = detector.on_receiver_report(10, (i + 1) * 100_000);
         }
-        
+
         // Should be capped at LOSS_WINDOW_SIZE
-        assert_eq!(detector.history_count(), LossBasedBweDetector::LOSS_WINDOW_SIZE as u32);
+        assert_eq!(
+            detector.history_count(),
+            LossBasedBweDetector::LOSS_WINDOW_SIZE as u32
+        );
     }
 
     #[test]
@@ -460,12 +460,15 @@ mod tests {
         let mut detector = LossBasedBweDetector::new(100_000, 10_000_000, 1_000_000);
         let _ = detector.on_receiver_report(0, 2_000_000);
         let estimate_before = detector.estimate_bps();
-        
+
         // Timestamp regression should be handled gracefully (no increase, but no panic)
         let _ = detector.on_receiver_report(0, 1_000_000);
         let estimate_after = detector.estimate_bps();
-        
+
         // Estimate should not increase on timestamp regression
-        assert_eq!(estimate_before, estimate_after, "Estimate should not change on timestamp regression");
+        assert_eq!(
+            estimate_before, estimate_after,
+            "Estimate should not change on timestamp regression"
+        );
     }
 }

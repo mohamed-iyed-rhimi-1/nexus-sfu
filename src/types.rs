@@ -12,8 +12,7 @@
 // existing `use crate::types::X` imports continue to work
 // without modification across the codebase.
 pub use nexus_core::types::{
-    BandwidthBps, ConnectionId, MediaKind, ParticipantId,
-    RoomId, Ssrc, TimestampNs, TrackId,
+    BandwidthBps, ConnectionId, MediaKind, ParticipantId, RoomId, Ssrc, TimestampNs, TrackId,
 };
 
 // ============================================================
@@ -27,8 +26,7 @@ pub use nexus_core::types::{
 ///
 /// Supports concurrent add/remove operations across
 /// distributed nodes with automatic conflict resolution.
-pub type ParticipantSet =
-    nexus_state::crdt::Orswot<ParticipantId>;
+pub type ParticipantSet = nexus_state::crdt::Orswot<ParticipantId>;
 
 /// A distributed counter for packet statistics using
 /// CRDT (Grow-Only Counter).
@@ -55,8 +53,7 @@ pub struct TrackInfo {
 ///
 /// Concurrent updates are resolved by timestamp, with
 /// deterministic tie-breaking by actor ID.
-pub type TrackMetadata =
-    nexus_state::crdt::LWWReg<TrackInfo>;
+pub type TrackMetadata = nexus_state::crdt::LWWReg<TrackInfo>;
 
 #[cfg(test)]
 mod tests {

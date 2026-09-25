@@ -9,3 +9,6 @@ certs/
 # sdk
 sdk/node_modules/
 sdk/dist/
+
+# macOS Finder metadata
+.DS_Store

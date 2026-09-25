@@ -10,21 +10,11 @@ use nexus_state::types::Dot;
 type ParticipantId = u64;
 
 /// Simulates track information
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct TrackInfo {
     bitrate: u32,
     codec_id: u8,
     active: bool,
-}
-
-impl Default for TrackInfo {
-    fn default() -> Self {
-        Self {
-            bitrate: 0,
-            codec_id: 0,
-            active: false,
-        }
-    }
 }
 
 // ============================================================================
@@ -137,7 +127,7 @@ fn test_track_metadata_with_lwwreg() {
         0,
     );
 
-    let mut node1 = LWWReg::with_timestamp(
+    let node1 = LWWReg::with_timestamp(
         TrackInfo {
             bitrate: 2000,
             codec_id: 2,
@@ -387,16 +377,16 @@ fn test_statistics_merge_convergence() {
 #[test]
 fn test_room_state_simulation() {
     // Simulate a complete room with participants, tracks, and subscriptions
-    
+
     // Participant set
     let mut participants: Orswot<ParticipantId> = Orswot::new();
-    
+
     // Track metadata (one register per track - simulated with a simple approach)
     let mut track_bitrate = LWWReg::new(0u32, 0);
-    
+
     // Subscription graph
     let mut subscriptions: Orswot<Subscription> = Orswot::new();
-    
+
     // Packet counter
     let packet_counter = GCounter::new();
 
@@ -469,7 +459,10 @@ fn test_multi_node_sync_scenario() {
     // Verify final state
     // - 100 was removed by node1
     // - 101, 102, 103 were added by different nodes
-    assert!(!node0.contains(&100), "Removed participant should not be present");
+    assert!(
+        !node0.contains(&100),
+        "Removed participant should not be present"
+    );
     assert!(node0.contains(&101));
     assert!(node0.contains(&102));
     assert!(node0.contains(&103));

@@ -21,7 +21,7 @@ impl Ssrc {
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
-    
+
     /// Get raw value.
     #[inline]
     pub const fn value(self) -> u32 {
@@ -55,13 +55,13 @@ impl SeqNum {
     pub const fn new(value: u16) -> Self {
         Self(value)
     }
-    
+
     /// Get raw value.
     #[inline]
     pub const fn value(self) -> u16 {
         self.0
     }
-    
+
     /// Wrapping increment.
     #[inline]
     pub const fn wrapping_add(self, n: u16) -> Self {
@@ -95,13 +95,13 @@ impl Roc {
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
-    
+
     /// Get raw value.
     #[inline]
     pub const fn value(self) -> u32 {
         self.0
     }
-    
+
     /// Saturating increment.
     #[inline]
     pub const fn saturating_add(self, n: u32) -> Self {
@@ -131,15 +131,15 @@ pub enum ProtectionProfile {
     /// SRTP_AEAD_AES_128_GCM (RFC 7714)
     /// Key: 16 bytes, Salt: 12 bytes, Tag: 16 bytes
     AeadAes128Gcm = 0x0007,
-    
+
     /// SRTP_AEAD_AES_256_GCM (RFC 7714)
     /// Key: 32 bytes, Salt: 12 bytes, Tag: 16 bytes
     AeadAes256Gcm = 0x0008,
-    
+
     /// SRTP_AES128_CM_HMAC_SHA1_80 (RFC 5764)
     /// Key: 16 bytes, Salt: 14 bytes, Tag: 10 bytes
     Aes128CmHmacSha1_80 = 0x0001,
-    
+
     /// SRTP_AES128_CM_HMAC_SHA1_32 (RFC 5764)
     /// Key: 16 bytes, Salt: 14 bytes, Tag: 4 bytes
     Aes128CmHmacSha1_32 = 0x0002,
@@ -156,7 +156,7 @@ impl ProtectionProfile {
             Self::Aes128CmHmacSha1_32 => 16,
         }
     }
-    
+
     /// Get salt length in bytes.
     #[inline]
     pub const fn salt_len(self) -> usize {
@@ -167,7 +167,7 @@ impl ProtectionProfile {
             Self::Aes128CmHmacSha1_32 => 14,
         }
     }
-    
+
     /// Get authentication tag length in bytes.
     #[inline]
     pub const fn tag_len(self) -> usize {
@@ -178,19 +178,19 @@ impl ProtectionProfile {
             Self::Aes128CmHmacSha1_32 => 4,
         }
     }
-    
+
     /// Get total key material length (key + salt for both RTP and RTCP).
     #[inline]
     pub const fn master_key_len(self) -> usize {
         self.key_len() + self.salt_len()
     }
-    
+
     /// Check if this is an AEAD cipher suite.
     #[inline]
     pub const fn is_aead(self) -> bool {
         matches!(self, Self::AeadAes128Gcm | Self::AeadAes256Gcm)
     }
-    
+
     /// Try to create from raw u16 value.
     #[inline]
     pub const fn from_u16(value: u16) -> Option<Self> {
@@ -217,13 +217,13 @@ impl Default for ProtectionProfile {
 pub struct SrtpPolicy {
     /// Protection profile (cipher suite).
     pub profile: ProtectionProfile,
-    
+
     /// Allow replay protection to be disabled (for testing only).
     pub allow_replay: bool,
-    
+
     /// Window size for replay protection.
     pub window_size: u64,
-    
+
     /// SSRC value (0 = any SSRC allowed).
     pub ssrc: u32,
 }
@@ -250,14 +250,14 @@ impl SrtpPolicy {
             ssrc: 0,
         }
     }
-    
+
     /// Create policy with specific SSRC.
     #[inline]
     pub const fn with_ssrc(mut self, ssrc: u32) -> Self {
         self.ssrc = ssrc;
         self
     }
-    
+
     /// Create policy with replay allowed (testing only).
     #[inline]
     pub const fn with_allow_replay(mut self) -> Self {
@@ -301,30 +301,30 @@ impl RtpHeader {
         if data.len() < super::RTP_HEADER_SIZE {
             return None;
         }
-        
+
         let first = data[0];
         let version = (first >> 6) & 0x03;
-        
+
         // Version must be 2
         if version != 2 {
             return None;
         }
-        
+
         let padding = (first & 0x20) != 0;
         let extension = (first & 0x10) != 0;
         let csrc_count = first & 0x0F;
-        
+
         let second = data[1];
         let marker = (second & 0x80) != 0;
         let payload_type = second & 0x7F;
-        
+
         let sequence_number = u16::from_be_bytes([data[2], data[3]]);
         let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        
+
         // Calculate header length
         let mut header_len = super::RTP_HEADER_SIZE + (csrc_count as usize * 4);
-        
+
         // Check for header extension
         if extension {
             if data.len() < header_len + 4 {
@@ -334,11 +334,11 @@ impl RtpHeader {
             let ext_len = u16::from_be_bytes([data[header_len + 2], data[header_len + 3]]);
             header_len += 4 + (ext_len as usize * 4);
         }
-        
+
         if data.len() < header_len {
             return None;
         }
-        
+
         Some(Self {
             version,
             padding,
@@ -352,7 +352,7 @@ impl RtpHeader {
             header_len,
         })
     }
-    
+
     /// Get payload offset.
     #[inline]
     pub const fn payload_offset(&self) -> usize {
@@ -383,20 +383,20 @@ impl RtcpHeader {
         if data.len() < super::RTCP_HEADER_SIZE {
             return None;
         }
-        
+
         let first = data[0];
         let version = (first >> 6) & 0x03;
-        
+
         if version != 2 {
             return None;
         }
-        
+
         let padding = (first & 0x20) != 0;
         let count = first & 0x1F;
         let packet_type = data[1];
         let length = u16::from_be_bytes([data[2], data[3]]);
         let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        
+
         Some(Self {
             version,
             padding,
@@ -406,7 +406,7 @@ impl RtcpHeader {
             ssrc,
         })
     }
-    
+
     /// Get packet length in bytes (including header).
     #[inline]
     pub const fn packet_len(&self) -> usize {
@@ -426,19 +426,19 @@ impl PacketIndex {
     pub const fn new(roc: u32, seq: u16) -> Self {
         Self(((roc as u64) << 16) | (seq as u64))
     }
-    
+
     /// Get the ROC component.
     #[inline]
     pub const fn roc(self) -> u32 {
         (self.0 >> 16) as u32
     }
-    
+
     /// Get the sequence number component.
     #[inline]
     pub const fn seq(self) -> u16 {
         self.0 as u16
     }
-    
+
     /// Get raw 48-bit value.
     #[inline]
     pub const fn value(self) -> u64 {
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(p.salt_len(), 12);
         assert_eq!(p.tag_len(), 16);
         assert!(p.is_aead());
-        
+
         let p = ProtectionProfile::Aes128CmHmacSha1_80;
         assert_eq!(p.key_len(), 16);
         assert_eq!(p.salt_len(), 14);
@@ -498,7 +498,7 @@ mod tests {
             0x12, 0x34, 0x56, 0x78, // SSRC=0x12345678
             0x00, 0x00, 0x00, 0x00, // Payload
         ];
-        
+
         let hdr = RtpHeader::parse(&rtp).unwrap();
         assert_eq!(hdr.version, 2);
         assert!(!hdr.padding);
@@ -522,7 +522,7 @@ mod tests {
             0xAA, 0xBB, 0xCC, 0xDD, // CSRC 1
             0x11, 0x22, 0x33, 0x44, // CSRC 2
         ];
-        
+
         let hdr = RtpHeader::parse(&rtp).unwrap();
         assert_eq!(hdr.csrc_count, 2);
         assert_eq!(hdr.header_len, 20); // 12 + 2*4
@@ -530,7 +530,9 @@ mod tests {
 
     #[test]
     fn test_rtp_header_invalid_version() {
-        let rtp = [0x00, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x12, 0x34, 0x56, 0x78];
+        let rtp = [
+            0x00, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x12, 0x34, 0x56, 0x78,
+        ];
         assert!(RtpHeader::parse(&rtp).is_none());
     }
 
@@ -547,7 +549,7 @@ mod tests {
             0x00, 0x06, // Length=6
             0x12, 0x34, 0x56, 0x78, // SSRC
         ];
-        
+
         let hdr = RtcpHeader::parse(&rtcp).unwrap();
         assert_eq!(hdr.version, 2);
         assert!(!hdr.padding);
@@ -564,16 +566,15 @@ mod tests {
         assert_eq!(idx.roc(), 5);
         assert_eq!(idx.seq(), 1000);
         assert_eq!(idx.value(), (5u64 << 16) | 1000);
-        
+
         let idx2 = PacketIndex::new(5, 1001);
         assert!(idx < idx2);
     }
 
     #[test]
     fn test_srtp_policy() {
-        let policy = SrtpPolicy::aes_128_gcm()
-            .with_ssrc(0x12345678);
-        
+        let policy = SrtpPolicy::aes_128_gcm().with_ssrc(0x12345678);
+
         assert_eq!(policy.profile, ProtectionProfile::AeadAes128Gcm);
         assert_eq!(policy.ssrc, 0x12345678);
         assert!(!policy.allow_replay);

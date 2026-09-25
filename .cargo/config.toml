@@ -1,0 +1,6 @@
+# The `aes` crate (0.8) only uses ARMv8 AES instructions when built with this
+# cfg; without it, SRTP on aarch64 (Apple Silicon, Graviton) falls back to a
+# far slower software AES. x86_64 detects AES-NI at runtime without a flag.
+# Note: a RUSTFLAGS environment variable overrides these target rustflags.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8"]

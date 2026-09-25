@@ -20,7 +20,10 @@ use crate::event_loop::{EventLoop, SimEvent, SimEventKind};
 use crate::fault::{FaultEvent, FaultInjector};
 use crate::invariant::InvariantChecker;
 use crate::network::{LinkConfig, NetworkSimulator};
-use crate::report::{AssertionResult, InvariantViolationReport, PerformanceBenchmarks, SimulationReport, SimulationStats};
+use crate::report::{
+    AssertionResult, InvariantViolationReport, PerformanceBenchmarks, SimulationReport,
+    SimulationStats,
+};
 use crate::rng::SimRng;
 use crate::scenario::Scenario;
 
@@ -496,19 +499,21 @@ impl SimulationEngine {
                     simulation_duration_ns: final_time,
                 },
                 &latencies_us,
-                self.scenario.participants.len() as u32,
-                self.room_map.len() as u32,
-                self.scenario.tracks.len() as u32,
-                self.scenario.subscriptions.len() as u32,
-                max_subs,
-                self.total_forward_ops,
-                self.arena_peak_slots,
-                self.packet_arena.capacity() as u64,
-                bwe_estimate,
-                self.gossip_round_count,
-                self.crdt_ops_count,
-                convergence_time,
-                self.simulated_cores,
+                &crate::report::SimulationCounts {
+                    participants: self.scenario.participants.len() as u32,
+                    rooms: self.room_map.len() as u32,
+                    tracks: self.scenario.tracks.len() as u32,
+                    subscriptions: self.scenario.subscriptions.len() as u32,
+                    max_subs_per_track: max_subs,
+                    forward_ops: self.total_forward_ops,
+                    arena_peak: self.arena_peak_slots,
+                    arena_capacity: self.packet_arena.capacity() as u64,
+                    bwe_estimate,
+                    gossip_rounds: self.gossip_round_count,
+                    crdt_ops: self.crdt_ops_count,
+                    convergence_time_ns: convergence_time,
+                    simulated_cores: self.simulated_cores,
+                },
             ))
         } else {
             None
@@ -852,7 +857,8 @@ impl SimulationEngine {
                         track_type,
                         content_type: 0,
                         codec: 0,
-                        bitrate_kbps: 0, owner_node: 0,
+                        bitrate_kbps: 0,
+                        owner_node: 0,
                     },
                 );
 
@@ -1248,12 +1254,16 @@ impl SimulationEngine {
                 track_type,
                 content_type: 0,
                 codec: 0,
-                bitrate_kbps: 0, owner_node: 0,
+                bitrate_kbps: 0,
+                owner_node: 0,
             };
 
             for i in 1..self.distributed_states.len() {
                 // Try to add track (will fail silently if already exists)
-                if self.distributed_states[i].add_track(track_id, track_info.clone()).is_ok() {
+                if self.distributed_states[i]
+                    .add_track(track_id, track_info)
+                    .is_ok()
+                {
                     self.crdt_ops_count += 1;
                 }
             }
@@ -1266,7 +1276,9 @@ impl SimulationEngine {
                     if let Some(&subscriber_id) = self.participant_map.get(subscriber_name) {
                         for i in 1..self.distributed_states.len() {
                             if self.distributed_states[i]
-                                .add_subscription(track_id, subscriber_id).is_ok() {
+                                .add_subscription(track_id, subscriber_id)
+                                .is_ok()
+                            {
                                 self.crdt_ops_count += 1;
                             }
                         }

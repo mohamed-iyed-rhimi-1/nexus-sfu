@@ -36,12 +36,10 @@ impl FaultInjector {
     pub fn inject_into_event_loop(&self, event_loop: &mut EventLoop) {
         for (time_ns, fault) in &self.scheduled_faults {
             let kind = match fault {
-                FaultEvent::NetworkPartition { node_a, node_b } => {
-                    SimEventKind::NetworkPartition {
-                        node_a: node_a.clone(),
-                        node_b: node_b.clone(),
-                    }
-                }
+                FaultEvent::NetworkPartition { node_a, node_b } => SimEventKind::NetworkPartition {
+                    node_a: node_a.clone(),
+                    node_b: node_b.clone(),
+                },
                 FaultEvent::NetworkHeal { node_a, node_b } => SimEventKind::NetworkHeal {
                     node_a: node_a.clone(),
                     node_b: node_b.clone(),
@@ -67,7 +65,6 @@ impl Default for FaultInjector {
         Self::new()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

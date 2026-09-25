@@ -35,8 +35,7 @@ impl AtomicStack {
     pub fn new(capacity: u32) -> Self {
         assert!(capacity > 0, "AtomicStack capacity must be > 0");
 
-        let mut nodes: Vec<StackNode> =
-            Vec::with_capacity(capacity as usize);
+        let mut nodes: Vec<StackNode> = Vec::with_capacity(capacity as usize);
         for i in 0..capacity {
             nodes.push(StackNode {
                 slot_index: i,
@@ -46,8 +45,7 @@ impl AtomicStack {
 
         let nodes_box = nodes.into_boxed_slice();
         let nodes_ptr = Box::into_raw(nodes_box);
-        let nodes_nn =
-            unsafe { NonNull::new_unchecked(nodes_ptr) };
+        let nodes_nn = unsafe { NonNull::new_unchecked(nodes_ptr) };
 
         let stack = Self {
             head: AtomicPtr::new(std::ptr::null_mut()),
@@ -80,18 +78,11 @@ impl AtomicStack {
         loop {
             let old_head = self.head.load(Ordering::Acquire);
             unsafe {
-                (*node_ptr)
-                    .next
-                    .store(old_head, Ordering::Release);
+                (*node_ptr).next.store(old_head, Ordering::Release);
             }
             if self
                 .head
-                .compare_exchange_weak(
-                    old_head,
-                    node_ptr,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(old_head, node_ptr, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
                 break;
@@ -106,9 +97,7 @@ impl AtomicStack {
             if old_head.is_null() {
                 return None;
             }
-            let next = unsafe {
-                (*old_head).next.load(Ordering::Acquire)
-            };
+            let next = unsafe { (*old_head).next.load(Ordering::Acquire) };
             match self.head.compare_exchange_weak(
                 old_head,
                 next,
@@ -116,8 +105,7 @@ impl AtomicStack {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    let slot_index =
-                        unsafe { (*old_head).slot_index };
+                    let slot_index = unsafe { (*old_head).slot_index };
                     assert!(
                         slot_index < self.capacity,
                         "popped slot_index {} >= capacity {}",
@@ -136,12 +124,9 @@ impl AtomicStack {
         let mut current = self.head.load(Ordering::Acquire);
         let max_iterations = self.capacity;
         let mut iterations = 0u32;
-        while !current.is_null() && iterations < max_iterations
-        {
+        while !current.is_null() && iterations < max_iterations {
             count += 1;
-            current = unsafe {
-                (*current).next.load(Ordering::Acquire)
-            };
+            current = unsafe { (*current).next.load(Ordering::Acquire) };
             iterations += 1;
         }
         count
@@ -174,7 +159,6 @@ impl Drop for AtomicStack {
     }
 }
 
-
 /// Pre-allocated memory pool for zero-allocation packet handling.
 pub struct PacketArena {
     #[allow(dead_code)] // Backing store for base_ptr
@@ -191,22 +175,13 @@ impl PacketArena {
     /// Create arena with specified size in megabytes.
     pub fn new(size_mb: u32) -> Result<Self, ArenaError> {
         assert!(size_mb > 0, "arena size_mb must be > 0");
-        assert!(
-            size_mb <= 1024,
-            "arena size_mb must be <= 1024"
-        );
+        assert!(size_mb <= 1024, "arena size_mb must be <= 1024");
 
-        let size_bytes =
-            (size_mb as usize) * 1024 * 1024;
-        let capacity_slots =
-            (size_bytes / SLOT_SIZE_BYTES as usize) as u32;
-        assert!(
-            capacity_slots > 0,
-            "arena must have at least one slot"
-        );
+        let size_bytes = (size_mb as usize) * 1024 * 1024;
+        let capacity_slots = (size_bytes / SLOT_SIZE_BYTES as usize) as u32;
+        assert!(capacity_slots > 0, "arena must have at least one slot");
 
-        let memory = MmapMut::map_anon(size_bytes)
-            .map_err(|_| ArenaError::MmapFailed)?;
+        let memory = MmapMut::map_anon(size_bytes).map_err(|_| ArenaError::MmapFailed)?;
         let base_ptr = memory.as_ptr() as *mut u8;
         let free_list = AtomicStack::new(capacity_slots);
 
@@ -227,10 +202,7 @@ impl PacketArena {
 
     #[inline(always)]
     pub fn alloc(&self) -> Option<PacketSlot> {
-        assert!(
-            self.capacity_slots > 0,
-            "arena capacity must be > 0"
-        );
+        assert!(self.capacity_slots > 0, "arena capacity must be > 0");
         let slot_index = self.free_list.pop()?;
         assert!(
             slot_index < self.capacity_slots,
@@ -238,8 +210,7 @@ impl PacketArena {
             slot_index,
             self.capacity_slots
         );
-        let offset =
-            slot_index as usize * SLOT_SIZE_BYTES as usize;
+        let offset = slot_index as usize * SLOT_SIZE_BYTES as usize;
         let data_ptr = unsafe { self.base_ptr.add(offset) };
         Some(PacketSlot::new(data_ptr, slot_index, self))
     }
@@ -278,10 +249,7 @@ pub struct PacketSlot {
 }
 
 impl std::fmt::Debug for PacketSlot {
-    fn fmt(
-        &self,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PacketSlot")
             .field("slot_index", &self.slot_index)
             .field("data_len_bytes", &self.data_len_bytes)
@@ -294,13 +262,8 @@ unsafe impl Send for PacketSlot {}
 unsafe impl Sync for PacketSlot {}
 
 impl PacketSlot {
-    fn new(
-        data_ptr: *mut u8,
-        slot_index: u32,
-        arena: &PacketArena,
-    ) -> Self {
-        let ref_count =
-            Box::into_raw(Box::new(AtomicU32::new(1)));
+    fn new(data_ptr: *mut u8, slot_index: u32, arena: &PacketArena) -> Self {
+        let ref_count = Box::into_raw(Box::new(AtomicU32::new(1)));
         Self {
             data_ptr,
             slot_index,
@@ -312,16 +275,10 @@ impl PacketSlot {
 
     #[inline(always)]
     pub fn clone_shallow(&self) -> Self {
-        let current_count = unsafe {
-            (*self.ref_count).load(Ordering::Acquire)
-        };
-        assert!(
-            current_count > 0,
-            "cannot clone slot with ref_count 0"
-        );
+        let current_count = unsafe { (*self.ref_count).load(Ordering::Acquire) };
+        assert!(current_count > 0, "cannot clone slot with ref_count 0");
         unsafe {
-            (*self.ref_count)
-                .fetch_add(1, Ordering::AcqRel);
+            (*self.ref_count).fetch_add(1, Ordering::AcqRel);
         }
         Self {
             data_ptr: self.data_ptr,
@@ -340,30 +297,18 @@ impl PacketSlot {
             self.data_len_bytes,
             SLOT_SIZE_BYTES
         );
-        unsafe {
-            std::slice::from_raw_parts(
-                self.data_ptr,
-                self.data_len_bytes as usize,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_len_bytes as usize) }
     }
 
     #[inline(always)]
     pub fn data_mut(&mut self) -> &mut [u8] {
-        let current_count = unsafe {
-            (*self.ref_count).load(Ordering::Acquire)
-        };
+        let current_count = unsafe { (*self.ref_count).load(Ordering::Acquire) };
         assert!(
             current_count == 1,
             "data_mut requires exclusive access, got {}",
             current_count
         );
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.data_ptr,
-                SLOT_SIZE_BYTES as usize,
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr, SLOT_SIZE_BYTES as usize) }
     }
 
     #[inline(always)]
@@ -394,25 +339,18 @@ impl PacketSlot {
 
     #[inline(always)]
     pub fn ref_count(&self) -> u32 {
-        unsafe {
-            (*self.ref_count).load(Ordering::Acquire)
-        }
+        unsafe { (*self.ref_count).load(Ordering::Acquire) }
     }
 }
 
 impl Drop for PacketSlot {
     fn drop(&mut self) {
-        let prev_count = unsafe {
-            (*self.ref_count)
-                .fetch_sub(1, Ordering::Release)
-        };
+        let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::Release) };
         assert!(prev_count > 0, "ref_count underflow");
         if prev_count == 1 {
             unsafe {
                 (*self.arena).dealloc(self.slot_index);
-                let _ = Box::from_raw(
-                    self.ref_count as *mut AtomicU32,
-                );
+                let _ = Box::from_raw(self.ref_count as *mut AtomicU32);
             }
         }
     }
@@ -473,12 +411,7 @@ impl ArenaPartition {
     ///
     /// - ≥2 assertions (range validation)
     /// - ≤70 lines
-    pub fn new(
-        partition_id: u32,
-        start_slot: u32,
-        end_slot: u32,
-        arena: &PacketArena,
-    ) -> Self {
+    pub fn new(partition_id: u32, start_slot: u32, end_slot: u32, arena: &PacketArena) -> Self {
         // Precondition: valid range
         assert!(
             start_slot < end_slot,
@@ -495,15 +428,15 @@ impl ArenaPartition {
         );
 
         let capacity = end_slot - start_slot;
-        
+
         // Create local free-list with partition-local indices
         // We use indices relative to start_slot internally
         let free_list = AtomicStack::new(capacity);
-        
+
         // Clear the free list (it was initialized with 0..capacity)
         // and repopulate with actual slot indices
         while free_list.pop().is_some() {}
-        
+
         // Push actual slot indices (in reverse for LIFO order)
         for slot_idx in (start_slot..end_slot).rev() {
             free_list.push(slot_idx - start_slot);
@@ -542,13 +475,13 @@ impl ArenaPartition {
             self.start_slot < self.end_slot,
             "partition must have valid range"
         );
-        
+
         // Pop from local free-list (relative index)
         let relative_idx = self.free_list.pop()?;
-        
+
         // Convert to absolute slot index
         let slot_index = self.start_slot + relative_idx;
-        
+
         // Postcondition: slot is within partition range
         assert!(
             slot_index >= self.start_slot && slot_index < self.end_slot,
@@ -594,10 +527,10 @@ impl ArenaPartition {
             self.start_slot,
             self.end_slot
         );
-        
+
         // Convert to relative index
         let relative_idx = slot_index - self.start_slot;
-        
+
         // Postcondition: relative index is valid
         assert!(
             relative_idx < self.capacity(),
@@ -705,15 +638,10 @@ impl PartitionedPacketSlot {
     /// - ≤70 lines
     #[inline(always)]
     pub fn clone_shallow(&self) -> Self {
-        let current_count = unsafe {
-            (*self.ref_count).load(Ordering::Acquire)
-        };
+        let current_count = unsafe { (*self.ref_count).load(Ordering::Acquire) };
         // Precondition: refcount is positive
-        assert!(
-            current_count > 0,
-            "cannot clone slot with ref_count 0"
-        );
-        
+        assert!(current_count > 0, "cannot clone slot with ref_count 0");
+
         unsafe {
             (*self.ref_count).fetch_add(1, Ordering::AcqRel);
         }
@@ -737,31 +665,19 @@ impl PartitionedPacketSlot {
             self.data_len_bytes,
             SLOT_SIZE_BYTES
         );
-        unsafe {
-            std::slice::from_raw_parts(
-                self.data_ptr,
-                self.data_len_bytes as usize,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_len_bytes as usize) }
     }
 
     /// Get mutable access to packet data (requires exclusive ownership).
     #[inline(always)]
     pub fn data_mut(&mut self) -> &mut [u8] {
-        let current_count = unsafe {
-            (*self.ref_count).load(Ordering::Acquire)
-        };
+        let current_count = unsafe { (*self.ref_count).load(Ordering::Acquire) };
         assert!(
             current_count == 1,
             "data_mut requires exclusive access, got {}",
             current_count
         );
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.data_ptr,
-                SLOT_SIZE_BYTES as usize,
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr, SLOT_SIZE_BYTES as usize) }
     }
 
     /// Set the data length.
@@ -809,9 +725,7 @@ impl PartitionedPacketSlot {
 
 impl Drop for PartitionedPacketSlot {
     fn drop(&mut self) {
-        let prev_count = unsafe {
-            (*self.ref_count).fetch_sub(1, Ordering::Release)
-        };
+        let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::Release) };
         assert!(prev_count > 0, "ref_count underflow");
         if prev_count == 1 {
             unsafe {
@@ -844,15 +758,9 @@ impl Drop for PartitionedPacketSlot {
 ///
 /// - ≥2 assertions
 /// - ≤70 lines
-pub fn create_partitions(
-    arena: &PacketArena,
-    num_partitions: u32,
-) -> Vec<ArenaPartition> {
+pub fn create_partitions(arena: &PacketArena, num_partitions: u32) -> Vec<ArenaPartition> {
     // Precondition: valid partition count
-    assert!(
-        num_partitions > 0,
-        "num_partitions must be > 0"
-    );
+    assert!(num_partitions > 0, "num_partitions must be > 0");
     assert!(
         num_partitions <= arena.capacity_slots,
         "num_partitions {} must be <= arena capacity {}",
@@ -885,11 +793,9 @@ pub fn create_partitions(
 
     // Postcondition: all slots are covered
     assert_eq!(
-        current_start,
-        total_slots,
+        current_start, total_slots,
         "partitions must cover all {} slots, got {}",
-        total_slots,
-        current_start
+        total_slots, current_start
     );
     // Postcondition: correct number of partitions
     assert_eq!(
@@ -935,8 +841,7 @@ mod tests {
     #[test]
     fn test_arena_new() {
         let arena = PacketArena::new(1).unwrap();
-        let expected =
-            (1024 * 1024) / SLOT_SIZE_BYTES as usize;
+        let expected = (1024 * 1024) / SLOT_SIZE_BYTES as usize;
         assert_eq!(arena.capacity() as usize, expected);
         assert_eq!(arena.free_count() as usize, expected);
         assert_eq!(arena.allocated_count(), 0);
@@ -956,8 +861,7 @@ mod tests {
     fn test_slot_data_access() {
         let arena = PacketArena::new(1).unwrap();
         let mut slot = arena.alloc().unwrap();
-        slot.data_mut()[0..4]
-            .copy_from_slice(&[1, 2, 3, 4]);
+        slot.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
         slot.set_len(4);
         assert_eq!(slot.len(), 4);
         assert_eq!(slot.data(), &[1, 2, 3, 4]);
@@ -967,8 +871,7 @@ mod tests {
     fn test_slot_clone_shallow() {
         let arena = PacketArena::new(1).unwrap();
         let mut slot = arena.alloc().unwrap();
-        slot.data_mut()[0..4]
-            .copy_from_slice(&[1, 2, 3, 4]);
+        slot.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
         slot.set_len(4);
         assert_eq!(slot.ref_count(), 1);
         let clone1 = slot.clone_shallow();
@@ -999,7 +902,7 @@ mod tests {
     fn test_partition_new() {
         let arena = PacketArena::new(1).unwrap();
         let partition = ArenaPartition::new(0, 0, 100, &arena);
-        
+
         assert_eq!(partition.partition_id(), 0);
         assert_eq!(partition.start_slot(), 0);
         assert_eq!(partition.end_slot(), 100);
@@ -1012,13 +915,13 @@ mod tests {
     fn test_partition_alloc_dealloc() {
         let arena = PacketArena::new(1).unwrap();
         let partition = ArenaPartition::new(0, 0, 100, &arena);
-        
+
         let initial_free = partition.free_count();
         let slot = partition.alloc().expect("should allocate");
-        
+
         assert_eq!(partition.free_count(), initial_free - 1);
         assert!(partition.owns_slot(slot.slot_index()));
-        
+
         drop(slot);
         assert_eq!(partition.free_count(), initial_free);
     }
@@ -1027,11 +930,11 @@ mod tests {
     fn test_partition_slot_data() {
         let arena = PacketArena::new(1).unwrap();
         let partition = ArenaPartition::new(0, 0, 100, &arena);
-        
+
         let mut slot = partition.alloc().unwrap();
         slot.data_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
         slot.set_len(4);
-        
+
         assert_eq!(slot.len(), 4);
         assert_eq!(slot.data(), &[1, 2, 3, 4]);
     }
@@ -1040,16 +943,16 @@ mod tests {
     fn test_partition_clone_shallow() {
         let arena = PacketArena::new(1).unwrap();
         let partition = ArenaPartition::new(0, 0, 100, &arena);
-        
+
         let mut slot = partition.alloc().unwrap();
         slot.data_mut()[0..4].copy_from_slice(&[5, 6, 7, 8]);
         slot.set_len(4);
-        
+
         assert_eq!(slot.ref_count(), 1);
         let clone = slot.clone_shallow();
         assert_eq!(slot.ref_count(), 2);
         assert_eq!(clone.data(), &[5, 6, 7, 8]);
-        
+
         drop(clone);
         assert_eq!(slot.ref_count(), 1);
     }
@@ -1058,30 +961,31 @@ mod tests {
     fn test_create_partitions() {
         let arena = PacketArena::new(1).unwrap();
         let total_slots = arena.capacity();
-        
+
         let partitions = create_partitions(&arena, 4);
-        
+
         assert_eq!(partitions.len(), 4);
-        
+
         // Verify disjoint ranges
         let mut covered_slots = 0u32;
         for (i, partition) in partitions.iter().enumerate() {
             assert_eq!(partition.partition_id(), i as u32);
             covered_slots += partition.capacity();
-            
+
             // Check no overlap with other partitions
             for (j, other) in partitions.iter().enumerate() {
                 if i != j {
                     assert!(
-                        partition.end_slot() <= other.start_slot() ||
-                        partition.start_slot() >= other.end_slot(),
+                        partition.end_slot() <= other.start_slot()
+                            || partition.start_slot() >= other.end_slot(),
                         "partitions {} and {} overlap",
-                        i, j
+                        i,
+                        j
                     );
                 }
             }
         }
-        
+
         // Verify all slots are covered
         assert_eq!(covered_slots, total_slots);
     }
@@ -1090,7 +994,7 @@ mod tests {
     fn test_partition_disjoint_allocation() {
         let arena = PacketArena::new(1).unwrap();
         let partitions = create_partitions(&arena, 4);
-        
+
         // Allocate from each partition
         let mut slots: Vec<PartitionedPacketSlot> = Vec::new();
         for partition in &partitions {
@@ -1102,13 +1006,14 @@ mod tests {
                 }
             }
         }
-        
+
         // Verify no duplicate slot indices
         let mut indices: Vec<u32> = slots.iter().map(|s| s.slot_index()).collect();
         indices.sort();
         for i in 1..indices.len() {
             assert_ne!(
-                indices[i], indices[i-1],
+                indices[i],
+                indices[i - 1],
                 "duplicate slot index {}",
                 indices[i]
             );
@@ -1119,7 +1024,7 @@ mod tests {
     fn test_partition_owns_slot() {
         let arena = PacketArena::new(1).unwrap();
         let partition = ArenaPartition::new(0, 100, 200, &arena);
-        
+
         assert!(!partition.owns_slot(99));
         assert!(partition.owns_slot(100));
         assert!(partition.owns_slot(150));

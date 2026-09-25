@@ -3,11 +3,8 @@
 //! These tests verify the correctness of the distributed state manager,
 //! including CRDT properties like commutativity, associativity, and idempotence.
 
-use nexus_state::{
-    DistributedState, DistributedStateConfig, CrdtError,
-    Dot, MAX_ACTORS,
-};
 use nexus_state::gossip::types::{StateUpdate, TrackInfo};
+use nexus_state::{CrdtError, DistributedState, DistributedStateConfig, Dot, MAX_ACTORS};
 
 // =============================================================================
 // Room Tests
@@ -61,7 +58,10 @@ fn test_room_capacity_limit() {
 
     // Fourth room should fail
     let result = state.create_room(4, "Room 4".to_string(), 100);
-    assert!(matches!(result, Err(CrdtError::CapacityExhausted { capacity: 3 })));
+    assert!(matches!(
+        result,
+        Err(CrdtError::CapacityExhausted { capacity: 3 })
+    ));
 }
 
 // =============================================================================
@@ -120,7 +120,10 @@ fn test_participant_room_capacity() {
 
     // Third should fail
     let result = state.add_participant(1, 3);
-    assert!(matches!(result, Err(CrdtError::CapacityExhausted { capacity: 2 })));
+    assert!(matches!(
+        result,
+        Err(CrdtError::CapacityExhausted { capacity: 2 })
+    ));
 }
 
 #[test]
@@ -156,7 +159,8 @@ fn test_add_update_track() {
         track_type: 1, // video
         content_type: 0,
         codec: 100,
-        bitrate_kbps: 2500, owner_node: 0,
+        bitrate_kbps: 2500,
+        owner_node: 0,
     };
 
     // Add track
@@ -171,9 +175,11 @@ fn test_add_update_track() {
 
     // Update track
     let new_info = TrackInfo {
-        track_type: 1, content_type: 0,
+        track_type: 1,
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 5000, owner_node: 0,
+        bitrate_kbps: 5000,
+        owner_node: 0,
     };
     let ts2 = state.update_track(1, new_info).unwrap();
     assert!(ts2 > ts1);
@@ -222,7 +228,10 @@ fn test_track_capacity_limit() {
 
     // Fourth should fail
     let result = state.add_track(4, TrackInfo::default());
-    assert!(matches!(result, Err(CrdtError::CapacityExhausted { capacity: 3 })));
+    assert!(matches!(
+        result,
+        Err(CrdtError::CapacityExhausted { capacity: 3 })
+    ));
 }
 
 // =============================================================================
@@ -294,7 +303,10 @@ fn test_subscription_capacity_limit() {
 
     // Fourth should fail
     let result = state.add_subscription(4, 1);
-    assert!(matches!(result, Err(CrdtError::CapacityExhausted { capacity: 3 })));
+    assert!(matches!(
+        result,
+        Err(CrdtError::CapacityExhausted { capacity: 3 })
+    ));
 }
 
 // =============================================================================
@@ -373,14 +385,18 @@ fn test_merge_track_updated() {
     let state = DistributedState::new(config);
 
     let info1 = TrackInfo {
-        track_type: 1, content_type: 0,
+        track_type: 1,
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 1000, owner_node: 0,
+        bitrate_kbps: 1000,
+        owner_node: 0,
     };
     let info2 = TrackInfo {
-        track_type: 1, content_type: 0,
+        track_type: 1,
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 2000, owner_node: 0,
+        bitrate_kbps: 2000,
+        owner_node: 0,
     };
 
     // Merge with lower timestamp first
@@ -464,7 +480,6 @@ fn test_merge_deltas_batch() {
     state.merge_deltas(updates).unwrap();
 
     // All updates should have been applied
-    assert!(state.participant_count(1) >= 0); // At least processed without error
     assert_eq!(state.subscription_count(), 1);
 }
 
@@ -479,14 +494,18 @@ fn test_lww_conflict_resolution() {
 
     // Two updates with same timestamp but different actors
     let info1 = TrackInfo {
-        track_type: 1, content_type: 0,
+        track_type: 1,
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 1000, owner_node: 0,
+        bitrate_kbps: 1000,
+        owner_node: 0,
     };
     let info2 = TrackInfo {
-        track_type: 1, content_type: 0,
+        track_type: 1,
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 2000, owner_node: 0,
+        bitrate_kbps: 2000,
+        owner_node: 0,
     };
 
     // Actor 1, timestamp 100
@@ -535,7 +554,9 @@ fn test_concurrent_updates() {
     let config = DistributedStateConfig::new(1);
     let state = Arc::new(DistributedState::new(config));
 
-    state.create_room(1, "Concurrent".to_string(), 1000).unwrap();
+    state
+        .create_room(1, "Concurrent".to_string(), 1000)
+        .unwrap();
 
     let mut handles = vec![];
 
@@ -581,7 +602,8 @@ fn test_concurrent_track_updates() {
         let handle = thread::spawn(move || {
             for i in 0..10 {
                 let info = TrackInfo {
-                    track_type: 1, content_type: 0,
+                    track_type: 1,
+                    content_type: 0,
                     codec: 100,
                     bitrate_kbps: (thread_id * 1000 + i * 100) as u32,
                     owner_node: 0,
@@ -598,8 +620,7 @@ fn test_concurrent_track_updates() {
     }
 
     // Track should exist with some valid bitrate
-    let track = state.get_track(1).unwrap();
-    assert!(track.bitrate_kbps > 0 || track.bitrate_kbps == 0); // Just checking it's accessible
+    assert!(state.get_track(1).is_some());
 }
 
 // =============================================================================
@@ -613,7 +634,11 @@ fn test_generate_deltas() {
     // ParticipantAdded
     let delta = DistributedState::generate_participant_added_delta(1, 42, dot);
     match delta {
-        StateUpdate::ParticipantAdded { room_id, participant_id, dot: d } => {
+        StateUpdate::ParticipantAdded {
+            room_id,
+            participant_id,
+            dot: d,
+        } => {
             assert_eq!(room_id, 1);
             assert_eq!(participant_id, 42);
             assert_eq!(d.clock(), 100);
@@ -624,7 +649,11 @@ fn test_generate_deltas() {
     // ParticipantRemoved
     let delta = DistributedState::generate_participant_removed_delta(1, 42, dot);
     match delta {
-        StateUpdate::ParticipantRemoved { room_id, participant_id, .. } => {
+        StateUpdate::ParticipantRemoved {
+            room_id,
+            participant_id,
+            ..
+        } => {
             assert_eq!(room_id, 1);
             assert_eq!(participant_id, 42);
         }
@@ -633,13 +662,20 @@ fn test_generate_deltas() {
 
     // TrackUpdated
     let info = TrackInfo {
-        track_type: 1, content_type: 0,
+        track_type: 1,
+        content_type: 0,
         codec: 100,
-        bitrate_kbps: 2500, owner_node: 0,
+        bitrate_kbps: 2500,
+        owner_node: 0,
     };
     let delta = DistributedState::generate_track_updated_delta(1, info, 200, 1);
     match delta {
-        StateUpdate::TrackUpdated { track_id, info: i, timestamp, actor } => {
+        StateUpdate::TrackUpdated {
+            track_id,
+            info: i,
+            timestamp,
+            actor,
+        } => {
             assert_eq!(track_id, 1);
             assert_eq!(i.bitrate_kbps, 2500);
             assert_eq!(timestamp, 200);
@@ -651,7 +687,11 @@ fn test_generate_deltas() {
     // SubscriptionAdded
     let delta = DistributedState::generate_subscription_added_delta(1, 42, dot);
     match delta {
-        StateUpdate::SubscriptionAdded { track_id, participant_id, .. } => {
+        StateUpdate::SubscriptionAdded {
+            track_id,
+            participant_id,
+            ..
+        } => {
             assert_eq!(track_id, 1);
             assert_eq!(participant_id, 42);
         }
@@ -661,7 +701,11 @@ fn test_generate_deltas() {
     // SubscriptionRemoved
     let delta = DistributedState::generate_subscription_removed_delta(1, 42, dot);
     match delta {
-        StateUpdate::SubscriptionRemoved { track_id, participant_id, .. } => {
+        StateUpdate::SubscriptionRemoved {
+            track_id,
+            participant_id,
+            ..
+        } => {
             assert_eq!(track_id, 1);
             assert_eq!(participant_id, 42);
         }

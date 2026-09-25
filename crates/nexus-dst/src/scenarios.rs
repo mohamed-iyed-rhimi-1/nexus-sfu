@@ -1,6 +1,6 @@
-/// Built-in simulation scenarios embedded as TOML strings.
-///
-/// Each scenario is a valid TOML document that can be parsed with `Scenario::from_toml()`.
+//! Built-in simulation scenarios embedded as TOML strings.
+//!
+//! Each scenario is a valid TOML document that can be parsed with `Scenario::from_toml()`.
 
 /// Basic room lifecycle: create room → join → publish → subscribe → forward → leave → cleanup.
 pub const BASIC_LIFECYCLE: &str = r#"
@@ -1203,7 +1203,12 @@ pub fn extreme_stress_test_toml() -> String {
                 writeln!(toml, "[[subscriptions]]").unwrap();
                 writeln!(toml, r#"subscriber = "p{subscriber_global:04}""#).unwrap();
                 writeln!(toml, r#"track = "p{publisher_global:04}_video""#).unwrap();
-                writeln!(toml, "subscribe_at_ms = {}", 5000 + subscriber_global * 2 + 1).unwrap();
+                writeln!(
+                    toml,
+                    "subscribe_at_ms = {}",
+                    5000 + subscriber_global * 2 + 1
+                )
+                .unwrap();
                 writeln!(toml).unwrap();
             }
         }
@@ -1526,7 +1531,8 @@ const BUILTINS: &[BuiltinEntry] = &[
     },
     BuiltinEntry {
         name: "extreme_stress_test",
-        description: "500 participants, 10 rooms, full mesh - push architecture limits with benchmarks",
+        description:
+            "500 participants, 10 rooms, full mesh - push architecture limits with benchmarks",
         toml: BuiltinToml::Dynamic(extreme_stress_test_toml),
     },
     BuiltinEntry {
@@ -1543,10 +1549,13 @@ const BUILTINS: &[BuiltinEntry] = &[
 
 /// Look up a built-in scenario by name. Returns the TOML string if found.
 pub fn get_builtin_scenario(name: &str) -> Option<String> {
-    BUILTINS.iter().find(|e| e.name == name).map(|e| match &e.toml {
-        BuiltinToml::Static(s) => (*s).to_string(),
-        BuiltinToml::Dynamic(f) => f(),
-    })
+    BUILTINS
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| match &e.toml {
+            BuiltinToml::Static(s) => (*s).to_string(),
+            BuiltinToml::Dynamic(f) => f(),
+        })
 }
 
 /// List all built-in scenarios as `(name, description)` pairs.

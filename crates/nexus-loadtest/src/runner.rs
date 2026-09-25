@@ -13,7 +13,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::client::HeadlessClient;
-use crate::config::{ClientConfig, ClientRole, ConferenceConfig, OutputFormat, StressConfig, TestConfig, WebinarConfig};
+use crate::config::{
+    ClientConfig, ClientRole, ConferenceConfig, OutputFormat, StressConfig, TestConfig,
+    WebinarConfig,
+};
 use crate::error::LoadTestError;
 use crate::metrics::{AggregatedMetrics, MetricsCollector};
 use crate::progress::ProgressDisplay;
@@ -29,6 +32,9 @@ struct SpawnResult {
     /// Error message (if failed)
     error: Option<String>,
 }
+
+/// Per-client discover/subscribe task: (client index, subscribed track IDs or error)
+type SubscribeTask = JoinHandle<(usize, Result<Vec<u64>, String>)>;
 
 /// Test runner that orchestrates load tests
 ///
@@ -93,11 +99,11 @@ impl TestRunner {
     /// Spawn a single client and connect it to the SFU
     ///
     /// Returns the client wrapped in Arc<Mutex<>> for concurrent access.
-    async fn spawn_client(
-        client_id: usize,
-        client_config: ClientConfig,
-    ) -> SpawnResult {
-        debug!("Spawning client {} with role {:?}", client_id, client_config.role);
+    async fn spawn_client(client_id: usize, client_config: ClientConfig) -> SpawnResult {
+        debug!(
+            "Spawning client {} with role {:?}",
+            client_id, client_config.role
+        );
 
         // Create the client
         let client = match HeadlessClient::new(client_config).await {
@@ -124,10 +130,7 @@ impl TestRunner {
     /// concurrency limit to avoid overwhelming the system.
     ///
     /// **Validates: Requirements 2.3** - Support spawning at least 1000 concurrent clients
-    pub async fn spawn_clients(
-        &mut self,
-        configs: Vec<ClientConfig>,
-    ) -> Result<(), LoadTestError> {
+    pub async fn spawn_clients(&mut self, configs: Vec<ClientConfig>) -> Result<(), LoadTestError> {
         let total_clients = configs.len();
         info!("Spawning {} clients concurrently", total_clients);
 
@@ -139,9 +142,7 @@ impl TestRunner {
             self.metrics_collector.register_client(client_id);
 
             // Spawn task for this client
-            let handle = tokio::spawn(async move {
-                Self::spawn_client(client_id, config).await
-            });
+            let handle = tokio::spawn(async move { Self::spawn_client(client_id, config).await });
             handles.push(handle);
         }
 
@@ -181,7 +182,8 @@ impl TestRunner {
         let client_count = self.clients.len();
         info!("Connecting {} clients to SFU", client_count);
 
-        let mut handles: Vec<JoinHandle<(usize, Result<(), String>)>> = Vec::with_capacity(client_count);
+        let mut handles: Vec<JoinHandle<(usize, Result<(), String>)>> =
+            Vec::with_capacity(client_count);
 
         for (client_id, client) in self.clients.iter().enumerate() {
             let client = Arc::clone(client);
@@ -200,20 +202,18 @@ impl TestRunner {
         // Collect results
         for handle in handles {
             match handle.await {
-                Ok((client_id, result)) => {
-                    match result {
-                        Ok(()) => {
-                            self.success_count += 1;
-                            self.metrics_collector.mark_connected(client_id);
-                            debug!("Client {} connected successfully", client_id);
-                        }
-                        Err(e) => {
-                            self.failed_count += 1;
-                            self.metrics_collector.mark_failed(client_id);
-                            warn!("Client {} failed to connect: {}", client_id, e);
-                        }
+                Ok((client_id, result)) => match result {
+                    Ok(()) => {
+                        self.success_count += 1;
+                        self.metrics_collector.mark_connected(client_id);
+                        debug!("Client {} connected successfully", client_id);
                     }
-                }
+                    Err(e) => {
+                        self.failed_count += 1;
+                        self.metrics_collector.mark_failed(client_id);
+                        warn!("Client {} failed to connect: {}", client_id, e);
+                    }
+                },
                 Err(e) => {
                     error!("Task join error during connect: {}", e);
                     self.failed_count += 1;
@@ -263,6 +263,51 @@ impl TestRunner {
         Ok(())
     }
 
+    /// Have every subscribing client discover announced tracks and subscribe, concurrently.
+    ///
+    /// Returns `(successful, attempted)` subscription counts; a client that fails
+    /// counts as one failed attempt.
+    pub async fn discover_and_subscribe_all(&mut self, timeout: Duration) -> (u32, u32) {
+        let mut handles: Vec<SubscribeTask> = Vec::new();
+        for (idx, client) in self.clients.iter().enumerate() {
+            let client = Arc::clone(client);
+            handles.push(tokio::spawn(async move {
+                let mut c = client.lock().await;
+                if c.role().can_subscribe() {
+                    (
+                        idx,
+                        c.discover_and_subscribe(timeout)
+                            .await
+                            .map_err(|e| e.to_string()),
+                    )
+                } else {
+                    (idx, Ok(Vec::new()))
+                }
+            }));
+        }
+
+        let mut successful = 0u32;
+        let mut attempted = 0u32;
+        for handle in handles {
+            match handle.await {
+                Ok((idx, Ok(tracks))) => {
+                    successful += tracks.len() as u32;
+                    attempted += tracks.len() as u32;
+                    debug!("Client {} subscribed to {} tracks", idx, tracks.len());
+                }
+                Ok((idx, Err(e))) => {
+                    attempted += 1;
+                    warn!("Client {} failed to discover/subscribe: {}", idx, e);
+                }
+                Err(e) => {
+                    attempted += 1;
+                    error!("Subscribe task join error: {}", e);
+                }
+            }
+        }
+        (successful, attempted)
+    }
+
     /// Collect metrics from all clients
     ///
     /// Aggregates metrics from all clients in the pool into the metrics collector.
@@ -292,7 +337,8 @@ impl TestRunner {
                 );
 
                 // Record bytes
-                self.metrics_collector.record_bytes(client_id, metrics.bytes_received);
+                self.metrics_collector
+                    .record_bytes(client_id, metrics.bytes_received);
 
                 // Record time to first frame
                 if let Some(ttff) = metrics.time_to_first_frame {
@@ -301,7 +347,8 @@ impl TestRunner {
 
                 // Record connection time
                 if let Some(conn_time) = metrics.connection_time {
-                    self.metrics_collector.record_connection_time(client_id, conn_time);
+                    self.metrics_collector
+                        .record_connection_time(client_id, conn_time);
                 }
             }
         }
@@ -381,6 +428,7 @@ impl TestRunner {
             role: ClientRole::Broadcaster,
             connection_timeout: config.base.connection_timeout,
             ice_servers: Vec::new(),
+            connection: config.base.connection.clone(),
         };
         client_configs.push(broadcaster_config);
 
@@ -391,7 +439,8 @@ impl TestRunner {
                 room: config.room.clone(),
                 role: ClientRole::Viewer,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(viewer_config);
         }
@@ -419,28 +468,9 @@ impl TestRunner {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Step 4b: Have all viewers discover and subscribe to the broadcaster's tracks concurrently
-        let mut subscribe_handles: Vec<JoinHandle<(usize, Result<Vec<u64>, String>)>> = Vec::new();
-        for (idx, client) in runner.clients.iter().enumerate() {
-            let client = Arc::clone(client);
-            let handle = tokio::spawn(async move {
-                let mut c = client.lock().await;
-                if c.role().can_subscribe() {
-                    let result = c.discover_and_subscribe(Duration::from_secs(5)).await
-                        .map_err(|e| e.to_string());
-                    (idx, result)
-                } else {
-                    (idx, Ok(Vec::new()))
-                }
-            });
-            subscribe_handles.push(handle);
-        }
-        for handle in subscribe_handles {
-            match handle.await {
-                Ok((idx, Err(e))) => warn!("Viewer {} failed to discover/subscribe: {}", idx, e),
-                Err(e) => warn!("Subscribe task join error: {}", e),
-                _ => {}
-            }
-        }
+        runner
+            .discover_and_subscribe_all(Duration::from_secs(5))
+            .await;
 
         // Create report generator for Prometheus updates
         let report_generator = ReportGenerator::new(
@@ -517,7 +547,10 @@ impl TestRunner {
             report_generator.output(&report, config.base.report_file.as_deref())?;
         } else {
             // For Prometheus, keep the server running briefly to allow scraping
-            info!("Prometheus metrics available at http://0.0.0.0:{}/metrics", config.base.prometheus_port);
+            info!(
+                "Prometheus metrics available at http://0.0.0.0:{}/metrics",
+                config.base.prometheus_port
+            );
             info!("Press Ctrl+C to stop the metrics server, or wait 5 seconds for auto-shutdown");
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
@@ -568,7 +601,8 @@ impl TestRunner {
                 room: config.room.clone(),
                 role: ClientRole::Participant,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(participant_config);
         }
@@ -598,42 +632,9 @@ impl TestRunner {
         // Step 5: Each participant discovers and subscribes to other participants' tracks concurrently
         // Requirement 4.3: Each Participant subscribes to all other Participants' tracks
         // Requirement 4.4: Track subscription success rate
-        let mut subscribe_handles: Vec<JoinHandle<(usize, Result<Vec<u64>, String>)>> = Vec::new();
-        for (idx, client) in runner.clients.iter().enumerate() {
-            let client = Arc::clone(client);
-            let handle = tokio::spawn(async move {
-                let mut c = client.lock().await;
-                if c.role().can_subscribe() {
-                    let result = c.discover_and_subscribe(Duration::from_secs(5)).await
-                        .map_err(|e| e.to_string());
-                    (idx, result)
-                } else {
-                    (idx, Ok(Vec::new()))
-                }
-            });
-            subscribe_handles.push(handle);
-        }
-
-        let mut total_subscriptions = 0u32;
-        let mut successful_subscriptions = 0u32;
-        for handle in subscribe_handles {
-            match handle.await {
-                Ok((idx, Ok(tracks))) => {
-                    let count = tracks.len() as u32;
-                    total_subscriptions += count;
-                    successful_subscriptions += count;
-                    debug!("Client {} subscribed to {} tracks", idx, count);
-                }
-                Ok((idx, Err(e))) => {
-                    total_subscriptions += 1;
-                    warn!("Client {} failed to discover/subscribe: {}", idx, e);
-                }
-                Err(e) => {
-                    total_subscriptions += 1;
-                    error!("Subscribe task join error: {}", e);
-                }
-            }
-        }
+        let (successful_subscriptions, total_subscriptions) = runner
+            .discover_and_subscribe_all(Duration::from_secs(5))
+            .await;
 
         // Calculate subscription success rate for Requirement 4.4
         let subscription_success_rate = if total_subscriptions > 0 {
@@ -721,7 +722,10 @@ impl TestRunner {
             report_generator.output(&report, config.base.report_file.as_deref())?;
         } else {
             // For Prometheus, keep the server running briefly to allow scraping
-            info!("Prometheus metrics available at http://0.0.0.0:{}/metrics", config.base.prometheus_port);
+            info!(
+                "Prometheus metrics available at http://0.0.0.0:{}/metrics",
+                config.base.prometheus_port
+            );
             info!("Press Ctrl+C to stop the metrics server, or wait 5 seconds for auto-shutdown");
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
@@ -770,7 +774,8 @@ impl TestRunner {
         );
 
         // Track per-room metrics independently (Requirement 5.3)
-        let mut room_runners: Vec<(String, TestRunner)> = Vec::with_capacity(config.room_count as usize);
+        let mut room_runners: Vec<(String, TestRunner)> =
+            Vec::with_capacity(config.room_count as usize);
         let mut room_init_failures: Vec<(String, String)> = Vec::new();
 
         // Step 1: Create R rooms with P participants each (Requirements 5.1, 5.2)
@@ -778,7 +783,10 @@ impl TestRunner {
 
         for room_idx in 0..config.room_count {
             let room_name = format!("stress-room-{}", room_idx);
-            info!("Initializing room '{}' with {} participants", room_name, config.participants_per_room);
+            info!(
+                "Initializing room '{}' with {} participants",
+                room_name, config.participants_per_room
+            );
 
             let mut runner = TestRunner::new(config.base.clone());
 
@@ -790,7 +798,8 @@ impl TestRunner {
                     room: room_name.clone(),
                     role: ClientRole::Participant,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(participant_config);
             }
@@ -812,14 +821,20 @@ impl TestRunner {
                         }
                         Err(e) => {
                             // Requirement 5.5: Log the failure and continue with remaining rooms
-                            warn!("Room '{}' connection failed: {}. Continuing with remaining rooms.", room_name, e);
+                            warn!(
+                                "Room '{}' connection failed: {}. Continuing with remaining rooms.",
+                                room_name, e
+                            );
                             room_init_failures.push((room_name, e.to_string()));
                         }
                     }
                 }
                 Err(e) => {
                     // Requirement 5.5: Log the failure and continue with remaining rooms
-                    warn!("Room '{}' spawn failed: {}. Continuing with remaining rooms.", room_name, e);
+                    warn!(
+                        "Room '{}' spawn failed: {}. Continuing with remaining rooms.",
+                        room_name, e
+                    );
                     room_init_failures.push((room_name, e.to_string()));
                 }
             }
@@ -828,7 +843,10 @@ impl TestRunner {
         // Log summary of room initialization
         let total_successful: u32 = room_runners.iter().map(|(_, r)| r.success_count()).sum();
         let total_failed: u32 = room_runners.iter().map(|(_, r)| r.failed_count()).sum();
-        progress.set_connected(total_successful, total_failed + room_init_failures.len() as u32);
+        progress.set_connected(
+            total_successful,
+            total_failed + room_init_failures.len() as u32,
+        );
 
         info!(
             "Room initialization complete: {} rooms active, {} rooms failed",
@@ -843,12 +861,12 @@ impl TestRunner {
             let empty_metrics = AggregatedMetrics::default();
             let report = report_generator.generate("stress", &config.base, empty_metrics);
             report_generator.output(&report, config.base.report_file.as_deref())?;
-            
+
             // Stop Prometheus server if running
             if let Some(ref mut server) = prometheus_server {
                 server.stop().await;
             }
-            
+
             return Ok(report);
         }
 
@@ -863,6 +881,13 @@ impl TestRunner {
         // Give some time for tracks to be published and propagated
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        // Each participant subscribes to the other participants in its room
+        for (_room_name, runner) in room_runners.iter_mut() {
+            runner
+                .discover_and_subscribe_all(Duration::from_secs(5))
+                .await;
+        }
+
         // Step 3: Run for the configured duration, collecting metrics periodically
         // Requirement 5.3: Track per-room metrics independently
         let test_start = std::time::Instant::now();
@@ -875,7 +900,8 @@ impl TestRunner {
             }
 
             // Update progress display with aggregated metrics
-            let aggregated = Self::aggregate_room_metrics(&room_runners, room_init_failures.len() as u32);
+            let aggregated =
+                Self::aggregate_room_metrics(&room_runners, room_init_failures.len() as u32);
             progress.update_stress(&aggregated, room_runners.len(), room_init_failures.len());
 
             // Update Prometheus metrics if server is running
@@ -908,7 +934,8 @@ impl TestRunner {
         }
 
         // Step 5: Aggregate metrics across all rooms (Requirement 5.4)
-        let aggregated_metrics = Self::aggregate_room_metrics(&room_runners, room_init_failures.len() as u32);
+        let aggregated_metrics =
+            Self::aggregate_room_metrics(&room_runners, room_init_failures.len() as u32);
 
         // Finish progress display
         progress.finish(&aggregated_metrics);
@@ -940,7 +967,10 @@ impl TestRunner {
             report_generator.output(&report, config.base.report_file.as_deref())?;
         } else {
             // For Prometheus, keep the server running briefly to allow scraping
-            info!("Prometheus metrics available at http://0.0.0.0:{}/metrics", config.base.prometheus_port);
+            info!(
+                "Prometheus metrics available at http://0.0.0.0:{}/metrics",
+                config.base.prometheus_port
+            );
             info!("Press Ctrl+C to stop the metrics server, or wait 5 seconds for auto-shutdown");
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
@@ -957,10 +987,13 @@ impl TestRunner {
     ///
     /// Combines per-room metrics into a single aggregated result.
     /// This implements Requirement 5.4: Aggregate metrics across all rooms.
-    pub fn aggregate_room_metrics(room_runners: &[(String, TestRunner)], failed_rooms: u32) -> AggregatedMetrics {
+    pub fn aggregate_room_metrics(
+        room_runners: &[(String, TestRunner)],
+        failed_rooms: u32,
+    ) -> AggregatedMetrics {
         use crate::metrics::{
-            calculate_connection_success_rate, calculate_packet_loss_rate,
-            calculate_percentile, calculate_throughput_bps, calculate_throughput_pps,
+            calculate_connection_success_rate, calculate_packet_loss_rate, calculate_percentile,
+            calculate_throughput_bps, calculate_throughput_pps,
         };
 
         if room_runners.is_empty() {
@@ -1027,7 +1060,8 @@ impl TestRunner {
         let latency_p99 = calculate_percentile(&all_latencies, 99.0);
 
         // Calculate packet loss rate
-        let packet_loss_rate = calculate_packet_loss_rate(total_packets_received, total_packets_lost);
+        let packet_loss_rate =
+            calculate_packet_loss_rate(total_packets_received, total_packets_lost);
 
         // Calculate average jitter
         let jitter_avg = if all_jitter.is_empty() {
@@ -1048,7 +1082,8 @@ impl TestRunner {
         let throughput_bps = calculate_throughput_bps(total_bytes, duration);
 
         // Calculate connection success rate
-        let connection_success_rate = calculate_connection_success_rate(successful_clients, failed_clients);
+        let connection_success_rate =
+            calculate_connection_success_rate(successful_clients, failed_clients);
 
         // Calculate average time to first frame
         let avg_time_to_first_frame = if all_ttff.is_empty() {
@@ -1136,7 +1171,8 @@ mod tests {
                 room: config.room.clone(),
                 role: ClientRole::Broadcaster,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(broadcaster_config);
 
@@ -1147,7 +1183,8 @@ mod tests {
                     room: config.room.clone(),
                     role: ClientRole::Viewer,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(viewer_config);
             }
@@ -1172,13 +1209,15 @@ mod tests {
         assert_eq!(configs.len(), 11);
 
         // Verify exactly 1 broadcaster (Requirement 3.1)
-        let broadcaster_count = configs.iter()
+        let broadcaster_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Broadcaster)
             .count();
         assert_eq!(broadcaster_count, 1, "Should have exactly 1 broadcaster");
 
         // Verify exactly N viewers (Requirement 3.2)
-        let viewer_count = configs.iter()
+        let viewer_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Viewer)
             .count();
         assert_eq!(viewer_count, 10, "Should have exactly 10 viewers");
@@ -1204,7 +1243,8 @@ mod tests {
                 room: config.room.clone(),
                 role: ClientRole::Broadcaster,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(broadcaster_config);
 
@@ -1214,7 +1254,8 @@ mod tests {
                     room: config.room.clone(),
                     role: ClientRole::Viewer,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(viewer_config);
             }
@@ -1246,7 +1287,8 @@ mod tests {
                 room: config.room.clone(),
                 role: ClientRole::Broadcaster,
                 connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: config.base.connection.clone(),
             };
             client_configs.push(broadcaster_config);
 
@@ -1256,7 +1298,8 @@ mod tests {
                     room: config.room.clone(),
                     role: ClientRole::Viewer,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(viewer_config);
             }
@@ -1275,12 +1318,14 @@ mod tests {
         // Verify 1 broadcaster + 1000 viewers = 1001 total
         assert_eq!(configs.len(), 1001);
 
-        let broadcaster_count = configs.iter()
+        let broadcaster_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Broadcaster)
             .count();
         assert_eq!(broadcaster_count, 1);
 
-        let viewer_count = configs.iter()
+        let viewer_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Viewer)
             .count();
         assert_eq!(viewer_count, 1000);
@@ -1301,7 +1346,8 @@ mod tests {
                     room: config.room.clone(),
                     role: ClientRole::Participant,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(participant_config);
             }
@@ -1326,18 +1372,21 @@ mod tests {
         assert_eq!(configs.len(), 5);
 
         // Verify all are Participants
-        let participant_count = configs.iter()
+        let participant_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Participant)
             .count();
         assert_eq!(participant_count, 5, "Should have exactly 5 participants");
 
         // Verify no Broadcasters or Viewers
-        let broadcaster_count = configs.iter()
+        let broadcaster_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Broadcaster)
             .count();
         assert_eq!(broadcaster_count, 0, "Should have no broadcasters");
 
-        let viewer_count = configs.iter()
+        let viewer_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Viewer)
             .count();
         assert_eq!(viewer_count, 0, "Should have no viewers");
@@ -1361,7 +1410,8 @@ mod tests {
                     room: config.room.clone(),
                     role: ClientRole::Participant,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(participant_config);
             }
@@ -1393,7 +1443,8 @@ mod tests {
                     room: config.room.clone(),
                     role: ClientRole::Participant,
                     connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                    ice_servers: Vec::new(),
+                    connection: config.base.connection.clone(),
                 };
                 client_configs.push(participant_config);
             }
@@ -1412,7 +1463,8 @@ mod tests {
         // Verify exactly 100 participants
         assert_eq!(configs.len(), 100);
 
-        let participant_count = configs.iter()
+        let participant_count = configs
+            .iter()
             .filter(|c| c.role == ClientRole::Participant)
             .count();
         assert_eq!(participant_count, 100);
@@ -1476,7 +1528,8 @@ mod tests {
                         room: room_name.clone(),
                         role: ClientRole::Participant,
                         connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                        ice_servers: Vec::new(),
+                        connection: config.base.connection.clone(),
                     };
                     client_configs.push(participant_config);
                 }
@@ -1522,7 +1575,10 @@ mod tests {
 
         // Verify total participant count = R * P
         let total_participants: usize = room_configs.iter().map(|(_, c)| c.len()).sum();
-        assert_eq!(total_participants, 15, "Total should be 3 * 5 = 15 participants");
+        assert_eq!(
+            total_participants, 15,
+            "Total should be 3 * 5 = 15 participants"
+        );
     }
 
     /// Test stress config with zero rooms
@@ -1541,7 +1597,8 @@ mod tests {
                         room: room_name.clone(),
                         role: ClientRole::Participant,
                         connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                        ice_servers: Vec::new(),
+                        connection: config.base.connection.clone(),
                     };
                     client_configs.push(participant_config);
                 }
@@ -1580,7 +1637,8 @@ mod tests {
                         room: room_name.clone(),
                         role: ClientRole::Participant,
                         connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                        ice_servers: Vec::new(),
+                        connection: config.base.connection.clone(),
                     };
                     client_configs.push(participant_config);
                 }
@@ -1622,7 +1680,8 @@ mod tests {
                         room: room_name.clone(),
                         role: ClientRole::Participant,
                         connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                        ice_servers: Vec::new(),
+                        connection: config.base.connection.clone(),
                     };
                     client_configs.push(participant_config);
                 }
@@ -1664,7 +1723,8 @@ mod tests {
                         room: room_name.clone(),
                         role: ClientRole::Participant,
                         connection_timeout: config.base.connection_timeout,
-            ice_servers: Vec::new(),
+                        ice_servers: Vec::new(),
+                        connection: config.base.connection.clone(),
                     };
                     client_configs.push(participant_config);
                 }
@@ -1732,13 +1792,17 @@ mod tests {
         let mut runner1 = TestRunner::with_defaults();
         runner1.metrics_collector_mut().register_client(0);
         runner1.metrics_collector_mut().mark_connected(0);
-        runner1.metrics_collector_mut().record_latency(0, Duration::from_millis(10));
+        runner1
+            .metrics_collector_mut()
+            .record_latency(0, Duration::from_millis(10));
         runner1.metrics_collector_mut().record_packets(0, 100, 5);
 
         let mut runner2 = TestRunner::with_defaults();
         runner2.metrics_collector_mut().register_client(0);
         runner2.metrics_collector_mut().mark_connected(0);
-        runner2.metrics_collector_mut().record_latency(0, Duration::from_millis(20));
+        runner2
+            .metrics_collector_mut()
+            .record_latency(0, Duration::from_millis(20));
         runner2.metrics_collector_mut().record_packets(0, 200, 10);
 
         let room_runners = vec![

@@ -151,7 +151,6 @@ impl AppState {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // API Server
 // ---------------------------------------------------------------------------
@@ -253,7 +252,11 @@ impl ApiServer {
             MIN_SECRET_LEN
         );
 
-        let state = Arc::new(AppState::with_distributed_state(jwt_secret, metrics, distributed_state));
+        let state = Arc::new(AppState::with_distributed_state(
+            jwt_secret,
+            metrics,
+            distributed_state,
+        ));
 
         // Build router with all routes
         let router = Router::new()
@@ -318,7 +321,6 @@ impl ApiServer {
         self.router.clone()
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // JWT Authentication Middleware
@@ -431,7 +433,6 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }
 }
 
-
 /// POST /rooms - Create a new room
 ///
 /// Requires JWT authentication.
@@ -473,11 +474,9 @@ async fn create_room_handler(
 
     // Create room in distributed state if available (for orchestrator synchronization)
     if let Some(ref distributed_state) = state.distributed_state {
-        if let Err(e) = distributed_state.create_room(
-            room_id,
-            request.name.clone(),
-            request.max_participants,
-        ) {
+        if let Err(e) =
+            distributed_state.create_room(room_id, request.name.clone(), request.max_participants)
+        {
             warn!("Failed to create room in distributed state: {:?}", e);
             return Err(ApiError::Internal(format!(
                 "Failed to create room in distributed state: {:?}",

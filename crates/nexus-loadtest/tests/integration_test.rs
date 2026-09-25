@@ -11,9 +11,8 @@
 use std::time::Duration;
 
 use nexus_loadtest::{
-    AggregatedMetrics, ClientConfig, ClientRole, ConferenceConfig, MetricsCollector,
-    OutputFormat, PerformanceTargets, ReportGenerator, TestConfig, TestReport, TestRunner,
-    WebinarConfig,
+    AggregatedMetrics, ClientConfig, ClientRole, ConferenceConfig, MetricsCollector, OutputFormat,
+    PerformanceTargets, ReportGenerator, TestConfig, TestReport, TestRunner, WebinarConfig,
 };
 
 /// Helper to create a test configuration
@@ -26,6 +25,7 @@ fn create_test_config(output_format: OutputFormat) -> TestConfig {
         connection_timeout: Duration::from_secs(30),
         verbose: false,
         prometheus_port: 9090,
+        connection: Default::default(),
     }
 }
 
@@ -46,7 +46,6 @@ fn create_sample_metrics() -> AggregatedMetrics {
         failed_clients: 2,
     }
 }
-
 
 // =============================================================================
 // Webinar Scenario Tests
@@ -75,6 +74,7 @@ mod webinar_scenario {
             role: ClientRole::Broadcaster,
             connection_timeout: base_config.connection_timeout,
             ice_servers: Vec::new(),
+            connection: Default::default(),
         };
         client_configs.push(broadcaster_config);
 
@@ -85,7 +85,8 @@ mod webinar_scenario {
                 room: room.clone(),
                 role: ClientRole::Viewer,
                 connection_timeout: base_config.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: Default::default(),
             };
             client_configs.push(viewer_config);
         }
@@ -119,7 +120,10 @@ mod webinar_scenario {
         // Verify all clients have correct room and URL
         for config in &client_configs {
             assert_eq!(config.room, room, "All clients should be in the same room");
-            assert_eq!(config.sfu_url, sfu_url, "All clients should connect to the same SFU");
+            assert_eq!(
+                config.sfu_url, sfu_url,
+                "All clients should connect to the same SFU"
+            );
         }
     }
 
@@ -165,7 +169,6 @@ mod webinar_scenario {
     }
 }
 
-
 // =============================================================================
 // Conference Scenario Tests
 // =============================================================================
@@ -193,7 +196,8 @@ mod conference_scenario {
                 room: room.clone(),
                 role: ClientRole::Participant,
                 connection_timeout: base_config.connection_timeout,
-            ice_servers: Vec::new(),
+                ice_servers: Vec::new(),
+                connection: Default::default(),
             };
             client_configs.push(participant_config);
         }
@@ -219,7 +223,10 @@ mod conference_scenario {
         // Verify all clients have correct room and URL
         for config in &client_configs {
             assert_eq!(config.room, room, "All clients should be in the same room");
-            assert_eq!(config.sfu_url, sfu_url, "All clients should connect to the same SFU");
+            assert_eq!(
+                config.sfu_url, sfu_url,
+                "All clients should connect to the same SFU"
+            );
         }
     }
 
@@ -230,7 +237,10 @@ mod conference_scenario {
     fn participant_role_has_correct_capabilities() {
         let role = ClientRole::Participant;
         assert!(role.can_publish(), "Participant should be able to publish");
-        assert!(role.can_subscribe(), "Participant should be able to subscribe");
+        assert!(
+            role.can_subscribe(),
+            "Participant should be able to subscribe"
+        );
     }
 
     /// Test conference subscription count calculation
@@ -283,7 +293,6 @@ mod conference_scenario {
         }
     }
 }
-
 
 // =============================================================================
 // Report Generation Tests
@@ -360,7 +369,10 @@ mod report_generation {
             serde_json::from_str(&json_output).expect("Should be valid JSON");
 
         // Verify required fields (Requirement 7.4)
-        assert!(parsed.get("scenario").is_some(), "JSON should have scenario");
+        assert!(
+            parsed.get("scenario").is_some(),
+            "JSON should have scenario"
+        );
         assert!(parsed.get("sfu_url").is_some(), "JSON should have sfu_url");
         assert!(
             parsed.get("duration_secs").is_some(),
@@ -409,7 +421,9 @@ mod report_generation {
         let original_report = generator.generate("stress", &config, metrics);
 
         // Serialize to JSON
-        let json = original_report.to_json().expect("Serialization should succeed");
+        let json = original_report
+            .to_json()
+            .expect("Serialization should succeed");
 
         // Deserialize back
         let restored_report = TestReport::from_json(&json).expect("Deserialization should succeed");
@@ -490,7 +504,11 @@ mod report_generation {
         let config = create_test_config(OutputFormat::Console);
         let metrics = create_sample_metrics();
 
-        for format in [OutputFormat::Console, OutputFormat::Json, OutputFormat::Prometheus] {
+        for format in [
+            OutputFormat::Console,
+            OutputFormat::Json,
+            OutputFormat::Prometheus,
+        ] {
             let generator = ReportGenerator::new(format, PerformanceTargets::default());
             let report = generator.generate("webinar", &config, metrics.clone());
 
@@ -502,7 +520,6 @@ mod report_generation {
         }
     }
 }
-
 
 // =============================================================================
 // Target Validation Tests
@@ -521,17 +538,17 @@ mod target_validation {
 
         // Create metrics that pass all default targets
         let passing_metrics = AggregatedMetrics {
-            latency_p50: Duration::from_millis(3),  // < 5ms target
+            latency_p50: Duration::from_millis(3), // < 5ms target
             latency_p95: Duration::from_millis(10),
             latency_p99: Duration::from_millis(12), // < 15ms target
             packet_loss_rate: 0.01,
             jitter_avg: Duration::from_millis(1),
-            throughput_pps: 600_000.0,              // > 500K target
+            throughput_pps: 600_000.0, // > 500K target
             throughput_bps: 1_000_000_000.0,
             connection_success_rate: 0.99,
             avg_time_to_first_frame: Duration::from_millis(50),
             total_clients: 1100,
-            successful_clients: 1050,               // > 1000 target
+            successful_clients: 1050, // > 1000 target
             failed_clients: 50,
         };
 
@@ -559,18 +576,21 @@ mod target_validation {
             latency_p99: Duration::from_millis(25), // > 15ms target
             packet_loss_rate: 0.05,
             jitter_avg: Duration::from_millis(5),
-            throughput_pps: 100_000.0,              // < 500K target
+            throughput_pps: 100_000.0, // < 500K target
             throughput_bps: 500_000.0,
             connection_success_rate: 0.80,
             avg_time_to_first_frame: Duration::from_millis(100),
             total_clients: 500,
-            successful_clients: 400,                // < 1000 target
+            successful_clients: 400, // < 1000 target
             failed_clients: 100,
         };
 
         let report = generator.generate("conference", &config, failing_metrics);
 
-        assert!(!report.passed, "Report should fail when targets are not met");
+        assert!(
+            !report.passed,
+            "Report should fail when targets are not met"
+        );
         assert!(
             report.target_validations.iter().all(|v| !v.passed),
             "All individual validations should fail"
@@ -592,12 +612,12 @@ mod target_validation {
             latency_p99: Duration::from_millis(12), // < 15ms target (PASS)
             packet_loss_rate: 0.01,
             jitter_avg: Duration::from_millis(1),
-            throughput_pps: 600_000.0,              // > 500K target (PASS)
+            throughput_pps: 600_000.0, // > 500K target (PASS)
             throughput_bps: 1_000_000_000.0,
             connection_success_rate: 0.99,
             avg_time_to_first_frame: Duration::from_millis(50),
             total_clients: 1100,
-            successful_clients: 1050,               // > 1000 target (PASS)
+            successful_clients: 1050, // > 1000 target (PASS)
             failed_clients: 50,
         };
 
@@ -609,8 +629,16 @@ mod target_validation {
         );
 
         // Count passed and failed validations
-        let passed_count = report.target_validations.iter().filter(|v| v.passed).count();
-        let failed_count = report.target_validations.iter().filter(|v| !v.passed).count();
+        let passed_count = report
+            .target_validations
+            .iter()
+            .filter(|v| v.passed)
+            .count();
+        let failed_count = report
+            .target_validations
+            .iter()
+            .filter(|v| !v.passed)
+            .count();
 
         assert_eq!(passed_count, 3, "3 targets should pass");
         assert_eq!(failed_count, 1, "1 target should fail");
@@ -622,10 +650,10 @@ mod target_validation {
     #[test]
     fn custom_targets_are_respected() {
         let custom_targets = PerformanceTargets {
-            latency_p50_ms: 20,      // More lenient
-            latency_p99_ms: 50,      // More lenient
-            min_participants: 100,   // Lower requirement
-            throughput_pps: 50_000,  // Lower requirement
+            latency_p50_ms: 20,     // More lenient
+            latency_p99_ms: 50,     // More lenient
+            min_participants: 100,  // Lower requirement
+            throughput_pps: 50_000, // Lower requirement
         };
 
         let generator = ReportGenerator::new(OutputFormat::Console, custom_targets);
@@ -638,12 +666,12 @@ mod target_validation {
             latency_p99: Duration::from_millis(40), // < 50ms custom target
             packet_loss_rate: 0.02,
             jitter_avg: Duration::from_millis(3),
-            throughput_pps: 75_000.0,               // > 50K custom target
+            throughput_pps: 75_000.0, // > 50K custom target
             throughput_bps: 500_000.0,
             connection_success_rate: 0.90,
             avg_time_to_first_frame: Duration::from_millis(80),
             total_clients: 150,
-            successful_clients: 120,                // > 100 custom target
+            successful_clients: 120, // > 100 custom target
             failed_clients: 30,
         };
 
@@ -655,7 +683,6 @@ mod target_validation {
         );
     }
 }
-
 
 // =============================================================================
 // Metrics Collection Tests
@@ -876,7 +903,11 @@ mod end_to_end_flow {
     #[test]
     fn all_scenarios_produce_valid_reports() {
         let scenarios = ["webinar", "conference", "stress"];
-        let formats = [OutputFormat::Console, OutputFormat::Json, OutputFormat::Prometheus];
+        let formats = [
+            OutputFormat::Console,
+            OutputFormat::Json,
+            OutputFormat::Prometheus,
+        ];
 
         for scenario in scenarios {
             for format in formats {

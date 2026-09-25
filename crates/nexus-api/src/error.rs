@@ -50,18 +50,10 @@ impl IntoResponse for ApiError {
     /// - Internal → 500
     fn into_response(self) -> Response {
         let (status, error_type) = match &self {
-            ApiError::Unauthorized { .. } => {
-                (StatusCode::UNAUTHORIZED, "unauthorized")
-            }
-            ApiError::NotFound { .. } => {
-                (StatusCode::NOT_FOUND, "not_found")
-            }
-            ApiError::BadRequest { .. } => {
-                (StatusCode::BAD_REQUEST, "bad_request")
-            }
-            ApiError::Internal(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
-            }
+            ApiError::Unauthorized { .. } => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            ApiError::NotFound { .. } => (StatusCode::NOT_FOUND, "not_found"),
+            ApiError::BadRequest { .. } => (StatusCode::BAD_REQUEST, "bad_request"),
+            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
 
         let body = ErrorResponse {

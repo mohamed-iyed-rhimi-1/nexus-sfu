@@ -162,7 +162,10 @@ impl RecordingSession {
     ///
     /// # TigerStyle: ≥2 assertions
     pub fn pause(&mut self, now_ns: u64) {
-        assert!(self.state == SessionState::Active, "can only pause active session");
+        assert!(
+            self.state == SessionState::Active,
+            "can only pause active session"
+        );
         assert!(now_ns >= self.start_time_ns, "time must not go backwards");
 
         self.pause_start_ns = now_ns;
@@ -173,7 +176,10 @@ impl RecordingSession {
     ///
     /// # TigerStyle: ≥2 assertions
     pub fn resume(&mut self, now_ns: u64) {
-        assert!(self.state == SessionState::Paused, "can only resume paused session");
+        assert!(
+            self.state == SessionState::Paused,
+            "can only resume paused session"
+        );
         assert!(now_ns >= self.pause_start_ns, "time must not go backwards");
 
         self.paused_duration_ns += now_ns - self.pause_start_ns;

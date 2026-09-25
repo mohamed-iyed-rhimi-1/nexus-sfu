@@ -325,7 +325,7 @@ impl AfXdpSocket {
     pub fn new(ifname: &str, queue_id: u32, queue_size: u32) -> Result<Self, XdpError> {
         // Assertion: interface name must not be empty
         assert!(!ifname.is_empty(), "interface name must not be empty");
-        
+
         // Assertion: queue size must be power of 2
         assert!(
             queue_size.is_power_of_two(),
@@ -423,7 +423,7 @@ impl AfXdpSocket {
     pub fn recv_batch(&mut self, max_packets: usize) -> Result<Vec<AfXdpPacket>, XdpError> {
         // Assertion: max_packets must be > 0
         assert!(max_packets > 0, "max_packets must be > 0");
-        
+
         // Assertion: max_packets must not exceed maximum
         assert!(
             max_packets <= MAX_BATCH_PACKETS,
@@ -597,9 +597,8 @@ impl AfXdpSocket {
     fn get_ifindex(ifname: &str) -> Result<u32, XdpError> {
         use std::ffi::CString;
 
-        let c_ifname = CString::new(ifname).map_err(|_| {
-            XdpError::SocketError("invalid interface name".to_string())
-        })?;
+        let c_ifname = CString::new(ifname)
+            .map_err(|_| XdpError::SocketError("invalid interface name".to_string()))?;
 
         let ifindex = unsafe { libc::if_nametoindex(c_ifname.as_ptr()) };
 
@@ -670,11 +669,7 @@ impl AfXdpSocket {
     }
 
     /// Create and map a ring.
-    fn create_ring(
-        _fd: RawFd,
-        size: u32,
-        _is_fill_or_rx: bool,
-    ) -> Result<XskRingDesc, XdpError> {
+    fn create_ring(_fd: RawFd, size: u32, _is_fill_or_rx: bool) -> Result<XskRingDesc, XdpError> {
         // Ring creation via mmap
         // This is a simplified placeholder - real implementation would use
         // xsk_ring_prod__reserve() / xsk_ring_cons__peek() from libbpf

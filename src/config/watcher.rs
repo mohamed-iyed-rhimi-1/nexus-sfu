@@ -17,6 +17,10 @@ impl ConfigWatcher {
         let config_clone = Arc::clone(&config);
         let path_clone = path.clone();
 
+        // Capture a Tokio handle at construction time so the notify callback
+        // (which runs on a non-Tokio thread) can spawn async work.
+        let tokio_handle = tokio::runtime::Handle::current();
+
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
                 if event.kind.is_modify() {
@@ -40,16 +44,14 @@ impl ConfigWatcher {
                                 return;
                             }
 
-                            // Only reload control plane settings
-                            let rt = tokio::runtime::Handle::try_current();
-                            if let Ok(handle) = rt {
-                                let config_clone = Arc::clone(&config_clone);
-                                handle.spawn(async move {
-                                    let mut config = config_clone.write().await;
-                                    config.reload_control_plane(&new_config);
-                                    info!("Configuration reloaded (control plane settings only)");
-                                });
-                            }
+                            // Only reload control plane settings.
+                            // Use the pre-captured Tokio handle (notify runs on its own thread).
+                            let config_clone = Arc::clone(&config_clone);
+                            tokio_handle.spawn(async move {
+                                let mut config = config_clone.write().await;
+                                config.reload_control_plane(&new_config);
+                                info!("Configuration reloaded (control plane settings only)");
+                            });
                         }
                         Err(e) => {
                             error!("Hot-reload: failed to load config file: {}", e);

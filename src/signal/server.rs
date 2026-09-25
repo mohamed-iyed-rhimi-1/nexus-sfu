@@ -31,8 +31,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use nexus_signal::websocket::server::{OrchestratorEvent, WebSocketServer};
 use crate::nexus_api::JwtValidator;
+use nexus_signal::websocket::server::{OrchestratorEvent, WebSocketServer};
 
 use nexus_signal::{QuicConfig, QuicSignaling};
 
@@ -111,8 +111,11 @@ impl SignalingServer {
         shutdown: Arc<AtomicBool>,
         orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
     ) -> Self {
-        assert!(!config.jwt_secret.is_empty(), "JWT secret must not be empty");
-        
+        assert!(
+            !config.jwt_secret.is_empty(),
+            "JWT secret must not be empty"
+        );
+
         Self {
             config,
             shutdown,
@@ -152,18 +155,17 @@ impl SignalingServer {
         match self.try_start_quic().await {
             Ok(quic_server) => {
                 info!(addr = %self.config.quic_addr, "QUIC signaling started successfully");
-                
-                // QUIC handles TLS, so run WebSocket as plain WS for browser fallback.
-                // Browsers can't easily use WSS with self-signed certs in development.
-                let ws_server = self.create_websocket_server_plain();
+
+                // When QUIC is available (TLS certs configured), WS fallback also uses TLS.
+                let ws_server = self.create_websocket_server();
                 self.active_transport.store(3, Ordering::Release); // Both
-                
+
                 info!(
                     quic_addr = %self.config.quic_addr,
                     ws_addr = %self.config.ws_addr,
                     "Both QUIC and WebSocket signaling active"
                 );
-                
+
                 // Run both servers
                 self.run_both(quic_server, ws_server).await
             }
@@ -172,13 +174,13 @@ impl SignalingServer {
                     error = %e,
                     "QUIC signaling failed, falling back to WebSocket"
                 );
-                
+
                 // Fall back to WebSocket only
                 let ws_server = self.create_websocket_server();
                 self.active_transport.store(2, Ordering::Release); // WebSocket
-                
+
                 info!(addr = %self.config.ws_addr, "WebSocket signaling started (fallback)");
-                
+
                 self.run_websocket(ws_server).await
             }
         }
@@ -199,10 +201,7 @@ impl SignalingServer {
             ));
         }
         if !std::path::Path::new(&self.config.tls_key_path).exists() {
-            return Err(format!(
-                "TLS key not found: {}",
-                self.config.tls_key_path
-            ));
+            return Err(format!("TLS key not found: {}", self.config.tls_key_path));
         }
 
         // Create QUIC config
@@ -231,23 +230,12 @@ impl SignalingServer {
         )
     }
 
-    /// Create a plain (non-TLS) WebSocket server for use alongside QUIC.
-    /// When QUIC handles TLS signaling, the WS fallback runs without TLS
-    /// so browsers can connect without self-signed cert issues in development.
-    fn create_websocket_server_plain(&self) -> WebSocketServer {
-        WebSocketServer::new(
-            self.config.ws_addr,
-            Arc::new(JwtValidator::new(&self.config.jwt_secret)),
-            self.shutdown.clone(),
-            self.orchestrator_tx.clone(),
-            "",
-            "",
-        )
-    }
-
     /// Run WebSocket server only.
     async fn run_websocket(self, server: WebSocketServer) -> Result<(), String> {
-        server.run().await.map_err(|e| format!("WebSocket server error: {}", e))
+        server
+            .run()
+            .await
+            .map_err(|e| format!("WebSocket server error: {}", e))
     }
 
     /// Run both QUIC and WebSocket servers.
@@ -256,9 +244,10 @@ impl SignalingServer {
         quic_server: Arc<QuicSignaling>,
         ws_server: WebSocketServer,
     ) -> Result<(), String> {
-        let shutdown = self.shutdown.clone();
-        
-        // Spawn QUIC server task
+        let shutdown_quic = self.shutdown.clone();
+        let shutdown_ws = self.shutdown.clone();
+
+        // Spawn both servers in separate tasks, both cancellable via shutdown.
         let quic_handle = tokio::spawn(async move {
             tokio::select! {
                 result = quic_server.run() => {
@@ -266,29 +255,50 @@ impl SignalingServer {
                         error!(error = %e, "QUIC signaling server error");
                     }
                 }
-                _ = wait_for_shutdown(shutdown) => {
+                _ = wait_for_shutdown(shutdown_quic) => {
                     info!("QUIC signaling server shutting down");
                 }
             }
         });
 
-        // Run WebSocket server in current task
-        let ws_result = ws_server.run().await;
+        let ws_handle = tokio::spawn(async move {
+            tokio::select! {
+                result = ws_server.run() => {
+                    if let Err(e) = result {
+                        error!(error = %e, "WebSocket signaling server error");
+                    }
+                }
+                _ = wait_for_shutdown(shutdown_ws) => {
+                    info!("WebSocket signaling server shutting down");
+                }
+            }
+        });
 
-        // Wait for QUIC to finish
-        let _ = quic_handle.await;
+        // Wait for both to finish.
+        let (quic_res, ws_res) = tokio::join!(quic_handle, ws_handle);
+        if let Err(e) = quic_res {
+            error!("QUIC task panicked: {}", e);
+        }
+        if let Err(e) = ws_res {
+            error!("WS task panicked: {}", e);
+        }
 
-        ws_result.map_err(|e| format!("WebSocket server error: {}", e))
+        Ok(())
     }
 }
 
 /// Wait for shutdown signal.
+/// Uses a polling interval to check the AtomicBool.
+/// A `tokio::sync::watch` channel would be more efficient,
+/// but this keeps compatibility with the existing AtomicBool interface.
 async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
+    use tokio::time::{interval, Duration};
+    let mut check = interval(Duration::from_millis(100));
     loop {
+        check.tick().await;
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -299,16 +309,16 @@ mod tests {
     #[test]
     fn test_active_transport_encoding() {
         let transport = Arc::new(std::sync::atomic::AtomicU8::new(0));
-        
+
         transport.store(0, Ordering::Release);
         assert_eq!(transport.load(Ordering::Acquire), 0);
-        
+
         transport.store(1, Ordering::Release);
         assert_eq!(transport.load(Ordering::Acquire), 1);
-        
+
         transport.store(2, Ordering::Release);
         assert_eq!(transport.load(Ordering::Acquire), 2);
-        
+
         transport.store(3, Ordering::Release);
         assert_eq!(transport.load(Ordering::Acquire), 3);
     }

@@ -31,7 +31,6 @@ pub mod metrics {
     include!(concat!(env!("OUT_DIR"), "/nexus.metrics.v1.rs"));
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// Google Congestion Control (GCC) implementation.
-/// 
+///
 /// Uses delay-based bandwidth estimation combined with loss-based estimation,
 /// probing, and priority-based track allocation. The combined estimate uses
 /// `min(delay_estimate, loss_estimate)` to be conservative.
@@ -79,14 +79,15 @@ impl AimdConfig {
         let decrease_factor = 0.85;
         let headroom_factor = 0.85;
 
+        // RFC 8698 §5: validate AIMD parameters
         assert!(increase_bps > 0, "Increase must be positive");
         assert!(
-            decrease_factor > 0.0 && decrease_factor < 1.0,
-            "Decrease factor must be in (0, 1)"
+            (0.5..=0.95).contains(&decrease_factor),
+            "Decrease factor must be in [0.5, 0.95] per RFC 8698"
         );
         assert!(
-            headroom_factor > 0.0 && headroom_factor < 1.0,
-            "Headroom factor must be in (0, 1)"
+            (0.5..=1.0).contains(&headroom_factor),
+            "Headroom factor must be in [0.5, 1.0]"
         );
 
         Self {
@@ -199,13 +200,15 @@ impl CongestionController {
     /// * `feedback` - Transport feedback containing packet arrival info
     /// * `timestamp_us` - Current timestamp in microseconds
     pub fn on_transport_feedback(&self, feedback: &TransportFeedback, timestamp_us: u64) {
-        self.stats.feedbacks_processed.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .feedbacks_processed
+            .fetch_add(1, Ordering::Relaxed);
 
         let mut inner = self.inner.lock();
 
         // Update delay-based estimate
         let delay_state = inner.delay_detector.on_feedback(feedback);
-        
+
         // Convert DelayBasedBweState to u8 for storage
         let state_val = match delay_state {
             DelayBasedBweState::Normal => 0,
@@ -235,7 +238,8 @@ impl CongestionController {
             DelayBasedBweState::Normal => current_estimate,
         };
 
-        self.delay_estimate_bps.store(delay_estimate, Ordering::Relaxed);
+        self.delay_estimate_bps
+            .store(delay_estimate, Ordering::Relaxed);
         inner.last_update_us = timestamp_us;
     }
 
@@ -255,12 +259,7 @@ impl CongestionController {
     /// - Uses interior mutability for shared access
     /// - Lock-free atomic updates for statistics
     /// - Minimal lock contention (mutex only for mutable state)
-    pub fn on_receiver_report(
-        &self,
-        fraction_lost: u8,
-        rtt_us: Option<u64>,
-        timestamp_us: u64,
-    ) {
+    pub fn on_receiver_report(&self, fraction_lost: u8, rtt_us: Option<u64>, timestamp_us: u64) {
         self.stats.reports_processed.fetch_add(1, Ordering::Relaxed);
 
         // Calculate loss percentage for statistics (lock-free)
@@ -278,13 +277,18 @@ impl CongestionController {
         }
 
         // Update loss-based estimate
-        let _loss_state = inner.loss_detector.on_receiver_report(fraction_lost, timestamp_us);
+        let _loss_state = inner
+            .loss_detector
+            .on_receiver_report(fraction_lost, timestamp_us);
         let loss_estimate = inner.loss_detector.estimate_bps();
-        self.loss_estimate_bps.store(loss_estimate, Ordering::Relaxed);
+        self.loss_estimate_bps
+            .store(loss_estimate, Ordering::Relaxed);
 
         // Update probe controller with loss feedback
         if inner.probe_controller.state() == ProbeState::Probing {
-            let result = inner.probe_controller.on_feedback(loss_percent, timestamp_us);
+            let result = inner
+                .probe_controller
+                .on_feedback(loss_percent, timestamp_us);
             match result {
                 ProbeResult::Success => {
                     self.stats.probe_successes.fetch_add(1, Ordering::Relaxed);
@@ -328,8 +332,13 @@ impl CongestionController {
             let mut inner = self.inner.lock();
 
             // Check if we should start probing
-            if inner.probe_controller.should_probe(raw_estimate, timestamp_us) {
-                inner.probe_controller.start_probe(raw_estimate, timestamp_us);
+            if inner
+                .probe_controller
+                .should_probe(raw_estimate, timestamp_us)
+            {
+                inner
+                    .probe_controller
+                    .start_probe(raw_estimate, timestamp_us);
                 self.stats.probe_attempts.fetch_add(1, Ordering::Relaxed);
             }
 
@@ -381,7 +390,7 @@ impl CongestionController {
     }
 
     /// Allocate bandwidth across tracks by priority with two-phase allocation.
-    /// 
+    ///
     /// Phase 1: Reserve minimum layer bitrate for all tracks to prevent starvation.
     /// Phase 2: Distribute remaining bandwidth in priority order.
     ///
@@ -398,9 +407,9 @@ impl CongestionController {
         );
 
         let available = self.target_bps.load(Ordering::Relaxed);
-        
+
         // Phase 1: Reserve minimum layer for all tracks
-        let (total_min_bitrate, can_satisfy_all_mins) = 
+        let (total_min_bitrate, can_satisfy_all_mins) =
             Self::allocate_minimum_layers(tracks, available);
 
         // Phase 2: Distribute remaining bandwidth by priority
@@ -431,7 +440,7 @@ impl CongestionController {
     fn allocate_minimum_layers(tracks: &mut [TrackAllocation], available: u64) -> (u64, bool) {
         // Precondition: available must be reasonable
         assert!(available <= u64::MAX / 2, "available overflow protection");
-        
+
         // Calculate total minimum bitrate needed
         let mut total_min_bitrate = 0u64;
         for track in tracks.iter() {
@@ -442,7 +451,7 @@ impl CongestionController {
         }
 
         let can_satisfy_all_mins = total_min_bitrate <= available;
-        
+
         if can_satisfy_all_mins {
             // Reserve minimum for all tracks
             for track in tracks.iter_mut() {
@@ -463,8 +472,11 @@ impl CongestionController {
         }
 
         // Postcondition: total_min_bitrate is bounded
-        assert!(total_min_bitrate <= u64::MAX / 2, "total_min_bitrate overflow");
-        
+        assert!(
+            total_min_bitrate <= u64::MAX / 2,
+            "total_min_bitrate overflow"
+        );
+
         (total_min_bitrate, can_satisfy_all_mins)
     }
 
@@ -476,7 +488,7 @@ impl CongestionController {
     fn allocate_remaining_by_priority(tracks: &mut [TrackAllocation], mut remaining: u64) {
         // Precondition: remaining must be reasonable
         assert!(remaining <= u64::MAX / 2, "remaining overflow protection");
-        
+
         // Sort by priority (descending)
         tracks.sort_by(|a, b| b.priority.cmp(&a.priority));
 
@@ -489,7 +501,7 @@ impl CongestionController {
             let current_allocation = track.allocated_bitrate_bps;
             let max_additional = track.max_bitrate_bps.saturating_sub(current_allocation);
             let additional = max_additional.min(remaining);
-            
+
             track.allocated_bitrate_bps += additional;
             remaining = remaining.saturating_sub(additional);
         }
@@ -506,13 +518,13 @@ impl CongestionController {
     /// - ≤70 lines
     /// - ≥2 assertions
     fn finalize_allocations(
-        tracks: &mut [TrackAllocation], 
-        available: u64, 
-        can_satisfy_all_mins: bool
+        tracks: &mut [TrackAllocation],
+        available: u64,
+        can_satisfy_all_mins: bool,
     ) -> u64 {
         // Precondition: available must be reasonable
         assert!(available <= u64::MAX / 2, "available overflow protection");
-        
+
         let mut total_allocated = 0u64;
         for track in tracks.iter_mut() {
             track.select_layer();
@@ -598,8 +610,10 @@ impl CongestionController {
             probe_failures: self.stats.probe_failures.load(Ordering::Relaxed),
             delay_state,
             loss_percent: self.stats.loss_percent_x100.load(Ordering::Relaxed) as f64 / 100.0,
-            allocation_efficiency: self.stats.allocation_efficiency_x100.load(Ordering::Relaxed)
-                as f64
+            allocation_efficiency: self
+                .stats
+                .allocation_efficiency_x100
+                .load(Ordering::Relaxed) as f64
                 / 10000.0,
             current_estimate_bps: self.estimated_bps.load(Ordering::Relaxed),
             target_bitrate_bps: self.target_bps.load(Ordering::Relaxed),
@@ -621,7 +635,10 @@ impl CongestionController {
     /// Start a probe (for testing).
     #[cfg(test)]
     pub(crate) fn start_probe(&self, bitrate: u64, timestamp_us: u64) {
-        self.inner.lock().probe_controller.start_probe(bitrate, timestamp_us);
+        self.inner
+            .lock()
+            .probe_controller
+            .start_probe(bitrate, timestamp_us);
     }
 
     /// Get RTT estimator srtt (for testing).
@@ -637,7 +654,6 @@ impl CongestionController {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,10 +662,10 @@ mod tests {
     #[test]
     fn test_gcc_initialization() {
         let gcc = CongestionController::new(100_000, 10_000_000, 1_000_000);
-        
+
         assert_eq!(gcc.estimated_bandwidth_bps(), 1_000_000);
         assert!(gcc.target_bitrate_bps() < gcc.estimated_bandwidth_bps());
-        
+
         let stats = gcc.stats();
         assert_eq!(stats.feedbacks_processed, 0);
         assert_eq!(stats.reports_processed, 0);
@@ -982,7 +998,11 @@ mod tests {
 
         // Each track should get some allocation (proportional)
         for track in &tracks {
-            assert!(track.allocated_bitrate_bps > 0, "Track {} got zero allocation", track.track_id);
+            assert!(
+                track.allocated_bitrate_bps > 0,
+                "Track {} got zero allocation",
+                track.track_id
+            );
         }
     }
 
@@ -1007,7 +1027,7 @@ mod tests {
         // Manually set underuse state and verify time-based increase
         gcc.delay_estimate_bps.store(initial, Ordering::Relaxed);
         gcc.set_last_update_us(0);
-        
+
         // Simulate underuse feedback at t=0
         let mut feedback1 = TransportFeedback::new(12345, 0);
         for i in 0..20 {
@@ -1019,7 +1039,7 @@ mod tests {
             });
         }
         gcc.on_transport_feedback(&feedback1, 0);
-        
+
         // Simulate underuse feedback at t=1s (1,000,000 us)
         let mut feedback2 = TransportFeedback::new(12345, 20);
         for i in 20..40 {
@@ -1030,11 +1050,11 @@ mod tests {
                 size_bytes: 1200,
             });
         }
-        
+
         let estimate_before = gcc.delay_estimate_bps.load(Ordering::Relaxed);
         gcc.on_transport_feedback(&feedback2, 1_000_000); // 1 second later
         let estimate_after = gcc.delay_estimate_bps.load(Ordering::Relaxed);
-        
+
         // With underuse, should have increased by approximately 8kbps * 1 second
         // The increase is time-based, so it should be proportional to elapsed time
         assert!(
@@ -1084,15 +1104,15 @@ mod tests {
     fn test_gcc_interior_mutability() {
         // Test that on_receiver_report can be called without &mut self
         let gcc = CongestionController::new(100_000, 10_000_000, 1_000_000);
-        
+
         // Call on_receiver_report multiple times without &mut
         gcc.on_receiver_report(10, Some(50_000), 0);
         gcc.on_receiver_report(20, Some(60_000), 100_000);
         gcc.on_receiver_report(5, Some(55_000), 200_000);
-        
+
         let stats = gcc.stats();
         assert_eq!(stats.reports_processed, 3);
-        
+
         // Verify RTT was updated
         let srtt = gcc.rtt_srtt_us();
         assert!(srtt > 0, "RTT should be updated");
@@ -1100,13 +1120,13 @@ mod tests {
 
     #[test]
     fn test_gcc_concurrent_access() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::Arc;
         use std::thread;
 
         let gcc = Arc::new(CongestionController::new(100_000, 10_000_000, 1_000_000));
         let timestamp_counter = Arc::new(AtomicU64::new(0));
-        
+
         // Spawn multiple threads that call on_receiver_report
         let mut handles = vec![];
         for i in 0..4 {

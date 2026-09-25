@@ -27,16 +27,27 @@ fn make_nexus_ctx(key: &[u8; 16], salt: &[u8; 14]) -> SrtpContext {
     let mut material = [0u8; 30];
     material[..16].copy_from_slice(key);
     material[16..30].copy_from_slice(salt);
-    let km = KeyMaterial::from_dtls_export(&material, ProtectionProfile::Aes128CmHmacSha1_80).unwrap();
-    SrtpContext::new(&km, SrtpPolicy { profile: ProtectionProfile::Aes128CmHmacSha1_80, ..SrtpPolicy::default() }).unwrap()
+    let km =
+        KeyMaterial::from_dtls_export(&material, ProtectionProfile::Aes128CmHmacSha1_80).unwrap();
+    SrtpContext::new(
+        &km,
+        SrtpPolicy {
+            profile: ProtectionProfile::Aes128CmHmacSha1_80,
+            ..SrtpPolicy::default()
+        },
+    )
+    .unwrap()
 }
 
 fn make_webrtc_ctx(key: &[u8; 16], salt: &[u8; 14]) -> webrtc_srtp::context::Context {
     webrtc_srtp::context::Context::new(
-        key, salt,
+        key,
+        salt,
         webrtc_srtp::protection_profile::ProtectionProfile::Aes128CmHmacSha1_80,
-        None, None,
-    ).unwrap()
+        None,
+        None,
+    )
+    .unwrap()
 }
 
 /// Simulate: publisher (webrtc-rs) → SFU (nexus) → subscriber (webrtc-rs)
@@ -68,7 +79,8 @@ fn test_sfu_forwarding_across_seq_wrap() {
         let plain_rtp = build_rtp(seq, ssrc, &payload);
 
         // Step 1: Publisher encrypts
-        let protected_pub = pub_encrypt.encrypt_rtp(&plain_rtp)
+        let protected_pub = pub_encrypt
+            .encrypt_rtp(&plain_rtp)
             .unwrap_or_else(|e| panic!("pub encrypt seq={seq} failed: {e:?}"));
 
         // Step 2: SFU decrypts
@@ -82,18 +94,27 @@ fn test_sfu_forwarding_across_seq_wrap() {
         let decrypted_rtp = &sfu_buf[..decrypted_len];
 
         // Verify decrypted matches original
-        assert_eq!(decrypted_rtp, &plain_rtp[..], "SFU decrypted mismatch at seq={seq}");
+        assert_eq!(
+            decrypted_rtp,
+            &plain_rtp[..],
+            "SFU decrypted mismatch at seq={seq}"
+        );
 
         // Step 3: SFU re-encrypts for subscriber
         let mut sub_buf = vec![0u8; decrypted_len + 16];
         sub_buf[..decrypted_len].copy_from_slice(decrypted_rtp);
-        let protected_len = sfu_encrypt.protect_rtp(&mut sub_buf, decrypted_len)
+        let protected_len = sfu_encrypt
+            .protect_rtp(&mut sub_buf, decrypted_len)
             .unwrap_or_else(|e| panic!("SFU encrypt seq={seq} failed: {e:?}"));
 
         // Step 4: Subscriber decrypts
         match sub_decrypt.decrypt_rtp(&sub_buf[..protected_len]) {
             Ok(decrypted) => {
-                assert_eq!(&decrypted[..], &plain_rtp[..], "subscriber mismatch at seq={seq}");
+                assert_eq!(
+                    &decrypted[..],
+                    &plain_rtp[..],
+                    "subscriber mismatch at seq={seq}"
+                );
                 success += 1;
             }
             Err(e) => {
@@ -106,7 +127,10 @@ fn test_sfu_forwarding_across_seq_wrap() {
     }
 
     eprintln!("Results: {success} success, {auth_failures} failures out of {num_packets}");
-    assert_eq!(auth_failures, 0, "{auth_failures} auth failures across seq wrap");
+    assert_eq!(
+        auth_failures, 0,
+        "{auth_failures} auth failures across seq wrap"
+    );
 }
 
 /// Same test but with multiple SSRCs (audio + video) interleaved
@@ -139,7 +163,9 @@ fn test_sfu_forwarding_multi_ssrc_wrap() {
         let protected = pub_encrypt.encrypt_rtp(&plain).unwrap();
 
         let mut buf = protected.to_vec();
-        let dec_len = sfu_decrypt.unprotect_rtp(&mut buf, protected.len()).unwrap();
+        let dec_len = sfu_decrypt
+            .unprotect_rtp(&mut buf, protected.len())
+            .unwrap();
 
         let mut sub_buf = vec![0u8; dec_len + 16];
         sub_buf[..dec_len].copy_from_slice(&buf[..dec_len]);

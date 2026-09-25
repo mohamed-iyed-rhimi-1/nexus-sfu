@@ -249,7 +249,7 @@ fn test_message_processing_bounded() {
     // Second call processes remaining messages
     let should_continue = participant.process_messages();
     assert!(should_continue);
-    
+
     // Verify actor is still active
     assert_eq!(participant.state(), ActorState::Active);
 }

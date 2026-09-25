@@ -66,6 +66,12 @@ pub struct HotPathMetrics {
     pub send_count: AtomicU64,
 }
 
+impl Default for HotPathMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HotPathMetrics {
     /// Create new hot-path metrics.
     pub const fn new() -> Self {
@@ -82,21 +88,24 @@ impl HotPathMetrics {
     /// Record packet receive latency.
     #[inline(always)]
     pub fn record_recv(&self, latency_ns: u64) {
-        self.recv_latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.recv_latency_sum_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.recv_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record packet forward latency.
     #[inline(always)]
     pub fn record_forward(&self, latency_ns: u64) {
-        self.forward_latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.forward_latency_sum_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.forward_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record packet send latency.
     #[inline(always)]
     pub fn record_send(&self, latency_ns: u64) {
-        self.send_latency_sum_ns.fetch_add(latency_ns, Ordering::Relaxed);
+        self.send_latency_sum_ns
+            .fetch_add(latency_ns, Ordering::Relaxed);
         self.send_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -319,21 +328,12 @@ macro_rules! send_span {
 // ============================================================================
 
 /// Extended logging configuration with optional file output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExtendedLoggingConfig {
     /// Base logging config
     pub base: LoggingConfig,
     /// Optional file path for log output
     pub file_path: Option<String>,
-}
-
-impl Default for ExtendedLoggingConfig {
-    fn default() -> Self {
-        Self {
-            base: LoggingConfig::default(),
-            file_path: None,
-        }
-    }
 }
 
 impl From<LoggingConfig> for ExtendedLoggingConfig {
@@ -403,8 +403,8 @@ pub fn init_tracing_extended(config: &ExtendedLoggingConfig) -> Result<(), Traci
     };
 
     // Create env filter with configured level
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level.to_string()));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_string()));
 
     // Build the subscriber based on configuration
     if config.base.structured {
@@ -432,7 +432,7 @@ fn init_json_subscriber(
     // Create JSON layer for stdout
     let json_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_timer(SystemTime::default())
+        .with_timer(SystemTime)
         .with_thread_ids(config.base.include_thread_ids)
         .with_thread_names(config.base.include_thread_ids)
         .with_target(true)
@@ -443,14 +443,18 @@ fn init_json_subscriber(
 
     // Add file layer if configured
     if let Some(ref file_path) = config.file_path {
-        let file = File::create(file_path).map_err(|e| TracingError::FileCreate {
-            path: file_path.clone(),
-            source: e,
-        })?;
+        let file = File::options()
+            .create(true)
+            .append(true)
+            .open(file_path)
+            .map_err(|e| TracingError::FileCreate {
+                path: file_path.clone(),
+                source: e,
+            })?;
 
         let file_layer = tracing_subscriber::fmt::layer()
             .json()
-            .with_timer(SystemTime::default())
+            .with_timer(SystemTime)
             .with_thread_ids(config.base.include_thread_ids)
             .with_thread_names(config.base.include_thread_ids)
             .with_target(true)
@@ -486,7 +490,7 @@ fn init_pretty_subscriber(
 
     // Create pretty layer for stdout
     let pretty_layer = tracing_subscriber::fmt::layer()
-        .with_timer(SystemTime::default())
+        .with_timer(SystemTime)
         .with_thread_ids(config.base.include_thread_ids)
         .with_thread_names(config.base.include_thread_ids)
         .with_target(true)
@@ -497,13 +501,17 @@ fn init_pretty_subscriber(
 
     // Add file layer if configured
     if let Some(ref file_path) = config.file_path {
-        let file = File::create(file_path).map_err(|e| TracingError::FileCreate {
-            path: file_path.clone(),
-            source: e,
-        })?;
+        let file = File::options()
+            .create(true)
+            .append(true)
+            .open(file_path)
+            .map_err(|e| TracingError::FileCreate {
+                path: file_path.clone(),
+                source: e,
+            })?;
 
         let file_layer = tracing_subscriber::fmt::layer()
-            .with_timer(SystemTime::default())
+            .with_timer(SystemTime)
             .with_thread_ids(config.base.include_thread_ids)
             .with_thread_names(config.base.include_thread_ids)
             .with_target(true)
@@ -584,15 +592,15 @@ mod tests {
     #[test]
     fn test_hot_path_metrics_record() {
         let metrics = HotPathMetrics::new();
-        
+
         metrics.record_recv(1000);
         assert_eq!(metrics.recv_count.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.recv_latency_sum_ns.load(Ordering::Relaxed), 1000);
-        
+
         metrics.record_forward(2000);
         assert_eq!(metrics.forward_count.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.forward_latency_sum_ns.load(Ordering::Relaxed), 2000);
-        
+
         metrics.record_send(3000);
         assert_eq!(metrics.send_count.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.send_latency_sum_ns.load(Ordering::Relaxed), 3000);
@@ -601,11 +609,11 @@ mod tests {
     #[test]
     fn test_hot_path_metrics_avg() {
         let metrics = HotPathMetrics::new();
-        
+
         // Record multiple samples
         metrics.record_recv(1000); // 1us
         metrics.record_recv(3000); // 3us
-        
+
         // Average should be 2us
         let avg = metrics.avg_recv_latency_us();
         assert!((avg - 2.0).abs() < 0.001);
@@ -614,13 +622,13 @@ mod tests {
     #[test]
     fn test_hot_path_metrics_reset() {
         let metrics = HotPathMetrics::new();
-        
+
         metrics.record_recv(1000);
         metrics.record_forward(2000);
         metrics.record_send(3000);
-        
+
         metrics.reset();
-        
+
         assert_eq!(metrics.recv_count.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.forward_count.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.send_count.load(Ordering::Relaxed), 0);
@@ -629,13 +637,13 @@ mod tests {
     #[test]
     fn test_hot_path_metrics_snapshot() {
         let metrics = HotPathMetrics::new();
-        
+
         metrics.record_recv(1000);
         metrics.record_forward(2000);
         metrics.record_send(3000);
-        
+
         let snapshot = metrics.snapshot();
-        
+
         assert_eq!(snapshot.recv_count, 1);
         assert_eq!(snapshot.recv_latency_sum_ns, 1000);
         assert_eq!(snapshot.forward_count, 1);
@@ -648,13 +656,13 @@ mod tests {
     fn test_latency_guard() {
         // Reset global metrics
         HOT_PATH_METRICS.reset();
-        
+
         {
             let _guard = LatencyGuard::recv();
             // Simulate some work
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
-        
+
         // Should have recorded one recv
         assert_eq!(HOT_PATH_METRICS.recv_count.load(Ordering::Relaxed), 1);
         assert!(HOT_PATH_METRICS.recv_latency_sum_ns.load(Ordering::Relaxed) > 0);

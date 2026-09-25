@@ -256,7 +256,7 @@ impl Default for DistributedStateConfig {
 ///
 /// Stores room-level information that is replicated across the cluster
 /// using a Last-Writer-Wins register.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RoomMetadata {
     /// Unique room identifier
     room_id: RoomId,
@@ -325,17 +325,6 @@ impl RoomMetadata {
     #[inline]
     pub const fn created_at_ns(&self) -> u64 {
         self.created_at_ns
-    }
-}
-
-impl Default for RoomMetadata {
-    fn default() -> Self {
-        Self {
-            room_id: 0,
-            name: String::new(),
-            max_participants: 0,
-            created_at_ns: 0,
-        }
     }
 }
 
@@ -658,7 +647,7 @@ impl DistributedState {
         // Broadcast state update to gossip protocol
         self.broadcast_update(StateUpdate::ParticipantAdded {
             room_id,
-            participant_id: participant_id.into(),
+            participant_id,
             dot,
         });
 
@@ -708,7 +697,7 @@ impl DistributedState {
         // Broadcast state update to gossip protocol
         self.broadcast_update(StateUpdate::ParticipantRemoved {
             room_id,
-            participant_id: participant_id.into(),
+            participant_id,
             dot,
         });
 
@@ -737,13 +726,8 @@ impl DistributedState {
                     (set.len() as usize).min(MAX_PARTICIPANTS_PER_ROOM as usize),
                 );
                 // Bounded iteration
-                let mut count = 0;
-                for elem in set.iter() {
-                    if count >= MAX_PARTICIPANTS_PER_ROOM as usize {
-                        break;
-                    }
+                for elem in set.iter().take(MAX_PARTICIPANTS_PER_ROOM as usize) {
                     result.push(*elem);
-                    count += 1;
                 }
                 result
             })
@@ -763,8 +747,7 @@ impl DistributedState {
         let participants = self.participants.read().unwrap();
         participants
             .get(&room_id)
-            .map(|set| set.len() as usize)
-            .unwrap_or(0)
+            .map_or(0, |set| set.len() as usize)
     }
 
     /// Checks if a participant exists in a room.
@@ -781,8 +764,7 @@ impl DistributedState {
         let participants = self.participants.read().unwrap();
         participants
             .get(&room_id)
-            .map(|set| set.contains(&participant_id))
-            .unwrap_or(false)
+            .is_some_and(|set| set.contains(&participant_id))
     }
 
     // =========================================================================
@@ -895,7 +877,7 @@ impl DistributedState {
     /// `Some(TrackInfo)` if track exists, `None` otherwise.
     pub fn get_track(&self, track_id: TrackId) -> Option<TrackInfo> {
         let tracks = self.tracks.read().unwrap();
-        tracks.get(&track_id).map(|reg| reg.get())
+        tracks.get(&track_id).map(crate::LWWReg::get)
     }
 
     /// Removes a track.
@@ -962,12 +944,12 @@ impl DistributedState {
         }
 
         // Add subscription
-        subscriptions.add((track_id.into(), participant_id.into()), dot)?;
+        subscriptions.add((track_id, participant_id), dot)?;
 
         // Broadcast state update to gossip protocol
         self.broadcast_update(StateUpdate::SubscriptionAdded {
-            track_id: track_id.into(),
-            participant_id: participant_id.into(),
+            track_id,
+            participant_id,
             dot,
         });
 
@@ -1007,12 +989,12 @@ impl DistributedState {
         let mut subscriptions = self.subscriptions.write().unwrap();
 
         // Remove subscription
-        subscriptions.remove(&(track_id.into(), participant_id.into()), dot)?;
+        subscriptions.remove(&(track_id, participant_id), dot)?;
 
         // Broadcast state update to gossip protocol
         self.broadcast_update(StateUpdate::SubscriptionRemoved {
-            track_id: track_id.into(),
-            participant_id: participant_id.into(),
+            track_id,
+            participant_id,
             dot,
         });
 
@@ -1039,15 +1021,10 @@ impl DistributedState {
         let mut result = Vec::new();
 
         // Bounded iteration
-        let mut count = 0;
-        for (tid, pid) in subscriptions.iter() {
-            if count >= self.config.max_subscriptions {
-                break;
-            }
+        for (tid, pid) in subscriptions.iter().take(self.config.max_subscriptions) {
             if *tid == track_id {
                 result.push(*pid);
             }
-            count += 1;
         }
 
         result
@@ -1073,15 +1050,10 @@ impl DistributedState {
         let mut result = Vec::new();
 
         // Bounded iteration
-        let mut count = 0;
-        for (tid, pid) in subscriptions.iter() {
-            if count >= self.config.max_subscriptions {
-                break;
-            }
+        for (tid, pid) in subscriptions.iter().take(self.config.max_subscriptions) {
             if *pid == participant_id {
                 result.push(*tid);
             }
-            count += 1;
         }
 
         result
@@ -1182,6 +1154,9 @@ impl DistributedState {
     /// # Returns
     ///
     /// `Ok(())` on successful merge, or error if merge failed.
+    // Deltas arrive owned from the gossip decoder; taking a reference would
+    // only force clones of the payloads stored below.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn merge_delta(&self, update: StateUpdate) -> Result<(), CrdtError> {
         match update {
             StateUpdate::ParticipantAdded {
@@ -1194,13 +1169,9 @@ impl DistributedState {
                 // Use room_id from delta to target the specific room
                 if let Some(set) = participants.get_mut(&room_id) {
                     // Try to add - ignore result as idempotence is handled by CRDT
-                    match set.add(participant_id.into(), dot) {
-                        Ok(_) => {
-                            // Successfully added participant
-                        }
-                        Err(CrdtError::DuplicateElement) => {
-                            // Duplicate element - ignore for idempotence
-                        }
+                    match set.add(participant_id, dot) {
+                        // Added, or duplicate element (ignored for idempotence)
+                        Ok(_) | Err(CrdtError::DuplicateElement) => {}
                         Err(e) => return Err(e),
                     }
                 }
@@ -1221,12 +1192,8 @@ impl DistributedState {
                 if let Some(set) = participants.get_mut(&room_id) {
                     // Ignore result as idempotence is handled by CRDT
                     match set.remove(&participant_id, dot) {
-                        Ok(_) => {
-                            // Successfully removed participant
-                        }
-                        Err(CrdtError::ElementNotFound) => {
-                            // Element not found - ignore for idempotence
-                        }
+                        // Removed, or element not found (ignored for idempotence)
+                        Ok(_) | Err(CrdtError::ElementNotFound) => {}
                         Err(e) => return Err(e),
                     }
                 }
@@ -1261,7 +1228,7 @@ impl DistributedState {
                 let mut subscriptions = self.subscriptions.write().unwrap();
 
                 // Try to add - ignore result as idempotence is handled by CRDT
-                match subscriptions.add((track_id, participant_id.into()), dot) {
+                match subscriptions.add((track_id, participant_id), dot) {
                     Ok(_) | Err(CrdtError::DuplicateElement) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -1275,7 +1242,7 @@ impl DistributedState {
                 let mut subscriptions = self.subscriptions.write().unwrap();
 
                 // Try to remove - ignore result as idempotence is handled by CRDT
-                match subscriptions.remove(&(track_id.into(), participant_id.into()), dot) {
+                match subscriptions.remove(&(track_id, participant_id), dot) {
                     Ok(_) | Err(CrdtError::ElementNotFound) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -1503,17 +1470,17 @@ mod tests {
 
     #[test]
     fn test_room_metadata_new() {
-        let metadata = RoomMetadata::new(1, "Test Room".to_string(), 100, 1234567890);
+        let metadata = RoomMetadata::new(1, "Test Room".to_string(), 100, 1_234_567_890);
         assert_eq!(metadata.room_id(), 1);
         assert_eq!(metadata.name(), "Test Room");
         assert_eq!(metadata.max_participants(), 100);
-        assert_eq!(metadata.created_at_ns(), 1234567890);
+        assert_eq!(metadata.created_at_ns(), 1_234_567_890);
     }
 
     #[test]
     #[should_panic(expected = "room_id must be non-zero")]
     fn test_room_metadata_invalid_room_id() {
-        RoomMetadata::new(0, "Test".to_string(), 100, 1234567890);
+        RoomMetadata::new(0, "Test".to_string(), 100, 1_234_567_890);
     }
 
     #[test]

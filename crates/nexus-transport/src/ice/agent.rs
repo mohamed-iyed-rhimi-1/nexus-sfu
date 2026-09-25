@@ -35,6 +35,7 @@
 //! }
 //! ```
 
+use getrandom::getrandom;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -118,11 +119,22 @@ pub struct IceAgent {
     /// Consent freshness timestamp (RFC 7675).
     last_consent: Instant,
 
+    /// Last consent check (keepalive) sent (RFC 7675 §5.1).
+    last_consent_check: Instant,
+
     /// Outbound STUN packet buffer. Drained by `poll_outbound()`.
     outbound: [Option<OutboundPacket>; MAX_OUTBOUND],
 
     /// Number of packets currently in the outbound buffer.
     outbound_count: u8,
+
+    /// Tie-breaker for role conflict resolution (RFC 8445 §5.1.1).
+    tie_breaker: u64,
+
+    /// Timestamp when a consent check was sent, awaiting response (RFC 7675 §5.1).
+    /// Set to Some(Instant) when sending a consent binding request,
+    /// cleared to None when receiving a successful response.
+    consent_check_pending_since: Option<Instant>,
 }
 
 impl IceAgent {
@@ -162,8 +174,11 @@ impl IceAgent {
             component: 1,
             last_activity: Instant::now(),
             last_consent: Instant::now(),
+            last_consent_check: Instant::now(),
             outbound: std::array::from_fn(|_| None),
             outbound_count: 0,
+            tie_breaker: generate_tie_breaker(),
+            consent_check_pending_since: None,
         }
     }
 
@@ -351,15 +366,6 @@ impl IceAgent {
         self.role = role;
     }
 
-    /// Gather local candidates.
-    ///
-    /// This will enumerate local interfaces, contact STUN servers,
-    /// and optionally allocate TURN relays.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Precondition assertion for state
-    /// - Postcondition assertion for candidate count bounds
     /// Add a locally-gathered candidate to the agent.
     ///
     /// Called by the orchestrator as candidates are discovered by the
@@ -769,19 +775,28 @@ impl IceAgent {
     /// - Postcondition: outbound_count == 0 after drain
     /// - Bounded output: at most MAX_OUTBOUND packets
     pub fn poll_outbound(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
-        // Only produce outbound traffic while actively checking
+        // The buffer may already hold packets queued since the last poll
+        // (e.g. nominations from try_nominate()); they are drained below.
+
+        // Phase 0: Consent keepalives (RFC 7675 §5.1)
+        // Send binding indication on selected pair every CONSENT_CHECK_INTERVAL_SECS.
+        // This runs in both Checking and Connected states.
+        if self.selected_pair.is_some()
+            && self.last_consent_check.elapsed() > Duration::from_secs(CONSENT_CHECK_INTERVAL_SECS)
+        {
+            let dest = self.selected_pair.as_ref().unwrap().remote.address;
+            let mut buf = [0u8; STUN_BUFFER_SIZE];
+            let txn_id = super::stun::server::generate_transaction_id();
+            let len = super::stun::server::create_binding_indication(&mut buf, &txn_id);
+            self.queue_outbound(dest, &buf, len);
+            self.last_consent_check = Instant::now();
+        }
+
+        // Only produce connectivity check traffic while actively checking
         if self.connection_state != IceConnectionState::Checking {
-            return Vec::new();
+            // Still return any packets queued above or since the last poll
+            return self.drain_outbound();
         }
-
-        // Reset buffer for this poll cycle
-        self.outbound_count = 0;
-        for slot in self.outbound.iter_mut() {
-            *slot = None;
-        }
-
-        // Collect all outbound packets from checklist, then queue them.
-        // Two-phase approach avoids borrow conflicts with self.
 
         // Phase 1: Collect from checklist into a local buffer
         let mut collected: Vec<(SocketAddr, [u8; STUN_BUFFER_SIZE], usize)> = Vec::new();
@@ -793,7 +808,8 @@ impl IceAgent {
             }
 
             // 1b. New connectivity checks
-            let remaining = MAX_OUTBOUND.saturating_sub(collected.len());
+            let remaining =
+                MAX_OUTBOUND.saturating_sub(collected.len() + self.outbound_count as usize);
             for _ in 0..remaining {
                 if let Some((_, dest, buf, len)) = checklist.next_check() {
                     collected.push((dest, buf, len));
@@ -809,18 +825,28 @@ impl IceAgent {
         }
 
         // Phase 3: Collect results
+        self.drain_outbound()
+    }
+
+    /// Return every queued outbound packet and empty the buffer.
+    fn drain_outbound(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut result = Vec::with_capacity(self.outbound_count as usize);
-        for i in 0..self.outbound_count as usize {
-            if let Some(ref pkt) = self.outbound[i] {
+        for slot in self.outbound.iter_mut().take(self.outbound_count as usize) {
+            if let Some(pkt) = slot.take() {
                 result.push((pkt.dest, pkt.buf[..pkt.len as usize].to_vec()));
             }
         }
+        self.outbound_count = 0;
 
-        // Postcondition: bounded output
+        // Postcondition: bounded output, buffer empty
         assert!(
             result.len() <= MAX_OUTBOUND,
             "poll_outbound must return at most {} packets",
             MAX_OUTBOUND
+        );
+        assert!(
+            self.outbound_count == 0,
+            "outbound buffer must be empty after drain"
         );
 
         result
@@ -876,8 +902,14 @@ impl IceAgent {
                 None
             }
             StunClass::Indication => {
-                // Binding indication - used for keepalives
-                // No response needed
+                // Binding indication (RFC 7675) — refresh consent on selected pair
+                if self
+                    .selected_pair
+                    .as_ref()
+                    .map_or(false, |p| p.remote.address == from)
+                {
+                    self.last_consent = Instant::now();
+                }
                 None
             }
         };
@@ -970,27 +1002,26 @@ impl IceAgent {
             return;
         }
 
-        // Extract the PRIORITY attribute from the request (RFC 8445 §7.2.5.3.1)
-        // The remote peer includes its candidate priority in the binding request.
-        let remote_priority = msg
-            .attributes
-            .iter()
-            .flatten()
-            .find_map(|attr| {
-                if let super::stun::attributes::StunAttribute::Priority(p) = attr {
-                    Some(*p)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                // Fallback: compute a reasonable priority for a peer-reflexive candidate
-                Candidate::calculate_priority(
-                    super::candidate::CandidateType::PeerReflexive,
-                    65535,
-                    self.component,
-                )
-            });
+        // Extract the PRIORITY attribute from the request (RFC 8445 §7.2.5.3.1).
+        // PRIORITY MUST be present in every binding request per RFC 8445.
+        let remote_priority = match msg.attributes.iter().flatten().find_map(|attr| {
+            if let super::stun::attributes::StunAttribute::Priority(p) = attr {
+                Some(*p)
+            } else {
+                None
+            }
+        }) {
+            Some(p) => p,
+            None => {
+                // RFC 8445 §7.2.5.3.1: PRIORITY attribute is REQUIRED.
+                // Log and skip peer-reflexive handling for non-compliant peers.
+                tracing::warn!(
+                    from = %from,
+                    "Binding request missing PRIORITY attribute (RFC 8445 violation)"
+                );
+                return;
+            }
+        };
 
         // Check if we already have a remote candidate with this address
         let known_remote = self.find_remote_candidate_by_addr(from);
@@ -1216,14 +1247,9 @@ impl IceAgent {
         Ok(())
     }
 
-    /// Get the tie-breaker value from the checklist.
-    ///
-    /// Returns 0 if no checklist exists.
+    /// Get the tie-breaker value (RFC 8445 §5.1.1).
     fn get_tie_breaker(&self) -> u64 {
-        self.checklist
-            .as_ref()
-            .map(|c| c.tie_breaker())
-            .unwrap_or(0)
+        self.tie_breaker
     }
 
     /// Build a 487 Role Conflict error response per RFC 8445 Section 7.2.1.1.
@@ -1399,7 +1425,8 @@ impl IceAgent {
 
     /// Check consent freshness (RFC 7675).
     ///
-    /// Returns true if consent is stale (>30 seconds since last consent).
+    /// Returns true if consent is stale (>30 seconds since last consent)
+    /// or a consent check has been pending for >5 seconds without response (RFC 7675 §5.1).
     ///
     /// # TigerStyle Compliance (Phase 1.8)
     ///
@@ -1412,7 +1439,26 @@ impl IceAgent {
             "Consent timestamp must not be in the future"
         );
 
+        // Per-transaction timeout: if a consent check has been pending >5s, it's stale
+        if let Some(pending_since) = self.consent_check_pending_since {
+            if pending_since.elapsed() > Duration::from_secs(CONSENT_CHECK_TRANSACTION_TIMEOUT_SECS)
+            {
+                return true;
+            }
+        }
+
         self.last_consent.elapsed() > Duration::from_secs(CONSENT_TIMEOUT_SECS)
+    }
+
+    /// Mark that a consent check binding request has been sent.
+    pub fn mark_consent_check_sent(&mut self) {
+        self.consent_check_pending_since = Some(Instant::now());
+    }
+
+    /// Mark that a consent check response was received successfully.
+    pub fn mark_consent_check_received(&mut self) {
+        self.consent_check_pending_since = None;
+        self.last_consent = Instant::now();
     }
 
     /// Close the agent.
@@ -1458,6 +1504,8 @@ impl IceAgent {
         self.selected_pair = None;
         self.outbound = std::array::from_fn(|_| None);
         self.outbound_count = 0;
+        self.tie_breaker = generate_tie_breaker();
+        self.consent_check_pending_since = None;
 
         Ok(())
     }
@@ -1508,6 +1556,55 @@ pub struct IceAgentStats {
     pub time_since_consent_ms: u32,
 }
 
+// ============================================================================
+// Compile-Time Assertions (TigerStyle)
+// ============================================================================
+
+// Assert candidate limits are bounded
+const _: () = assert!(
+    MAX_CANDIDATES <= 32,
+    "MAX_CANDIDATES must be <= 32 to fit in u8 counter"
+);
+
+// Assert candidate pair limit is reasonable
+const _: () = assert!(
+    MAX_CANDIDATE_PAIRS <= 1024,
+    "MAX_CANDIDATE_PAIRS must be <= 1024 to prevent memory exhaustion"
+);
+
+// Assert STUN transaction timeout bounds (TigerStyle Phase 1.1)
+#[allow(dead_code)] // Used in compile-time assertions for protocol timing bounds
+const STUN_TRANSACTION_TIMEOUT_MS: u32 = 500;
+#[allow(dead_code)] // Used in compile-time assertions for protocol timing bounds
+const CHECK_INTERVAL_MS: u32 = 50;
+const _: () = assert!(
+    STUN_TRANSACTION_TIMEOUT_MS >= 100 && STUN_TRANSACTION_TIMEOUT_MS <= 5000,
+    "STUN timeout must be in range 100-5000ms"
+);
+const _: () = assert!(
+    CHECK_INTERVAL_MS >= 10 && CHECK_INTERVAL_MS <= 1000,
+    "Check interval must be in range 10-1000ms"
+);
+
+/// Generate a random tie-breaker value using getrandom.
+fn generate_tie_breaker() -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom(&mut bytes).expect("getrandom failed");
+    u64::from_ne_bytes(bytes)
+}
+
+// Assert consent timeout is reasonable (RFC 7675)
+const CONSENT_TIMEOUT_SECS: u64 = 30;
+
+/// Per-transaction consent timeout (RFC 7675 §5.1).
+/// If a consent check binding request gets no response within 5 seconds,
+/// treat consent as stale.
+const CONSENT_CHECK_TRANSACTION_TIMEOUT_SECS: u64 = 5;
+
+/// Consent keepalive interval (RFC 7675 §5.1).
+/// Binding indications are sent every 15 seconds on the selected pair.
+const CONSENT_CHECK_INTERVAL_SECS: u64 = 15;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,6 +1623,23 @@ mod tests {
         assert_eq!(agent.connection_state(), IceConnectionState::New);
         assert_eq!(agent.gathering_state(), IceGatheringState::New);
         assert_eq!(agent.role(), IceRole::Controlling);
+    }
+
+    #[test]
+    fn test_poll_outbound_sends_packets_queued_between_polls() {
+        // Nominations are queued while processing a response, between polls;
+        // poll_outbound must send them rather than clearing the buffer first.
+        let mut agent = IceAgent::with_defaults(IceRole::Controlling);
+        let dest: SocketAddr = "192.168.1.200:5001".parse().unwrap();
+        let packet = [0xABu8; 20];
+        agent.queue_outbound(dest, &packet, packet.len());
+
+        let sent = agent.poll_outbound();
+        assert_eq!(sent, vec![(dest, packet.to_vec())]);
+        assert!(
+            agent.poll_outbound().is_empty(),
+            "drained packets must not be resent"
+        );
     }
 
     #[test]
@@ -1768,9 +1882,9 @@ mod tests {
     #[test]
     fn test_candidate_type_preferences() {
         // Verify type preferences are in correct order
-        assert!(TYPE_PREF_HOST > TYPE_PREF_PEER_REFLEXIVE);
-        assert!(TYPE_PREF_PEER_REFLEXIVE > TYPE_PREF_SERVER_REFLEXIVE);
-        assert!(TYPE_PREF_SERVER_REFLEXIVE > TYPE_PREF_RELAY);
+        const { assert!(TYPE_PREF_HOST > TYPE_PREF_PEER_REFLEXIVE) };
+        const { assert!(TYPE_PREF_PEER_REFLEXIVE > TYPE_PREF_SERVER_REFLEXIVE) };
+        const { assert!(TYPE_PREF_SERVER_REFLEXIVE > TYPE_PREF_RELAY) };
     }
 
     // ========================================================================
@@ -2111,36 +2225,3 @@ mod tests {
         }
     }
 }
-
-// ============================================================================
-// Compile-Time Assertions (TigerStyle)
-// ============================================================================
-
-// Assert candidate limits are bounded
-const _: () = assert!(
-    MAX_CANDIDATES <= 32,
-    "MAX_CANDIDATES must be <= 32 to fit in u8 counter"
-);
-
-// Assert candidate pair limit is reasonable
-const _: () = assert!(
-    MAX_CANDIDATE_PAIRS <= 1024,
-    "MAX_CANDIDATE_PAIRS must be <= 1024 to prevent memory exhaustion"
-);
-
-// Assert STUN transaction timeout bounds (TigerStyle Phase 1.1)
-#[allow(dead_code)] // Used in compile-time assertions for protocol timing bounds
-const STUN_TRANSACTION_TIMEOUT_MS: u32 = 500;
-#[allow(dead_code)] // Used in compile-time assertions for protocol timing bounds
-const CHECK_INTERVAL_MS: u32 = 50;
-const _: () = assert!(
-    STUN_TRANSACTION_TIMEOUT_MS >= 100 && STUN_TRANSACTION_TIMEOUT_MS <= 5000,
-    "STUN timeout must be in range 100-5000ms"
-);
-const _: () = assert!(
-    CHECK_INTERVAL_MS >= 10 && CHECK_INTERVAL_MS <= 1000,
-    "Check interval must be in range 10-1000ms"
-);
-
-// Assert consent timeout is reasonable (RFC 7675)
-const CONSENT_TIMEOUT_SECS: u64 = 30;

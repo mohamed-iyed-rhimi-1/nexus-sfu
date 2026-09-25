@@ -160,7 +160,6 @@ impl Default for WorkerPool {
     }
 }
 
-
 /// Migration executor for track actors
 ///
 /// Handles serialization, transfer, and reconstruction of track actors.
@@ -312,7 +311,6 @@ impl MigrationExecutor {
         Ok((actor, sender))
     }
 
-
     /// Execute a pending migration
     ///
     /// Orchestrates the full migration flow:
@@ -415,9 +413,11 @@ impl MigrationExecutor {
 
         // Get worker sender
         let workers = self.workers.lock();
-        let sender = workers.get(target_worker_id).ok_or(MigrationError::WorkerNotFound {
-            worker_id: target_worker_id,
-        })?;
+        let sender = workers
+            .get(target_worker_id)
+            .ok_or(MigrationError::WorkerNotFound {
+                worker_id: target_worker_id,
+            })?;
 
         // Create transfer message
         let msg = TrackActorMessage::TransferState {
@@ -426,13 +426,14 @@ impl MigrationExecutor {
         };
 
         // Send to target worker
-        sender.send(msg).map_err(|_| MigrationError::TransferFailed {
-            reason: "worker message queue full",
-        })?;
+        sender
+            .send(msg)
+            .map_err(|_| MigrationError::TransferFailed {
+                reason: "worker message queue full",
+            })?;
 
         Ok(())
     }
-
 
     /// Record migration latency using real timestamps
     ///
@@ -462,7 +463,10 @@ impl MigrationExecutor {
         if let Some(start) = start_time {
             let latency_nanos = now.saturating_sub(start);
             // Postcondition: latency should be positive
-            assert!(latency_nanos > 0 || start == now, "latency calculation error");
+            assert!(
+                latency_nanos > 0 || start == now,
+                "latency calculation error"
+            );
 
             if latency_nanos > 0 {
                 self.metrics.record_completion(latency_nanos);
@@ -556,14 +560,18 @@ impl MigrationExecutor {
 
         // Send abort message to source worker
         let workers = self.workers.lock();
-        let sender = workers.get(source_worker_id).ok_or(MigrationError::WorkerNotFound {
-            worker_id: source_worker_id,
-        })?;
+        let sender = workers
+            .get(source_worker_id)
+            .ok_or(MigrationError::WorkerNotFound {
+                worker_id: source_worker_id,
+            })?;
 
         let msg = TrackActorMessage::AbortMigration { migration_id };
-        sender.send(msg).map_err(|_| MigrationError::TransferFailed {
-            reason: "failed to send abort message",
-        })?;
+        sender
+            .send(msg)
+            .map_err(|_| MigrationError::TransferFailed {
+                reason: "failed to send abort message",
+            })?;
 
         // Dequeue the failed migration
         {
@@ -576,7 +584,6 @@ impl MigrationExecutor {
 
         Ok(())
     }
-
 
     /// Check for timed-out migrations and handle them
     ///

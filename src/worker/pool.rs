@@ -28,11 +28,11 @@ use std::time::Duration;
 use crossbeam::channel::{self, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 
-use nexus_transport::arena::{PacketArena, PacketSlot};
 use crate::error::WorkerError;
-use nexus_transport::ring_buffer::RingBuffer;
 use crate::transport::BatchSender;
 use crate::types::{MediaKind, ParticipantId, Ssrc, TrackId};
+use nexus_transport::arena::{PacketArena, PacketSlot};
+use nexus_transport::ring_buffer::RingBuffer;
 
 use nexus_actor::{MigrationEvent, MigrationMetrics, MigrationQueue};
 
@@ -41,6 +41,11 @@ use super::{WorkerMessage, WorkerStats};
 
 /// Default channel capacity for worker message queues.
 const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
+
+/// Packets a track actor's ring can hold for NACK retransmission. The
+/// retained window is `memory.ring_buffer_size` (≤ this), set via
+/// [`WorkerPool::set_ring_retention`]; each retained packet holds an arena slot.
+pub const ACTOR_RING_CAPACITY: usize = 2048;
 // ============================================================================
 // Real-Time Scheduling Support (Linux only)
 // ============================================================================
@@ -175,7 +180,10 @@ pub fn set_realtime_scheduling(priority: u32) -> Result<(), String> {
 
     if result != 0 {
         let errno = std::io::Error::last_os_error();
-        return Err(format!("sched_setscheduler(SCHED_FIFO, {}) failed: {}", priority, errno));
+        return Err(format!(
+            "sched_setscheduler(SCHED_FIFO, {}) failed: {}",
+            priority, errno
+        ));
     }
 
     // Postcondition: verify scheduling was actually set
@@ -188,8 +196,6 @@ pub fn set_realtime_scheduling(priority: u32) -> Result<(), String> {
 // ============================================================================
 // End Real-Time Scheduling Support
 // ============================================================================
-
-
 
 /// Default arena size per worker in MB.
 const DEFAULT_ARENA_SIZE_MB: u32 = 16;
@@ -311,9 +317,13 @@ impl WorkerHandle {
         self.track_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the track count.
+    /// Decrement the track count (saturating to avoid underflow).
     pub(crate) fn decrement_track_count(&self) {
-        self.track_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .track_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -404,9 +414,13 @@ pub struct MediaWorker {
     /// When a subscriber has `is_relay == true`, raw RTP is queued here
     /// instead of going through SRTP + batch_sender.
     relay_out_tx: Option<crossbeam::channel::Sender<RelayOutput>>,
+    /// Ring retention for new track actors (packets), shared with the pool.
+    ring_retention: Arc<AtomicU32>,
     /// Reverse SSRC→TrackId map for routing SPSC cross-worker packets.
     /// Updated when SetSsrc or SetSimulcastSsrc messages are processed.
     ssrc_to_track: HashMap<Ssrc, TrackId>,
+    /// RTCP transmission scheduler (RFC 3550 §6.2-6.4).
+    rtcp_scheduler: nexus_media::rtcp::RtcpScheduler,
 }
 
 /// A packet destined for a relay peer node.
@@ -437,8 +451,10 @@ struct TrackActorState {
     /// Content type: 0=camera, 1=screen, 2=audio.
     /// Screen share (1) bypasses viewport filtering.
     content_type: u8,
-    /// Ring buffer for packet storage.
-    ring_buffer: RingBuffer<2048>,
+    /// Ring buffer for packet storage (NACK retransmission).
+    ring_buffer: RingBuffer<ACTOR_RING_CAPACITY>,
+    /// Packets kept in `ring_buffer`; older ones release their arena slot.
+    ring_retention: u32,
     /// Subscribers for this track.
     subscribers: Vec<ActorSubscriber>,
     /// Packets received.
@@ -501,9 +517,6 @@ struct TrackActorState {
     last_twcc_sent_us: u64,
 }
 
-/// SR generation interval (1 second).
-const SR_INTERVAL_US: u64 = 1_000_000;
-
 /// Subscriber for an actor-based track.
 ///
 /// The SFU acts as an RFC 3550 §7.1 translator: it re-encrypts media
@@ -565,7 +578,13 @@ struct ActorSubscriber {
 
 impl TrackActorState {
     /// Create new actor state.
-    fn new(track_id: TrackId, participant_id: ParticipantId, ssrc: Ssrc, kind: MediaKind, content_type: u8) -> Self {
+    fn new(
+        track_id: TrackId,
+        participant_id: ParticipantId,
+        ssrc: Ssrc,
+        kind: MediaKind,
+        content_type: u8,
+    ) -> Self {
         // Default simulcast layers based on media kind
         let simulcast_layers = if kind == MediaKind::Video {
             vec![
@@ -593,6 +612,7 @@ impl TrackActorState {
             kind,
             content_type,
             ring_buffer: RingBuffer::new(),
+            ring_retention: ACTOR_RING_CAPACITY as u32,
             subscribers: Vec::with_capacity(100),
             packets_received: 0,
             packets_forwarded: 0,
@@ -625,8 +645,13 @@ impl TrackActorState {
     /// Add a subscriber.
     fn add_subscriber(&mut self, id: u32, participant_id: ParticipantId, dest_addr: SocketAddr) {
         // Generate a stable outbound SSRC for this subscription (P2-3).
-        static NEXT_SSRC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x1000_0000);
-        let ssrc = NEXT_SSRC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Skip 0 on wrap-around since SSRC 0 is reserved/invalid.
+        static NEXT_SSRC: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0x1000_0000);
+        let mut ssrc = NEXT_SSRC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if ssrc == 0 {
+            ssrc = NEXT_SSRC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         self.subscribers.push(ActorSubscriber {
             id,
@@ -643,7 +668,8 @@ impl TrackActorState {
             viewport_pinned: Vec::new(),
             is_relay: false,
             relay_node: 0,
-            pt_override: 0, outbound_ssrc: ssrc,
+            pt_override: 0,
+            outbound_ssrc: ssrc,
         });
     }
 
@@ -660,7 +686,7 @@ impl TrackActorState {
     /// Process a packet.
     fn process_packet(&mut self, packet: PacketSlot) {
         self.packets_received += 1;
-        self.ring_buffer.push(packet);
+        self.ring_buffer.push_bounded(packet, self.ring_retention);
     }
 
     /// Select best layer for allocated bitrate.
@@ -752,7 +778,7 @@ impl MediaWorker {
             coordinator: Some(nexus_bwe::BandwidthCoordinator::new(
                 100_000,    // min 100 kbps
                 10_000_000, // max 10 Mbps
-                1_000_000, // initial 1 Mbps
+                1_000_000,  // initial 1 Mbps
             )),
             last_allocation_check_us: 0,
             speaker_detector: nexus_bwe::SpeakerDetector::new(),
@@ -767,7 +793,9 @@ impl MediaWorker {
             last_remb_sent_us: 0,
             remb_generator: nexus_bwe::RembGenerator::new(1), // SFU sender SSRC
             relay_out_tx: None,
+            ring_retention: Arc::new(AtomicU32::new(ACTOR_RING_CAPACITY as u32)),
             ssrc_to_track: HashMap::new(),
+            rtcp_scheduler: nexus_media::rtcp::RtcpScheduler::new(1_000_000), // initial 1 Mbps
         })
     }
 
@@ -792,7 +820,10 @@ impl MediaWorker {
         );
         // Precondition: self slot is None
         assert!(
-            receivers.get(self.worker_id as usize).map(|r| r.is_none()).unwrap_or(true),
+            receivers
+                .get(self.worker_id as usize)
+                .map(|r| r.is_none())
+                .unwrap_or(true),
             "receiver for self must be None"
         );
 
@@ -827,7 +858,11 @@ impl MediaWorker {
     /// - ≥2 assertions
     /// - ≤70 lines
     #[inline]
-    pub fn route_to_worker(&mut self, target_worker_id: u32, packet: PacketSlot) -> Result<(), PacketSlot> {
+    pub fn route_to_worker(
+        &mut self,
+        target_worker_id: u32,
+        packet: PacketSlot,
+    ) -> Result<(), PacketSlot> {
         // Precondition: target is not self
         assert_ne!(
             target_worker_id, self.worker_id,
@@ -882,7 +917,10 @@ impl MediaWorker {
         // Precondition: SSRC is valid
         assert!(ssrc != 0, "ssrc must not be 0");
         // Precondition: hasher is initialized
-        assert!(self.ssrc_hasher.is_some(), "ssrc_hasher must be initialized");
+        assert!(
+            self.ssrc_hasher.is_some(),
+            "ssrc_hasher must be initialized"
+        );
 
         let target_worker_id = self.ssrc_hasher.as_ref().unwrap().hash(ssrc);
 
@@ -974,7 +1012,10 @@ impl MediaWorker {
         if self.coordinator.is_some() {
             self.perform_bandwidth_allocation(now_us);
         }
-        self.generate_and_send_sender_reports(now_us);
+        // SR generation uses RTCP scheduler (RFC 3550 §6) for timing
+        if self.rtcp_scheduler.is_time_to_send(now_us) {
+            self.generate_and_send_sender_reports(now_us);
+        }
         self.generate_and_send_remb(now_us);
         self.generate_and_send_twcc(now_us);
 
@@ -1008,34 +1049,32 @@ impl MediaWorker {
         let max_collect = MAX_DRAIN_PER_CHANNEL as usize * self.spsc_receivers.len();
         let mut collected: Vec<(TrackId, PacketSlot)> = Vec::with_capacity(max_collect.min(256));
 
-        for receiver_opt in &self.spsc_receivers {
-            if let Some(receiver) = receiver_opt {
-                let mut channel_processed: u32 = 0;
-                while channel_processed < MAX_DRAIN_PER_CHANNEL {
-                    match receiver.try_recv() {
-                        Some(packet) => {
-                            self.spsc_packets_received += 1;
-                            channel_processed += 1;
+        for receiver in self.spsc_receivers.iter().flatten() {
+            let mut channel_processed: u32 = 0;
+            while channel_processed < MAX_DRAIN_PER_CHANNEL {
+                match receiver.try_recv() {
+                    Some(packet) => {
+                        self.spsc_packets_received += 1;
+                        channel_processed += 1;
 
-                            let data = packet.data();
-                            if data.len() >= 12 {
-                                let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-                                if let Some(&track_id) = self.ssrc_to_track.get(&ssrc) {
-                                    collected.push((track_id, packet));
-                                } else {
-                                    self.packets_dropped += 1;
-                                    drop(packet);
-                                }
+                        let data = packet.data();
+                        if data.len() >= 12 {
+                            let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                            if let Some(&track_id) = self.ssrc_to_track.get(&ssrc) {
+                                collected.push((track_id, packet));
                             } else {
                                 self.packets_dropped += 1;
                                 drop(packet);
                             }
+                        } else {
+                            self.packets_dropped += 1;
+                            drop(packet);
                         }
-                        None => break,
                     }
+                    None => break,
                 }
-                total_processed += channel_processed;
             }
+            total_processed += channel_processed;
         }
 
         // Now process collected packets (requires &mut self)
@@ -1110,7 +1149,11 @@ impl MediaWorker {
                 self.terminate_actor(track_id);
                 true
             }
-            WorkerMessage::Packet { track_id, packet, source_addr } => {
+            WorkerMessage::Packet {
+                track_id,
+                packet,
+                source_addr,
+            } => {
                 // Delegate to actor_process_packet for unified packet handling
                 self.actor_process_packet(track_id, packet, source_addr);
                 true
@@ -1135,7 +1178,13 @@ impl MediaWorker {
                 dest_addr,
                 srtp_context,
             } => {
-                self.actor_subscribe(track_id, subscriber_id, participant_id, dest_addr, srtp_context);
+                self.actor_subscribe(
+                    track_id,
+                    subscriber_id,
+                    participant_id,
+                    dest_addr,
+                    srtp_context,
+                );
                 true
             }
             WorkerMessage::ActorUnsubscribe {
@@ -1145,7 +1194,11 @@ impl MediaWorker {
                 self.actor_unsubscribe(track_id, subscriber_id);
                 true
             }
-            WorkerMessage::ActorPacket { track_id, packet, source_addr } => {
+            WorkerMessage::ActorPacket {
+                track_id,
+                packet,
+                source_addr,
+            } => {
                 self.actor_process_packet(track_id, packet, source_addr);
                 true
             }
@@ -1210,7 +1263,10 @@ impl MediaWorker {
                 self.handle_transport_feedback(&feedback, timestamp_us);
                 true
             }
-            WorkerMessage::RtcpPli { media_ssrc, sender_ssrc } => {
+            WorkerMessage::RtcpPli {
+                media_ssrc,
+                sender_ssrc,
+            } => {
                 self.handle_rtcp_pli(media_ssrc, sender_ssrc);
                 true
             }
@@ -1247,7 +1303,14 @@ impl MediaWorker {
                 target_layer,
                 srtp_context,
             } => {
-                self.add_subscriber(track_id, subscriber_id, participant_id, dest_addr, target_layer, srtp_context);
+                self.add_subscriber(
+                    track_id,
+                    subscriber_id,
+                    participant_id,
+                    dest_addr,
+                    target_layer,
+                    srtp_context,
+                );
                 true
             }
             WorkerMessage::RemoveSubscriber {
@@ -1270,10 +1333,7 @@ impl MediaWorker {
                 }
                 true
             }
-            WorkerMessage::SetSsrc {
-                track_id,
-                ssrc,
-            } => {
+            WorkerMessage::SetSsrc { track_id, ssrc } => {
                 if let Some(actor) = self.actors.get_mut(&track_id) {
                     actor.ssrc = ssrc;
                     actor.sr_generator = nexus_media::rtcp::SenderReportGenerator::new(ssrc);
@@ -1289,9 +1349,15 @@ impl MediaWorker {
             } => {
                 assert!(target_layer < 3, "Target layer must be 0, 1, or 2");
                 if let Some(actor) = self.actors.get_mut(&track_id) {
-                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id) {
+                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id)
+                    {
                         sub.target_layer = target_layer;
-                        tracing::debug!(track_id, subscriber_id, target_layer, "Subscriber layer updated");
+                        tracing::debug!(
+                            track_id,
+                            subscriber_id,
+                            target_layer,
+                            "Subscriber layer updated"
+                        );
                     }
                 }
                 true
@@ -1316,9 +1382,15 @@ impl MediaWorker {
                 payload_type,
             } => {
                 if let Some(actor) = self.actors.get_mut(&track_id) {
-                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id) {
+                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id)
+                    {
                         sub.pt_override = payload_type;
-                        tracing::debug!(track_id, subscriber_id, payload_type, "Subscriber PT override set");
+                        tracing::debug!(
+                            track_id,
+                            subscriber_id,
+                            payload_type,
+                            "Subscriber PT override set"
+                        );
                     }
                 }
                 true
@@ -1340,11 +1412,13 @@ impl MediaWorker {
                 pinned,
             } => {
                 if let Some(actor) = self.actors.get_mut(&track_id) {
-                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id) {
+                    if let Some(sub) = actor.subscribers.iter_mut().find(|s| s.id == subscriber_id)
+                    {
                         sub.viewport_visible = visible;
                         sub.viewport_pinned = pinned;
                         tracing::debug!(
-                            track_id, subscriber_id,
+                            track_id,
+                            subscriber_id,
                             visible_count = sub.viewport_visible.len(),
                             pinned_count = sub.viewport_pinned.len(),
                             "Subscriber viewport updated"
@@ -1385,11 +1459,13 @@ impl MediaWorker {
                             viewport_pinned: Vec::new(),
                             is_relay: true,
                             relay_node: peer_node,
-                            pt_override: 0, outbound_ssrc: 0,
+                            pt_override: 0,
+                            outbound_ssrc: 0,
                         });
                         tracing::info!(
                             worker_id = self.worker_id,
-                            track_id, peer_node,
+                            track_id,
+                            peer_node,
                             "Added relay subscriber"
                         );
                     }
@@ -1424,7 +1500,7 @@ impl MediaWorker {
                             &self.relay_out_tx,
                         );
 
-                        actor.ring_buffer.push(slot);
+                        actor.ring_buffer.push_bounded(slot, actor.ring_retention);
                         actor.packets_received += 1;
                     }
                 }
@@ -1444,7 +1520,9 @@ impl MediaWorker {
         kind: MediaKind,
         content_type: u8,
     ) {
-        let actor_state = TrackActorState::new(track_id, participant_id, ssrc, kind, content_type);
+        let mut actor_state =
+            TrackActorState::new(track_id, participant_id, ssrc, kind, content_type);
+        actor_state.ring_retention = self.ring_retention.load(Ordering::Relaxed);
         self.actors.insert(track_id, actor_state);
         self.track_count.fetch_add(1, Ordering::Relaxed);
         self.actor_messages_processed += 1;
@@ -1475,7 +1553,8 @@ impl MediaWorker {
                 viewport_pinned: Vec::new(),
                 is_relay: false,
                 relay_node: 0,
-                pt_override: 0, outbound_ssrc: 0,
+                pt_override: 0,
+                outbound_ssrc: 0,
             });
         }
         self.actor_messages_processed += 1;
@@ -1490,12 +1569,19 @@ impl MediaWorker {
     }
 
     /// Process a packet through the actor system.
-    fn actor_process_packet(&mut self, track_id: TrackId, packet: PacketSlot, source_addr: SocketAddr) {
+    fn actor_process_packet(
+        &mut self,
+        track_id: TrackId,
+        packet: PacketSlot,
+        source_addr: SocketAddr,
+    ) {
         // Check if actor exists first
-        let has_subscribers = self.actors.get(&track_id)
+        let has_subscribers = self
+            .actors
+            .get(&track_id)
             .map(|a| !a.subscribers.is_empty())
             .unwrap_or(false);
-        
+
         // Capture timestamp before mutable borrow (for TWCC recording)
         let now_us = self.get_timestamp_us();
 
@@ -1510,7 +1596,7 @@ impl MediaWorker {
                     "Set publisher address from first RTP/RTCP packet"
                 );
             }
-            
+
             // Extract RTP timestamp from packet for SR generation
             if packet.len() >= 12 {
                 let rtp_timestamp = u32::from_be_bytes([
@@ -1521,7 +1607,7 @@ impl MediaWorker {
                 ]);
                 actor.last_rtp_timestamp = Some(rtp_timestamp);
             }
-            
+
             // Update SR generator stats once per RTP packet
             actor.sr_generator.update_stats(packet.len() as usize);
 
@@ -1529,7 +1615,9 @@ impl MediaWorker {
             if actor.twcc_ext_id != 0 && packet.len() >= 12 {
                 let data = packet.data();
                 if let Ok(hdr) = nexus_media::RtpHeader::parse(&data[..packet.len() as usize]) {
-                    if let Some(ext_val) = hdr.get_extension_value(&data[..packet.len() as usize], actor.twcc_ext_id) {
+                    if let Some(ext_val) =
+                        hdr.get_extension_value(&data[..packet.len() as usize], actor.twcc_ext_id)
+                    {
                         let twcc_seq = if ext_val.len() >= 2 {
                             u16::from_be_bytes([ext_val[0], ext_val[1]])
                         } else if ext_val.len() == 1 {
@@ -1547,7 +1635,7 @@ impl MediaWorker {
                 }
             }
         }
-        
+
         // Forward to subscribers if needed
         if has_subscribers {
             if let Some(actor) = self.actors.get_mut(&track_id) {
@@ -1582,7 +1670,7 @@ impl MediaWorker {
                 );
             }
         }
-        
+
         // Now process the packet (store in ring buffer)
         if let Some(actor) = self.actors.get_mut(&track_id) {
             actor.process_packet(packet);
@@ -1639,26 +1727,26 @@ impl MediaWorker {
             if fixed_header_len + 4 > packet_len {
                 return None;
             }
-            let ext_profile = u16::from_be_bytes([
-                buf[fixed_header_len],
-                buf[fixed_header_len + 1],
-            ]);
+            let ext_profile =
+                u16::from_be_bytes([buf[fixed_header_len], buf[fixed_header_len + 1]]);
             if ext_profile != 0xBEDE {
                 // Check for two-byte header format (RFC 8285 §4.3): 0x100N
                 if (ext_profile & 0xFFF0) == 0x1000 {
                     return Self::inject_mid_extension_two_byte(
-                        buf, packet_len, fixed_header_len,
-                        mid_ext_id, mid_value, mid_value_len,
+                        buf,
+                        packet_len,
+                        fixed_header_len,
+                        mid_ext_id,
+                        mid_value,
+                        mid_value_len,
                     );
                 }
                 // Unknown format — don't modify
                 return None;
             }
 
-            let ext_len_words = u16::from_be_bytes([
-                buf[fixed_header_len + 2],
-                buf[fixed_header_len + 3],
-            ]) as usize;
+            let ext_len_words =
+                u16::from_be_bytes([buf[fixed_header_len + 2], buf[fixed_header_len + 3]]) as usize;
             let ext_data_start = fixed_header_len + 4;
             let ext_data_len = ext_len_words * 4;
             let payload_start = ext_data_start + ext_data_len;
@@ -1705,7 +1793,10 @@ impl MediaWorker {
 
             // Shift existing extension data right by mid_element_len
             if ext_data_len > 0 {
-                buf.copy_within(ext_data_start..ext_data_start + ext_data_len, ext_data_start + mid_element_len);
+                buf.copy_within(
+                    ext_data_start..ext_data_start + ext_data_len,
+                    ext_data_start + mid_element_len,
+                );
             }
 
             // Write MID element at ext_data_start
@@ -1740,7 +1831,10 @@ impl MediaWorker {
             // Shift everything after fixed header right by ext_header_total
             let payload_len = packet_len - fixed_header_len;
             if payload_len > 0 {
-                buf.copy_within(fixed_header_len..packet_len, fixed_header_len + ext_header_total);
+                buf.copy_within(
+                    fixed_header_len..packet_len,
+                    fixed_header_len + ext_header_total,
+                );
             }
 
             // Set extension bit in RTP header
@@ -1779,10 +1873,8 @@ impl MediaWorker {
         mid_value: &[u8],
         mid_value_len: usize,
     ) -> Option<usize> {
-        let ext_len_words = u16::from_be_bytes([
-            buf[fixed_header_len + 2],
-            buf[fixed_header_len + 3],
-        ]) as usize;
+        let ext_len_words =
+            u16::from_be_bytes([buf[fixed_header_len + 2], buf[fixed_header_len + 3]]) as usize;
         let ext_data_start = fixed_header_len + 4;
         let ext_data_len = ext_len_words * 4;
         let payload_start = ext_data_start + ext_data_len;
@@ -1825,7 +1917,10 @@ impl MediaWorker {
 
         // Shift existing extension data right
         if ext_data_len > 0 {
-            buf.copy_within(ext_data_start..ext_data_start + ext_data_len, ext_data_start + mid_element_len);
+            buf.copy_within(
+                ext_data_start..ext_data_start + ext_data_len,
+                ext_data_start + mid_element_len,
+            );
         }
 
         // Write two-byte MID element
@@ -1855,6 +1950,7 @@ impl MediaWorker {
     /// - Rollover counter (ROC) tracking sequence number wraps
     /// - Replay protection window state
     /// - Key derivation state for SRTP key scheduling
+    ///
     /// Therefore, we MUST encrypt separately for each subscriber — a single
     /// encrypted packet cannot be reused across subscribers.
     ///
@@ -1868,6 +1964,8 @@ impl MediaWorker {
     /// - ≥2 assertions
     /// - Bounded loop (MAX_SUBSCRIBERS_PER_TRACK)
     /// - Explicit error handling
+    // Static so callers can pass disjoint &mut fields of self (split borrows).
+    #[allow(clippy::too_many_arguments)]
     fn forward_to_subscribers_static(
         actor: &mut TrackActorState,
         packet: &PacketSlot,
@@ -1881,24 +1979,24 @@ impl MediaWorker {
         relay_out_tx: &Option<crossbeam::channel::Sender<RelayOutput>>,
     ) {
         // Precondition assertions (TigerStyle: ≥2 assertions)
-        assert!(packet.len() > 0, "packet length must be positive");
+        assert!(!packet.is_empty(), "packet length must be positive");
         assert!(packet.len() >= 12, "packet must have RTP header");
         assert!(packet_layer < 3, "packet layer must be 0, 1, or 2");
 
         // In sim mode, SRTP protection is bypassed so this counter is unused
         #[cfg(feature = "sim")]
         let _ = &dropped_unprotected;
-        
+
         const MAX_SUBSCRIBERS_PER_TRACK: usize = 2000;
-        
+
         let subscriber_count = actor.subscribers.len().min(MAX_SUBSCRIBERS_PER_TRACK);
         let packet_len = packet.len() as usize;
         let mut forwarded_count = 0u32;
-        
+
         // Bounded iteration over subscribers
         for i in 0..subscriber_count {
             let subscriber = &mut actor.subscribers[i];
-            
+
             // Simulcast layer filtering: only forward if this packet's layer
             // matches the subscriber's target layer.
             // For audio (kind == Audio), packet_layer is always 0 and
@@ -1921,7 +2019,7 @@ impl MediaWorker {
                     continue;
                 }
             }
-            
+
             // Relay forwarding: skip SRTP, send raw RTP to peer node.
             if subscriber.is_relay {
                 if let Some(tx) = relay_out_tx {
@@ -1960,7 +2058,8 @@ impl MediaWorker {
                         actor.mid_ext_id,
                         &actor.mid_value,
                         actor.mid_value_len as usize,
-                    ).unwrap_or(packet_len)
+                    )
+                    .unwrap_or(packet_len)
                 } else {
                     packet_len
                 };
@@ -1973,16 +2072,16 @@ impl MediaWorker {
                         actor.rid_ext_id,
                         &actor.rid_value,
                         actor.rid_value_len as usize,
-                    ).unwrap_or(actual_len)
+                    )
+                    .unwrap_or(actual_len)
                 } else {
                     actual_len
                 };
 
                 // RFC 3550 §7.1 translator (sim path — same logic, no SRTP)
                 let pub_seq = u16::from_be_bytes([slot_data[2], slot_data[3]]);
-                let pub_ts = u32::from_be_bytes([
-                    slot_data[4], slot_data[5], slot_data[6], slot_data[7],
-                ]);
+                let pub_ts =
+                    u32::from_be_bytes([slot_data[4], slot_data[5], slot_data[6], slot_data[7]]);
                 let seq = subscriber.seq_counter;
                 subscriber.seq_map[(seq as usize) & 0x3FF] = pub_seq;
                 subscriber.seq_counter = subscriber.seq_counter.wrapping_add(1);
@@ -2023,7 +2122,7 @@ impl MediaWorker {
                     continue;
                 }
             };
-            
+
             // Allocate from arena FIRST, then encrypt in-place
             #[cfg(not(feature = "sim"))]
             {
@@ -2035,7 +2134,7 @@ impl MediaWorker {
                         break;
                     }
                 };
-                
+
                 // Copy RTP data into arena slot
                 let slot_data = forward_slot.data_mut();
                 let srtp_tag_len = srtp_ctx.cipher_tag_len();
@@ -2052,7 +2151,8 @@ impl MediaWorker {
                         actor.mid_ext_id,
                         &actor.mid_value,
                         actor.mid_value_len as usize,
-                    ).unwrap_or(packet_len)
+                    )
+                    .unwrap_or(packet_len)
                 } else {
                     packet_len
                 };
@@ -2065,7 +2165,8 @@ impl MediaWorker {
                         actor.rid_ext_id,
                         &actor.rid_value,
                         actor.rid_value_len as usize,
-                    ).unwrap_or(actual_len)
+                    )
+                    .unwrap_or(actual_len)
                 } else {
                     actual_len
                 };
@@ -2084,9 +2185,8 @@ impl MediaWorker {
 
                 // Read publisher's original seq and timestamp
                 let pub_seq = u16::from_be_bytes([slot_data[2], slot_data[3]]);
-                let pub_ts = u32::from_be_bytes([
-                    slot_data[4], slot_data[5], slot_data[6], slot_data[7],
-                ]);
+                let pub_ts =
+                    u32::from_be_bytes([slot_data[4], slot_data[5], slot_data[6], slot_data[7]]);
 
                 // Seq mapping: record pub_seq for RTCP RR translation
                 let sub_seq = subscriber.seq_counter;
@@ -2135,23 +2235,25 @@ impl MediaWorker {
                         continue;
                     }
                 };
-                
+
                 forward_slot.set_len(protected_len as u16);
-                
+
                 // Track bytes copied for capacity planning
                 *bytes_copied_fanout += protected_len as u64;
-                
+
                 // Queue directly to batch sender — no second copy
                 batch_sender.queue(subscriber.dest_addr, forward_slot);
                 forwarded_count += 1;
             }
         }
-        
+
         actor.packets_forwarded += forwarded_count as u64;
 
         // Postcondition assertion (TigerStyle)
-        assert!(forwarded_count <= subscriber_count as u32, 
-            "forwarded count must not exceed subscriber count");
+        assert!(
+            forwarded_count <= subscriber_count as u32,
+            "forwarded count must not exceed subscriber count"
+        );
     }
 
     /// Terminate a TrackActor.
@@ -2196,6 +2298,7 @@ impl MediaWorker {
             MediaKind::Video, // kind - default to video
             0,                // content_type - default to camera
         );
+        actor_state.ring_retention = self.ring_retention.load(Ordering::Relaxed);
 
         // Restore subscribers
         for sub_snap in snapshot.subscribers {
@@ -2246,12 +2349,9 @@ impl MediaWorker {
         }
 
         // Update speaker detector with packet rates
-        for (_track_id, actor) in &self.actors {
-            self.speaker_detector.update(
-                actor.track_id as u64,
-                actor.packets_received,
-                timestamp_us,
-            );
+        for actor in self.actors.values() {
+            self.speaker_detector
+                .update(actor.track_id, actor.packets_received, timestamp_us);
         }
 
         // Detect current speaker
@@ -2260,8 +2360,8 @@ impl MediaWorker {
         // Collect track information with proper priorities
         let allocs: Vec<nexus_bwe::TrackAllocation> = self
             .actors
-            .iter()
-            .map(|(_track_id, actor)| {
+            .values()
+            .map(|actor| {
                 // Determine priority based on speaker detection and media kind
                 // Map internal MediaKind to BWE MediaKind
                 let media_kind = match actor.kind {
@@ -2271,11 +2371,11 @@ impl MediaWorker {
 
                 let priority = self
                     .speaker_detector
-                    .get_priority(actor.track_id as u64, media_kind);
+                    .get_priority(actor.track_id, media_kind);
 
                 // Build allocation request with proper structure
                 let mut allocation = nexus_bwe::TrackAllocation::new(
-                    actor.track_id as u64,
+                    actor.track_id,
                     priority,
                     actor.max_bitrate_bps,
                 );
@@ -2307,6 +2407,12 @@ impl MediaWorker {
             })
             .collect();
 
+        // Update RTCP scheduler with current estimated bandwidth (RFC 3550 §6.2)
+        let target_bps = coordinator.target_bitrate();
+        if target_bps > 0 {
+            self.rtcp_scheduler.set_session_bandwidth(target_bps);
+        }
+
         // Put coordinator back before modifying actors
         self.coordinator = Some(coordinator);
 
@@ -2326,7 +2432,8 @@ impl MediaWorker {
                 actor.last_layer_switch_us = timestamp_us;
 
                 // Propagate target_layer to all subscribers (bounded)
-                let sub_count = actor.subscribers.len().min(100);
+                const MAX_SUBS: usize = 2000;
+                let sub_count = actor.subscribers.len().min(MAX_SUBS);
                 for i in 0..sub_count {
                     let sub = &mut actor.subscribers[i];
                     // Respect subscriber's max_requested_layer
@@ -2338,7 +2445,11 @@ impl MediaWorker {
         // Send REMB packets with SRTCP protection to publishers
         for (publisher_addr, remb_packet) in remb_packets {
             // Find the actor with matching publisher address to get SRTCP context
-            if let Some(actor) = self.actors.values_mut().find(|a| a.publisher_addr == Some(publisher_addr)) {
+            if let Some(actor) = self
+                .actors
+                .values_mut()
+                .find(|a| a.publisher_addr == Some(publisher_addr))
+            {
                 if let Some(ref mut srtcp_ctx) = actor.publisher_srtcp_context {
                     // Apply SRTCP protection — add room for 4-byte index + auth tag
                     let srtcp_overhead = 4 + srtcp_ctx.cipher_tag_len();
@@ -2346,7 +2457,7 @@ impl MediaWorker {
                     protected_remb.extend_from_slice(&remb_packet);
                     protected_remb.resize(remb_packet.len() + srtcp_overhead, 0);
                     let remb_len = remb_packet.len();
-                    
+
                     match srtcp_ctx.protect_rtcp(&mut protected_remb, remb_len) {
                         Ok(protected_len) => {
                             protected_remb.truncate(protected_len);
@@ -2402,7 +2513,7 @@ impl MediaWorker {
         let max_tracks = 1000;
         let mut track_count = 0;
 
-        for (_track_id, actor) in &mut self.actors {
+        for actor in self.actors.values_mut() {
             // Enforce bound
             if track_count >= max_tracks {
                 break;
@@ -2414,8 +2525,9 @@ impl MediaWorker {
                 continue;
             }
 
-            let time_since_last_sr = timestamp_us.saturating_sub(actor.last_sr_sent_us);
-            if time_since_last_sr < SR_INTERVAL_US && actor.last_sr_sent_us > 0 {
+            // Per-track SR suppression: don't re-send if this specific track
+            // already sent an SR this cycle (e.g., multiple scheduler firings).
+            if actor.last_sr_sent_us == timestamp_us {
                 continue;
             }
 
@@ -2440,14 +2552,16 @@ impl MediaWorker {
             // RTP timestamp must match what the subscriber actually receives.
             const MAX_SUBSCRIBERS_PER_TRACK: usize = 2000;
             let subscriber_count = actor.subscribers.len().min(MAX_SUBSCRIBERS_PER_TRACK);
-            assert!(subscriber_count <= MAX_SUBSCRIBERS_PER_TRACK,
-                "Subscriber count must not exceed MAX_SUBSCRIBERS_PER_TRACK");
-            
+            assert!(
+                subscriber_count <= MAX_SUBSCRIBERS_PER_TRACK,
+                "Subscriber count must not exceed MAX_SUBSCRIBERS_PER_TRACK"
+            );
+
             let mut sr_queued = false;
-            
+
             for i in 0..subscriber_count {
                 let subscriber = &mut actor.subscribers[i];
-                
+
                 // Only send if SRTCP context is available
                 if let Some(ref mut srtp_ctx) = subscriber.srtp_context {
                     // Rebase RTP timestamp to subscriber's timeline
@@ -2463,7 +2577,7 @@ impl MediaWorker {
                     protected_sr.extend_from_slice(&sr_packet);
                     protected_sr.resize(sr_packet.len() + srtcp_overhead, 0);
                     let sr_len = sr_packet.len();
-                    
+
                     // Apply SRTCP protection
                     match srtp_ctx.protect_rtcp(&mut protected_sr, sr_len) {
                         Ok(protected_len) => {
@@ -2489,7 +2603,7 @@ impl MediaWorker {
                     );
                 }
             }
-            
+
             // Postcondition assertion: we processed at most MAX_SUBSCRIBERS_PER_TRACK
             debug_assert!(subscriber_count <= MAX_SUBSCRIBERS_PER_TRACK);
 
@@ -2502,9 +2616,15 @@ impl MediaWorker {
             }
         }
 
-        // Send all collected SR packets
-        for (dest_addr, packet) in sr_packets {
-            self.send_rtcp_packet(dest_addr, &packet);
+        // Send all collected SR packets and update RTCP scheduler accounting
+        for (dest_addr, packet) in &sr_packets {
+            self.send_rtcp_packet(*dest_addr, packet);
+        }
+        // Update RTCP scheduler with actual packet sizes (RFC 3550 §6.3.2)
+        if !sr_packets.is_empty() {
+            let avg_size =
+                sr_packets.iter().map(|(_, p)| p.len()).sum::<usize>() / sr_packets.len();
+            self.rtcp_scheduler.on_rtcp_packet(avg_size, timestamp_us);
         }
 
         // Postcondition: bounded iteration
@@ -2524,7 +2644,7 @@ impl MediaWorker {
     fn generate_and_send_remb(&mut self, now_us: u64) {
         // REMB generation interval (5 seconds, per GCC spec recommendation)
         const REMB_INTERVAL_US: u64 = 1_000_000; // 1 second per GCC spec
-        
+
         // Check interval
         if now_us.saturating_sub(self.last_remb_sent_us) < REMB_INTERVAL_US {
             return;
@@ -2561,10 +2681,11 @@ impl MediaWorker {
             }
 
             // Need both publisher address and SRTCP context
-            let (publisher_addr, srtcp_ctx) = match (actor.publisher_addr, actor.publisher_srtcp_context.as_mut()) {
-                (Some(addr), Some(ctx)) => (addr, ctx),
-                _ => continue,
-            };
+            let (publisher_addr, srtcp_ctx) =
+                match (actor.publisher_addr, actor.publisher_srtcp_context.as_mut()) {
+                    (Some(addr), Some(ctx)) => (addr, ctx),
+                    _ => continue,
+                };
 
             // Generate REMB packet
             let mut remb_packet = self.remb_generator.generate(estimated_bps, actor.ssrc);
@@ -2636,7 +2757,10 @@ impl MediaWorker {
             // Need publisher address and SRTCP context
             let publisher_addr = match actor.publisher_addr {
                 Some(a) => a,
-                None => { actor.twcc_arrivals.clear(); continue; }
+                None => {
+                    actor.twcc_arrivals.clear();
+                    continue;
+                }
             };
 
             // Sort arrivals by sequence number
@@ -2709,12 +2833,14 @@ impl MediaWorker {
             );
         }
 
-        // TODO: SRTP-protect the packet if subscriber has SRTP context
-        // For now, send unprotected
+        // Note: SRTCP protection is applied by callers before invoking this
+        // function. All RTCP paths (SR, REMB, PLI, NACK, TWCC) protect packets
+        // via their respective publisher_srtcp_context or subscriber srtp_context
+        // prior to reaching this point.
 
         // Enqueue for sending via batch sender
         self.batch_sender.queue(dest_addr, slot);
-        
+
         tracing::trace!(
             dest = ?dest_addr,
             len = packet.len(),
@@ -2771,8 +2897,9 @@ impl MediaWorker {
     ///
     /// * `media_ssrc > 0` - Valid SSRC
     fn handle_rtcp_pli(&mut self, media_ssrc: u32, sender_ssrc: u32) {
-        // Precondition assertion
-        assert!(media_ssrc > 0, "Media SSRC must be non-zero");
+        if media_ssrc == 0 {
+            return;
+        }
 
         tracing::debug!(
             worker_id = self.worker_id,
@@ -2868,7 +2995,10 @@ impl MediaWorker {
     ) -> Vec<u16> {
         // Precondition assertions
         assert!(media_ssrc > 0, "Media SSRC must be non-zero");
-        assert!(lost_packets.len() <= 64, "Lost packets must be bounded to 64");
+        assert!(
+            lost_packets.len() <= 64,
+            "Lost packets must be bounded to 64"
+        );
 
         // Find the actor for this SSRC
         let actor = match self.actors.values_mut().find(|a| a.ssrc == media_ssrc) {
@@ -2885,9 +3015,7 @@ impl MediaWorker {
         const MAX_RETRANSMIT_PER_NACK: usize = 64;
         let count = lost_packets.len().min(MAX_RETRANSMIT_PER_NACK);
 
-        for i in 0..count {
-            let seq = lost_packets[i];
-
+        for &seq in lost_packets.iter().take(count) {
             match actor.ring_buffer.peek(seq as u32) {
                 Some(cached_packet) => {
                     if let Some(sub_idx) = subscriber_idx {
@@ -2976,12 +3104,14 @@ impl MediaWorker {
     /// * `media_ssrc > 0` - Valid SSRC
     /// * `lost_packets.len() <= 64` - Bounded packet list
     fn handle_rtcp_nack(&mut self, media_ssrc: u32, sender_ssrc: u32, lost_packets: Vec<u16>) {
-        // Precondition assertions
-        assert!(media_ssrc > 0, "Media SSRC must be non-zero");
-        assert!(
-            lost_packets.len() <= 64,
-            "Lost packets must be bounded to 64"
-        );
+        if media_ssrc == 0 {
+            return;
+        }
+        let lost_packets = if lost_packets.len() > 64 {
+            lost_packets[..64].to_vec()
+        } else {
+            lost_packets
+        };
 
         tracing::debug!(
             worker_id = self.worker_id,
@@ -3094,15 +3224,19 @@ impl MediaWorker {
     /// # Returns
     ///
     /// NACK packet with FCI entries
-    fn build_nack_packet_static(media_ssrc: u32, lost_packets: &[u16], sender_ssrc: u32) -> Vec<u8> {
+    fn build_nack_packet_static(
+        media_ssrc: u32,
+        lost_packets: &[u16],
+        sender_ssrc: u32,
+    ) -> Vec<u8> {
         // Bound lost_packets to 64 entries max
         let bounded_lost = &lost_packets[..lost_packets.len().min(64)];
-        
+
         // Calculate number of FCI entries needed
         // Each FCI entry encodes 1 PID + up to 16 BLP bits (17 packets total)
         let fci_count = (bounded_lost.len() + 16) / 17;
         let fci_count = fci_count.max(1); // At least one FCI entry
-        
+
         // Calculate packet size: header (8) + media SSRC (4) + FCI entries (4 bytes each)
         let packet_size = 12 + (fci_count * 4);
         let mut packet = vec![0u8; packet_size];
@@ -3122,31 +3256,31 @@ impl MediaWorker {
         // Write FCI entries - iterate over lost_packets in chunks of up to 17
         let mut offset = 12;
         let mut packet_idx = 0;
-        
+
         while packet_idx < bounded_lost.len() && offset + 4 <= packet_size {
             // PID is the first packet in this chunk
             let pid = bounded_lost[packet_idx];
             packet[offset..offset + 2].copy_from_slice(&pid.to_be_bytes());
-            
+
             // BLP encodes the next up to 16 packets
             let mut blp: u16 = 0;
             packet_idx += 1; // Move past PID
-            
+
             // Process up to 16 more packets for BLP
             let mut blp_count = 0;
             while blp_count < 16 && packet_idx < bounded_lost.len() {
                 let seq = bounded_lost[packet_idx];
                 let offset_from_pid = seq.wrapping_sub(pid).wrapping_sub(1);
-                
+
                 // Only set bit if within 16-bit range
                 if offset_from_pid < 16 {
                     blp |= 1 << offset_from_pid;
                 }
-                
+
                 packet_idx += 1;
                 blp_count += 1;
             }
-            
+
             packet[offset + 2..offset + 4].copy_from_slice(&blp.to_be_bytes());
             offset += 4;
         }
@@ -3180,7 +3314,12 @@ impl MediaWorker {
     /// # Assertions
     ///
     /// * `track_id > 0` - Valid track ID
-    fn set_publisher_srtcp(&mut self, track_id: TrackId, key_material: nexus_transport::srtp::KeyMaterial, srtp_policy: nexus_transport::srtp::SrtpPolicy) {
+    fn set_publisher_srtcp(
+        &mut self,
+        track_id: TrackId,
+        key_material: nexus_transport::srtp::KeyMaterial,
+        srtp_policy: nexus_transport::srtp::SrtpPolicy,
+    ) {
         // Precondition assertion
         assert!(track_id > 0, "Track ID must be non-zero");
 
@@ -3346,8 +3485,11 @@ impl MediaWorker {
                     viewport_pinned: Vec::new(),
                     is_relay: false,
                     relay_node: 0,
-                    pt_override: 0, outbound_ssrc: 0,
+                    pt_override: 0,
+                    outbound_ssrc: 0,
                 });
+                // Update RTCP scheduler member counts
+                self.update_rtcp_member_counts();
                 tracing::info!(
                     worker_id = self.worker_id,
                     track_id,
@@ -3383,6 +3525,7 @@ impl MediaWorker {
     fn remove_subscriber(&mut self, track_id: TrackId, subscriber_id: u32) {
         if let Some(actor) = self.actors.get_mut(&track_id) {
             actor.subscribers.retain(|s| s.id != subscriber_id);
+            self.update_rtcp_member_counts();
             tracing::info!(
                 worker_id = self.worker_id,
                 track_id,
@@ -3397,6 +3540,19 @@ impl MediaWorker {
                 "Cannot remove subscriber - track not found"
             );
         }
+    }
+
+    /// Update RTCP scheduler member/sender counts from current actor state.
+    fn update_rtcp_member_counts(&mut self) {
+        let senders = self.actors.len() as u32;
+        let members: u32 = self
+            .actors
+            .values()
+            .map(|a| a.subscribers.len() as u32)
+            .sum::<u32>()
+            .saturating_add(senders); // senders + subscribers
+        self.rtcp_scheduler.update_members(members.max(1), senders);
+        self.rtcp_scheduler.set_we_sent(senders > 0);
     }
 
     /// Flush outbound batches.
@@ -3420,7 +3576,11 @@ impl MediaWorker {
             iterations += 1;
 
             match msg {
-                WorkerMessage::Packet { track_id, packet, source_addr } => {
+                WorkerMessage::Packet {
+                    track_id,
+                    packet,
+                    source_addr,
+                } => {
                     self.actor_process_packet(track_id as TrackId, packet, source_addr);
                 }
                 WorkerMessage::Shutdown => break,
@@ -3473,6 +3633,8 @@ pub struct WorkerPool {
     next_track_id: AtomicU64,
     /// Shutdown flag.
     is_shutdown: AtomicBool,
+    /// Ring retention handed to workers for new track actors.
+    ring_retention: Arc<AtomicU32>,
 
     // === Migration Support ===
     /// Migration queue (bounded to MAX_CONCURRENT_MIGRATIONS).
@@ -3488,10 +3650,6 @@ pub struct WorkerPool {
     /// Receiver for relay output packets from workers.
     /// Drained by the SFU main loop and forwarded to RelayManager.
     relay_out_rx: crossbeam::channel::Receiver<RelayOutput>,
-    /// SPSC channel storage — kept alive for the lifetime of the pool.
-    /// Previously leaked via Box::leak; now properly owned.
-    #[allow(dead_code)]
-    spsc_channel_storage: Vec<Box<super::spsc::SpscChannel<4096>>>,
 }
 
 impl WorkerPool {
@@ -3549,7 +3707,7 @@ impl WorkerPool {
                 80 // Default priority
             } else {
                 assert!(
-                    realtime_priority_level >= 1 && realtime_priority_level <= 99,
+                    (1..=99).contains(&realtime_priority_level),
                     "realtime_priority_level must be in range 1-99"
                 );
                 realtime_priority_level
@@ -3572,6 +3730,7 @@ impl WorkerPool {
         // Relay output channel — all workers share the sender.
         // SFU main loop drains relay_out_rx → RelayManager.
         let (relay_out_tx, relay_out_rx) = crossbeam::channel::bounded::<RelayOutput>(8192);
+        let ring_retention = Arc::new(AtomicU32::new(ACTOR_RING_CAPACITY as u32));
 
         // =========================================================================
         // Phase 1: Create N×(N-1) SPSC channels and distribute handles
@@ -3579,17 +3738,16 @@ impl WorkerPool {
         // Each worker gets N-1 senders (to other workers) and N-1 receivers (from other workers)
         // =========================================================================
         let n = num_workers as usize;
-        
-        // Storage for channel boxes (to keep them alive)
-        let mut spsc_channel_storage: Vec<Box<super::spsc::SpscChannel<4096>>> = Vec::with_capacity(n * n);
-        
+
         // Initialize sender/receiver vectors for each worker
         // worker_senders[i][j] = sender from worker i to worker j (None if i == j)
         // worker_receivers[i][j] = receiver for worker i from worker j (None if i == j)
-        let mut worker_senders: Vec<Vec<Option<super::spsc::SpscSender<4096>>>> = Vec::with_capacity(n);
-        let mut worker_receivers: Vec<Vec<Option<super::spsc::SpscReceiver<4096>>>> = Vec::with_capacity(n);
-        
-        // Initialize with None values (can't use vec![vec![None; n]; n] because SpscSender/Receiver don't impl Clone)
+        let mut worker_senders: Vec<Vec<Option<super::spsc::SpscSender<4096>>>> =
+            Vec::with_capacity(n);
+        let mut worker_receivers: Vec<Vec<Option<super::spsc::SpscReceiver<4096>>>> =
+            Vec::with_capacity(n);
+
+        // Initialize with None values
         for _ in 0..n {
             let mut sender_row = Vec::with_capacity(n);
             let mut receiver_row = Vec::with_capacity(n);
@@ -3600,33 +3758,35 @@ impl WorkerPool {
             worker_senders.push(sender_row);
             worker_receivers.push(receiver_row);
         }
-        
-        // Create channels and distribute handles
+
+        // Create channels and distribute handles.
+        // Arc inside sender/receiver keeps channel alive — no external storage needed.
+        let mut channel_count = 0usize;
+        // Index loops: each channel fills senders[i][j] and receivers[j][i].
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             for j in 0..n {
                 if i != j {
-                    // Create channel from worker i to worker j
-                    let (channel, sender, receiver) = super::spsc::channel::<4096>();
-                    
+                    let (sender, receiver) = super::spsc::channel::<4096>();
+
                     // Worker i gets the sender (to send to worker j)
                     worker_senders[i][j] = Some(sender);
-                    
+
                     // Worker j gets the receiver (to receive from worker i)
                     worker_receivers[j][i] = Some(receiver);
-                    
-                    // Store channel to keep it alive
-                    spsc_channel_storage.push(channel);
+
+                    channel_count += 1;
                 }
             }
         }
-        
+
         // Postcondition: verify channel count
         assert_eq!(
-            spsc_channel_storage.len(),
+            channel_count,
             n * n.saturating_sub(1),
             "must have N×(N-1) SPSC channels"
         );
-        
+
         // Verify distribution
         for i in 0..n {
             let sender_count = worker_senders[i].iter().filter(|s| s.is_some()).count();
@@ -3644,9 +3804,6 @@ impl WorkerPool {
                 i
             );
         }
-
-        // Store channel storage in the pool to keep channels alive (no leak)
-        let spsc_channel_storage_owned = spsc_channel_storage;
 
         // =========================================================================
         // Phase 3: Spawn worker threads
@@ -3689,12 +3846,13 @@ impl WorkerPool {
             };
 
             // Take SPSC channel handles for this worker (move ownership, not clone)
-            let spsc_senders: Vec<Option<super::spsc::SpscSender<4096>>> = 
+            let spsc_senders: Vec<Option<super::spsc::SpscSender<4096>>> =
                 std::mem::take(&mut worker_senders[worker_id as usize]);
-            let spsc_receivers: Vec<Option<super::spsc::SpscReceiver<4096>>> = 
+            let spsc_receivers: Vec<Option<super::spsc::SpscReceiver<4096>>> =
                 std::mem::take(&mut worker_receivers[worker_id as usize]);
 
             let relay_tx_clone = relay_out_tx.clone();
+            let ring_retention_clone = Arc::clone(&ring_retention);
 
             // Spawn worker thread
             let thread = thread::Builder::new()
@@ -3753,6 +3911,7 @@ impl WorkerPool {
                             // Set SPSC channel handles (Requirement 1.3)
                             worker.set_spsc_channels(spsc_receivers, spsc_senders);
                             worker.relay_out_tx = Some(relay_tx_clone);
+                            worker.ring_retention = ring_retention_clone;
                             worker.run()
                         }
                         Err(e) => {
@@ -3867,8 +4026,27 @@ impl WorkerPool {
             migration_metrics: Arc::new(MigrationMetrics::new()),
             last_rebalance_time: Arc::new(AtomicU64::new(0)),
             relay_out_rx,
-            spsc_channel_storage: spsc_channel_storage_owned,
+            ring_retention,
         })
+    }
+
+    /// Set how many packets each track keeps for NACK retransmission
+    /// (`memory.ring_buffer_size`). Applies to tracks created afterwards.
+    ///
+    /// Retained packets hold slots in the ingest arena, so this bounds that
+    /// use to `tracks × packets` instead of `tracks × ACTOR_RING_CAPACITY`.
+    pub fn set_ring_retention(&self, packets: u32) {
+        assert!(packets > 0, "ring retention must be positive");
+        let clamped = packets.min(ACTOR_RING_CAPACITY as u32);
+        if clamped < packets {
+            tracing::warn!(
+                "ring_buffer_size {} exceeds track ring capacity {}, using {}",
+                packets,
+                ACTOR_RING_CAPACITY,
+                clamped
+            );
+        }
+        self.ring_retention.store(clamped, Ordering::Relaxed);
     }
 
     /// Create a worker pool with default settings.
@@ -3932,10 +4110,7 @@ impl WorkerPool {
     /// tracks from SDP m-lines at signaling time, and SSRCs are bound later
     /// when the first RTP packet arrives. This eliminates the split between
     /// "SDP-registered" and "late SSRC" paths.
-    pub fn create_track_unbound(
-        &mut self,
-        kind: MediaKind,
-    ) -> Result<(TrackId, u32), WorkerError> {
+    pub fn create_track_unbound(&mut self, kind: MediaKind) -> Result<(TrackId, u32), WorkerError> {
         let track_id = self.next_track_id.fetch_add(1, Ordering::Relaxed);
         // Round-robin worker assignment (no SSRC to hash)
         let worker_id = (track_id as u32) % self.workers.len() as u32;
@@ -3980,10 +4155,19 @@ impl WorkerPool {
     ///
     /// # Assertions
     /// - track_id is assigned
-    pub fn route_packet(&self, track_id: TrackId, packet: PacketSlot, source_addr: SocketAddr) -> Result<(), WorkerError> {
+    pub fn route_packet(
+        &self,
+        track_id: TrackId,
+        packet: PacketSlot,
+        source_addr: SocketAddr,
+    ) -> Result<(), WorkerError> {
         if let Some(&worker_id) = self.track_to_worker.get(&track_id) {
             let worker = &self.workers[worker_id as usize];
-            worker.send(WorkerMessage::Packet { track_id, packet, source_addr })
+            worker.send(WorkerMessage::Packet {
+                track_id,
+                packet,
+                source_addr,
+            })
         } else {
             Err(WorkerError::InvalidConfig {
                 message: format!("track {} not assigned to any worker", track_id),
@@ -4002,11 +4186,10 @@ impl WorkerPool {
         }
     }
 
-    /// Route a packet by SSRC using consistent hashing.
+    /// Route a packet by SSRC using the SSRC router for track lookup.
     ///
-    /// Determines the target worker for the given SSRC and routes the packet
-    /// via the legacy crossbeam channel. This is the external API for routing
-    /// packets from the transport layer.
+    /// Looks up the track_id from the SSRC router, then routes to the
+    /// appropriate worker. Drops the packet if the SSRC is not registered.
     ///
     /// For cross-worker routing within the data plane (worker-to-worker),
     /// use `MediaWorker::route_by_ssrc()` which uses lock-free SPSC channels.
@@ -4016,10 +4199,12 @@ impl WorkerPool {
     /// * `ssrc` - SSRC of the packet
     /// * `packet` - Packet to route
     /// * `source_addr` - Source address of the packet
+    /// * `ssrc_router` - SSRC router for looking up track_id
     ///
     /// # Returns
     ///
-    /// The worker ID the packet was routed to.
+    /// The worker ID the packet was routed to, or `None` if the SSRC is
+    /// not registered (packet is dropped).
     ///
     /// # Assertions
     /// - ssrc != 0
@@ -4028,16 +4213,27 @@ impl WorkerPool {
         ssrc: Ssrc,
         packet: PacketSlot,
         source_addr: SocketAddr,
+        ssrc_router: &crate::forward::SsrcRouter,
     ) -> Result<u32, WorkerError> {
         // TigerStyle: Assert preconditions
-        assert!(ssrc != 0, "ssrc must not be 0");
+        debug_assert!(ssrc != 0, "ssrc must not be 0");
 
-        let worker_id = self.track_hasher.hash(ssrc);
+        // Look up track_id from SSRC router; drop packet if unknown
+        let (track_id, worker_id) = match ssrc_router.lookup(ssrc) {
+            Some(entry) => entry,
+            None => {
+                tracing::debug!("Dropping packet for unknown SSRC {}", ssrc);
+                return Err(WorkerError::InvalidConfig {
+                    message: format!("unknown SSRC {}", ssrc),
+                });
+            }
+        };
+
         let worker = &self.workers[worker_id as usize];
 
-        // Route via legacy channel (for external routing)
+        // Route via legacy channel with resolved track_id
         worker.send(WorkerMessage::Packet {
-            track_id: 0, // Track ID unknown, worker will look up by SSRC
+            track_id,
             packet,
             source_addr,
         })?;
@@ -4127,16 +4323,20 @@ impl WorkerPool {
 
         let worker_id = match self.track_to_worker.get(&track_id) {
             Some(&id) => id,
-            None => return Err(WorkerError::InvalidConfig {
-                message: format!("track {} not assigned to worker", track_id),
-            }),
+            None => {
+                return Err(WorkerError::InvalidConfig {
+                    message: format!("track {} not assigned to worker", track_id),
+                })
+            }
         };
 
         let worker = match self.get_worker(worker_id) {
             Some(w) => w,
-            None => return Err(WorkerError::InvalidConfig {
-                message: format!("worker {} not found", worker_id),
-            }),
+            None => {
+                return Err(WorkerError::InvalidConfig {
+                    message: format!("worker {} not found", worker_id),
+                })
+            }
         };
 
         worker.send(WorkerMessage::AddSubscriber {
@@ -4232,11 +4432,7 @@ impl WorkerPool {
     /// Screen share tracks bypass viewport filtering.
     ///
     /// # TigerStyle: ≥2 assertions
-    pub fn set_content_type(
-        &self,
-        track_id: TrackId,
-        content_type: u8,
-    ) -> Result<(), WorkerError> {
+    pub fn set_content_type(&self, track_id: TrackId, content_type: u8) -> Result<(), WorkerError> {
         assert!(track_id != 0, "track_id must be non-zero");
         assert!(content_type <= 2, "content_type must be 0, 1, or 2");
 
@@ -4248,7 +4444,10 @@ impl WorkerPool {
             Some(w) => w,
             None => return Ok(()),
         };
-        worker.send(WorkerMessage::SetContentType { track_id, content_type })
+        worker.send(WorkerMessage::SetContentType {
+            track_id,
+            content_type,
+        })
     }
 
     /// Get the relay output receiver. The SFU main loop drains this
@@ -4270,16 +4469,20 @@ impl WorkerPool {
 
         let worker_id = match self.track_to_worker.get(&track_id) {
             Some(&id) => id,
-            None => return Err(WorkerError::InvalidConfig {
-                message: format!("track {} not assigned to worker", track_id),
-            }),
+            None => {
+                return Err(WorkerError::InvalidConfig {
+                    message: format!("track {} not assigned to worker", track_id),
+                })
+            }
         };
 
         let worker = match self.get_worker(worker_id) {
             Some(w) => w,
-            None => return Err(WorkerError::InvalidConfig {
-                message: format!("worker {} not found", worker_id),
-            }),
+            None => {
+                return Err(WorkerError::InvalidConfig {
+                    message: format!("worker {} not found", worker_id),
+                })
+            }
         };
 
         // Derive subscriber_id from peer_node to ensure uniqueness.
@@ -4316,7 +4519,7 @@ impl WorkerPool {
 
         worker.send(WorkerMessage::RelayPacket {
             track_id,
-            data,
+            data: Box::new(data),
             len,
         })
     }
@@ -4442,7 +4645,7 @@ impl WorkerPool {
         // Enqueue migration
         let mut queue = self.migration_queue.lock();
         let migration_id = queue
-            .enqueue(track_id as u64, source_worker_id, target_worker_id)
+            .enqueue(track_id, source_worker_id, target_worker_id)
             .ok_or_else(|| WorkerError::InvalidConfig {
                 message: "migration queue full".to_string(),
             })?;

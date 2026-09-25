@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use nexus_state::gossip::{
-    GossipConfig, GossipMessage, MembershipList, PeerState,
-    StateUpdate, SwimProtocol, MAX_PEERS, MAX_PIGGYBACK_UPDATES,
+    GossipConfig, GossipMessage, MembershipList, PeerState, StateUpdate, SwimProtocol, MAX_PEERS,
+    MAX_PIGGYBACK_UPDATES,
 };
 use nexus_state::types::Dot;
 use nexus_state::GossipError;
@@ -464,8 +464,10 @@ fn test_config_validation() {
     assert!(GossipConfig::for_testing().validate().is_ok());
 
     // Invalid: zero probe interval
-    let mut config = GossipConfig::default();
-    config.probe_interval_ms = 0;
+    let config = GossipConfig {
+        probe_interval_ms: 0,
+        ..Default::default()
+    };
     assert!(config.validate().is_err());
 
     // Invalid: suspect timeout not greater than ping timeout
@@ -501,7 +503,10 @@ fn test_error_peer_not_found() {
     let mut list = MembershipList::new(0);
 
     let result = list.remove_peer(99);
-    assert!(matches!(result, Err(GossipError::PeerNotFound { actor_id: 99 })));
+    assert!(matches!(
+        result,
+        Err(GossipError::PeerNotFound { actor_id: 99 })
+    ));
 }
 
 #[test]

@@ -25,7 +25,11 @@ impl ConfigError {
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Configuration error in '{}': {}", self.field, self.message)
+        write!(
+            f,
+            "Configuration error in '{}': {}",
+            self.field, self.message
+        )
     }
 }
 

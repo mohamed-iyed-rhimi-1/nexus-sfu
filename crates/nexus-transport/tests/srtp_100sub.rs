@@ -22,16 +22,27 @@ fn make_nexus_ctx(key: &[u8], salt: &[u8]) -> SrtpContext {
     let mut material = vec![0u8; key.len() + salt.len()];
     material[..key.len()].copy_from_slice(key);
     material[key.len()..].copy_from_slice(salt);
-    let km = KeyMaterial::from_dtls_export(&material, ProtectionProfile::Aes128CmHmacSha1_80).unwrap();
-    SrtpContext::new(&km, SrtpPolicy { profile: ProtectionProfile::Aes128CmHmacSha1_80, ..SrtpPolicy::default() }).unwrap()
+    let km =
+        KeyMaterial::from_dtls_export(&material, ProtectionProfile::Aes128CmHmacSha1_80).unwrap();
+    SrtpContext::new(
+        &km,
+        SrtpPolicy {
+            profile: ProtectionProfile::Aes128CmHmacSha1_80,
+            ..SrtpPolicy::default()
+        },
+    )
+    .unwrap()
 }
 
 fn make_webrtc_ctx(key: &[u8], salt: &[u8]) -> webrtc_srtp::context::Context {
     webrtc_srtp::context::Context::new(
-        key, salt,
+        key,
+        salt,
         webrtc_srtp::protection_profile::ProtectionProfile::Aes128CmHmacSha1_80,
-        None, None,
-    ).unwrap()
+        None,
+        None,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -41,23 +52,25 @@ fn test_100_subscribers_across_wrap() {
     const PUB_SALT: [u8; 14] = [0xAA; 14];
 
     // Generate unique keys per subscriber
-    let sub_keys: Vec<([u8; 16], [u8; 14])> = (0..NUM_SUBSCRIBERS).map(|i| {
-        let mut key = [0u8; 16];
-        let mut salt = [0u8; 14];
-        key[0] = (i + 1) as u8;
-        key[1] = ((i + 1) >> 8) as u8;
-        salt[0] = (i + 1) as u8;
-        (key, salt)
-    }).collect();
+    let sub_keys: Vec<([u8; 16], [u8; 14])> = (0..NUM_SUBSCRIBERS)
+        .map(|i| {
+            let mut key = [0u8; 16];
+            let mut salt = [0u8; 14];
+            key[0] = (i + 1) as u8;
+            key[1] = ((i + 1) >> 8) as u8;
+            salt[0] = (i + 1) as u8;
+            (key, salt)
+        })
+        .collect();
 
     // SFU inbound context (decrypts publisher's packets)
     let mut sfu_inbound = make_nexus_ctx(&PUB_KEY, &PUB_SALT);
 
     // Per-subscriber: SFU outbound context + subscriber decrypt context
-    let mut sfu_outbound: Vec<SrtpContext> = sub_keys.iter()
-        .map(|(k, s)| make_nexus_ctx(k, s))
-        .collect();
-    let mut sub_decrypt: Vec<webrtc_srtp::context::Context> = sub_keys.iter()
+    let mut sfu_outbound: Vec<SrtpContext> =
+        sub_keys.iter().map(|(k, s)| make_nexus_ctx(k, s)).collect();
+    let mut sub_decrypt: Vec<webrtc_srtp::context::Context> = sub_keys
+        .iter()
         .map(|(k, s)| make_webrtc_ctx(k, s))
         .collect();
 
@@ -80,14 +93,18 @@ fn test_100_subscribers_across_wrap() {
 
         // SFU decrypts
         let mut sfu_buf = protected_pub.to_vec();
-        let dec_len = sfu_inbound.unprotect_rtp(&mut sfu_buf, protected_pub.len()).unwrap();
+        let dec_len = sfu_inbound
+            .unprotect_rtp(&mut sfu_buf, protected_pub.len())
+            .unwrap();
         let decrypted = &sfu_buf[..dec_len];
 
         // SFU re-encrypts for each subscriber
         for sub_idx in 0..NUM_SUBSCRIBERS {
             let mut sub_buf = vec![0u8; dec_len + 16];
             sub_buf[..dec_len].copy_from_slice(decrypted);
-            let prot_len = sfu_outbound[sub_idx].protect_rtp(&mut sub_buf, dec_len).unwrap();
+            let prot_len = sfu_outbound[sub_idx]
+                .protect_rtp(&mut sub_buf, dec_len)
+                .unwrap();
 
             // Subscriber decrypts
             match sub_decrypt[sub_idx].decrypt_rtp(&sub_buf[..prot_len]) {

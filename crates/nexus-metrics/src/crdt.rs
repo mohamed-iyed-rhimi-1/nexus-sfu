@@ -42,13 +42,15 @@ impl CrdtMetrics {
     /// Record gossip message sent
     #[inline(always)]
     pub fn record_gossip_sent(&self) {
-        self.gossip_messages_sent_total.fetch_add(1, Ordering::Relaxed);
+        self.gossip_messages_sent_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record gossip message received
     #[inline(always)]
     pub fn record_gossip_received(&self) {
-        self.gossip_messages_received_total.fetch_add(1, Ordering::Relaxed);
+        self.gossip_messages_received_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record state sync completion
@@ -58,8 +60,10 @@ impl CrdtMetrics {
     pub fn record_state_sync(&self, latency_nanos: u64) {
         assert!(latency_nanos > 0, "latency_nanos must be > 0");
         self.state_syncs_total.fetch_add(1, Ordering::Relaxed);
-        self.state_sync_latency_sum_nanos.fetch_add(latency_nanos, Ordering::Relaxed);
-        self.state_sync_latency_count.fetch_add(1, Ordering::Relaxed);
+        self.state_sync_latency_sum_nanos
+            .fetch_add(latency_nanos, Ordering::Relaxed);
+        self.state_sync_latency_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Set active peer count

@@ -9,14 +9,12 @@ pub mod webrtc;
 
 // Convenience re-exports for commonly used types
 pub use sdp::{
-    SdpParser, SdpPrinter, SdpNegotiator, SdpError, SessionDescription,
-    MediaDescription, MediaType, IceCandidate, DtlsFingerprint, FingerprintAlgorithm,
-    DtlsSetup, Direction, CodecCapability, CodecType,
+    CodecCapability, CodecType, Direction, DtlsFingerprint, DtlsSetup, FingerprintAlgorithm,
+    IceCandidate, MediaDescription, MediaType, SdpError, SdpNegotiator, SdpParser, SdpPrinter,
+    SessionDescription,
 };
 
 pub use webrtc::{
-    WebRtcSession, SessionConfig, SessionState,
-    WebRtcTransport, WebRtcError,
-    TransportId, TransportStats,
-    PacketType,
+    PacketType, SessionConfig, SessionState, TransportId, TransportStats, WebRtcError,
+    WebRtcSession, WebRtcTransport,
 };

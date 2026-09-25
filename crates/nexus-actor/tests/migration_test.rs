@@ -130,7 +130,7 @@ fn test_sequence_gap_detection() {
     // Skip sequence number 2 - implementation handles gaps gracefully
     let packet3 = PacketSlot::new(&[3; 100]);
     actor.handle_packet_seq(packet3, 3);
-    
+
     // Verify the packet was processed (gap is within reorder window)
     // The implementation buffers out-of-order packets
     assert!(actor.packets_received() >= 1);
@@ -208,7 +208,8 @@ fn test_migration_abort() {
     assert_eq!(actor.state(), ActorState::Migrating);
 
     // Abort migration via message
-    tx.send(TrackActorMessage::AbortMigration { migration_id: 1 }).unwrap();
+    tx.send(TrackActorMessage::AbortMigration { migration_id: 1 })
+        .unwrap();
     actor.process_messages();
     assert_eq!(actor.state(), ActorState::Active);
 }

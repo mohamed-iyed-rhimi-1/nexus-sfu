@@ -8,16 +8,18 @@ fn nexus_estimate_roc(s_l: u16, roc: u32, seq: u16, initialized: bool) -> u32 {
     }
     if s_l < 32768 {
         if seq.wrapping_sub(s_l) > 32768 {
-            if roc > 0 { roc - 1 } else { 0 }
+            if roc > 0 {
+                roc - 1
+            } else {
+                0
+            }
         } else {
             roc
         }
+    } else if s_l - 32768 > seq {
+        roc + 1
     } else {
-        if s_l - 32768 > seq {
-            roc + 1
-        } else {
-            roc
-        }
+        roc
     }
 }
 
@@ -33,13 +35,11 @@ fn nexus_update(s_l: &mut u16, roc: &mut u32, seq: u16, initialized: &mut bool) 
         if seq.wrapping_sub(old_s_l) <= 32768 && seq > old_s_l {
             *s_l = seq;
         }
-    } else {
-        if old_s_l - 32768 > seq {
-            *roc += 1;
-            *s_l = seq;
-        } else if seq > old_s_l {
-            *s_l = seq;
-        }
+    } else if old_s_l - 32768 > seq {
+        *roc += 1;
+        *s_l = seq;
+    } else if seq > old_s_l {
+        *s_l = seq;
     }
 }
 
@@ -57,13 +57,13 @@ fn webrtc_estimate_roc(last_seq: u16, roc: u32, seq: u16, processed: bool) -> u3
         } else {
             roc
         }
-    } else if last_seq < MAX_ROC_DISORDER
-        && seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER)
-    {
-        if roc > 0 { roc - 1 } else { 0 }
-    } else if seq < MAX_ROC_DISORDER
-        && last_seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER)
-    {
+    } else if last_seq < MAX_ROC_DISORDER && seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER) {
+        if roc > 0 {
+            roc - 1
+        } else {
+            0
+        }
+    } else if seq < MAX_ROC_DISORDER && last_seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER) {
         roc + 1
     } else {
         roc
@@ -78,13 +78,9 @@ fn webrtc_update(last_seq: &mut u16, roc: &mut u32, seq: u16, processed: &mut bo
         if *last_seq > MAX_ROC_DISORDER {
             *roc += 1;
         }
-    } else if *last_seq < MAX_ROC_DISORDER
-        && seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER)
-    {
+    } else if *last_seq < MAX_ROC_DISORDER && seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER) {
         *roc -= 1;
-    } else if seq < MAX_ROC_DISORDER
-        && *last_seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER)
-    {
+    } else if seq < MAX_ROC_DISORDER && *last_seq > (MAX_SEQUENCE_NUMBER - MAX_ROC_DISORDER) {
         *roc += 1;
     }
     *last_seq = seq;

@@ -101,7 +101,6 @@ pub struct GsoStatsSnapshot {
     pub errors: u64,
 }
 
-
 /// GSO batch sender for efficient multi-packet transmission.
 ///
 /// Sends multiple same-size packets to the same destination using
@@ -190,7 +189,6 @@ impl GsoBatchSender {
         &self.stats
     }
 
-
     /// Send a batch of packets to the same destination.
     ///
     /// Uses GSO if available and all packets are the same size.
@@ -210,7 +208,10 @@ impl GsoBatchSender {
         // Assertion: packets must not be empty
         assert!(!packets.is_empty(), "packets must not be empty");
         // Assertion: each packet must have data
-        assert!(packets.iter().all(|p| !p.is_empty()), "all packets must have data");
+        assert!(
+            packets.iter().all(|p| !p.is_empty()),
+            "all packets must have data"
+        );
 
         if packets.len() == 1 {
             // Single packet - just use sendto
@@ -303,13 +304,11 @@ impl GsoBatchSender {
         Ok(packets.len())
     }
 
-
     /// Prepare GSO cmsg with UDP_SEGMENT.
     #[cfg(target_os = "linux")]
     fn prepare_gso_cmsg(buf: &mut [u8], segment_size: u16) -> usize {
-        let cmsg_space = unsafe {
-            libc::CMSG_SPACE(std::mem::size_of::<u16>() as libc::c_uint) as usize
-        };
+        let cmsg_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as libc::c_uint) as usize };
 
         assert!(buf.len() >= cmsg_space, "cmsg buffer too small");
 
@@ -341,7 +340,10 @@ impl GsoBatchSender {
                     (*sa).sin_port = v4.port().to_be();
                     (*sa).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
                 }
-                (storage, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
             }
             SocketAddr::V6(v6) => {
                 let sa = &mut storage as *mut _ as *mut libc::sockaddr_in6;
@@ -352,7 +354,10 @@ impl GsoBatchSender {
                     (*sa).sin6_addr.s6_addr = v6.ip().octets();
                     (*sa).sin6_scope_id = v6.scope_id();
                 }
-                (storage, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
             }
         }
     }
@@ -481,7 +486,6 @@ impl GsoBatchSender {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

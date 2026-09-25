@@ -251,7 +251,11 @@ pub fn validate_rtp_packet(data: &[u8]) -> ValidationResult {
 
     if data.len() < base_header_size {
         return ValidationResult::invalid(
-            format!("RTP header truncated: {} < {}", data.len(), base_header_size),
+            format!(
+                "RTP header truncated: {} < {}",
+                data.len(),
+                base_header_size
+            ),
             RecoveryHint::Drop,
         );
     }
@@ -322,10 +326,20 @@ pub fn validate_rtcp_packet(data: &[u8]) -> ValidationResult {
 
 #[derive(Debug)]
 pub enum RecoveryAction {
-    Drop { packet_type: PacketType, reason: String },
-    RequestRetransmit { packet_type: PacketType },
-    ResetConnection { reason: String },
-    LogAndContinue { packet_type: PacketType, warning: String },
+    Drop {
+        packet_type: PacketType,
+        reason: String,
+    },
+    RequestRetransmit {
+        packet_type: PacketType,
+    },
+    ResetConnection {
+        reason: String,
+    },
+    LogAndContinue {
+        packet_type: PacketType,
+        warning: String,
+    },
 }
 
 pub fn recover_from_malformed_packet(
@@ -368,7 +382,10 @@ pub fn recover_from_malformed_packet(
 
 pub fn demux_and_validate(data: &[u8]) -> (PacketType, ValidationResult) {
     if data.is_empty() {
-        return (PacketType::Unknown, ValidationResult::invalid("Empty packet", RecoveryHint::Drop));
+        return (
+            PacketType::Unknown,
+            ValidationResult::invalid("Empty packet", RecoveryHint::Drop),
+        );
     }
 
     let packet_type: PacketType = PacketType::classify(data);
@@ -400,11 +417,8 @@ mod tests {
     #[test]
     fn test_classify_stun() {
         let stun_packet: [u8; 20] = [
-            0x00, 0x01, 0x00, 0x00,
-            0x21, 0x12, 0xA4, 0x42,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(PacketType::classify(&stun_packet), PacketType::Stun);
     }
@@ -412,9 +426,7 @@ mod tests {
     #[test]
     fn test_classify_dtls() {
         let dtls_packet: [u8; 13] = [
-            22, 0xFE, 0xFD, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00,
+            22, 0xFE, 0xFD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
         ];
         assert_eq!(PacketType::classify(&dtls_packet), PacketType::Dtls);
     }
@@ -422,19 +434,14 @@ mod tests {
     #[test]
     fn test_classify_rtp() {
         let rtp_packet: [u8; 12] = [
-            0x80, 0x60, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01,
+            0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
         ];
         assert_eq!(PacketType::classify(&rtp_packet), PacketType::Rtp);
     }
 
     #[test]
     fn test_classify_rtcp() {
-        let rtcp_packet: [u8; 8] = [
-            0x80, 0xC8, 0x00, 0x06,
-            0x00, 0x00, 0x00, 0x01,
-        ];
+        let rtcp_packet: [u8; 8] = [0x80, 0xC8, 0x00, 0x06, 0x00, 0x00, 0x00, 0x01];
         assert_eq!(PacketType::classify(&rtcp_packet), PacketType::Rtcp);
     }
 
@@ -448,11 +455,8 @@ mod tests {
     #[test]
     fn test_validate_stun_valid() {
         let stun: [u8; 20] = [
-            0x00, 0x01, 0x00, 0x00,
-            0x21, 0x12, 0xA4, 0x42,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let result = validate_stun_packet(&stun);
         assert!(result.valid);
@@ -461,11 +465,8 @@ mod tests {
     #[test]
     fn test_validate_stun_bad_magic() {
         let stun: [u8; 20] = [
-            0x00, 0x01, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let result = validate_stun_packet(&stun);
         assert!(!result.valid);

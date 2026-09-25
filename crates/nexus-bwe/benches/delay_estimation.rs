@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use nexus_bwe::{KalmanFilter, DelayBasedBweDetector, TransportFeedback, PacketArrivalInfo};
+use nexus_bwe::{DelayBasedBweDetector, KalmanFilter, PacketArrivalInfo, TransportFeedback};
 
 fn bench_kalman_filter_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("kalman_filter");
@@ -42,5 +42,9 @@ fn bench_delay_detector_feedback(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_kalman_filter_update, bench_delay_detector_feedback);
+criterion_group!(
+    benches,
+    bench_kalman_filter_update,
+    bench_delay_detector_feedback
+);
 criterion_main!(benches);

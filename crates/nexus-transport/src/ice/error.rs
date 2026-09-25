@@ -14,13 +14,9 @@ use std::net::SocketAddr;
 #[derive(Debug, thiserror::Error)]
 pub enum IceError {
     // ========== STUN Errors ==========
-    
     /// STUN message too short to parse.
     #[error("STUN message too short: {actual_bytes} bytes, minimum {min_bytes} bytes")]
-    StunTooShort {
-        actual_bytes: u32,
-        min_bytes: u32,
-    },
+    StunTooShort { actual_bytes: u32, min_bytes: u32 },
 
     /// Invalid STUN message header.
     #[error("invalid STUN header: first two bits must be 0")]
@@ -28,15 +24,11 @@ pub enum IceError {
 
     /// Invalid STUN magic cookie.
     #[error("invalid STUN magic cookie: expected 0x2112A442, got 0x{actual:08X}")]
-    StunInvalidMagicCookie {
-        actual: u32,
-    },
+    StunInvalidMagicCookie { actual: u32 },
 
     /// Unknown STUN method.
     #[error("unknown STUN method: 0x{method:04X}")]
-    StunUnknownMethod {
-        method: u16,
-    },
+    StunUnknownMethod { method: u16 },
 
     /// Invalid STUN attribute.
     #[error("invalid STUN attribute type 0x{attr_type:04X}: {reason}")]
@@ -51,45 +43,28 @@ pub enum IceError {
 
     /// STUN FINGERPRINT verification failed.
     #[error("STUN FINGERPRINT verification failed: expected 0x{expected:08X}, got 0x{actual:08X}")]
-    StunFingerprintFailed {
-        expected: u32,
-        actual: u32,
-    },
+    StunFingerprintFailed { expected: u32, actual: u32 },
 
     /// STUN transaction timeout.
     #[error("STUN transaction timeout after {timeout_ms} ms")]
-    StunTimeout {
-        timeout_ms: u32,
-    },
+    StunTimeout { timeout_ms: u32 },
 
     /// STUN error response received.
     #[error("STUN error response: {code} {reason}")]
-    StunErrorResponse {
-        code: u16,
-        reason: &'static str,
-    },
+    StunErrorResponse { code: u16, reason: &'static str },
 
     // ========== ICE Errors ==========
-
     /// Too many candidates.
     #[error("too many candidates: {count} exceeds maximum {max}")]
-    TooManyCandidates {
-        count: u32,
-        max: u32,
-    },
+    TooManyCandidates { count: u32, max: u32 },
 
     /// Too many candidate pairs.
     #[error("too many candidate pairs: {count} exceeds maximum {max}")]
-    TooManyPairs {
-        count: u32,
-        max: u32,
-    },
+    TooManyPairs { count: u32, max: u32 },
 
     /// Invalid candidate SDP.
     #[error("invalid candidate SDP: {reason}")]
-    InvalidCandidateSdp {
-        reason: &'static str,
-    },
+    InvalidCandidateSdp { reason: &'static str },
 
     /// ICE connectivity check failed.
     #[error("connectivity check failed for pair {local_addr} -> {remote_addr}")]
@@ -127,9 +102,7 @@ pub enum IceError {
 
     /// Invalid candidate.
     #[error("invalid candidate: {reason}")]
-    InvalidCandidate {
-        reason: &'static str,
-    },
+    InvalidCandidate { reason: &'static str },
 
     /// Invalid state for operation.
     #[error("invalid state: expected {expected}, got {actual}")]
@@ -140,12 +113,9 @@ pub enum IceError {
 
     /// Candidate gathering failed.
     #[error("candidate gathering failed: {reason}")]
-    GatheringFailed {
-        reason: &'static str,
-    },
+    GatheringFailed { reason: &'static str },
 
     // ========== Transport Errors ==========
-
     /// Socket bind failed.
     #[error("failed to bind socket to {addr}: {reason}")]
     BindFailed {
@@ -162,9 +132,7 @@ pub enum IceError {
 
     /// Socket receive failed.
     #[error("failed to receive: {reason}")]
-    RecvFailed {
-        reason: &'static str,
-    },
+    RecvFailed { reason: &'static str },
 
     /// I/O error.
     #[error("I/O error: {0}")]
@@ -180,9 +148,9 @@ impl IceError {
         matches!(
             self,
             Self::StunTimeout { .. }
-            | Self::ConnectivityCheckFailed { .. }
-            | Self::SendFailed { .. }
-            | Self::RecvFailed { .. }
+                | Self::ConnectivityCheckFailed { .. }
+                | Self::SendFailed { .. }
+                | Self::RecvFailed { .. }
         )
     }
 
@@ -192,14 +160,14 @@ impl IceError {
         matches!(
             self,
             Self::StunTooShort { .. }
-            | Self::StunInvalidHeader
-            | Self::StunInvalidMagicCookie { .. }
-            | Self::StunUnknownMethod { .. }
-            | Self::StunInvalidAttribute { .. }
-            | Self::StunIntegrityFailed
-            | Self::StunFingerprintFailed { .. }
-            | Self::StunTimeout { .. }
-            | Self::StunErrorResponse { .. }
+                | Self::StunInvalidHeader
+                | Self::StunInvalidMagicCookie { .. }
+                | Self::StunUnknownMethod { .. }
+                | Self::StunInvalidAttribute { .. }
+                | Self::StunIntegrityFailed
+                | Self::StunFingerprintFailed { .. }
+                | Self::StunTimeout { .. }
+                | Self::StunErrorResponse { .. }
         )
     }
 }

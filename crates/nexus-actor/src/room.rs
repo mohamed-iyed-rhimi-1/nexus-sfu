@@ -239,7 +239,10 @@ impl RoomActor {
 
         // Integrate with DistributedState (Requirement 3.1)
         // Call add_participant and log on error (Requirement 3.5)
-        if let Err(e) = self.distributed_state.add_participant(self.id as u32, participant_id as u64) {
+        if let Err(e) = self
+            .distributed_state
+            .add_participant(self.id as u32, participant_id as u64)
+        {
             eprintln!(
                 "Warning: Failed to add participant {} to room {} in distributed state: {:?}",
                 participant_id, self.id, e
@@ -265,8 +268,14 @@ impl RoomActor {
             self.track_count.fetch_sub(removed_count, Ordering::Relaxed);
 
             // Remove from distributed state
-            if let Err(e) = self.distributed_state.remove_participant(self.id as u32, participant_id as u64) {
-                eprintln!("Warning: Failed to remove participant from distributed state: {:?}", e);
+            if let Err(e) = self
+                .distributed_state
+                .remove_participant(self.id as u32, participant_id as u64)
+            {
+                eprintln!(
+                    "Warning: Failed to remove participant from distributed state: {:?}",
+                    e
+                );
             }
         }
     }
@@ -484,7 +493,14 @@ mod tests {
 
     #[test]
     fn test_spawn_room() {
-        let (room, _tx) = RoomActor::spawn(1, "Test Room".to_string(), 100, 0, now_ns(), test_distributed_state());
+        let (room, _tx) = RoomActor::spawn(
+            1,
+            "Test Room".to_string(),
+            100,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
 
         assert_eq!(room.id(), 1);
         assert_eq!(room.name(), "Test Room");
@@ -496,7 +512,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "room id must not be 0")]
     fn test_spawn_zero_id() {
-        let _ = RoomActor::spawn(0, "Test".to_string(), 100, 0, now_ns(), test_distributed_state());
+        let _ = RoomActor::spawn(
+            0,
+            "Test".to_string(),
+            100,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
     }
 
     #[test]
@@ -508,7 +531,14 @@ mod tests {
 
     #[test]
     fn test_add_participant() {
-        let (mut room, tx) = RoomActor::spawn(1, "Test".to_string(), 100, 0, now_ns(), test_distributed_state());
+        let (mut room, tx) = RoomActor::spawn(
+            1,
+            "Test".to_string(),
+            100,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
 
         tx.send(RoomActorMessage::AddParticipant {
             participant_id: 10,
@@ -527,7 +557,14 @@ mod tests {
 
     #[test]
     fn test_room_capacity_enforcement() {
-        let (mut room, tx) = RoomActor::spawn(1, "Test".to_string(), 2, 0, now_ns(), test_distributed_state());
+        let (mut room, tx) = RoomActor::spawn(
+            1,
+            "Test".to_string(),
+            2,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
 
         // Add 2 participants (should succeed)
         tx.send(RoomActorMessage::AddParticipant {
@@ -562,7 +599,14 @@ mod tests {
 
     #[test]
     fn test_announce_track() {
-        let (mut room, tx) = RoomActor::spawn(1, "Test".to_string(), 100, 0, now_ns(), test_distributed_state());
+        let (mut room, tx) = RoomActor::spawn(
+            1,
+            "Test".to_string(),
+            100,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
 
         // Add participant first
         tx.send(RoomActorMessage::AddParticipant {
@@ -591,7 +635,14 @@ mod tests {
 
     #[test]
     fn test_remove_participant_removes_tracks() {
-        let (mut room, tx) = RoomActor::spawn(1, "Test".to_string(), 100, 0, now_ns(), test_distributed_state());
+        let (mut room, tx) = RoomActor::spawn(
+            1,
+            "Test".to_string(),
+            100,
+            0,
+            now_ns(),
+            test_distributed_state(),
+        );
 
         // Add participant
         tx.send(RoomActorMessage::AddParticipant {

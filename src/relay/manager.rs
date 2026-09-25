@@ -9,13 +9,15 @@
 //! - All loops bounded
 //! - Explicit error handling
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crossbeam::channel::{Receiver, Sender, bounded};
+use arc_swap::ArcSwap;
+use crossbeam::channel::{bounded, Receiver, Sender};
 use tracing::{debug, info};
 
 use crate::relay::link::{RelayLink, MAX_RELAY_PACKET, RELAY_HEADER_SIZE};
@@ -52,6 +54,10 @@ pub struct RelayManager {
     recv_handle: Option<JoinHandle<()>>,
     /// Shutdown flag for the receiver thread.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Allowed source addresses — shared with the receiver thread.
+    allowed_addrs: Arc<ArcSwap<HashSet<SocketAddr>>>,
+    /// Counter for rejected relay packets from unknown sources.
+    pub rejected_packets: Arc<AtomicU64>,
 }
 
 impl RelayManager {
@@ -67,7 +73,7 @@ impl RelayManager {
         let recv_socket = UdpSocket::bind(relay_addr)?;
         let recv_addr = recv_socket.local_addr()?;
         recv_socket.set_nonblocking(false)?; // Blocking for the receiver thread.
-        // Set read timeout so the receiver thread can check the shutdown flag
+                                             // Set read timeout so the receiver thread can check the shutdown flag
         recv_socket.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
 
         let (packet_tx, packet_rx) = bounded(RELAY_RECV_CHANNEL_CAP);
@@ -83,6 +89,8 @@ impl RelayManager {
             packet_rx,
             recv_handle: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            allowed_addrs: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+            rejected_packets: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -95,10 +103,12 @@ impl RelayManager {
         let socket = self.recv_socket.clone();
         let tx = self.packet_tx.clone();
         let shutdown = self.shutdown.clone();
+        let allowed_addrs = self.allowed_addrs.clone();
+        let rejected_packets = self.rejected_packets.clone();
 
         let handle = thread::Builder::new()
             .name("nexus-relay-recv".into())
-            .spawn(move || relay_recv_loop(socket, tx, shutdown))
+            .spawn(move || relay_recv_loop(socket, tx, shutdown, allowed_addrs, rejected_packets))
             .expect("failed to spawn relay receiver thread");
 
         self.recv_handle = Some(handle);
@@ -120,7 +130,10 @@ impl RelayManager {
         assert!(peer_node != self.local_node, "cannot relay to self");
 
         if self.links.len() >= MAX_RELAY_PEERS {
-            return Err(io::Error::new(io::ErrorKind::Other, "max relay peers reached"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "max relay peers reached",
+            ));
         }
 
         if self.links.contains_key(&peer_node) {
@@ -131,6 +144,7 @@ impl RelayManager {
         let link = RelayLink::new(peer_node, peer_relay_addr)?;
         info!(peer_node, addr = %peer_relay_addr, "relay link established");
         self.links.insert(peer_node, link);
+        self.update_allowed_addrs();
         Ok(())
     }
 
@@ -138,7 +152,14 @@ impl RelayManager {
     pub fn remove_peer(&mut self, peer_node: u64) {
         if self.links.remove(&peer_node).is_some() {
             info!(peer_node, "relay link removed");
+            self.update_allowed_addrs();
         }
+    }
+
+    /// Rebuild the allowed address set from current peer links.
+    fn update_allowed_addrs(&self) {
+        let addrs: HashSet<SocketAddr> = self.links.values().map(|link| link.peer_addr()).collect();
+        self.allowed_addrs.store(Arc::new(addrs));
     }
 
     /// Send an RTP packet to a peer node for a specific track.
@@ -188,7 +209,8 @@ impl RelayManager {
 
 impl Drop for RelayManager {
     fn drop(&mut self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(handle) = self.recv_handle.take() {
             let _ = handle.join();
         }
@@ -202,6 +224,8 @@ fn relay_recv_loop(
     socket: Arc<UdpSocket>,
     tx: Sender<RelayPacket>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    allowed_addrs: Arc<ArcSwap<HashSet<SocketAddr>>>,
+    rejected_packets: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; MAX_RELAY_PACKET];
 
@@ -210,25 +234,30 @@ fn relay_recv_loop(
             return;
         }
 
-        let n = match socket.recv(&mut buf) {
-            Ok(n) => n,
+        let (n, src_addr) = match socket.recv_from(&mut buf) {
+            Ok(r) => r,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => continue,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                // Socket closed or fatal error — exit thread.
                 debug!(err = %e, "relay receiver exiting");
                 return;
             }
         };
+
+        // Validate source address against allowed peers.
+        let addrs = allowed_addrs.load();
+        if !addrs.is_empty() && !addrs.contains(&src_addr) {
+            rejected_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
 
         if n < RELAY_HEADER_SIZE {
             continue; // Runt packet.
         }
 
         let track_id = u64::from_be_bytes([
-            buf[0], buf[1], buf[2], buf[3],
-            buf[4], buf[5], buf[6], buf[7],
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ]);
 
         if track_id == 0 {

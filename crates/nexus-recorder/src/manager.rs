@@ -38,7 +38,11 @@ pub enum RecorderError {
     SessionNotFound(RoomId),
     SessionAlreadyExists(RoomId),
     CapacityExceeded,
-    InvalidState { room_id: RoomId, current: SessionState, expected: &'static str },
+    InvalidState {
+        room_id: RoomId,
+        current: SessionState,
+        expected: &'static str,
+    },
 }
 
 impl std::fmt::Display for RecorderError {
@@ -50,7 +54,11 @@ impl std::fmt::Display for RecorderError {
                 write!(f, "recording already exists for room {}", id)
             }
             RecorderError::CapacityExceeded => write!(f, "max concurrent recordings reached"),
-            RecorderError::InvalidState { room_id, current, expected } => {
+            RecorderError::InvalidState {
+                room_id,
+                current,
+                expected,
+            } => {
                 write!(
                     f,
                     "room {} recording is {:?}, expected {}",
@@ -93,7 +101,7 @@ impl RecordingManager {
     /// # TigerStyle: ≥2 assertions
     pub fn new(output_dir: PathBuf) -> Result<Self, RecorderError> {
         assert!(
-            output_dir.as_os_str().len() > 0,
+            !output_dir.as_os_str().is_empty(),
             "output_dir must be non-empty"
         );
 
@@ -125,7 +133,11 @@ impl RecordingManager {
             return Err(RecorderError::CapacityExceeded);
         }
 
-        if self.sessions.iter().any(|s| s.room_id() == room_id && s.state() != SessionState::Stopped) {
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.room_id() == room_id && s.state() != SessionState::Stopped)
+        {
             return Err(RecorderError::SessionAlreadyExists(room_id));
         }
 
@@ -139,11 +151,7 @@ impl RecordingManager {
     /// Pause recording a room — packets silently dropped until resumed.
     ///
     /// # TigerStyle: ≥2 assertions
-    pub fn pause_recording(
-        &mut self,
-        room_id: RoomId,
-        now_ns: u64,
-    ) -> Result<(), RecorderError> {
+    pub fn pause_recording(&mut self, room_id: RoomId, now_ns: u64) -> Result<(), RecorderError> {
         assert!(room_id > 0, "room_id must be non-zero");
         assert!(now_ns > 0, "now_ns must be positive");
 
@@ -165,11 +173,7 @@ impl RecordingManager {
     /// Resume recording a room after pause.
     ///
     /// # TigerStyle: ≥2 assertions
-    pub fn resume_recording(
-        &mut self,
-        room_id: RoomId,
-        now_ns: u64,
-    ) -> Result<(), RecorderError> {
+    pub fn resume_recording(&mut self, room_id: RoomId, now_ns: u64) -> Result<(), RecorderError> {
         assert!(room_id > 0, "room_id must be non-zero");
         assert!(now_ns > 0, "now_ns must be positive");
 
@@ -344,7 +348,10 @@ impl RecordingManager {
         &self.output_dir
     }
 
-    fn find_session_mut(&mut self, room_id: RoomId) -> Result<&mut RecordingSession, RecorderError> {
+    fn find_session_mut(
+        &mut self,
+        room_id: RoomId,
+    ) -> Result<&mut RecordingSession, RecorderError> {
         self.sessions
             .iter_mut()
             .find(|s| s.room_id() == room_id && s.state() != SessionState::Stopped)
@@ -417,20 +424,26 @@ mod tests {
         assert!(mgr.sink_for_track(room_id, 1).is_some());
 
         // Pause — sink not available.
-        mgr.pause_recording(room_id, start_ns + 1_000_000_000).unwrap();
+        mgr.pause_recording(room_id, start_ns + 1_000_000_000)
+            .unwrap();
         assert!(mgr.sink_for_track(room_id, 1).is_none());
         assert!(!mgr.is_recording(room_id));
 
         // Double pause fails.
-        assert!(mgr.pause_recording(room_id, start_ns + 2_000_000_000).is_err());
+        assert!(mgr
+            .pause_recording(room_id, start_ns + 2_000_000_000)
+            .is_err());
 
         // Resume — sink available again.
-        mgr.resume_recording(room_id, start_ns + 3_000_000_000).unwrap();
+        mgr.resume_recording(room_id, start_ns + 3_000_000_000)
+            .unwrap();
         assert!(mgr.sink_for_track(room_id, 1).is_some());
         assert!(mgr.is_recording(room_id));
 
         // Double resume fails.
-        assert!(mgr.resume_recording(room_id, start_ns + 4_000_000_000).is_err());
+        assert!(mgr
+            .resume_recording(room_id, start_ns + 4_000_000_000)
+            .is_err());
 
         mgr.stop_recording(room_id).unwrap();
         let _ = mgr.shutdown();

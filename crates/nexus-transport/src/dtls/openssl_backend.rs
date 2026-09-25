@@ -25,11 +25,11 @@ use openssl::ec::{EcGroup, EcKey};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkey::PKey;
-use openssl::ssl::{
-    SslContext, SslContextBuilder, SslMethod, SslOptions, SslVerifyMode,
-    SslVersion, Ssl, SslStream, HandshakeError, MidHandshakeSslStream,
-};
 use openssl::srtp::SrtpProfileId;
+use openssl::ssl::{
+    HandshakeError, MidHandshakeSslStream, Ssl, SslContext, SslContextBuilder, SslMethod,
+    SslOptions, SslStream, SslVerifyMode, SslVersion,
+};
 use openssl::x509::X509;
 use std::io::{Read, Write};
 
@@ -73,10 +73,7 @@ impl MemBio {
     /// Feed incoming network data (DTLS records from UDP).
     fn feed(&mut self, data: &[u8]) {
         assert!(!data.is_empty(), "feed data must not be empty");
-        assert!(
-            data.len() <= MAX_BIO_READ,
-            "feed data exceeds MAX_BIO_READ"
-        );
+        assert!(data.len() <= MAX_BIO_READ, "feed data exceeds MAX_BIO_READ");
         self.incoming.extend_from_slice(data);
     }
 
@@ -182,7 +179,8 @@ impl OpenSslDtlsEngine {
         // Build self-signed X.509 certificate
         let mut x509_builder = X509::builder()
             .map_err(|e| DtlsError::handshake_failed(format!("X509 builder: {}", e)))?;
-        x509_builder.set_version(2)
+        x509_builder
+            .set_version(2)
             .map_err(|e| DtlsError::handshake_failed(format!("set version: {}", e)))?;
 
         // Serial number
@@ -190,18 +188,22 @@ impl OpenSslDtlsEngine {
             .map_err(|e| DtlsError::handshake_failed(format!("serial: {}", e)))?;
         let serial_asn1 = openssl::asn1::Asn1Integer::from_bn(&serial)
             .map_err(|e| DtlsError::handshake_failed(format!("serial asn1: {}", e)))?;
-        x509_builder.set_serial_number(&serial_asn1)
+        x509_builder
+            .set_serial_number(&serial_asn1)
             .map_err(|e| DtlsError::handshake_failed(format!("set serial: {}", e)))?;
 
         // Subject name
         let mut name_builder = openssl::x509::X509NameBuilder::new()
             .map_err(|e| DtlsError::handshake_failed(format!("name builder: {}", e)))?;
-        name_builder.append_entry_by_text("CN", "Nexus SFU")
+        name_builder
+            .append_entry_by_text("CN", "Nexus SFU")
             .map_err(|e| DtlsError::handshake_failed(format!("CN: {}", e)))?;
         let name = name_builder.build();
-        x509_builder.set_subject_name(&name)
+        x509_builder
+            .set_subject_name(&name)
             .map_err(|e| DtlsError::handshake_failed(format!("set subject: {}", e)))?;
-        x509_builder.set_issuer_name(&name)
+        x509_builder
+            .set_issuer_name(&name)
             .map_err(|e| DtlsError::handshake_failed(format!("set issuer: {}", e)))?;
 
         // Validity: now to +365 days
@@ -209,22 +211,28 @@ impl OpenSslDtlsEngine {
             .map_err(|e| DtlsError::handshake_failed(format!("not_before: {}", e)))?;
         let not_after = openssl::asn1::Asn1Time::days_from_now(365)
             .map_err(|e| DtlsError::handshake_failed(format!("not_after: {}", e)))?;
-        x509_builder.set_not_before(&not_before)
+        x509_builder
+            .set_not_before(&not_before)
             .map_err(|e| DtlsError::handshake_failed(format!("set not_before: {}", e)))?;
-        x509_builder.set_not_after(&not_after)
+        x509_builder
+            .set_not_after(&not_after)
             .map_err(|e| DtlsError::handshake_failed(format!("set not_after: {}", e)))?;
 
-        x509_builder.set_pubkey(&pkey)
+        x509_builder
+            .set_pubkey(&pkey)
             .map_err(|e| DtlsError::handshake_failed(format!("set pubkey: {}", e)))?;
-        x509_builder.sign(&pkey, MessageDigest::sha256())
+        x509_builder
+            .sign(&pkey, MessageDigest::sha256())
             .map_err(|e| DtlsError::handshake_failed(format!("sign: {}", e)))?;
 
         let x509 = x509_builder.build();
-        let certificate_der = x509.to_der()
+        let certificate_der = x509
+            .to_der()
             .map_err(|e| DtlsError::handshake_failed(format!("to_der: {}", e)))?;
 
         // Compute SHA-256 fingerprint
-        let digest = x509.digest(MessageDigest::sha256())
+        let digest = x509
+            .digest(MessageDigest::sha256())
             .map_err(|e| DtlsError::handshake_failed(format!("digest: {}", e)))?;
         let mut fingerprint = [0u8; 32];
         assert_eq!(digest.len(), 32, "SHA-256 digest must be 32 bytes");
@@ -236,30 +244,37 @@ impl OpenSslDtlsEngine {
             .map_err(|e| DtlsError::handshake_failed(format!("SSL ctx: {}", e)))?;
 
         // Set DTLS 1.2 minimum
-        ctx_builder.set_min_proto_version(Some(SslVersion::DTLS1_2))
+        ctx_builder
+            .set_min_proto_version(Some(SslVersion::DTLS1_2))
             .map_err(|e| DtlsError::handshake_failed(format!("min version: {}", e)))?;
 
         // Set certificate and private key
-        ctx_builder.set_certificate(&x509)
+        ctx_builder
+            .set_certificate(&x509)
             .map_err(|e| DtlsError::handshake_failed(format!("set cert: {}", e)))?;
-        ctx_builder.set_private_key(&pkey)
+        ctx_builder
+            .set_private_key(&pkey)
             .map_err(|e| DtlsError::handshake_failed(format!("set key: {}", e)))?;
-        ctx_builder.check_private_key()
+        ctx_builder
+            .check_private_key()
             .map_err(|e| DtlsError::handshake_failed(format!("check key: {}", e)))?;
 
         // Cipher suites for DTLS-SRTP
-        ctx_builder.set_cipher_list(
-            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
-        ).map_err(|e| DtlsError::handshake_failed(format!("ciphers: {}", e)))?;
+        ctx_builder
+            .set_cipher_list("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
+            .map_err(|e| DtlsError::handshake_failed(format!("ciphers: {}", e)))?;
 
         // SRTP profiles — prefer AES128_CM_SHA1_80 for interoperability.
         // While RFC 8827 §6.5 recommends GCM, webrtc-rs (used in loadtest)
         // and some browser versions have incomplete GCM-SRTP support.
         // AES128_CM_SHA1_80 is universally supported. GCM is offered as
         // fallback for clients that prefer it.
-        ctx_builder.set_tlsext_use_srtp(
-            &format!("{}:{}", SRTP_AES128_CM_SHA1_80, SRTP_AEAD_AES_128_GCM)
-        ).map_err(|e| DtlsError::handshake_failed(format!("srtp ext: {}", e)))?;
+        ctx_builder
+            .set_tlsext_use_srtp(&format!(
+                "{}:{}",
+                SRTP_AES128_CM_SHA1_80, SRTP_AEAD_AES_128_GCM
+            ))
+            .map_err(|e| DtlsError::handshake_failed(format!("srtp ext: {}", e)))?;
 
         // Verify mode: request peer cert but don't fail if missing
         // (WebRTC uses fingerprint verification via SDP, not CA chain)
@@ -355,9 +370,7 @@ impl OpenSslDtlsEngine {
                 }
                 Err(DtlsError::handshake_failed("OpenSSL handshake failure"))
             }
-            Err(e) => {
-                Err(DtlsError::handshake_failed(format!("handshake: {}", e)))
-            }
+            Err(e) => Err(DtlsError::handshake_failed(format!("handshake: {}", e))),
         }
     }
 
@@ -370,10 +383,7 @@ impl OpenSslDtlsEngine {
     /// - `Err` — Fatal handshake error
     pub fn process(&mut self, data: &[u8]) -> Result<Vec<u8>, DtlsError> {
         assert!(!data.is_empty(), "process data must not be empty");
-        assert!(
-            data.len() <= MAX_BIO_READ,
-            "data exceeds MAX_BIO_READ"
-        );
+        assert!(data.len() <= MAX_BIO_READ, "data exceeds MAX_BIO_READ");
 
         if let Some(mut mid) = self.mid_handshake.take() {
             // Feed incoming data to the read BIO
@@ -395,19 +405,17 @@ impl OpenSslDtlsEngine {
                 }
                 Err(HandshakeError::Failure(mut mid)) => {
                     let _output = mid.get_mut().take_outgoing();
-                    
+
                     // Log OpenSSL error details
                     let ssl_error = mid.error();
                     tracing::error!(
                         ssl_error = ?ssl_error,
                         "OpenSSL handshake failure - detailed error"
                     );
-                    
+
                     Err(DtlsError::handshake_failed("OpenSSL handshake failure"))
                 }
-                Err(e) => {
-                    Err(DtlsError::handshake_failed(format!("handshake: {}", e)))
-                }
+                Err(e) => Err(DtlsError::handshake_failed(format!("handshake: {}", e))),
             }
         } else if let Some(ref mut stream) = self.stream {
             // Session established, process application data
@@ -425,7 +433,9 @@ impl OpenSslDtlsEngine {
                 }
             }
         } else {
-            Err(DtlsError::handshake_failed("no active handshake or session"))
+            Err(DtlsError::handshake_failed(
+                "no active handshake or session",
+            ))
         }
     }
 
@@ -434,48 +444,58 @@ impl OpenSslDtlsEngine {
     /// Uses the TLS exporter (RFC 5705) with label "EXTRACTOR-dtls_srtp"
     /// to derive SRTP keys from the TLS master secret.
     fn export_srtp_material(&mut self) -> Result<(), DtlsError> {
-        let stream = self.stream.as_ref()
+        let stream = self
+            .stream
+            .as_ref()
             .ok_or_else(|| DtlsError::handshake_failed("no stream for SRTP export"))?;
 
         let ssl = stream.ssl();
 
         // Determine the negotiated SRTP profile using numeric ID (more robust
         // than string matching — avoids any name format discrepancies).
-        let (profile_id, srtp_profile, key_len, salt_len) = if let Some(profile) = ssl.selected_srtp_profile() {
-            let id = profile.id();
-            let name = profile.name();
-            tracing::info!(
-                profile_name = name,
-                profile_id = ?id,
-                "OpenSSL selected SRTP profile"
-            );
-
-            if id == SrtpProfileId::SRTP_AES128_CM_SHA1_80 {
-                (0x0001u16, super::crypto::SrtpProfile::Aes128CmHmacSha1_80, 16usize, 14usize)
-            } else if id == SrtpProfileId::SRTP_AEAD_AES_128_GCM {
-                (0x0007u16, super::crypto::SrtpProfile::AeadAes128Gcm, 16, 12)
-            } else if id == SrtpProfileId::SRTP_AEAD_AES_256_GCM {
-                (0x0008u16, super::crypto::SrtpProfile::AeadAes256Gcm, 32, 12)
-            } else if id == SrtpProfileId::SRTP_AES128_CM_SHA1_32 {
-                (0x0002u16, super::crypto::SrtpProfile::Aes128CmHmacSha1_32, 16, 14)
-            } else {
-                tracing::warn!(
+        let (profile_id, srtp_profile, key_len, salt_len) =
+            if let Some(profile) = ssl.selected_srtp_profile() {
+                let id = profile.id();
+                let name = profile.name();
+                tracing::info!(
                     profile_name = name,
                     profile_id = ?id,
-                    "Unknown SRTP profile, defaulting to AES128_CM_SHA1_80"
+                    "OpenSSL selected SRTP profile"
                 );
-                (0x0001u16, super::crypto::SrtpProfile::Aes128CmHmacSha1_80, 16, 14)
-            }
-        } else {
-            tracing::warn!("No SRTP profile negotiated, defaulting to AES128_CM_SHA1_80");
-            (0x0001u16, super::crypto::SrtpProfile::Aes128CmHmacSha1_80, 16, 14)
-        };
+
+                if id == SrtpProfileId::SRTP_AES128_CM_SHA1_80 {
+                    (
+                        0x0001u16,
+                        super::crypto::SrtpProfile::Aes128CmHmacSha1_80,
+                        16usize,
+                        14usize,
+                    )
+                } else if id == SrtpProfileId::SRTP_AEAD_AES_128_GCM {
+                    (0x0007u16, super::crypto::SrtpProfile::AeadAes128Gcm, 16, 12)
+                } else if id == SrtpProfileId::SRTP_AEAD_AES_256_GCM {
+                    (0x0008u16, super::crypto::SrtpProfile::AeadAes256Gcm, 32, 12)
+                } else if id == SrtpProfileId::SRTP_AES128_CM_SHA1_32 {
+                    (
+                        0x0002u16,
+                        super::crypto::SrtpProfile::Aes128CmHmacSha1_32,
+                        16,
+                        14,
+                    )
+                } else {
+                    return Err(DtlsError::UnsupportedSrtpProfile(id.as_raw() as u16));
+                }
+            } else {
+                // RFC 5764 §4.1: use_srtp extension MUST be present in the handshake.
+                // Without it, SRTP keys cannot be derived and media cannot flow.
+                return Err(DtlsError::SrtpNotNegotiated);
+            };
 
         self.srtp_profile = Some(profile_id);
 
         // Postcondition: salt_len must match the profile's declared salt length
         assert_eq!(
-            salt_len, srtp_profile.salt_length(),
+            salt_len,
+            srtp_profile.salt_length(),
             "salt_len must match profile salt_length"
         );
 
@@ -488,11 +508,8 @@ impl OpenSslDtlsEngine {
         // DTLS-SRTP key export. We match this for interoperability.
         let material_len = 2 * (key_len + salt_len);
         let mut material = vec![0u8; material_len];
-        ssl.export_keying_material(
-            &mut material,
-            "EXTRACTOR-dtls_srtp",
-            None,
-        ).map_err(|e| DtlsError::handshake_failed(format!("SRTP export: {}", e)))?;
+        ssl.export_keying_material(&mut material, "EXTRACTOR-dtls_srtp", None)
+            .map_err(|e| DtlsError::handshake_failed(format!("SRTP export: {}", e)))?;
 
         tracing::debug!(
             material_len,
@@ -531,11 +548,13 @@ impl OpenSslDtlsEngine {
 
         // Postcondition: accessor lengths must match what we set
         assert_eq!(
-            keys.client_salt().len(), salt_len,
+            keys.client_salt().len(),
+            salt_len,
             "client_salt accessor must return salt_len bytes"
         );
         assert_eq!(
-            keys.server_salt().len(), salt_len,
+            keys.server_salt().len(),
+            salt_len,
             "server_salt accessor must return salt_len bytes"
         );
 

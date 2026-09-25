@@ -32,15 +32,19 @@ mod printer;
 mod session;
 
 pub use attributes::{
-    IceCandidate, DtlsFingerprint, DtlsSetup, RtpCodec, RtcpFeedback,
-    SsrcInfo, ExtMap, Fmtp, Direction, FingerprintAlgorithm, CandidateType,
+    CandidateType, Direction, DtlsFingerprint, DtlsSetup, ExtMap, FingerprintAlgorithm, Fmtp,
+    IceCandidate, RtcpFeedback, RtpCodec, SsrcInfo,
 };
 pub use error::SdpError;
-pub use media::{MediaDescription, MediaType, TransportProtocol, Mid, SsrcGroup, Rid, SimulcastAttr, Msid};
-pub use negotiator::{CodecCapability, CodecType, RecycledMline, SdpNegotiator, default_supported_codecs};
+pub use media::{
+    MediaDescription, MediaType, Mid, Msid, Rid, SimulcastAttr, SsrcGroup, TransportProtocol,
+};
+pub use negotiator::{
+    default_supported_codecs, CodecCapability, CodecType, OfferMline, RecycledMline, SdpNegotiator,
+};
 pub use parser::SdpParser;
 pub use printer::SdpPrinter;
-pub use session::{SessionDescription, Origin, Timing};
+pub use session::{Origin, SessionDescription, Timing};
 
 // ============================================================================
 // Constants
@@ -68,20 +72,32 @@ pub const MAX_SDP_SIZE: usize = 65536;
 pub const SDP_VERSION: u8 = 0;
 
 // Compile-time assertions for bounds (TigerStyle)
-const _: () = assert!(MAX_MEDIA_SECTIONS == 8,
-    "MAX_MEDIA_SECTIONS must be exactly 8 per WebRTC spec");
-const _: () = assert!(MAX_CODECS_PER_MEDIA == 16,
-    "MAX_CODECS_PER_MEDIA must be exactly 16 to prevent memory exhaustion");
-const _: () = assert!(MAX_CANDIDATES_PER_MEDIA == 32,
-    "MAX_CANDIDATES_PER_MEDIA must match ICE module MAX_CANDIDATES");
-const _: () = assert!(MAX_SSRCS_PER_MEDIA <= 8,
-    "MAX_SSRCS_PER_MEDIA must be bounded for simulcast scenarios");
-const _: () = assert!(MAX_SDP_SIZE == 65536,
-    "MAX_SDP_SIZE must be 64KB to prevent DoS attacks");
+const _: () = assert!(
+    MAX_MEDIA_SECTIONS == 8,
+    "MAX_MEDIA_SECTIONS must be exactly 8 per WebRTC spec"
+);
+const _: () = assert!(
+    MAX_CODECS_PER_MEDIA == 16,
+    "MAX_CODECS_PER_MEDIA must be exactly 16 to prevent memory exhaustion"
+);
+const _: () = assert!(
+    MAX_CANDIDATES_PER_MEDIA == 32,
+    "MAX_CANDIDATES_PER_MEDIA must match ICE module MAX_CANDIDATES"
+);
+const _: () = assert!(
+    MAX_SSRCS_PER_MEDIA <= 8,
+    "MAX_SSRCS_PER_MEDIA must be bounded for simulcast scenarios"
+);
+const _: () = assert!(
+    MAX_SDP_SIZE == 65536,
+    "MAX_SDP_SIZE must be 64KB to prevent DoS attacks"
+);
 
 // Assert string buffer sizes are reasonable
-const _: () = assert!(std::mem::size_of::<session::Origin>() <= 256,
-    "Origin struct must fit in 256 bytes");
+const _: () = assert!(
+    std::mem::size_of::<session::Origin>() <= 256,
+    "Origin struct must fit in 256 bytes"
+);
 
 /// Minimum ICE ufrag length (RFC 8445).
 pub const MIN_ICE_UFRAG_LEN: usize = 4;
@@ -111,6 +127,6 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(SDP_VERSION, 0);
-        assert!(MAX_MEDIA_SECTIONS >= 8);
+        const { assert!(MAX_MEDIA_SECTIONS >= 8) };
     }
 }

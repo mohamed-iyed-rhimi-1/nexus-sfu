@@ -532,7 +532,8 @@ impl Checklist {
         let waiting_idx = self.find_next_waiting_pair()?;
 
         // Generate check (immutable borrow)
-        let (request, len) = self.create_check_request(waiting_idx, false);
+        let (request, len) =
+            self.create_check_request(waiting_idx, false, &generate_transaction_id());
 
         // Now do the mutable updates
         let pair = self.pairs[waiting_idx].as_mut()?;
@@ -584,15 +585,18 @@ impl Checklist {
     }
 
     /// Create STUN binding request for connectivity check.
+    ///
+    /// New checks pass a fresh transaction ID; retransmissions MUST reuse the
+    /// original one (RFC 5389 §7.2.1) so the response matches the pending check.
     fn create_check_request(
         &self,
         pair_idx: usize,
         nominating: bool,
+        transaction_id: &[u8; 12],
     ) -> ([u8; STUN_BUFFER_SIZE], usize) {
         let mut buf = [0u8; STUN_BUFFER_SIZE];
 
         let pair = self.pairs[pair_idx].as_ref().unwrap();
-        let transaction_id = generate_transaction_id();
 
         // Username: remote_ufrag:local_ufrag (RFC 8445 Section 7.2.2)
         let username = format!(
@@ -613,7 +617,7 @@ impl Checklist {
 
         let len = create_binding_request(
             &mut buf,
-            &transaction_id,
+            transaction_id,
             &username,
             pair.local.priority,
             is_controlling,
@@ -1044,7 +1048,7 @@ impl Checklist {
         let now = Instant::now();
 
         // First pass: collect checks that need retransmission and those that failed
-        let mut needs_retransmit: Vec<(usize, u16, bool)> = Vec::new(); // slot_idx, pair_idx, nominating
+        let mut needs_retransmit: Vec<(usize, u16, bool, [u8; 12])> = Vec::new(); // slot_idx, pair_idx, nominating, transaction_id
         let mut needs_fail: Vec<(usize, u16)> = Vec::new(); // slot_idx, pair_idx
 
         for (slot_idx, slot) in self.pending.iter().enumerate() {
@@ -1065,7 +1069,12 @@ impl Checklist {
 
                 if now.duration_since(check.sent_at) >= rto {
                     if check.retransmissions < MAX_RETRANSMISSIONS as u8 {
-                        needs_retransmit.push((slot_idx, check.pair_idx, check.nominating));
+                        needs_retransmit.push((
+                            slot_idx,
+                            check.pair_idx,
+                            check.nominating,
+                            check.transaction_id,
+                        ));
                     } else {
                         needs_fail.push((slot_idx, check.pair_idx));
                     }
@@ -1074,8 +1083,9 @@ impl Checklist {
         }
 
         // Second pass: create retransmit requests (immutable borrow)
-        for &(_, pair_idx, nominating) in &needs_retransmit {
-            let (request, len) = self.create_check_request(pair_idx as usize, nominating);
+        for &(_, pair_idx, nominating, transaction_id) in &needs_retransmit {
+            let (request, len) =
+                self.create_check_request(pair_idx as usize, nominating, &transaction_id);
 
             if let Some(ref pair) = self.pairs[pair_idx as usize] {
                 retransmits.push((pair_idx, pair.remote.address, request, len));
@@ -1083,7 +1093,7 @@ impl Checklist {
         }
 
         // Third pass: update state (mutable borrow)
-        for (slot_idx, _, _) in needs_retransmit {
+        for (slot_idx, _, _, _) in needs_retransmit {
             if let Some(ref mut check) = self.pending[slot_idx] {
                 check.sent_at = now;
                 check.retransmissions += 1;
@@ -1151,7 +1161,7 @@ impl Checklist {
 
         if let Some(idx) = best_idx {
             // Send nomination request
-            let (request, len) = self.create_check_request(idx, true);
+            let (request, len) = self.create_check_request(idx, true, &generate_transaction_id());
 
             // Add to pending
             let check = PendingCheck {
@@ -1289,6 +1299,31 @@ fn extract_transaction_id(request: &[u8]) -> [u8; 12] {
     tid
 }
 
+// ============================================================================
+// Compile-Time Assertions (TigerStyle Phase 3.1)
+// ============================================================================
+
+const _: () = assert!(
+    MAX_CANDIDATE_PAIRS == 100,
+    "MAX_CANDIDATE_PAIRS must be capped at 100 per RFC 8445"
+);
+const _: () = assert!(
+    MAX_CANDIDATE_PAIRS <= 256,
+    "MAX_CANDIDATE_PAIRS must be bounded to prevent memory exhaustion"
+);
+const _: () = assert!(
+    MAX_PARALLEL_CHECKS <= 10,
+    "MAX_PARALLEL_CHECKS must be reasonable for concurrent checking"
+);
+const _: () = assert!(
+    MAX_RETRANSMISSIONS <= 7,
+    "MAX_RETRANSMISSIONS must be bounded to prevent excessive delays"
+);
+const _: () = assert!(
+    INITIAL_RTO.as_millis() >= 100,
+    "Initial RTO must be >= 100ms for reliable operation"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1325,6 +1360,36 @@ mod tests {
         let pair = checklist.pair(0).unwrap();
         assert_eq!(pair.local.address, local_host);
         assert_eq!(pair.remote.address, remote_host);
+    }
+
+    #[test]
+    fn test_retransmission_reuses_transaction_id() {
+        // RFC 5389 §7.2.1: a retransmitted request keeps its transaction ID,
+        // otherwise the response can't be matched to the pending check.
+        let mut checklist = Checklist::new(
+            create_test_credentials(),
+            create_test_credentials(),
+            IceRole::Controlling,
+        );
+        let local: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+        let remote: SocketAddr = "192.168.1.200:5001".parse().unwrap();
+        checklist.form_pairs(
+            &[Candidate::new_host(local, 1, 0)],
+            &[Candidate::new_host(remote, 1, 0)],
+        );
+
+        let (_, _, original, _) = checklist.next_check().expect("one waiting pair");
+        let original_tid = extract_transaction_id(&original);
+
+        // Age the pending check past the initial RTO so it is retransmitted
+        for check in checklist.pending.iter_mut().flatten() {
+            check.sent_at = Instant::now() - INITIAL_RTO;
+        }
+        let retransmits = checklist.check_retransmissions();
+
+        assert_eq!(retransmits.len(), 1);
+        assert_eq!(extract_transaction_id(&retransmits[0].2), original_tid);
+        assert!(checklist.find_pending_check(&original_tid).is_some());
     }
 
     #[test]
@@ -1531,11 +1596,14 @@ mod tests {
 
     #[test]
     fn test_candidate_foundation() {
-        let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
-        let candidate = Candidate::new_host(addr, 1, 0);
+        // RFC 8445 §5.1.1.3: same type + base IP + transport share a foundation
+        // (the port is not part of it); a different base IP gets a different one.
+        let a = Candidate::new_host("192.168.1.100:5000".parse().unwrap(), 1, 0);
+        let same_ip = Candidate::new_host("192.168.1.100:6000".parse().unwrap(), 1, 0);
+        let other_ip = Candidate::new_host("192.168.1.101:5000".parse().unwrap(), 1, 0);
 
-        // Foundation should be set
-        assert!(candidate.foundation > 0 || candidate.foundation == 0);
+        assert_eq!(a.foundation, same_ip.foundation);
+        assert_ne!(a.foundation, other_ip.foundation);
     }
 
     // ========================================================================
@@ -1674,28 +1742,3 @@ mod tests {
         assert_eq!(checklist.succeeded_count(), 0);
     }
 }
-
-// ============================================================================
-// Compile-Time Assertions (TigerStyle Phase 3.1)
-// ============================================================================
-
-const _: () = assert!(
-    MAX_CANDIDATE_PAIRS == 100,
-    "MAX_CANDIDATE_PAIRS must be capped at 100 per RFC 8445"
-);
-const _: () = assert!(
-    MAX_CANDIDATE_PAIRS <= 256,
-    "MAX_CANDIDATE_PAIRS must be bounded to prevent memory exhaustion"
-);
-const _: () = assert!(
-    MAX_PARALLEL_CHECKS <= 10,
-    "MAX_PARALLEL_CHECKS must be reasonable for concurrent checking"
-);
-const _: () = assert!(
-    MAX_RETRANSMISSIONS <= 7,
-    "MAX_RETRANSMISSIONS must be bounded to prevent excessive delays"
-);
-const _: () = assert!(
-    INITIAL_RTO.as_millis() >= 100,
-    "Initial RTO must be >= 100ms for reliable operation"
-);

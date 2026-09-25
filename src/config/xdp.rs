@@ -272,8 +272,10 @@ mod tests {
 
     #[test]
     fn test_xdp_config_enabled_requires_interface() {
-        let mut config = XdpConfig::default();
-        config.enabled = true;
+        let mut config = XdpConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         config.interface = "eth0".to_string();
@@ -282,44 +284,50 @@ mod tests {
 
     #[test]
     fn test_xdp_config_ring_size_power_of_two() {
-        let mut config = XdpConfig::default();
-        config.enabled = true;
-        config.interface = "eth0".to_string();
-        config.fill_ring_size = 1000; // Not power of 2
+        let config = XdpConfig {
+            enabled: true,
+            interface: "eth0".to_string(),
+            fill_ring_size: 1000, // Not power of 2
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_xdp_config_batch_size_bounds() {
-        let mut config = XdpConfig::default();
-        config.enabled = true;
-        config.interface = "eth0".to_string();
-        
+        let mut config = XdpConfig {
+            enabled: true,
+            interface: "eth0".to_string(),
+            ..Default::default()
+        };
+
         config.batch_size = 0;
         assert!(config.validate().is_err());
-        
+
         config.batch_size = 65;
         assert!(config.validate().is_err());
-        
+
         config.batch_size = 64;
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_xdp_config_attach_mode() {
-        let mut config = XdpConfig::default();
-        config.enabled = true;
-        config.interface = "eth0".to_string();
-        
+        let mut config = XdpConfig {
+            enabled: true,
+            interface: "eth0".to_string(),
+            ..Default::default()
+        };
+
         config.attach_mode = "invalid".to_string();
         assert!(config.validate().is_err());
-        
+
         config.attach_mode = "native".to_string();
         assert!(config.validate().is_ok());
-        
+
         config.attach_mode = "generic".to_string();
         assert!(config.validate().is_ok());
-        
+
         config.attach_mode = "offload".to_string();
         assert!(config.validate().is_ok());
     }

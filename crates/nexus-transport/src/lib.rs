@@ -44,18 +44,18 @@
 //! - `gso` — GSO (Generic Segmentation Offload) batch sender
 
 pub mod arena;
-pub mod ring_buffer;
-pub mod udp;
-pub mod io_uring;
 pub mod batch;
-pub mod ice;
 pub mod dtls;
-pub mod srtp;
-pub mod socket_config;
 pub mod gro;
 pub mod gso;
+pub mod ice;
+pub mod io_uring;
 pub mod media_transport;
+pub mod ring_buffer;
+pub mod socket_config;
+pub mod srtp;
 pub mod turn;
+pub mod udp;
 
 #[cfg(test)]
 mod arena_proptest;
@@ -65,87 +65,67 @@ mod arena_refcount_proptest;
 
 // Re-export key types at crate root for convenience.
 pub use arena::{
-    PacketArena, PacketSlot, SLOT_SIZE_BYTES,
-    ArenaPartition, PartitionedPacketSlot, create_partitions,
+    create_partitions, ArenaPartition, PacketArena, PacketSlot, PartitionedPacketSlot,
+    SLOT_SIZE_BYTES,
 };
+pub use batch::{BatchSender, BatchSenderStats, BatchSenderStatsSnapshot};
 pub use ring_buffer::RingBuffer;
-pub use batch::{
-    BatchSender, BatchSenderStats, BatchSenderStatsSnapshot,
-};
 pub use udp::{
-    RecvPacket, ReceiveMode, TransportConfig, TransportStats,
-    TransportStatsSnapshot, UdpTransport,
+    ReceiveMode, RecvPacket, TransportConfig, TransportStats, TransportStatsSnapshot, UdpTransport,
 };
 
 // Re-export io_uring types.
 pub use io_uring::{
-    IoUringTransport, IoUringConfig, IoUringRecvPacket,
-    IoUringStats, IoUringStatsSnapshot, IoUringReceiveMode,
-    create_transport_with_fallback,
+    create_transport_with_fallback, IoUringConfig, IoUringReceiveMode, IoUringRecvPacket,
+    IoUringStats, IoUringStatsSnapshot, IoUringTransport,
 };
 
 // Re-export ICE types.
 pub use ice::{
-    IceAgent, IceConfig, IceRole, IceCredentials,
-    IceConnectionState, IceGatheringState, IceError,
-    Candidate, CandidateType, CandidatePair, CandidatePairState,
-    CandidateGatherer, GatheredCandidates, GatheringState,
-    Checklist, ChecklistState,
-    StunMessage, StunAttribute, StunClass, StunMethod,
+    Candidate, CandidateGatherer, CandidatePair, CandidatePairState, CandidateType, Checklist,
+    ChecklistState, GatheredCandidates, GatheringState, IceAgent, IceConfig, IceConnectionState,
+    IceCredentials, IceError, IceGatheringState, IceRole, StunAttribute, StunClass, StunMessage,
+    StunMethod,
 };
 
 // Re-export DTLS types.
 pub use dtls::{
-    DtlsError, DtlsSession, SessionState, SessionConfig,
-    CipherSuite as DtlsCipherSuite, KeyMaterial as DtlsKeyMaterial,
-    SrtpProfile, RecordLayer, ContentType,
-    HandshakeType, HandshakeState,
+    CipherSuite as DtlsCipherSuite, ContentType, DtlsError, DtlsSession, HandshakeState,
+    HandshakeType, KeyMaterial as DtlsKeyMaterial, RecordLayer, SessionConfig, SessionState,
+    SrtpProfile,
 };
 
 // Re-export SRTP types.
 pub use srtp::{
-    SrtpContext, SrtpSession, SrtpSessionPool, SrtpStats,
-    SrtpError, SrtpKeys, KeyDerivation,
-    KeyMaterial as SrtpKeyMaterial,
-    ReplayProtection, AesGcmCipher, AesCmHmacCipher, SrtpCipher,
-    CipherSuite as SrtpCipherSuite,
+    AesCmHmacCipher, AesGcmCipher, CipherSuite as SrtpCipherSuite, KeyDerivation,
+    KeyMaterial as SrtpKeyMaterial, ReplayProtection, SrtpCipher, SrtpContext, SrtpError, SrtpKeys,
+    SrtpSession, SrtpSessionPool, SrtpStats,
 };
 
 // Re-export socket configuration types.
 pub use socket_config::{
-    configure_socket_buffers, configure_high_performance_socket,
-    enable_gro, check_gso_available,
+    check_gso_available, configure_high_performance_socket, configure_socket_buffers, enable_gro,
     SocketBufferInfo, DEFAULT_BUFFER_SIZE, MIN_ACCEPTABLE_BUFFER_SIZE,
 };
 
 // Re-export GRO types.
 pub use gro::{
-    GroSplitter, GroPacketIterator, GroStats,
-    parse_gro_size_from_cmsg,
-    MAX_GRO_SEGMENT_SIZE, MIN_GRO_SEGMENT_SIZE,
+    parse_gro_size_from_cmsg, GroPacketIterator, GroSplitter, GroStats, MAX_GRO_SEGMENT_SIZE,
+    MIN_GRO_SEGMENT_SIZE,
 };
 
 // Re-export GSO types.
-pub use gso::{
-    GsoBatchSender, GsoStats, GsoStatsSnapshot,
-    MAX_GSO_SEGMENTS, MAX_GSO_BUFFER_SIZE,
-};
+pub use gso::{GsoBatchSender, GsoStats, GsoStatsSnapshot, MAX_GSO_BUFFER_SIZE, MAX_GSO_SEGMENTS};
 
 // Re-export media transport types.
-pub use media_transport::{
-    MediaTransport, TransportMode, MediaRecvPacket,
-};
+pub use media_transport::{MediaRecvPacket, MediaTransport, TransportMode};
 
 // Re-export TURN types.
 pub use turn::{
-    TurnClient, TurnClientConfig, TurnError,
-    Allocation, AllocationState,
-    TurnCredentials, TurnServerInfo, Permission, ChannelBinding,
-    RelayedAddress, TransportProtocol,
-    DEFAULT_ALLOCATION_LIFETIME, MAX_ALLOCATION_LIFETIME, MIN_ALLOCATION_LIFETIME,
-    PERMISSION_LIFETIME, CHANNEL_BINDING_LIFETIME,
-    CHANNEL_NUMBER_MIN, CHANNEL_NUMBER_MAX,
-    MAX_PERMISSIONS, MAX_CHANNEL_BINDINGS,
-    CHANNEL_DATA_HEADER_SIZE, MAX_TURN_DATA_SIZE,
-    REFRESH_MARGIN_SECONDS, TRANSPORT_UDP, TRANSPORT_TCP,
+    Allocation, AllocationState, ChannelBinding, Permission, RelayedAddress, TransportProtocol,
+    TurnClient, TurnClientConfig, TurnCredentials, TurnError, TurnServerInfo,
+    CHANNEL_BINDING_LIFETIME, CHANNEL_DATA_HEADER_SIZE, CHANNEL_NUMBER_MAX, CHANNEL_NUMBER_MIN,
+    DEFAULT_ALLOCATION_LIFETIME, MAX_ALLOCATION_LIFETIME, MAX_CHANNEL_BINDINGS, MAX_PERMISSIONS,
+    MAX_TURN_DATA_SIZE, MIN_ALLOCATION_LIFETIME, PERMISSION_LIFETIME, REFRESH_MARGIN_SECONDS,
+    TRANSPORT_TCP, TRANSPORT_UDP,
 };

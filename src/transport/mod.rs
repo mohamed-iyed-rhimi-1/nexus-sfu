@@ -24,13 +24,13 @@
 
 // Re-export all transport types from nexus-transport crate
 pub use nexus_transport::batch::{BatchSender, BatchSenderStats, BatchSenderStatsSnapshot};
+pub use nexus_transport::io_uring::{
+    create_transport_with_fallback, IoUringConfig, IoUringReceiveMode, IoUringRecvPacket,
+    IoUringStats, IoUringStatsSnapshot, IoUringTransport,
+};
+pub use nexus_transport::media_transport::{MediaRecvPacket, MediaTransport, TransportMode};
 pub use nexus_transport::udp::{
     ReceiveMode, RecvPacket, TransportConfig, TransportStats, TransportStatsSnapshot, UdpTransport,
-};
-pub use nexus_transport::media_transport::{MediaTransport, TransportMode, MediaRecvPacket};
-pub use nexus_transport::io_uring::{
-    IoUringTransport, IoUringConfig, IoUringRecvPacket, IoUringStats, IoUringStatsSnapshot,
-    IoUringReceiveMode, create_transport_with_fallback,
 };
 
 // XDP support (Linux only, stays in src/ as it's application-specific)

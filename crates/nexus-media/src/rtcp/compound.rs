@@ -5,8 +5,8 @@
 //! This module provides an iterator that yields individual
 //! RTCP packets from a compound datagram.
 
-use nexus_core::RtcpError;
 use super::header::{RtcpHeader, RTCP_HEADER_MIN_SIZE_BYTES, RTCP_VERSION};
+use nexus_core::RtcpError;
 
 /// Maximum number of RTCP packets in a compound packet.
 /// RFC 3550 doesn't specify a limit, but 16 is generous
@@ -38,8 +38,7 @@ pub fn demux_compound(data: &[u8]) -> Result<CompoundPacket<'_>, RtcpError> {
 
     let mut offset: usize = 0;
 
-    while offset + RTCP_HEADER_MIN_SIZE_BYTES <= data.len()
-        && entries.count < MAX_COMPOUND_PACKETS
+    while offset + RTCP_HEADER_MIN_SIZE_BYTES <= data.len() && entries.count < MAX_COMPOUND_PACKETS
     {
         // Validate version before full parse
         let version = (data[offset] >> 6) & 0x03;
@@ -92,8 +91,6 @@ impl<'a> CompoundPacket<'a> {
 
     /// Iterate over parsed sub-packets.
     pub fn iter(&self) -> impl Iterator<Item = &CompoundEntry<'a>> {
-        self.entries[..self.count]
-            .iter()
-            .filter_map(|e| e.as_ref())
+        self.entries[..self.count].iter().filter_map(|e| e.as_ref())
     }
 }

@@ -100,7 +100,7 @@ impl FileHeader {
             },
             flags: 0,
             room_id: room_id as u64,
-            track_id: track_id as u64,
+            track_id,
             ssrc,
             start_time_ns,
             _reserved: [0u8; 28],

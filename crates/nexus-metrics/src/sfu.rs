@@ -72,7 +72,8 @@ impl SfuMetrics {
     pub fn record_packet_received(&self, bytes: u32) {
         assert!(bytes > 0, "bytes must be > 0");
         self.packets_received_total.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received_total.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_received_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Record packet forwarded
@@ -84,13 +85,16 @@ impl SfuMetrics {
     pub fn record_packet_forwarded(&self, bytes: u32, latency_nanos: u64) {
         assert!(bytes > 0, "bytes must be > 0");
         assert!(latency_nanos > 0, "latency_nanos must be > 0");
-        
+
         self.packets_forwarded_total.fetch_add(1, Ordering::Relaxed);
-        self.bytes_forwarded_total.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_forwarded_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
 
         // Update latency stats
-        self.forwarding_latency_sum_nanos.fetch_add(latency_nanos, Ordering::Relaxed);
-        self.forwarding_latency_count.fetch_add(1, Ordering::Relaxed);
+        self.forwarding_latency_sum_nanos
+            .fetch_add(latency_nanos, Ordering::Relaxed);
+        self.forwarding_latency_count
+            .fetch_add(1, Ordering::Relaxed);
 
         // Update histogram bucket
         let latency_ms = latency_nanos / 1_000_000;
@@ -272,7 +276,10 @@ impl SfuMetrics {
             (0.050, self.latency_bucket_50ms.load(Ordering::Relaxed)),
             (0.100, self.latency_bucket_100ms.load(Ordering::Relaxed)),
             (0.500, self.latency_bucket_500ms.load(Ordering::Relaxed)),
-            (f64::INFINITY, self.latency_bucket_inf.load(Ordering::Relaxed)),
+            (
+                f64::INFINITY,
+                self.latency_bucket_inf.load(Ordering::Relaxed),
+            ),
         ]
     }
 

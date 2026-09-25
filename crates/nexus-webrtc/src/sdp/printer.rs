@@ -91,9 +91,8 @@ impl SdpPrinter {
         lines.push(format!("o={}", session.origin.to_sdp()));
 
         // s= session name
-        let name =
-            std::str::from_utf8(&session.session_name[..session.session_name_len as usize])
-                .unwrap_or("-");
+        let name = std::str::from_utf8(&session.session_name[..session.session_name_len as usize])
+            .unwrap_or("-");
         lines.push(format!("s={}", name));
 
         // t= timing
@@ -366,8 +365,7 @@ impl SdpPrinter {
             if let Some(ref ssrc) = media.ssrcs[i] {
                 let attr =
                     std::str::from_utf8(&ssrc.attribute[..ssrc.attr_len as usize]).unwrap_or("");
-                let val =
-                    std::str::from_utf8(&ssrc.value[..ssrc.value_len as usize]).unwrap_or("");
+                let val = std::str::from_utf8(&ssrc.value[..ssrc.value_len as usize]).unwrap_or("");
                 lines.push(format!("a=ssrc:{} {}:{}", ssrc.ssrc, attr, val));
             }
         }
@@ -418,11 +416,11 @@ impl SdpPrinter {
     /// Print standalone msid (RFC 8830).
     fn print_msid(media: &MediaDescription, lines: &mut Vec<String>) {
         if let Some(ref msid) = media.msid {
-            let stream = std::str::from_utf8(&msid.stream_id[..msid.stream_id_len as usize])
-                .unwrap_or("");
+            let stream =
+                std::str::from_utf8(&msid.stream_id[..msid.stream_id_len as usize]).unwrap_or("");
             if msid.track_id_len > 0 {
-                let track = std::str::from_utf8(&msid.track_id[..msid.track_id_len as usize])
-                    .unwrap_or("");
+                let track =
+                    std::str::from_utf8(&msid.track_id[..msid.track_id_len as usize]).unwrap_or("");
                 lines.push(format!("a=msid:{} {}", stream, track));
             } else {
                 lines.push(format!("a=msid:{}", stream));
@@ -466,7 +464,8 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut media =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         let codec = RtpCodec::parse(111, "opus/48000/2").unwrap();
         media.add_codec(codec).unwrap();
@@ -492,7 +491,8 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut media = MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut media =
+            MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         let codec = RtpCodec::parse(96, "VP8/90000").unwrap();
         media.add_codec(codec).unwrap();
@@ -511,14 +511,16 @@ mod tests {
         session.set_fingerprint(test_fingerprint());
 
         // Audio
-        let mut audio = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut audio =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         audio.mid = Some(Mid::new("0"));
         let opus = RtpCodec::parse(111, "opus/48000/2").unwrap();
         audio.add_codec(opus).unwrap();
         session.add_media(audio).unwrap();
 
         // Video
-        let mut video = MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut video =
+            MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
         video.mid = Some(Mid::new("1"));
         let vp8 = RtpCodec::parse(96, "VP8/90000").unwrap();
         video.add_codec(vp8).unwrap();
@@ -538,13 +540,15 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut audio = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut audio =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         audio.mid = Some(Mid::new("0"));
         let opus = RtpCodec::parse(111, "opus/48000/2").unwrap();
         audio.add_codec(opus).unwrap();
         session.add_media(audio).unwrap();
 
-        let mut video = MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut video =
+            MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
         video.mid = Some(Mid::new("1"));
         let vp8 = RtpCodec::parse(96, "VP8/90000").unwrap();
         video.add_codec(vp8).unwrap();
@@ -563,7 +567,8 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut media =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         media.direction = Direction::SendOnly;
         let codec = RtpCodec::parse(111, "opus/48000/2").unwrap();
@@ -581,7 +586,8 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut media =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         media.rtcp_mux = true;
         media.rtcp_rsize = true;
@@ -602,7 +608,8 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut media =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         media.direction = Direction::SendRecv;
         let codec = RtpCodec::parse(111, "opus/48000/2").unwrap();
@@ -628,7 +635,8 @@ mod tests {
         session.set_ice_credentials("testufrag", "testpwd1234567890123456");
         session.set_fingerprint(test_fingerprint());
 
-        let mut media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        let mut media =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         let codec = RtpCodec::parse(111, "opus/48000/2").unwrap();
         media.add_codec(codec).unwrap();

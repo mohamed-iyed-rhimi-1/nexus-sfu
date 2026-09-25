@@ -102,15 +102,11 @@ pub enum TransportError {
 
     /// io_uring initialization failed (Linux only)
     #[error("io_uring initialization failed: {message}")]
-    IoUringInitFailed {
-        message: String,
-    },
+    IoUringInitFailed { message: String },
 
     /// Configuration error
     #[error("configuration error: {message}")]
-    ConfigError {
-        message: String,
-    },
+    ConfigError { message: String },
 
     /// Failed to set socket option
     #[error("failed to set socket option: {source}")]
@@ -160,10 +156,7 @@ pub enum RtpError {
     InvalidVersion { version: u8 },
 
     /// CSRC count exceeds available bytes
-    InvalidCsrcCount {
-        count: u8,
-        available_bytes: usize,
-    },
+    InvalidCsrcCount { count: u8, available_bytes: usize },
 
     /// Invalid header extension
     InvalidExtension,
@@ -189,11 +182,7 @@ impl fmt::Display for RtpError {
                 )
             }
             RtpError::InvalidVersion { version } => {
-                write!(
-                    f,
-                    "invalid RTP version: {}, expected 2",
-                    version
-                )
+                write!(f, "invalid RTP version: {}, expected 2", version)
             }
             RtpError::InvalidCsrcCount {
                 count,
@@ -244,10 +233,7 @@ pub enum RtcpError {
     InvalidPacketType { packet_type: u8 },
 
     /// Invalid report block count
-    InvalidReportCount {
-        count: u8,
-        available_bytes: usize,
-    },
+    InvalidReportCount { count: u8, available_bytes: usize },
 }
 
 impl fmt::Display for RtcpError {
@@ -264,18 +250,10 @@ impl fmt::Display for RtcpError {
                 )
             }
             RtcpError::InvalidVersion { version } => {
-                write!(
-                    f,
-                    "invalid RTCP version: {}, expected 2",
-                    version
-                )
+                write!(f, "invalid RTCP version: {}, expected 2", version)
             }
             RtcpError::InvalidPacketType { packet_type } => {
-                write!(
-                    f,
-                    "invalid RTCP packet type: {}",
-                    packet_type
-                )
+                write!(f, "invalid RTCP packet type: {}", packet_type)
             }
             RtcpError::InvalidReportCount {
                 count,
@@ -314,11 +292,7 @@ impl fmt::Display for ArenaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ArenaError::Exhausted { capacity_slots } => {
-                write!(
-                    f,
-                    "arena exhausted: all {} slots in use",
-                    capacity_slots
-                )
+                write!(f, "arena exhausted: all {} slots in use", capacity_slots)
             }
             ArenaError::InvalidSlot {
                 index,
@@ -368,32 +342,14 @@ impl fmt::Display for WorkerError {
             WorkerError::ChannelFull { worker_id } => {
                 write!(f, "worker {} channel full", worker_id)
             }
-            WorkerError::WorkerPanicked {
-                worker_id,
-                message,
-            } => {
-                write!(
-                    f,
-                    "worker {} panicked: {}",
-                    worker_id, message
-                )
+            WorkerError::WorkerPanicked { worker_id, message } => {
+                write!(f, "worker {} panicked: {}", worker_id, message)
             }
             WorkerError::ShutdownTimeout { timeout_ms } => {
-                write!(
-                    f,
-                    "shutdown timed out after {}ms",
-                    timeout_ms
-                )
+                write!(f, "shutdown timed out after {}ms", timeout_ms)
             }
-            WorkerError::AffinityFailed {
-                worker_id,
-                core_id,
-            } => {
-                write!(
-                    f,
-                    "failed to pin worker {} to core {}",
-                    worker_id, core_id
-                )
+            WorkerError::AffinityFailed { worker_id, core_id } => {
+                write!(f, "failed to pin worker {} to core {}", worker_id, core_id)
             }
             WorkerError::InvalidConfig { message } => {
                 write!(f, "invalid worker config: {}", message)
@@ -549,33 +505,17 @@ impl SignalingError {
             SignalingError::InvalidMessage { .. } => INVALID_MESSAGE,
             SignalingError::AuthenticationFailed { .. } => AUTH_FAILED,
             SignalingError::RoomNotFound { .. } => ROOM_NOT_FOUND,
-            SignalingError::ParticipantNotFound { .. } => {
-                PARTICIPANT_NOT_FOUND
-            }
+            SignalingError::ParticipantNotFound { .. } => PARTICIPANT_NOT_FOUND,
             SignalingError::SendFailed { .. } => SEND_FAILED,
-            SignalingError::ConnectionTimeout { .. } => {
-                CONNECTION_TIMEOUT
-            }
-            SignalingError::ConnectionLimitReached { .. } => {
-                CONNECTION_LIMIT
-            }
+            SignalingError::ConnectionTimeout { .. } => CONNECTION_TIMEOUT,
+            SignalingError::ConnectionLimitReached { .. } => CONNECTION_LIMIT,
             SignalingError::MessageQueueFull { .. } => QUEUE_FULL,
             SignalingError::InvalidState { .. } => INVALID_STATE,
-            SignalingError::ConsentCheckFailed { .. } => {
-                CONSENT_FAILED
-            }
-            SignalingError::ReconnectionExhausted { .. } => {
-                RECONNECT_EXHAUSTED
-            }
-            SignalingError::ValidationFailed { .. } => {
-                VALIDATION_FAILED
-            }
-            SignalingError::ServerNotRunning { .. } => {
-                SERVER_NOT_RUNNING
-            }
-            SignalingError::HealthCheckFailed { .. } => {
-                HEALTH_CHECK_FAILED
-            }
+            SignalingError::ConsentCheckFailed { .. } => CONSENT_FAILED,
+            SignalingError::ReconnectionExhausted { .. } => RECONNECT_EXHAUSTED,
+            SignalingError::ValidationFailed { .. } => VALIDATION_FAILED,
+            SignalingError::ServerNotRunning { .. } => SERVER_NOT_RUNNING,
+            SignalingError::HealthCheckFailed { .. } => HEALTH_CHECK_FAILED,
         }
     }
 
@@ -614,37 +554,28 @@ impl fmt::Display for SignalingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SignalingError::ConnectionFailed { source } => {
-                write!(
-                    f, "[E{}] connection failed: {}",
-                    self.error_code(), source
-                )
+                write!(f, "[E{}] connection failed: {}", self.error_code(), source)
             }
             SignalingError::InvalidMessage { reason } => {
-                write!(
-                    f, "[E{}] invalid message: {}",
-                    self.error_code(), reason
-                )
+                write!(f, "[E{}] invalid message: {}", self.error_code(), reason)
             }
-            SignalingError::AuthenticationFailed {
-                participant_name,
-            } => {
+            SignalingError::AuthenticationFailed { participant_name } => {
                 write!(
-                    f, "[E{}] authentication failed for '{}'",
-                    self.error_code(), participant_name
+                    f,
+                    "[E{}] authentication failed for '{}'",
+                    self.error_code(),
+                    participant_name
                 )
             }
             SignalingError::RoomNotFound { room_id } => {
-                write!(
-                    f, "[E{}] room {} not found",
-                    self.error_code(), room_id
-                )
+                write!(f, "[E{}] room {} not found", self.error_code(), room_id)
             }
-            SignalingError::ParticipantNotFound {
-                participant_id,
-            } => {
+            SignalingError::ParticipantNotFound { participant_id } => {
                 write!(
-                    f, "[E{}] participant {} not found",
-                    self.error_code(), participant_id
+                    f,
+                    "[E{}] participant {} not found",
+                    self.error_code(),
+                    participant_id
                 )
             }
             SignalingError::SendFailed {
@@ -671,9 +602,7 @@ impl fmt::Display for SignalingError {
                     timeout_ms
                 )
             }
-            SignalingError::ConnectionLimitReached {
-                max_connections,
-            } => {
+            SignalingError::ConnectionLimitReached { max_connections } => {
                 write!(
                     f,
                     "[E{}] connection limit reached: max {} connections",
@@ -694,10 +623,7 @@ impl fmt::Display for SignalingError {
                     queue_size
                 )
             }
-            SignalingError::InvalidState {
-                expected,
-                actual,
-            } => {
+            SignalingError::InvalidState { expected, actual } => {
                 write!(
                     f,
                     "[E{}] invalid state: expected {}, got {}",
@@ -766,9 +692,7 @@ impl fmt::Display for SignalingError {
 impl std::error::Error for SignalingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            SignalingError::ConnectionFailed { source } => {
-                Some(source)
-            }
+            SignalingError::ConnectionFailed { source } => Some(source),
             _ => None,
         }
     }
@@ -788,10 +712,7 @@ pub enum RoomError {
     RoomNotFound { room_id: u32 },
 
     /// Participant not found in room
-    ParticipantNotFound {
-        room_id: u32,
-        participant_id: u32,
-    },
+    ParticipantNotFound { room_id: u32, participant_id: u32 },
 
     /// Room name too long
     NameTooLong { len: usize, max_len: usize },
@@ -833,18 +754,10 @@ impl fmt::Display for RoomError {
                 )
             }
             RoomError::NameTooLong { len, max_len } => {
-                write!(
-                    f,
-                    "room name too long: {} chars, max {}",
-                    len, max_len
-                )
+                write!(f, "room name too long: {} chars, max {}", len, max_len)
             }
             RoomError::NameAlreadyExists { name } => {
-                write!(
-                    f,
-                    "room name '{}' already exists",
-                    name
-                )
+                write!(f, "room name '{}' already exists", name)
             }
             RoomError::TrackNotFound { track_id } => {
                 write!(f, "track {} not found", track_id)
@@ -930,14 +843,10 @@ mod tests {
 
     #[test]
     fn test_transport_error_display() {
-        let addr: SocketAddr =
-            "127.0.0.1:8080".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let err = TransportError::BindFailed {
             addr,
-            source: io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "address in use",
-            ),
+            source: io::Error::new(io::ErrorKind::AddrInUse, "address in use"),
         };
         assert!(err.to_string().contains("127.0.0.1:8080"));
     }
@@ -970,10 +879,7 @@ mod tests {
         let rtp_err = RtpError::InvalidVersion { version: 1 };
         let parse_err: ParseError = rtp_err.into();
         let sfu_err: SfuError = parse_err.into();
-        assert!(matches!(
-            sfu_err,
-            SfuError::Parse(ParseError::Rtp(_))
-        ));
+        assert!(matches!(sfu_err, SfuError::Parse(ParseError::Rtp(_))));
     }
 
     #[test]

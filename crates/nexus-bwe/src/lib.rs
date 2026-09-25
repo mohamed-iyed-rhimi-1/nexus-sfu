@@ -42,8 +42,8 @@ mod types;
 pub use allocation::{SimulcastLayer, TrackAllocation, TrackPriority};
 pub use coordinator::BandwidthCoordinator;
 pub use delay::{
-    DelayBasedBweDetector, DelayBasedBweState, KalmanFilter,
-    DEFAULT_DELAY_GRADIENT_THRESHOLD, DEFAULT_OVERUSE_TIME_THRESHOLD_MS,
+    DelayBasedBweDetector, DelayBasedBweState, KalmanFilter, DEFAULT_DELAY_GRADIENT_THRESHOLD,
+    DEFAULT_OVERUSE_TIME_THRESHOLD_MS,
 };
 pub use feedback::{PacketArrivalInfo, TransportFeedback, MAX_FEEDBACK_PACKETS};
 pub use gcc::{CongestionController, GccStats, GccStatsSnapshot};

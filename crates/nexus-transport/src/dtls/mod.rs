@@ -28,21 +28,27 @@
 //! - Bounded loops and retries
 //! - No panics on hot path (only assertions for programmer errors)
 
-mod error;
-mod types;
-mod record;
-mod handshake;
 mod crypto;
-mod session;
+mod error;
+mod handshake;
 mod openssl_backend;
+mod record;
+mod session;
+mod types;
 
+pub use crypto::{
+    compute_ecdhe_shared_secret_ring, generate_ecdhe_keypair_ring, CipherSuite, KeyMaterial,
+    SrtpProfile,
+};
 pub use error::DtlsError;
-pub use types::*;
-pub use record::{RecordLayer, ContentType, FragmentAssembler};
-pub use handshake::{HandshakeType, HandshakeState, Flight, FragmentBuffer, DtlsClientHandshake, ClientHandshakeState, SrtpKeys};
-pub use crypto::{CipherSuite, KeyMaterial, SrtpProfile, generate_ecdhe_keypair_ring, compute_ecdhe_shared_secret_ring};
+pub use handshake::{
+    ClientHandshakeState, DtlsClientHandshake, Flight, FragmentBuffer, HandshakeState,
+    HandshakeType, SrtpKeys,
+};
 pub use openssl_backend::OpenSslDtlsEngine;
-pub use session::{DtlsSession, SessionState, SessionConfig, HANDSHAKE_TIMEOUT_MS};
+pub use record::{ContentType, FragmentAssembler, RecordLayer};
+pub use session::{DtlsSession, SessionConfig, SessionState, HANDSHAKE_TIMEOUT_MS};
+pub use types::*;
 
 /// Maximum DTLS record size.
 pub const MAX_DTLS_RECORD_SIZE: usize = 16384;
@@ -80,29 +86,29 @@ const _: () = {
     assert!(MAX_RETRANSMISSIONS == 6);
     assert!(INITIAL_RTO_MS == 1000);
     assert!(MAX_FRAGMENT_SIZE == 1400);
-    
+
     // Version bounds
     assert!(DTLS_VERSION_1_2 == 0xFEFD);
     assert!(DTLS_VERSION_1_0 == 0xFEFF);
-    
+
     // Timeout bounds (30 seconds)
     assert!(30000u32 == 30 * 1000);
-    
+
     // Key sizes
-    assert!(16 == 128 / 8);  // AES-128 key size
-    assert!(12 == 96 / 8);   // GCM nonce size
-    assert!(16 == 128 / 8);  // GCM tag size
-    assert!(32 == 256 / 8);  // P-256 shared secret size
+    assert!(16 == 128 / 8); // AES-128 key size
+    assert!(12 == 96 / 8); // GCM nonce size
+    assert!(16 == 128 / 8); // GCM tag size
+    assert!(32 == 256 / 8); // P-256 shared secret size
     assert!(65 == 1 + 32 + 32); // Uncompressed P-256 public key
-    
+
     // Retransmission bounds
     assert!(INITIAL_RTO_MS >= 1000);
     assert!(MAX_RETRANSMISSIONS <= 10);
-    
+
     // Fragment bounds
     assert!(MAX_FRAGMENT_SIZE <= MAX_DTLS_RECORD_SIZE);
     assert!(MAX_FRAGMENT_SIZE >= 1200); // Must exceed typical MTU
-    
+
     // Flight bounds
     assert!(MAX_FLIGHT_SIZE >= 4); // Minimum for server flight
     assert!(MAX_FLIGHT_SIZE <= 16); // Reasonable upper bound

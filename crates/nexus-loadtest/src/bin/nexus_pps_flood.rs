@@ -30,7 +30,9 @@ extern "C" fn on_sigint(_: libc::c_int) {
 
 fn install_signal_handler(stop: &Arc<AtomicBool>) {
     let s = Arc::clone(stop);
-    unsafe { libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t); }
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
+    }
     std::thread::spawn(move || {
         while !SIGNAL_RECEIVED.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(50));
@@ -74,12 +76,14 @@ struct Args {
 
 fn build_rtp(seq: u16, ts: u32, ssrc: u32, payload_size: usize) -> Vec<u8> {
     let mut p = vec![0u8; 12 + payload_size];
-    p[0] = 0x80;       // V=2
-    p[1] = 0x60;       // PT=96
+    p[0] = 0x80; // V=2
+    p[1] = 0x60; // PT=96
     p[2..4].copy_from_slice(&seq.to_be_bytes());
     p[4..8].copy_from_slice(&ts.to_be_bytes());
     p[8..12].copy_from_slice(&ssrc.to_be_bytes());
-    for i in 0..payload_size { p[12 + i] = (i & 0xFF) as u8; }
+    for i in 0..payload_size {
+        p[12 + i] = (i & 0xFF) as u8;
+    }
     p
 }
 
@@ -93,8 +97,9 @@ struct Stats {
 
 // ── Sender thread ────────────────────────────────────────────────────────
 
-fn sender(
-    id: u32,
+/// Per-thread send parameters
+#[derive(Clone, Copy)]
+struct SenderConfig {
     target: SocketAddr,
     pps: u64,
     dur: Duration,
@@ -103,9 +108,19 @@ fn sender(
     ssrc_count: u32,
     sndbuf: i32,
     unlimited: bool,
-    stop: Arc<AtomicBool>,
-    stats: Arc<Stats>,
-) {
+}
+
+fn sender(id: u32, cfg: SenderConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>) {
+    let SenderConfig {
+        target,
+        pps,
+        dur,
+        payload_size,
+        ssrc_base,
+        ssrc_count,
+        sndbuf,
+        unlimited,
+    } = cfg;
     let sock = UdpSocket::bind("0.0.0.0:0").expect("bind");
     // connect() avoids per-send address lookup – big perf win
     sock.connect(target).expect("connect");
@@ -116,7 +131,9 @@ fn sender(
         use std::os::fd::AsRawFd;
         unsafe {
             libc::setsockopt(
-                sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
                 &sndbuf as *const _ as *const libc::c_void,
                 std::mem::size_of::<i32>() as libc::socklen_t,
             );
@@ -134,7 +151,11 @@ fn sender(
     // Burst parameters for rate limiting
     // Larger bursts = less spin-wait overhead = more accurate at high rates
     let burst: u64 = if unlimited { 128 } else { (pps / 200).max(1) };
-    let burst_ns: u64 = if unlimited || pps == 0 { 0 } else { 1_000_000_000 * burst / pps };
+    let burst_ns: u64 = if unlimited || pps == 0 {
+        0
+    } else {
+        1_000_000_000 * burst / pps
+    };
 
     let mut seq: u16 = (id as u16).wrapping_mul(10000);
     let mut ts: u32 = 0;
@@ -204,9 +225,15 @@ fn main() {
     println!("║  Target PPS  : {:<33} ║", args.pps);
     println!("║  Duration    : {:<33} ║", format!("{}s", args.duration));
     println!("║  Threads     : {:<33} ║", args.threads);
-    println!("║  Packet size : {:<33} ║", format!("{} B ({}+12)", args.payload_size + 12, args.payload_size));
+    println!(
+        "║  Packet size : {:<33} ║",
+        format!("{} B ({}+12)", args.payload_size + 12, args.payload_size)
+    );
     println!("║  SSRCs       : {:<33} ║", args.ssrc_count);
-    println!("║  Rate limit  : {:<33} ║", if args.unlimited { "OFF" } else { "ON" });
+    println!(
+        "║  Rate limit  : {:<33} ║",
+        if args.unlimited { "OFF" } else { "ON" }
+    );
     println!("╚══════════════════════════════════════════════════╝");
     println!();
 
@@ -228,13 +255,21 @@ fn main() {
         all_stats.push(Arc::clone(&st));
 
         let stop = Arc::clone(&stop);
-        let (tgt, ps, sc, sb, ul) =
-            (args.target, args.payload_size, args.ssrc_count, args.sndbuf, args.unlimited);
+        let cfg = SenderConfig {
+            target: args.target,
+            pps: pps_per_thread,
+            dur,
+            payload_size: args.payload_size,
+            ssrc_base: t * args.ssrc_count,
+            ssrc_count: args.ssrc_count,
+            sndbuf: args.sndbuf,
+            unlimited: args.unlimited,
+        };
 
         handles.push(
             std::thread::Builder::new()
                 .name(format!("tx-{t}"))
-                .spawn(move || sender(t, tgt, pps_per_thread, dur, ps, t * sc, sc, sb, ul, stop, st))
+                .spawn(move || sender(t, cfg, stop, st))
                 .expect("spawn"),
         );
     }
@@ -245,41 +280,79 @@ fn main() {
     let mut last_t = Instant::now();
     let mut peak: f64 = 0.0;
 
-    println!("{:>6}  {:>12}  {:>12}  {:>12}  {:>8}", "Time", "Total", "Curr PPS", "Avg PPS", "Errors");
+    println!(
+        "{:>6}  {:>12}  {:>12}  {:>12}  {:>8}",
+        "Time", "Total", "Curr PPS", "Avg PPS", "Errors"
+    );
     println!("{}", "─".repeat(58));
 
     while t0.elapsed() < dur && !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(1));
 
-        let total: u64 = all_stats.iter().map(|s| s.sent.load(Ordering::Relaxed)).sum();
-        let errs: u64 = all_stats.iter().map(|s| s.errors.load(Ordering::Relaxed)).sum();
+        let total: u64 = all_stats
+            .iter()
+            .map(|s| s.sent.load(Ordering::Relaxed))
+            .sum();
+        let errs: u64 = all_stats
+            .iter()
+            .map(|s| s.errors.load(Ordering::Relaxed))
+            .sum();
         let now = Instant::now();
         let dt = now.duration_since(last_t).as_secs_f64();
-        let cur = if dt > 0.0 { (total - last_sent) as f64 / dt } else { 0.0 };
+        let cur = if dt > 0.0 {
+            (total - last_sent) as f64 / dt
+        } else {
+            0.0
+        };
         let avg = {
             let e = t0.elapsed().as_secs_f64();
-            if e > 0.0 { total as f64 / e } else { 0.0 }
+            if e > 0.0 {
+                total as f64 / e
+            } else {
+                0.0
+            }
         };
-        if cur > peak { peak = cur; }
+        if cur > peak {
+            peak = cur;
+        }
 
         println!(
             "{:>5.0}s  {:>12}  {:>12.0}  {:>12.0}  {:>8}",
-            t0.elapsed().as_secs_f64(), total, cur, avg, errs
+            t0.elapsed().as_secs_f64(),
+            total,
+            cur,
+            avg,
+            errs
         );
         last_sent = total;
         last_t = now;
     }
 
     stop.store(true, Ordering::Relaxed);
-    for h in handles { h.join().ok(); }
+    for h in handles {
+        h.join().ok();
+    }
 
     // ── Final report ─────────────────────────────────────────────────────
-    let total: u64 = all_stats.iter().map(|s| s.sent.load(Ordering::Relaxed)).sum();
-    let bytes: u64 = all_stats.iter().map(|s| s.bytes.load(Ordering::Relaxed)).sum();
-    let errs: u64 = all_stats.iter().map(|s| s.errors.load(Ordering::Relaxed)).sum();
+    let total: u64 = all_stats
+        .iter()
+        .map(|s| s.sent.load(Ordering::Relaxed))
+        .sum();
+    let bytes: u64 = all_stats
+        .iter()
+        .map(|s| s.bytes.load(Ordering::Relaxed))
+        .sum();
+    let errs: u64 = all_stats
+        .iter()
+        .map(|s| s.errors.load(Ordering::Relaxed))
+        .sum();
     let el = t0.elapsed().as_secs_f64();
     let avg = if el > 0.0 { total as f64 / el } else { 0.0 };
-    let mbps = if el > 0.0 { bytes as f64 * 8.0 / el / 1_000_000.0 } else { 0.0 };
+    let mbps = if el > 0.0 {
+        bytes as f64 * 8.0 / el / 1_000_000.0
+    } else {
+        0.0
+    };
     let met = avg >= args.pps as f64;
 
     println!();
@@ -292,8 +365,14 @@ fn main() {
     println!("║  Peak PPS     : {:<32} ║", format!("{peak:.0}"));
     println!("║  Throughput   : {:<32} ║", format!("{mbps:.1} Mbps"));
     println!("║  Errors       : {:<32} ║", errs);
-    println!("║  Target {}K : {:<32} ║", args.pps / 1000, if met { "✅ MET" } else { "❌ NOT MET" });
+    println!(
+        "║  Target {}K : {:<32} ║",
+        args.pps / 1000,
+        if met { "✅ MET" } else { "❌ NOT MET" }
+    );
     println!("╚══════════════════════════════════════════════════╝");
 
-    if !met { std::process::exit(1); }
+    if !met {
+        std::process::exit(1);
+    }
 }

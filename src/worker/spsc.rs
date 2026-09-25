@@ -18,6 +18,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use nexus_transport::arena::PacketSlot;
 
@@ -68,7 +69,10 @@ impl<const N: usize> SpscChannel<N> {
             N
         );
         // Precondition: N must fit in u32
-        assert!(N <= u32::MAX as usize, "SpscChannel capacity must fit in u32");
+        assert!(
+            N <= u32::MAX as usize,
+            "SpscChannel capacity must fit in u32"
+        );
 
         // Initialize buffer with None values
         // SAFETY: Option<PacketSlot> is safe to zero-initialize as None
@@ -117,9 +121,8 @@ impl<const N: usize> SpscChannel<N> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
 
-        // Precondition: head and tail are within bounds
-        assert!(head < u32::MAX, "head must not overflow");
-        assert!((head & self.mask) < N as u32, "head index must be < N");
+        // Precondition: masked index is within bounds (wrapping is by design)
+        debug_assert!((head & self.mask) < N as u32, "head index must be < N");
 
         // Check if channel is full
         let size = head.wrapping_sub(tail);
@@ -129,7 +132,7 @@ impl<const N: usize> SpscChannel<N> {
 
         // Write packet to buffer
         let index = (head & self.mask) as usize;
-        
+
         // SAFETY: We are the only producer, and we checked the slot is available
         unsafe {
             let buffer = &mut *self.buffer.get();
@@ -162,9 +165,8 @@ impl<const N: usize> SpscChannel<N> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
 
-        // Precondition: tail is within bounds
-        assert!(tail < u32::MAX, "tail must not overflow");
-        assert!((tail & self.mask) < N as u32, "tail index must be < N");
+        // Precondition: masked index is within bounds (wrapping is by design)
+        debug_assert!((tail & self.mask) < N as u32, "tail index must be < N");
 
         // Check if channel is empty
         if tail == head {
@@ -173,7 +175,7 @@ impl<const N: usize> SpscChannel<N> {
 
         // Read packet from buffer
         let index = (tail & self.mask) as usize;
-        
+
         // SAFETY: We are the only consumer, and we checked the slot has data
         let packet = unsafe {
             let buffer = &mut *self.buffer.get();
@@ -210,7 +212,10 @@ impl<const N: usize> SpscChannel<N> {
         // Postcondition: len is bounded by capacity
         debug_assert!(len <= N as u32, "len {} must be <= capacity {}", len, N);
         // Postcondition: len is non-negative (wrapping handles this)
-        debug_assert!(len <= u32::MAX / 2, "len must be reasonable (not wrapped negative)");
+        debug_assert!(
+            len <= u32::MAX / 2,
+            "len must be reasonable (not wrapped negative)"
+        );
 
         len
     }
@@ -223,18 +228,7 @@ impl<const N: usize> SpscChannel<N> {
     /// - ≤70 lines
     #[inline]
     pub fn is_empty(&self) -> bool {
-        let len = self.len();
-        let result = len == 0;
-
-        // Postcondition: consistency check
-        assert!(
-            !result || self.head.load(Ordering::Relaxed) == self.tail.load(Ordering::Relaxed),
-            "is_empty must be consistent with head == tail"
-        );
-        // Postcondition: len matches result
-        assert_eq!(result, len == 0, "is_empty must match len() == 0");
-
-        result
+        self.len() == 0
     }
 
     /// Check if the channel is full.
@@ -245,15 +239,7 @@ impl<const N: usize> SpscChannel<N> {
     /// - ≤70 lines
     #[inline]
     pub fn is_full(&self) -> bool {
-        let len = self.len();
-        let result = len >= N as u32;
-
-        // Postcondition: consistency check
-        assert!(len <= N as u32, "len must not exceed capacity");
-        // Postcondition: result matches len
-        assert_eq!(result, len >= N as u32, "is_full must match len() >= N");
-
-        result
+        self.len() >= N as u32
     }
 
     /// Get the channel capacity.
@@ -282,57 +268,24 @@ impl<const N: usize> Default for SpscChannel<N> {
 /// per channel.
 pub struct SpscSender<const N: usize> {
     /// Shared channel reference.
-    channel: *const SpscChannel<N>,
+    channel: Arc<SpscChannel<N>>,
 }
 
-// SAFETY: SpscSender is Send because it only accesses producer-side state
-unsafe impl<const N: usize> Send for SpscSender<N> {}
-
 impl<const N: usize> SpscSender<N> {
-    /// Create a new sender for the given channel.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure only one sender exists per channel.
-    ///
-    /// # TigerStyle
-    ///
-    /// - ≥2 assertions
-    /// - ≤70 lines
-    #[inline]
-    pub unsafe fn new(channel: &SpscChannel<N>) -> Self {
-        // Precondition: channel pointer is valid
-        assert!(!std::ptr::null::<SpscChannel<N>>().eq(&(channel as *const _)), 
-            "channel must not be null");
-        // Precondition: N is valid
-        assert!(N > 0, "capacity must be > 0");
-
-        Self {
-            channel: channel as *const SpscChannel<N>,
-        }
-    }
-
     /// Try to send a packet.
-    ///
-    /// # TigerStyle
-    ///
-    /// - ≥2 assertions
-    /// - ≤70 lines
     #[inline]
     pub fn try_send(&self, packet: PacketSlot) -> Result<(), PacketSlot> {
-        // Precondition: channel is valid
-        assert!(!self.channel.is_null(), "channel must be valid");
-        // Precondition: packet has data
-        assert!(packet.len() <= 8192, "packet length must be <= max datagram size");
-
-        // SAFETY: We own the producer side
-        unsafe { (*self.channel).try_send(packet) }
+        debug_assert!(
+            packet.len() <= 8192,
+            "packet length must be <= max datagram size"
+        );
+        self.channel.try_send(packet)
     }
 
     /// Check if the channel is full.
     #[inline]
     pub fn is_full(&self) -> bool {
-        unsafe { (*self.channel).is_full() }
+        self.channel.is_full()
     }
 }
 
@@ -342,96 +295,45 @@ impl<const N: usize> SpscSender<N> {
 /// per channel.
 pub struct SpscReceiver<const N: usize> {
     /// Shared channel reference.
-    channel: *const SpscChannel<N>,
+    channel: Arc<SpscChannel<N>>,
 }
 
-// SAFETY: SpscReceiver is Send because it only accesses consumer-side state
-unsafe impl<const N: usize> Send for SpscReceiver<N> {}
-
 impl<const N: usize> SpscReceiver<N> {
-    /// Create a new receiver for the given channel.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure only one receiver exists per channel.
-    ///
-    /// # TigerStyle
-    ///
-    /// - ≥2 assertions
-    /// - ≤70 lines
-    #[inline]
-    pub unsafe fn new(channel: &SpscChannel<N>) -> Self {
-        // Precondition: channel pointer is valid
-        assert!(!std::ptr::null::<SpscChannel<N>>().eq(&(channel as *const _)), 
-            "channel must not be null");
-        // Precondition: N is valid
-        assert!(N > 0, "capacity must be > 0");
-
-        Self {
-            channel: channel as *const SpscChannel<N>,
-        }
-    }
-
     /// Try to receive a packet.
-    ///
-    /// # TigerStyle
-    ///
-    /// - ≥2 assertions
-    /// - ≤70 lines
     #[inline]
     pub fn try_recv(&self) -> Option<PacketSlot> {
-        // Precondition: channel is valid
-        assert!(!self.channel.is_null(), "channel must be valid");
-        // Precondition: N is valid (compile-time)
-        assert!(N > 0, "capacity must be > 0");
-
-        // SAFETY: We own the consumer side
-        unsafe { (*self.channel).try_recv() }
+        self.channel.try_recv()
     }
 
     /// Check if the channel is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        unsafe { (*self.channel).is_empty() }
+        self.channel.is_empty()
     }
 
     /// Get the current length.
     #[inline]
     pub fn len(&self) -> u32 {
-        unsafe { (*self.channel).len() }
+        self.channel.len()
     }
 }
 
 /// Create a new SPSC channel pair (sender, receiver).
 ///
-/// Returns a boxed channel along with sender and receiver handles.
-/// The channel is heap-allocated to ensure stable address.
+/// Returns sender and receiver handles. The channel is shared via `Arc`.
 ///
 /// # Type Parameters
 ///
 /// * `N` - Channel capacity (must be power of 2)
-///
-/// # TigerStyle
-///
-/// - ≥2 assertions
-/// - ≤70 lines
-pub fn channel<const N: usize>() -> (Box<SpscChannel<N>>, SpscSender<N>, SpscReceiver<N>) {
-    // Precondition: N is valid
-    assert!(N > 0, "capacity must be > 0");
-    assert!(N.is_power_of_two(), "capacity must be power of 2");
+pub fn channel<const N: usize>() -> (SpscSender<N>, SpscReceiver<N>) {
+    let channel = Arc::new(SpscChannel::new());
 
-    let channel = Box::new(SpscChannel::new());
-    
-    // SAFETY: We create exactly one sender and one receiver
-    let sender = unsafe { SpscSender::new(&*channel) };
-    let receiver = unsafe { SpscReceiver::new(&*channel) };
+    let sender = SpscSender {
+        channel: Arc::clone(&channel),
+    };
+    let receiver = SpscReceiver { channel };
 
-    // Postcondition: channel is empty
-    assert!(channel.is_empty(), "new channel must be empty");
-    // Postcondition: sender and receiver point to same channel
-    assert_eq!(sender.channel, receiver.channel, "sender and receiver must share channel");
-
-    (channel, sender, receiver)
+    (sender, receiver)
 }
 
 #[cfg(test)]
@@ -461,15 +363,15 @@ mod tests {
     #[test]
     fn test_spsc_send_recv() {
         let channel: SpscChannel<1024> = SpscChannel::new();
-        
+
         let packet = create_test_packet();
         let original_len = packet.len();
-        
+
         // Send should succeed
         assert!(channel.try_send(packet).is_ok());
         assert_eq!(channel.len(), 1);
         assert!(!channel.is_empty());
-        
+
         // Receive should return the packet
         let received = channel.try_recv();
         assert!(received.is_some());
@@ -480,47 +382,47 @@ mod tests {
     #[test]
     fn test_spsc_fifo_order() {
         let channel: SpscChannel<1024> = SpscChannel::new();
-        
+
         // Send multiple packets
         for i in 0..10u16 {
             let mut packet = create_test_packet();
             packet.set_len(i);
             assert!(channel.try_send(packet).is_ok());
         }
-        
+
         assert_eq!(channel.len(), 10);
-        
+
         // Receive in FIFO order
         for i in 0..10u16 {
             let packet = channel.try_recv().expect("should have packet");
             assert_eq!(packet.len(), i, "packets must be received in FIFO order");
         }
-        
+
         assert!(channel.is_empty());
     }
 
     #[test]
     fn test_spsc_full() {
         let channel: SpscChannel<4> = SpscChannel::new();
-        
+
         // Fill the channel
         for _ in 0..4 {
             let packet = create_test_packet();
             assert!(channel.try_send(packet).is_ok());
         }
-        
+
         assert!(channel.is_full());
         assert_eq!(channel.len(), 4);
-        
+
         // Next send should fail
         let packet = create_test_packet();
         let result = channel.try_send(packet);
         assert!(result.is_err());
-        
+
         // Receive one to make room
         assert!(channel.try_recv().is_some());
         assert!(!channel.is_full());
-        
+
         // Now send should succeed
         let packet = create_test_packet();
         assert!(channel.try_send(packet).is_ok());
@@ -529,7 +431,7 @@ mod tests {
     #[test]
     fn test_spsc_empty_recv() {
         let channel: SpscChannel<1024> = SpscChannel::new();
-        
+
         // Receive from empty channel should return None
         assert!(channel.try_recv().is_none());
         assert!(channel.is_empty());
@@ -537,12 +439,12 @@ mod tests {
 
     #[test]
     fn test_spsc_channel_pair() {
-        let (_channel, sender, receiver) = channel::<1024>();
-        
+        let (sender, receiver) = channel::<1024>();
+
         // Send via sender
         let packet = create_test_packet();
         assert!(sender.try_send(packet).is_ok());
-        
+
         // Receive via receiver
         assert!(!receiver.is_empty());
         let received = receiver.try_recv();
@@ -559,7 +461,7 @@ mod tests {
     #[test]
     fn test_spsc_wraparound() {
         let channel: SpscChannel<4> = SpscChannel::new();
-        
+
         // Fill and drain multiple times to test wraparound
         for round in 0..10 {
             // Fill
@@ -568,7 +470,7 @@ mod tests {
                 packet.set_len(i + round * 4);
                 assert!(channel.try_send(packet).is_ok());
             }
-            
+
             // Drain
             for i in 0..4u16 {
                 let packet = channel.try_recv().expect("should have packet");

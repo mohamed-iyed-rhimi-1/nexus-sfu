@@ -32,8 +32,7 @@ use super::config::GossipConfig;
 use super::membership::MembershipList;
 use super::transport::GossipTransport;
 use super::types::{
-    GossipMessage, PeerInfo, PeerState, StateUpdate,
-    MAX_PEERS, MAX_PIGGYBACK_UPDATES,
+    GossipMessage, PeerInfo, PeerState, StateUpdate, MAX_PEERS, MAX_PIGGYBACK_UPDATES,
 };
 use crate::distributed_state::DistributedState;
 use crate::error::GossipError;
@@ -179,9 +178,19 @@ pub struct SwimProtocol {
 #[derive(Debug, Clone)]
 pub enum RelayEvent {
     /// A remote node wants us to relay a track to it.
-    Subscribe { track_id: u64, requester_node: u64 },
+    Subscribe {
+        /// Track to relay
+        track_id: u64,
+        /// Node requesting the relay
+        requester_node: u64,
+    },
     /// A remote node no longer needs relay of a track.
-    Unsubscribe { track_id: u64, requester_node: u64 },
+    Unsubscribe {
+        /// Track no longer needed
+        track_id: u64,
+        /// Node that requested the relay
+        requester_node: u64,
+    },
 }
 
 impl SwimProtocol {
@@ -300,7 +309,10 @@ impl SwimProtocol {
     /// * `state` - The distributed state to apply updates to
     #[inline]
     pub fn set_distributed_state(&mut self, state: Arc<DistributedState>) {
-        assert!(self.distributed_state.is_none(), "distributed_state already set");
+        assert!(
+            self.distributed_state.is_none(),
+            "distributed_state already set"
+        );
         self.distributed_state = Some(state);
     }
 
@@ -317,7 +329,11 @@ impl SwimProtocol {
     /// # Arguments
     /// * `actor_id` - Peer's actor ID
     /// * `addr` - Peer's network address
-    pub fn add_seed_peer(&mut self, actor_id: ActorId, addr: SocketAddr) -> Result<(), GossipError> {
+    pub fn add_seed_peer(
+        &mut self,
+        actor_id: ActorId,
+        addr: SocketAddr,
+    ) -> Result<(), GossipError> {
         // Add to membership list
         self.membership.add_peer(actor_id, addr)?;
 
@@ -424,14 +440,14 @@ impl SwimProtocol {
         self.last_anti_entropy_ns.store(now_ns, Ordering::Relaxed);
 
         // Select a random peer for full state sync
-        let peer = match self.membership.get_random_alive_peer() {
-            Some(p) => p,
-            None => return Ok(()), // No peers to sync with
+        let Some(peer) = self.membership.get_random_alive_peer() else {
+            return Ok(()); // No peers to sync with
         };
 
         // Build membership snapshot (bounded by MAX_PEERS)
         let all_peers = self.membership.get_all_peers();
-        let mut members: Vec<(ActorId, u64, u8)> = Vec::with_capacity(all_peers.len().min(MAX_PEERS));
+        let mut members: Vec<(ActorId, u64, u8)> =
+            Vec::with_capacity(all_peers.len().min(MAX_PEERS));
 
         for (i, p) in all_peers.into_iter().enumerate() {
             if i >= MAX_PEERS {
@@ -480,17 +496,14 @@ impl SwimProtocol {
         self.stats.pings_sent.fetch_add(1, Ordering::Relaxed);
 
         // Record pending ping only if not already pending (don't reset timeout)
-        if !self.pending_pings.contains_key(&target.actor_id()) {
-            self.pending_pings.insert(
-                target.actor_id(),
-                PendingPing {
-                    target: target.actor_id(),
-                    target_addr: target.addr(),
-                    sent_at_ns: current_time_ns(),
-                    indirect_requested: false,
-                },
-            );
-        }
+        self.pending_pings
+            .entry(target.actor_id())
+            .or_insert_with(|| PendingPing {
+                target: target.actor_id(),
+                target_addr: target.addr(),
+                sent_at_ns: current_time_ns(),
+                indirect_requested: false,
+            });
 
         Ok(())
     }
@@ -636,7 +649,11 @@ impl SwimProtocol {
     }
 
     /// Handle an incoming forwarded ack from an indirect probe helper.
-    fn handle_forwarded_ack(&mut self, target: ActorId, incarnation: u64) -> Result<(), GossipError> {
+    fn handle_forwarded_ack(
+        &mut self,
+        target: ActorId,
+        incarnation: u64,
+    ) -> Result<(), GossipError> {
         // Clear the pending ping for the target - indirect probe succeeded!
         self.pending_pings.remove(&target);
 
@@ -710,14 +727,13 @@ impl SwimProtocol {
 
         // Also clean up stale pending indirect probes
         let indirect_timeout_ns = ping_timeout_ns * 2;
-        self.pending_indirect.retain(|_, pending| {
-            now_ns.saturating_sub(pending.sent_at_ns) < indirect_timeout_ns
-        });
+        self.pending_indirect
+            .retain(|_, pending| now_ns.saturating_sub(pending.sent_at_ns) < indirect_timeout_ns);
 
         // Collect timed-out pings (bounded iteration)
         let mut timed_out: Vec<(ActorId, PendingPing)> = Vec::new();
 
-        for (actor_id, pending) in self.pending_pings.iter() {
+        for (actor_id, pending) in &self.pending_pings {
             if timed_out.len() >= MAX_PENDING_PINGS {
                 break;
             }
@@ -730,7 +746,21 @@ impl SwimProtocol {
 
         // Process timed-out pings
         for (actor_id, pending) in timed_out {
-            if !pending.indirect_requested {
+            if pending.indirect_requested {
+                // Indirect probes also failed, mark as suspect
+                self.pending_pings.remove(&actor_id);
+
+                if let Some(peer) = self.membership.find_peer(actor_id) {
+                    let incarnation = peer.incarnation();
+                    let _ = self.membership.mark_suspect(actor_id, incarnation);
+                    self.stats.suspicions_raised.fetch_add(1, Ordering::Relaxed);
+
+                    // Broadcast suspect to fanout peers (Comment 3)
+                    self.broadcast_suspect(actor_id, incarnation);
+                }
+
+                self.stats.ping_timeouts.fetch_add(1, Ordering::Relaxed);
+            } else {
                 // Try indirect probing
                 self.request_indirect_probes(actor_id, pending.target_addr);
 
@@ -739,20 +769,6 @@ impl SwimProtocol {
                     p.indirect_requested = true;
                     p.sent_at_ns = now_ns; // Reset timeout for indirect phase
                 }
-            } else {
-                // Indirect probes also failed, mark as suspect
-                self.pending_pings.remove(&actor_id);
-
-                if let Some(peer) = self.membership.find_peer(actor_id) {
-                    let incarnation = peer.incarnation();
-                    let _ = self.membership.mark_suspect(actor_id, incarnation);
-                    self.stats.suspicions_raised.fetch_add(1, Ordering::Relaxed);
-                    
-                    // Broadcast suspect to fanout peers (Comment 3)
-                    self.broadcast_suspect(actor_id, incarnation);
-                }
-
-                self.stats.ping_timeouts.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -760,7 +776,9 @@ impl SwimProtocol {
     /// Request indirect probes via other peers.
     fn request_indirect_probes(&mut self, target: ActorId, target_addr: SocketAddr) {
         // Get random alive peers to help with probing
-        let helpers = self.membership.get_random_alive_peers(self.config.fanout, target);
+        let helpers = self
+            .membership
+            .get_random_alive_peers(self.config.fanout, target);
         let local_addr = self.transport.local_addr();
 
         for helper in helpers {
@@ -778,7 +796,10 @@ impl SwimProtocol {
 
     /// Broadcast an alive message to refute suspicion.
     fn broadcast_alive(&mut self, actor_id: ActorId, incarnation: u64) -> Result<(), GossipError> {
-        let msg = GossipMessage::Alive { actor_id, incarnation };
+        let msg = GossipMessage::Alive {
+            actor_id,
+            incarnation,
+        };
 
         // Send to all alive peers
         let peers = self.membership.get_alive_peers();
@@ -791,10 +812,15 @@ impl SwimProtocol {
 
     /// Broadcast a suspect message to random fanout peers.
     fn broadcast_suspect(&mut self, actor_id: ActorId, incarnation: u64) {
-        let msg = GossipMessage::Suspect { actor_id, incarnation };
+        let msg = GossipMessage::Suspect {
+            actor_id,
+            incarnation,
+        };
 
         // Send to random fanout of alive peers (bounded)
-        let peers = self.membership.get_random_alive_peers(self.config.fanout, actor_id);
+        let peers = self
+            .membership
+            .get_random_alive_peers(self.config.fanout, actor_id);
         for peer in peers {
             let _ = self.transport.send(&msg, peer.addr());
         }
@@ -805,7 +831,9 @@ impl SwimProtocol {
         let msg = GossipMessage::Dead { actor_id };
 
         // Send to random fanout of alive peers (bounded)
-        let peers = self.membership.get_random_alive_peers(self.config.fanout, actor_id);
+        let peers = self
+            .membership
+            .get_random_alive_peers(self.config.fanout, actor_id);
         for peer in peers {
             let _ = self.transport.send(&msg, peer.addr());
         }
@@ -837,7 +865,10 @@ impl SwimProtocol {
 
     /// Get state updates for piggybacking.
     fn get_piggyback_updates(&mut self) -> Vec<StateUpdate> {
-        let count = self.piggyback_queue.len().min(self.config.max_piggyback_updates);
+        let count = self
+            .piggyback_queue
+            .len()
+            .min(self.config.max_piggyback_updates);
         let mut updates = Vec::with_capacity(count);
 
         for _ in 0..count {
@@ -879,7 +910,7 @@ impl SwimProtocol {
             for update in &updates {
                 // Log and skip on CRDT errors, continue processing remaining
                 // Note: No logging framework available, errors are silently skipped
-                let _ = self.apply_state_update(distributed_state, update);
+                let _ = Self::apply_state_update(distributed_state, update);
             }
         }
 
@@ -887,7 +918,10 @@ impl SwimProtocol {
         for update in updates {
             // Queue relay events for the orchestrator to drain.
             match &update {
-                StateUpdate::RelaySubscribe { track_id, requester_node } => {
+                StateUpdate::RelaySubscribe {
+                    track_id,
+                    requester_node,
+                } => {
                     if self.relay_events.len() < 1024 {
                         self.relay_events.push_back(RelayEvent::Subscribe {
                             track_id: *track_id,
@@ -895,7 +929,10 @@ impl SwimProtocol {
                         });
                     }
                 }
-                StateUpdate::RelayUnsubscribe { track_id, requester_node } => {
+                StateUpdate::RelayUnsubscribe {
+                    track_id,
+                    requester_node,
+                } => {
                     if self.relay_events.len() < 1024 {
                         self.relay_events.push_back(RelayEvent::Unsubscribe {
                             track_id: *track_id,
@@ -926,12 +963,14 @@ impl SwimProtocol {
     /// - ≤70 lines
     /// - ≥2 assertions
     fn apply_state_update(
-        &self,
         state: &DistributedState,
         update: &StateUpdate,
     ) -> Result<(), crate::error::CrdtError> {
         // Precondition: state must be valid
-        assert!(state.local_actor() < MAX_ACTORS as u64, "invalid local_actor");
+        assert!(
+            state.local_actor() < MAX_ACTORS as u64,
+            "invalid local_actor"
+        );
 
         match update {
             StateUpdate::ParticipantAdded {
@@ -942,7 +981,7 @@ impl SwimProtocol {
                 // Add participant to room
                 // Note: We ignore the dot from the update and generate a new one
                 // locally since add_participant generates its own dot
-                let _ = state.add_participant(*room_id, (*participant_id).into())?;
+                let _ = state.add_participant(*room_id, *participant_id)?;
             }
             StateUpdate::ParticipantRemoved {
                 room_id,
@@ -950,7 +989,7 @@ impl SwimProtocol {
                 dot: _,
             } => {
                 // Remove participant from room
-                let _ = state.remove_participant(*room_id, (*participant_id).into())?;
+                let _ = state.remove_participant(*room_id, *participant_id)?;
             }
             StateUpdate::TrackUpdated {
                 track_id,
@@ -960,10 +999,10 @@ impl SwimProtocol {
             } => {
                 // Update or add track metadata
                 // Try update first, if track doesn't exist, add it
-                if state.get_track((*track_id).into()).is_some() {
-                    let _ = state.update_track((*track_id).into(), *info)?;
+                if state.get_track(*track_id).is_some() {
+                    let _ = state.update_track(*track_id, *info)?;
                 } else {
-                    let _ = state.add_track((*track_id).into(), *info)?;
+                    let _ = state.add_track(*track_id, *info)?;
                 }
             }
             StateUpdate::SubscriptionAdded {
@@ -972,7 +1011,7 @@ impl SwimProtocol {
                 dot: _,
             } => {
                 // Add subscription
-                let _ = state.add_subscription((*track_id).into(), (*participant_id).into())?;
+                let _ = state.add_subscription(*track_id, *participant_id)?;
             }
             StateUpdate::SubscriptionRemoved {
                 track_id,
@@ -980,7 +1019,7 @@ impl SwimProtocol {
                 dot: _,
             } => {
                 // Remove subscription
-                let _ = state.remove_subscription((*track_id).into(), (*participant_id).into())?;
+                let _ = state.remove_subscription(*track_id, *participant_id)?;
             }
             StateUpdate::RelaySubscribe { .. } | StateUpdate::RelayUnsubscribe { .. } => {
                 // Relay events don't modify CRDT state — handled separately.
@@ -1004,44 +1043,37 @@ impl SwimProtocol {
                 from,
                 incarnation,
                 piggyback,
-            } => {
-                self.handle_ping(from, incarnation, piggyback, source)
-            }
+            } => self.handle_ping(from, incarnation, piggyback, source),
             GossipMessage::Ack {
                 from,
                 incarnation,
                 piggyback,
-            } => {
-                self.handle_ack(from, incarnation, piggyback)
-            }
+            } => self.handle_ack(from, incarnation, piggyback),
             GossipMessage::PingReq {
                 from,
                 target,
                 target_addr,
                 requester_addr,
-            } => {
-                self.handle_ping_req(from, target, target_addr, requester_addr)
-            }
-            GossipMessage::Suspect { actor_id, incarnation } => {
-                self.handle_suspect(actor_id, incarnation)
-            }
-            GossipMessage::Alive { actor_id, incarnation } => {
-                self.handle_alive(actor_id, incarnation)
-            }
-            GossipMessage::Dead { actor_id } => {
-                self.handle_dead(actor_id)
-            }
-            GossipMessage::ForwardedAck { target, incarnation } => {
-                self.handle_forwarded_ack(target, incarnation)
-            }
+            } => self.handle_ping_req(from, target, target_addr, requester_addr),
+            GossipMessage::Suspect {
+                actor_id,
+                incarnation,
+            } => self.handle_suspect(actor_id, incarnation),
+            GossipMessage::Alive {
+                actor_id,
+                incarnation,
+            } => self.handle_alive(actor_id, incarnation),
+            GossipMessage::Dead { actor_id } => self.handle_dead(actor_id),
+            GossipMessage::ForwardedAck {
+                target,
+                incarnation,
+            } => self.handle_forwarded_ack(target, incarnation),
             GossipMessage::StateSnapshot {
                 from,
                 incarnation,
                 members,
                 updates,
-            } => {
-                self.handle_state_snapshot(from, incarnation, members, updates, source)
-            }
+            } => self.handle_state_snapshot(from, incarnation, members, updates, source),
         }
     }
 
@@ -1050,13 +1082,10 @@ impl SwimProtocol {
     /// Attempts to receive and process incoming messages (non-blocking).
     pub fn recv_loop_iteration(&mut self) -> Result<(), GossipError> {
         // Try to receive with short timeout (non-blocking)
-        match self.transport.try_recv() {
-            Some((msg, source)) => {
-                self.handle_message(msg, source)?;
-            }
-            None => {
-                // No message available - not an error
-            }
+        if let Some((msg, source)) = self.transport.try_recv() {
+            self.handle_message(msg, source)?;
+        } else {
+            // No message available - not an error
         }
 
         Ok(())
@@ -1385,12 +1414,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // Requester should have a pending ping for target initially
-        requester.pending_pings.insert(3, PendingPing {
-            target: 3,
-            target_addr,
-            sent_at_ns: current_time_ns(),
-            indirect_requested: true,
-        });
+        requester.pending_pings.insert(
+            3,
+            PendingPing {
+                target: 3,
+                target_addr,
+                sent_at_ns: current_time_ns(),
+                indirect_requested: true,
+            },
+        );
 
         // Requester receives forwarded ack
         requester.recv_loop_iteration().unwrap();
@@ -1408,12 +1440,15 @@ mod tests {
         requester.membership_mut().add_peer(3, target_addr).unwrap();
 
         // Simulate pending ping awaiting indirect probe
-        requester.pending_pings.insert(3, PendingPing {
-            target: 3,
-            target_addr,
-            sent_at_ns: current_time_ns(),
-            indirect_requested: true,
-        });
+        requester.pending_pings.insert(
+            3,
+            PendingPing {
+                target: 3,
+                target_addr,
+                sent_at_ns: current_time_ns(),
+                indirect_requested: true,
+            },
+        );
 
         // Receive forwarded ack
         let forwarded_ack = GossipMessage::ForwardedAck {
@@ -1623,10 +1658,10 @@ mod tests {
         // Create and set distributed state
         let state_config = DistributedStateConfig::new(1);
         let state = Arc::new(DistributedState::new(state_config));
-        
+
         // Create a room first (required for adding participants)
         state.create_room(1, "Test Room".to_string(), 100).unwrap();
-        
+
         protocol.set_distributed_state(Arc::clone(&state));
 
         // Create state updates
@@ -1639,7 +1674,8 @@ mod tests {
             StateUpdate::TrackUpdated {
                 track_id: 100,
                 info: TrackInfo {
-                    track_type: 1, content_type: 0,
+                    track_type: 1,
+                    content_type: 0,
                     codec: 96,
                     bitrate_kbps: 1000,
                     owner_node: 0,
@@ -1677,13 +1713,11 @@ mod tests {
         let mut protocol = SwimProtocol::new(1, localhost_addr(), config).unwrap();
 
         // No distributed state set - updates should still be processed (counted and re-broadcast)
-        let updates = vec![
-            StateUpdate::ParticipantAdded {
-                room_id: 1,
-                participant_id: 42,
-                dot: Dot::new(1, 1),
-            },
-        ];
+        let updates = vec![StateUpdate::ParticipantAdded {
+            room_id: 1,
+            participant_id: 42,
+            dot: Dot::new(1, 1),
+        }];
 
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let msg = GossipMessage::Ping {
@@ -1716,13 +1750,11 @@ mod tests {
         protocol.set_distributed_state(Arc::clone(&state));
 
         // Create update for non-existent room (will fail)
-        let updates = vec![
-            StateUpdate::ParticipantAdded {
-                room_id: 999, // Room doesn't exist
-                participant_id: 42,
-                dot: Dot::new(1, 1),
-            },
-        ];
+        let updates = vec![StateUpdate::ParticipantAdded {
+            room_id: 999, // Room doesn't exist
+            participant_id: 42,
+            dot: Dot::new(1, 1),
+        }];
 
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let msg = GossipMessage::Ping {

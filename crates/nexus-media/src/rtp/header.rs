@@ -95,25 +95,17 @@ impl RtpHeader {
         let marker = (second_byte >> 7) & 0x01 != 0;
         let payload_type = second_byte & 0x7F;
 
-        let sequence_number =
-            u16::from_be_bytes([data[2], data[3]]);
-        let timestamp = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
-        let ssrc = u32::from_be_bytes([
-            data[8], data[9], data[10], data[11],
-        ]);
+        let sequence_number = u16::from_be_bytes([data[2], data[3]]);
+        let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
-        let csrc_size_bytes =
-            (csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
-        let header_after_csrc =
-            RTP_HEADER_MIN_SIZE_BYTES + csrc_size_bytes;
+        let csrc_size_bytes = (csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
+        let header_after_csrc = RTP_HEADER_MIN_SIZE_BYTES + csrc_size_bytes;
 
         if data.len() < header_after_csrc {
             return Err(RtpError::InvalidCsrcCount {
                 count: csrc_count,
-                available_bytes: data.len()
-                    - RTP_HEADER_MIN_SIZE_BYTES,
+                available_bytes: data.len() - RTP_HEADER_MIN_SIZE_BYTES,
             });
         }
 
@@ -126,10 +118,8 @@ impl RtpHeader {
                 return Err(RtpError::InvalidExtension);
             }
 
-            let ext_len_words = u16::from_be_bytes([
-                data[ext_header_start + 2],
-                data[ext_header_start + 3],
-            ]);
+            let ext_len_words =
+                u16::from_be_bytes([data[ext_header_start + 2], data[ext_header_start + 3]]);
             let ext_len_bytes = (ext_len_words as usize) * 4;
             let total_ext_size = 4 + ext_len_bytes;
             header_len_bytes += total_ext_size;
@@ -215,22 +205,18 @@ impl RtpHeader {
     /// - Caller must ensure SSE4.1 is available
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse4.1")]
-    #[inline(always)]
+    // `inline(always)` is rejected with `target_feature`; callers may lack SSE4.1
+    #[inline]
     unsafe fn parse_simd_x86(data: &[u8]) -> Option<Self> {
         let header_bytes = if data.len() >= 16 {
             _mm_loadu_si128(data.as_ptr() as *const __m128i)
         } else {
             let mut buf = [0u8; 16];
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf.as_mut_ptr(),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr(), data.len());
             _mm_loadu_si128(buf.as_ptr() as *const __m128i)
         };
 
-        let first_byte =
-            _mm_extract_epi8(header_bytes, 0) as u8;
+        let first_byte = _mm_extract_epi8(header_bytes, 0) as u8;
         let version = (first_byte >> 6) & 0x03;
         let padding = (first_byte >> 5) & 0x01 != 0;
         let extension = (first_byte >> 4) & 0x01 != 0;
@@ -240,27 +226,21 @@ impl RtpHeader {
             return None;
         }
 
-        let second_byte =
-            _mm_extract_epi8(header_bytes, 1) as u8;
+        let second_byte = _mm_extract_epi8(header_bytes, 1) as u8;
         let marker = (second_byte >> 7) & 0x01 != 0;
         let payload_type = second_byte & 0x7F;
 
-        let seq_le =
-            _mm_extract_epi16(header_bytes, 1) as u16;
+        let seq_le = _mm_extract_epi16(header_bytes, 1) as u16;
         let sequence_number = seq_le.swap_bytes();
 
-        let ts_le =
-            _mm_extract_epi32(header_bytes, 1) as u32;
+        let ts_le = _mm_extract_epi32(header_bytes, 1) as u32;
         let timestamp = ts_le.swap_bytes();
 
-        let ssrc_le =
-            _mm_extract_epi32(header_bytes, 2) as u32;
+        let ssrc_le = _mm_extract_epi32(header_bytes, 2) as u32;
         let ssrc = ssrc_le.swap_bytes();
 
-        let csrc_size_bytes =
-            (csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
-        let header_after_csrc =
-            RTP_HEADER_MIN_SIZE_BYTES + csrc_size_bytes;
+        let csrc_size_bytes = (csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
+        let header_after_csrc = RTP_HEADER_MIN_SIZE_BYTES + csrc_size_bytes;
 
         if data.len() < header_after_csrc {
             return None;
@@ -334,11 +314,7 @@ impl RtpHeader {
             vld1q_u8(data.as_ptr())
         } else {
             let mut buf = [0u8; 16];
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf.as_mut_ptr(),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr(), data.len());
             vld1q_u8(buf.as_ptr())
         };
 
@@ -375,10 +351,8 @@ impl RtpHeader {
             vgetq_lane_u8(header_bytes, 11),
         ]);
 
-        let csrc_size_bytes =
-            (csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
-        let header_after_csrc =
-            RTP_HEADER_MIN_SIZE_BYTES + csrc_size_bytes;
+        let csrc_size_bytes = (csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
+        let header_after_csrc = RTP_HEADER_MIN_SIZE_BYTES + csrc_size_bytes;
 
         if data.len() < header_after_csrc {
             return None;
@@ -456,9 +430,7 @@ impl RtpHeader {
             | ((self.extension as u8) << 4)
             | (self.csrc_count & 0x0F);
 
-        buffer[1] =
-            ((self.marker as u8) << 7)
-            | (self.payload_type & 0x7F);
+        buffer[1] = ((self.marker as u8) << 7) | (self.payload_type & 0x7F);
 
         let seq_bytes = self.sequence_number.to_be_bytes();
         buffer[2] = seq_bytes[0];
@@ -498,15 +470,10 @@ impl RtpHeader {
 
     /// Get CSRC list from packet data.
     #[inline]
-    pub fn csrc_list<'a>(
-        &self,
-        data: &'a [u8],
-    ) -> impl Iterator<Item = u32> + 'a {
+    pub fn csrc_list<'a>(&self, data: &'a [u8]) -> impl Iterator<Item = u32> + 'a {
         let csrc_count = self.csrc_count as usize;
         (0..csrc_count).map(move |i| {
-            let offset =
-                RTP_HEADER_MIN_SIZE_BYTES
-                + (i * RTP_CSRC_SIZE_BYTES);
+            let offset = RTP_HEADER_MIN_SIZE_BYTES + (i * RTP_CSRC_SIZE_BYTES);
             u32::from_be_bytes([
                 data[offset],
                 data[offset + 1],
@@ -522,34 +489,170 @@ impl RtpHeader {
     /// the payload bytes for the given `ext_id`, or `None` if not found.
     #[inline]
     pub fn get_extension_value<'a>(&self, data: &'a [u8], ext_id: u8) -> Option<&'a [u8]> {
-        if !self.extension { return None; }
+        if !self.extension {
+            return None;
+        }
 
-        let ext_start = RTP_HEADER_MIN_SIZE_BYTES + (self.csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
-        if data.len() < ext_start + 4 { return None; }
+        let ext_start =
+            RTP_HEADER_MIN_SIZE_BYTES + (self.csrc_count as usize) * RTP_CSRC_SIZE_BYTES;
+        if data.len() < ext_start + 4 {
+            return None;
+        }
 
         let profile = u16::from_be_bytes([data[ext_start], data[ext_start + 1]]);
         let ext_len_words = u16::from_be_bytes([data[ext_start + 2], data[ext_start + 3]]) as usize;
         let ext_data_start = ext_start + 4;
         let ext_data_end = ext_data_start + ext_len_words * 4;
-        if ext_data_end > data.len() { return None; }
+        if ext_data_end > data.len() {
+            return None;
+        }
 
         // RFC 5285 one-byte header: profile 0xBEDE
         if profile == 0xBEDE {
             let mut pos = ext_data_start;
             while pos < ext_data_end {
                 let byte = data[pos];
-                if byte == 0 { pos += 1; continue; } // padding
+                if byte == 0 {
+                    pos += 1;
+                    continue;
+                } // padding
                 let id = (byte >> 4) & 0x0F;
                 let len = (byte & 0x0F) as usize + 1;
                 pos += 1;
-                if id == 0x0F { break; } // terminator
-                if pos + len > ext_data_end { break; }
+                if id == 0x0F {
+                    break;
+                } // terminator
+                if pos + len > ext_data_end {
+                    break;
+                }
                 if id == ext_id {
                     return Some(&data[pos..pos + len]);
                 }
                 pos += len;
             }
         }
+        // RFC 5285 §4.2 two-byte header: profile 0x100X (top 12 bits = 0x100)
+        else if (profile & 0xFFF0) == 0x1000 {
+            let mut pos = ext_data_start;
+            while pos + 1 < ext_data_end {
+                let id = data[pos];
+                if id == 0 {
+                    pos += 1;
+                    continue;
+                } // padding
+                let len = data[pos + 1] as usize;
+                pos += 2;
+                if pos + len > ext_data_end {
+                    break;
+                }
+                if id == ext_id {
+                    return Some(&data[pos..pos + len]);
+                }
+                pos += len;
+                // Two-byte extensions are NOT padded to word boundaries within the block
+            }
+        }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal RTP packet with one-byte extension (0xBEDE).
+    fn build_rtp_with_one_byte_ext(ext_id: u8, ext_data: &[u8]) -> Vec<u8> {
+        let ext_len = ext_data.len();
+        assert!((1..=14).contains(&ext_id) && (1..=16).contains(&ext_len));
+        // Header byte: id in upper 4 bits, (len-1) in lower 4 bits
+        let mut ext_block = vec![(ext_id << 4) | ((ext_len - 1) as u8)];
+        ext_block.extend_from_slice(ext_data);
+        // Pad to 4-byte boundary
+        while ext_block.len() % 4 != 0 {
+            ext_block.push(0);
+        }
+        let ext_words = ext_block.len() / 4;
+
+        let mut pkt = vec![
+            0x90, 0x60, 0x00, 0x01, // V=2, P=0, X=1, CC=0, M=0, PT=96, Seq=1
+            0x00, 0x00, 0x00, 0xA0, // Timestamp
+            0x00, 0x00, 0x00, 0x01, // SSRC
+        ];
+        pkt.extend_from_slice(&0xBEDEu16.to_be_bytes());
+        pkt.extend_from_slice(&(ext_words as u16).to_be_bytes());
+        pkt.extend_from_slice(&ext_block);
+        pkt.extend_from_slice(&[0xDE, 0xAD]); // payload
+        pkt
+    }
+
+    /// Build a minimal RTP packet with two-byte extension (0x1000).
+    fn build_rtp_with_two_byte_ext(ext_id: u8, ext_data: &[u8]) -> Vec<u8> {
+        let ext_len = ext_data.len();
+        let mut ext_block = vec![ext_id, ext_len as u8];
+        ext_block.extend_from_slice(ext_data);
+        // Pad to 4-byte boundary
+        while ext_block.len() % 4 != 0 {
+            ext_block.push(0);
+        }
+        let ext_words = ext_block.len() / 4;
+
+        let mut pkt = vec![
+            0x90, 0x60, 0x00, 0x01, // V=2, P=0, X=1, CC=0, M=0, PT=96, Seq=1
+            0x00, 0x00, 0x00, 0xA0, // Timestamp
+            0x00, 0x00, 0x00, 0x01, // SSRC
+        ];
+        pkt.extend_from_slice(&0x1000u16.to_be_bytes()); // two-byte profile
+        pkt.extend_from_slice(&(ext_words as u16).to_be_bytes());
+        pkt.extend_from_slice(&ext_block);
+        pkt.extend_from_slice(&[0xDE, 0xAD]); // payload
+        pkt
+    }
+
+    #[test]
+    fn test_one_byte_extension_lookup() {
+        let pkt = build_rtp_with_one_byte_ext(3, &[0x42, 0x43]);
+        let hdr = RtpHeader::parse(&pkt).expect("parse failed");
+        assert!(hdr.extension);
+        let val = hdr.get_extension_value(&pkt, 3).expect("ext 3 not found");
+        assert_eq!(val, &[0x42, 0x43]);
+        // Non-existent ID returns None
+        assert!(hdr.get_extension_value(&pkt, 5).is_none());
+    }
+
+    #[test]
+    fn test_two_byte_extension_lookup() {
+        let pkt = build_rtp_with_two_byte_ext(200, &[0xAA, 0xBB, 0xCC]);
+        let hdr = RtpHeader::parse(&pkt).expect("parse failed");
+        assert!(hdr.extension);
+        // Two-byte format supports IDs > 14 (unlike one-byte)
+        let val = hdr
+            .get_extension_value(&pkt, 200)
+            .expect("ext 200 not found");
+        assert_eq!(val, &[0xAA, 0xBB, 0xCC]);
+        // Non-existent ID returns None
+        assert!(hdr.get_extension_value(&pkt, 1).is_none());
+    }
+
+    #[test]
+    fn test_two_byte_extension_appbits() {
+        // Profile 0x1005 (appbits = 5) should also be recognized as two-byte
+        let mut pkt = build_rtp_with_two_byte_ext(10, &[0xFF]);
+        // Overwrite profile to 0x1005
+        pkt[12] = 0x10;
+        pkt[13] = 0x05;
+        let hdr = RtpHeader::parse(&pkt).expect("parse failed");
+        let val = hdr.get_extension_value(&pkt, 10).expect("ext 10 not found");
+        assert_eq!(val, &[0xFF]);
+    }
+
+    #[test]
+    fn test_no_extension() {
+        let pkt = vec![
+            0x80, 0x60, 0x00, 0x01, // V=2, P=0, X=0, CC=0
+            0x00, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x01, 0xDE, 0xAD,
+        ];
+        let hdr = RtpHeader::parse(&pkt).expect("parse failed");
+        assert!(!hdr.extension);
+        assert!(hdr.get_extension_value(&pkt, 1).is_none());
     }
 }

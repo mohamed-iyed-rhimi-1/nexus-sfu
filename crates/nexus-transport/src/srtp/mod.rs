@@ -43,7 +43,9 @@ pub use crypto::{AesCmHmacCipher, AesGcmCipher, CipherSuite, SrtpCipher};
 pub use error::SrtpError;
 pub use keys::{KeyDerivation, KeyMaterial, SrtpKeys};
 pub use replay::ReplayProtection;
-pub use types::{PacketIndex, ProtectionProfile, Roc, RtcpHeader, RtpHeader, SeqNum, Ssrc, SrtpPolicy};
+pub use types::{
+    PacketIndex, ProtectionProfile, Roc, RtcpHeader, RtpHeader, SeqNum, SrtpPolicy, Ssrc,
+};
 
 // ============================================================================
 // Constants (RFC 3711 / RFC 7714)
@@ -123,30 +125,15 @@ const _: () = assert!(
     "replay window must be exactly 64 packets"
 );
 
-const _: () = assert!(
-    SRTP_KEY_SIZE == 16,
-    "AES-128 key must be 16 bytes"
-);
+const _: () = assert!(SRTP_KEY_SIZE == 16, "AES-128 key must be 16 bytes");
 
-const _: () = assert!(
-    SRTP_SALT_SIZE == 12,
-    "GCM salt must be 12 bytes"
-);
+const _: () = assert!(SRTP_SALT_SIZE == 12, "GCM salt must be 12 bytes");
 
-const _: () = assert!(
-    SRTP_AUTH_TAG_SIZE == 16,
-    "GCM auth tag must be 16 bytes"
-);
+const _: () = assert!(SRTP_AUTH_TAG_SIZE == 16, "GCM auth tag must be 16 bytes");
 
-const _: () = assert!(
-    RTP_HEADER_SIZE == 12,
-    "RTP header must be 12 bytes minimum"
-);
+const _: () = assert!(RTP_HEADER_SIZE == 12, "RTP header must be 12 bytes minimum");
 
-const _: () = assert!(
-    RTCP_HEADER_SIZE == 8,
-    "RTCP header must be 8 bytes minimum"
-);
+const _: () = assert!(RTCP_HEADER_SIZE == 8, "RTCP header must be 8 bytes minimum");
 
 // ============================================================================
 // Module Tests

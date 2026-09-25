@@ -121,13 +121,10 @@ impl RtcpHeader {
         let packet_type = RtcpType::from_byte(pt_byte);
 
         // Parse length in 32-bit words minus one (bytes 2-3)
-        let length_words =
-            u16::from_be_bytes([data[2], data[3]]);
+        let length_words = u16::from_be_bytes([data[2], data[3]]);
 
         // Parse SSRC (bytes 4-7)
-        let ssrc = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
+        let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
         Ok(RtcpHeader {
             version,

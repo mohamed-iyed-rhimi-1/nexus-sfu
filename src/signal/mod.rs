@@ -35,20 +35,19 @@ pub mod server;
 
 // Re-export handler types from nexus-signal
 pub use nexus_signal::websocket::handler::{
-    ClientStats, JoinResponse, MessageType, SessionTicket, SignalingHandler,
-    SignalingHandlerError, TrackEntry, MAX_SESSION_TICKETS, TICKET_LIFETIME_SECS,
-    MAX_PARTICIPANT_NAME_LEN, MAX_STATS_PAYLOAD_SIZE, MAX_TRACKS_IN_RESPONSE,
-    error_codes as handler_error_codes,
+    error_codes as handler_error_codes, ClientStats, JoinResponse, MessageType, SessionTicket,
+    SignalingHandler, SignalingHandlerError, TrackEntry, MAX_PARTICIPANT_NAME_LEN,
+    MAX_SESSION_TICKETS, MAX_STATS_PAYLOAD_SIZE, MAX_TRACKS_IN_RESPONSE, TICKET_LIFETIME_SECS,
 };
 
 // Re-export websocket server types from nexus-signal
-pub use nexus_signal::websocket::server::{WebSocketServer, OrchestratorEvent};
+pub use nexus_signal::websocket::server::{OrchestratorEvent, WebSocketServer};
 
 // Re-export signaling server (QUIC-first with WebSocket fallback)
-pub use server::{SignalingServer, SignalingConfig, ActiveTransport};
+pub use server::{ActiveTransport, SignalingConfig, SignalingServer};
 
 // Re-export from nexus_signal
-pub use nexus_signal::{SignalMessage, QuicSignaling, ParticipantInfo, TrackInfo};
+pub use nexus_signal::{OfferTrack, ParticipantInfo, QuicSignaling, SignalMessage, TrackInfo};
 
 // Legacy constants for backward compatibility
 pub const MAX_CONNECTIONS: u32 = 10_000;
@@ -71,6 +70,6 @@ pub mod error_codes {
 // ============================================================================
 
 pub use nexus_signal::websocket::{
+    register_signaling_connection, signaling_connections, unregister_signaling_connection,
     SignalingConnectionHandle,
-    signaling_connections, register_signaling_connection, unregister_signaling_connection,
 };

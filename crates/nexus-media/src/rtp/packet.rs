@@ -18,10 +18,7 @@ impl RtpHeader {
     /// Writes results into `out`. Returns the number of entries
     /// written (always `min(packets.len(), out.len())`).
     #[inline]
-    pub fn parse_batch_optimal(
-        packets: &[&[u8]],
-        out: &mut [Option<Self>],
-    ) -> usize {
+    pub fn parse_batch_optimal(packets: &[&[u8]], out: &mut [Option<Self>]) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512f") {
@@ -38,25 +35,18 @@ impl RtpHeader {
     /// Parse a batch of RTP packets using scalar parsing with
     /// prefetch optimization.
     #[inline]
-    pub fn parse_batch_scalar(
-        packets: &[&[u8]],
-        out: &mut [Option<Self>],
-    ) -> usize {
+    pub fn parse_batch_scalar(packets: &[&[u8]], out: &mut [Option<Self>]) -> usize {
         let count = packets.len().min(out.len());
         let prefetch_distance = 4;
 
         for i in 0..count {
             if i + prefetch_distance < packets.len() {
-                let prefetch_ptr =
-                    packets[i + prefetch_distance].as_ptr();
+                let prefetch_ptr = packets[i + prefetch_distance].as_ptr();
                 #[cfg(target_arch = "x86_64")]
                 {
                     if is_x86_feature_detected!("sse") {
                         unsafe {
-                            _mm_prefetch(
-                                prefetch_ptr as *const i8,
-                                _MM_HINT_T0,
-                            );
+                            _mm_prefetch(prefetch_ptr as *const i8, _MM_HINT_T0);
                         }
                     }
                 }
@@ -70,10 +60,7 @@ impl RtpHeader {
                         );
                     }
                 }
-                #[cfg(not(any(
-                    target_arch = "x86_64",
-                    target_arch = "aarch64"
-                )))]
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let _ = prefetch_ptr;
             }
 
@@ -85,10 +72,7 @@ impl RtpHeader {
 
     /// Parse a batch using AVX2-optimized chunking.
     #[inline]
-    pub fn parse_batch_avx2(
-        packets: &[&[u8]],
-        out: &mut [Option<Self>],
-    ) -> usize {
+    pub fn parse_batch_avx2(packets: &[&[u8]], out: &mut [Option<Self>]) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
@@ -100,10 +84,7 @@ impl RtpHeader {
 
     #[cfg(target_arch = "x86_64")]
     #[inline]
-    fn parse_batch_avx2_impl(
-        packets: &[&[u8]],
-        out: &mut [Option<Self>],
-    ) -> usize {
+    fn parse_batch_avx2_impl(packets: &[&[u8]], out: &mut [Option<Self>]) -> usize {
         const CHUNK_SIZE: usize = 8;
         let count = packets.len().min(out.len());
         let mut written = 0;
@@ -115,10 +96,7 @@ impl RtpHeader {
             if let Some(next_chunk) = chunks_peekable.peek() {
                 for packet in next_chunk.iter() {
                     unsafe {
-                        _mm_prefetch(
-                            packet.as_ptr() as *const i8,
-                            _MM_HINT_T0,
-                        );
+                        _mm_prefetch(packet.as_ptr() as *const i8, _MM_HINT_T0);
                     }
                 }
             }
@@ -134,10 +112,7 @@ impl RtpHeader {
 
     /// Parse a batch using AVX-512-optimized chunking.
     #[inline]
-    pub fn parse_batch_avx512(
-        packets: &[&[u8]],
-        out: &mut [Option<Self>],
-    ) -> usize {
+    pub fn parse_batch_avx512(packets: &[&[u8]], out: &mut [Option<Self>]) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512f") {
@@ -149,10 +124,7 @@ impl RtpHeader {
 
     #[cfg(target_arch = "x86_64")]
     #[inline]
-    fn parse_batch_avx512_impl(
-        packets: &[&[u8]],
-        out: &mut [Option<Self>],
-    ) -> usize {
+    fn parse_batch_avx512_impl(packets: &[&[u8]], out: &mut [Option<Self>]) -> usize {
         const CHUNK_SIZE: usize = 16;
         let count = packets.len().min(out.len());
         let mut written = 0;
@@ -164,10 +136,7 @@ impl RtpHeader {
             if let Some(next_chunk) = chunks_peekable.peek() {
                 for packet in next_chunk.iter() {
                     unsafe {
-                        _mm_prefetch(
-                            packet.as_ptr() as *const i8,
-                            _MM_HINT_T0,
-                        );
+                        _mm_prefetch(packet.as_ptr() as *const i8, _MM_HINT_T0);
                     }
                 }
             }

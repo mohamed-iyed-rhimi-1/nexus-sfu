@@ -1,11 +1,14 @@
 //! SDP session description.
 
+use super::attributes::{Direction, DtlsFingerprint, DtlsSetup};
 use super::error::SdpError;
-use super::media::{MediaDescription, IceUfrag, IcePwd};
-use super::attributes::{DtlsFingerprint, DtlsSetup, Direction};
+use super::media::{IcePwd, IceUfrag, MediaDescription};
 #[cfg(debug_assertions)]
 use super::parser::SdpParser;
-use super::{MAX_MEDIA_SECTIONS, MAX_SDP_SIZE, MIN_ICE_UFRAG_LEN, MAX_ICE_UFRAG_LEN, MIN_ICE_PWD_LEN, MAX_ICE_PWD_LEN};
+use super::{
+    MAX_ICE_PWD_LEN, MAX_ICE_UFRAG_LEN, MAX_MEDIA_SECTIONS, MAX_SDP_SIZE, MIN_ICE_PWD_LEN,
+    MIN_ICE_UFRAG_LEN,
+};
 
 /// Origin (o=) line.
 #[derive(Debug, Clone)]
@@ -30,16 +33,16 @@ impl Default for Origin {
     fn default() -> Self {
         let mut username = [0u8; 32];
         username[0] = b'-';
-        
+
         let mut net_type = [0u8; 4];
         net_type[..2].copy_from_slice(b"IN");
-        
+
         let mut addr_type = [0u8; 4];
         addr_type[..3].copy_from_slice(b"IP4");
-        
+
         let mut address = [0u8; 64];
         address[..7].copy_from_slice(b"0.0.0.0");
-        
+
         Self {
             username,
             username_len: 1,
@@ -62,21 +65,19 @@ impl Origin {
             ..Default::default()
         }
     }
-    
+
     /// Serialize to SDP line (without "o=" prefix).
     pub fn to_sdp(&self) -> String {
-        let username = std::str::from_utf8(&self.username[..self.username_len as usize]).unwrap_or("-");
+        let username =
+            std::str::from_utf8(&self.username[..self.username_len as usize]).unwrap_or("-");
         let net = std::str::from_utf8(&self.net_type[..2]).unwrap_or("IN");
         let addr_t = std::str::from_utf8(&self.addr_type[..3]).unwrap_or("IP4");
-        let addr = std::str::from_utf8(&self.address[..self.address_len as usize]).unwrap_or("0.0.0.0");
-        
-        format!("{} {} {} {} {} {}", 
-            username, 
-            self.session_id, 
-            self.session_version, 
-            net, 
-            addr_t, 
-            addr
+        let addr =
+            std::str::from_utf8(&self.address[..self.address_len as usize]).unwrap_or("0.0.0.0");
+
+        format!(
+            "{} {} {} {} {} {}",
+            username, self.session_id, self.session_version, net, addr_t, addr
         )
     }
 }
@@ -109,7 +110,7 @@ pub struct SessionDescription {
     pub session_name_len: u8,
     /// Timing.
     pub timing: Timing,
-    
+
     // Session-level ICE
     /// Session-level ICE ufrag.
     pub ice_ufrag: Option<super::media::IceUfrag>,
@@ -117,18 +118,18 @@ pub struct SessionDescription {
     pub ice_pwd: Option<super::media::IcePwd>,
     /// ICE-lite mode.
     pub ice_lite: bool,
-    
+
     // Session-level DTLS
     /// Session-level fingerprint.
     pub fingerprint: Option<DtlsFingerprint>,
     /// Session-level setup.
     pub setup: Option<DtlsSetup>,
-    
+
     // Groups
     /// BUNDLE group (MIDs).
     pub bundle_group: [u8; 64],
     pub bundle_group_len: u8,
-    
+
     // Media sections
     /// Media descriptions.
     pub media: [Option<MediaDescription>; MAX_MEDIA_SECTIONS],
@@ -140,7 +141,7 @@ impl Default for SessionDescription {
     fn default() -> Self {
         let mut session_name = [0u8; 64];
         session_name[0] = b'-';
-        
+
         Self {
             version: 0,
             origin: Origin::default(),
@@ -173,7 +174,7 @@ impl SessionDescription {
     pub fn set_version(&mut self, version: u64) {
         self.origin.session_version = version;
     }
-    
+
     /// Set session name.
     pub fn set_session_name(&mut self, name: &str) {
         let bytes = name.as_bytes();
@@ -181,37 +182,37 @@ impl SessionDescription {
         self.session_name[..len].copy_from_slice(&bytes[..len]);
         self.session_name_len = len as u8;
     }
-    
+
     /// Set ICE credentials (session-level).
     pub fn set_ice_credentials(&mut self, ufrag: &str, pwd: &str) {
         self.ice_ufrag = Some(super::media::IceUfrag::new(ufrag));
         self.ice_pwd = Some(super::media::IcePwd::new(pwd));
     }
-    
+
     /// Set DTLS fingerprint (session-level).
     pub fn set_fingerprint(&mut self, fingerprint: DtlsFingerprint) {
         self.fingerprint = Some(fingerprint);
     }
-    
+
     /// Set DTLS setup role (session-level).
     pub fn set_setup(&mut self, setup: DtlsSetup) {
         self.setup = Some(setup);
     }
-    
+
     /// Add a media section.
     pub fn add_media(&mut self, media: MediaDescription) -> Result<(), SdpError> {
         if self.media_count as usize >= MAX_MEDIA_SECTIONS {
-            return Err(SdpError::TooManyMedia { 
-                count: self.media_count as usize + 1, 
-                max: MAX_MEDIA_SECTIONS 
+            return Err(SdpError::TooManyMedia {
+                count: self.media_count as usize + 1,
+                max: MAX_MEDIA_SECTIONS,
             });
         }
-        
+
         self.media[self.media_count as usize] = Some(media);
         self.media_count += 1;
         Ok(())
     }
-    
+
     /// Set BUNDLE group.
     ///
     /// # TigerStyle Compliance
@@ -224,7 +225,7 @@ impl SessionDescription {
                 reason: "BUNDLE MIDs must not be empty",
             });
         }
-        
+
         // Validate all MIDs exist in media sections
         for mid in mids {
             if !self.has_media_with_mid(mid) {
@@ -233,13 +234,13 @@ impl SessionDescription {
                 });
             }
         }
-        
+
         let bundle = mids.join(" ");
         let bytes = bundle.as_bytes();
         let len = bytes.len().min(64);
         self.bundle_group[..len].copy_from_slice(&bytes[..len]);
         self.bundle_group_len = len as u8;
-        
+
         Ok(())
     }
 
@@ -261,7 +262,7 @@ impl SessionDescription {
         }
         false
     }
-    
+
     /// Serialize to complete SDP string.
     ///
     /// # TigerStyle Compliance
@@ -270,25 +271,27 @@ impl SessionDescription {
     /// - Bounded string generation
     pub fn to_sdp(&self) -> String {
         // Precondition: session must be valid
-        assert!(self.media_count <= MAX_MEDIA_SECTIONS as u8,
-            "Media count must be bounded");
-        
+        assert!(
+            self.media_count <= MAX_MEDIA_SECTIONS as u8,
+            "Media count must be bounded"
+        );
+
         let mut lines = Vec::new();
-        
+
         // v= version
         lines.push(format!("v={}", self.version));
-        
+
         // o= origin
         lines.push(format!("o={}", self.origin.to_sdp()));
-        
+
         // s= session name
         let name = std::str::from_utf8(&self.session_name[..self.session_name_len as usize])
             .unwrap_or("-");
         lines.push(format!("s={}", name));
-        
+
         // t= timing
         lines.push(format!("t={}", self.timing.to_sdp()));
-        
+
         // Session-level ICE
         if let Some(ref ufrag) = self.ice_ufrag {
             lines.push(format!("a=ice-ufrag:{}", ufrag.as_str()));
@@ -299,7 +302,7 @@ impl SessionDescription {
         if self.ice_lite {
             lines.push("a=ice-lite".to_string());
         }
-        
+
         // Session-level DTLS
         if let Some(ref fp) = self.fingerprint {
             lines.push(format!("a=fingerprint:{}", fp.to_sdp()));
@@ -307,39 +310,43 @@ impl SessionDescription {
         if let Some(ref setup) = self.setup {
             lines.push(format!("a=setup:{}", setup.as_str()));
         }
-        
+
         // BUNDLE
         if self.bundle_group_len > 0 {
             let bundle = std::str::from_utf8(&self.bundle_group[..self.bundle_group_len as usize])
                 .unwrap_or("");
             lines.push(format!("a=group:BUNDLE {}", bundle));
         }
-        
+
         // Media sections
         for i in 0..self.media_count as usize {
             if let Some(ref media) = self.media[i] {
                 lines.push(media.to_sdp());
             }
         }
-        
+
         let result = lines.join("\r\n") + "\r\n";
-        
+
         // Postcondition: result must be parseable (paired assertion)
-        assert!(result.len() <= MAX_SDP_SIZE,
-            "Generated SDP must not exceed MAX_SDP_SIZE");
-        
+        assert!(
+            result.len() <= MAX_SDP_SIZE,
+            "Generated SDP must not exceed MAX_SDP_SIZE"
+        );
+
         // Postcondition: result should be re-parseable (validation)
         #[cfg(debug_assertions)]
         {
             if let Ok(reparsed) = SdpParser::parse(&result) {
-                assert_eq!(reparsed.media_count, self.media_count,
-                    "Re-parsed SDP must have same media count");
+                assert_eq!(
+                    reparsed.media_count, self.media_count,
+                    "Re-parsed SDP must have same media count"
+                );
             }
         }
-        
+
         result
     }
-    
+
     /// Create an answer from an offer.
     ///
     /// This creates a compatible SDP answer based on the offer,
@@ -361,14 +368,14 @@ impl SessionDescription {
                 reason: "offer must have at least one media section",
             });
         }
-        
+
         // Validate our credentials
         let our_ufrag_obj = IceUfrag::new(our_ufrag);
         let our_pwd_obj = IcePwd::new(our_pwd);
         Self::validate_ice_ufrag(&our_ufrag_obj)?;
         Self::validate_ice_pwd(&our_pwd_obj)?;
         our_fingerprint.validate()?;
-        
+
         let mut answer = SessionDescription::new(self.origin.session_id);
         answer.set_session_name("Nexus SFU Answer");
         answer.set_ice_credentials(our_ufrag, our_pwd);
@@ -380,13 +387,13 @@ impl SessionDescription {
             _ => DtlsSetup::Active,
         };
         answer.set_setup(answer_setup);
-        
+
         // Copy bundle group
         if self.bundle_group_len > 0 {
             answer.bundle_group = self.bundle_group;
             answer.bundle_group_len = self.bundle_group_len;
         }
-        
+
         // Process each media section
         for i in 0..self.media_count as usize {
             if let Some(ref offer_media) = self.media[i] {
@@ -400,11 +407,13 @@ impl SessionDescription {
                 answer.add_media(answer_media)?;
             }
         }
-        
+
         // Postcondition: answer must have same media count as offer
-        assert_eq!(answer.media_count, self.media_count,
-            "Answer must have same media count as offer");
-        
+        assert_eq!(
+            answer.media_count, self.media_count,
+            "Answer must have same media count as offer"
+        );
+
         Ok(answer)
     }
 
@@ -422,26 +431,26 @@ impl SessionDescription {
         answer_setup: DtlsSetup,
     ) -> Result<MediaDescription, SdpError> {
         use super::MAX_CODECS_PER_MEDIA;
-        
+
         let mut media = MediaDescription::new(
             offer_media.media_type,
             9, // Port 9 is standard for WebRTC (ignored due to ICE)
             offer_media.protocol,
         );
-        
+
         // Copy MID
         media.mid = offer_media.mid.clone();
-        
+
         // Set direction (flip sendrecv/sendonly/recvonly)
         media.direction = Self::flip_direction(offer_media.direction);
-        
+
         // Copy ICE credentials
         media.set_ice_credentials(our_ufrag, our_pwd);
-        
+
         // Copy fingerprint
         media.set_fingerprint(our_fingerprint.clone());
         media.setup = Some(answer_setup);
-        
+
         // Negotiate codecs: For SFU, we accept all offered codecs since we forward
         // rather than transcode. This allows subscribers to choose their preferred codec.
         // If no codecs are offered, return an error.
@@ -450,7 +459,7 @@ impl SessionDescription {
                 media_type: offer_media.media_type.as_str().to_string(),
             });
         }
-        
+
         // Accept all offered codecs (bounded by MAX_CODECS_PER_MEDIA)
         let codec_limit = (offer_media.codec_count as usize).min(MAX_CODECS_PER_MEDIA);
         for i in 0..codec_limit {
@@ -458,7 +467,7 @@ impl SessionDescription {
                 media.add_codec(codec.clone())?;
             }
         }
-        
+
         // RTCP settings
         media.rtcp_mux = offer_media.rtcp_mux;
         media.rtcp_rsize = offer_media.rtcp_rsize;
@@ -481,7 +490,7 @@ impl SessionDescription {
 
         // Copy extmap-allow-mixed (RFC 8285)
         media.extmap_allow_mixed = offer_media.extmap_allow_mixed;
-        
+
         Ok(media)
     }
 
@@ -500,36 +509,36 @@ impl SessionDescription {
         answer_setup: DtlsSetup,
     ) -> Result<MediaDescription, SdpError> {
         use super::MAX_CODECS_PER_MEDIA;
-        
+
         let mut media = MediaDescription::new(
             offer_media.media_type,
             9, // Port 9 is standard for WebRTC (ignored due to ICE)
             offer_media.protocol,
         );
-        
+
         // Copy MID
         media.mid = offer_media.mid.clone();
-        
+
         // Set direction (flip sendrecv/sendonly/recvonly)
         media.direction = Self::flip_direction(offer_media.direction);
-        
+
         // Copy ICE credentials
         media.set_ice_credentials(our_ufrag, our_pwd);
-        
+
         // Copy fingerprint
         media.set_fingerprint(our_fingerprint.clone());
         media.setup = Some(answer_setup);
-        
+
         // Negotiate codecs using local capabilities
         // This returns NoCommonCodec if no matching codec found
         let negotiated_codecs = local_media.negotiate_codecs(offer_media)?;
-        
+
         // Add negotiated codecs (bounded by MAX_CODECS_PER_MEDIA)
         let codec_limit = negotiated_codecs.len().min(MAX_CODECS_PER_MEDIA);
         for codec in negotiated_codecs.into_iter().take(codec_limit) {
             media.add_codec(codec)?;
         }
-        
+
         // RTCP settings
         media.rtcp_mux = offer_media.rtcp_mux;
         media.rtcp_rsize = offer_media.rtcp_rsize;
@@ -552,7 +561,7 @@ impl SessionDescription {
 
         // Copy extmap-allow-mixed (RFC 8285)
         media.extmap_allow_mixed = offer_media.extmap_allow_mixed;
-        
+
         Ok(media)
     }
 
@@ -602,10 +611,10 @@ impl SessionDescription {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::media::{MediaType, TransportProtocol, Mid};
     use super::super::attributes::DtlsFingerprint;
-    
+    use super::super::media::{MediaType, Mid, TransportProtocol};
+    use super::*;
+
     #[test]
     fn test_origin_default() {
         let origin = Origin::default();
@@ -614,35 +623,31 @@ mod tests {
         assert!(sdp.contains("IN"));
         assert!(sdp.contains("IP4"));
     }
-    
+
     #[test]
     fn test_session_description_new() {
         let sdp = SessionDescription::new(12345);
         assert_eq!(sdp.version, 0);
         assert_eq!(sdp.origin.session_id, 12345);
     }
-    
+
     #[test]
     fn test_session_to_sdp() {
         let mut sdp = SessionDescription::new(12345);
         sdp.set_session_name("Test Session");
         sdp.set_ice_credentials("testufrag", "testpwd1234567890123456");
-        
+
         let output = sdp.to_sdp();
         assert!(output.starts_with("v=0"));
         assert!(output.contains("s=Test Session"));
         assert!(output.contains("a=ice-ufrag:testufrag"));
     }
-    
+
     #[test]
     fn test_add_media() {
         let mut sdp = SessionDescription::new(12345);
-        let media = MediaDescription::new(
-            MediaType::Audio,
-            9,
-            TransportProtocol::UdpTlsRtpSavpf,
-        );
-        
+        let media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+
         sdp.add_media(media).unwrap();
         assert_eq!(sdp.media_count, 1);
     }
@@ -650,28 +655,22 @@ mod tests {
     #[test]
     fn test_bundle_validation() {
         let mut sdp = SessionDescription::new(12345);
-        
-        let mut media1 = MediaDescription::new(
-            MediaType::Audio,
-            9,
-            TransportProtocol::UdpTlsRtpSavpf,
-        );
+
+        let mut media1 =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media1.mid = Some(Mid::new("0"));
         sdp.add_media(media1).unwrap();
-        
+
         // Try to set BUNDLE with non-existent MID
         let result = sdp.set_bundle(&["0", "1"]);
         assert!(matches!(result, Err(SdpError::InvalidBundleGroup { .. })));
-        
+
         // Add second media
-        let mut media2 = MediaDescription::new(
-            MediaType::Video,
-            9,
-            TransportProtocol::UdpTlsRtpSavpf,
-        );
+        let mut media2 =
+            MediaDescription::new(MediaType::Video, 9, TransportProtocol::UdpTlsRtpSavpf);
         media2.mid = Some(Mid::new("1"));
         sdp.add_media(media2).unwrap();
-        
+
         // Now should succeed
         let result = sdp.set_bundle(&["0", "1"]);
         assert!(result.is_ok());
@@ -680,25 +679,28 @@ mod tests {
     #[test]
     fn test_create_answer_validates_credentials() {
         let mut offer = SessionDescription::new(12345);
-        let mut media = MediaDescription::new(
-            MediaType::Audio,
-            9,
-            TransportProtocol::UdpTlsRtpSavpf,
-        );
+        let mut media =
+            MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
         media.mid = Some(Mid::new("0"));
         offer.add_media(media).unwrap();
-        
+
         let fp = DtlsFingerprint::parse(
             "sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90"
         ).unwrap();
-        
+
         // Short ufrag should fail
         let result = offer.create_answer("ab", "testpwd1234567890123456", &fp);
-        assert!(matches!(result, Err(SdpError::InvalidIceCredentialLength { .. })));
-        
+        assert!(matches!(
+            result,
+            Err(SdpError::InvalidIceCredentialLength { .. })
+        ));
+
         // Short pwd should fail
         let result = offer.create_answer("testufrag", "short", &fp);
-        assert!(matches!(result, Err(SdpError::InvalidIceCredentialLength { .. })));
+        assert!(matches!(
+            result,
+            Err(SdpError::InvalidIceCredentialLength { .. })
+        ));
     }
 
     #[test]

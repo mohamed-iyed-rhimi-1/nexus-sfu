@@ -79,7 +79,7 @@ impl<T: Clone> LWWReg<T> {
         const {
             assert!(std::mem::size_of::<T>() <= MAX_VALUE_SIZE);
         };
-        
+
         // Precondition: valid actor_id
         assert!(
             actor_id < MAX_ACTORS as u64,
@@ -198,13 +198,11 @@ impl<T: Clone> LWWReg<T> {
         let current_writer = self.writer.load(Ordering::Acquire);
 
         // Check if this write wins
-        let wins = if timestamp > current_ts {
-            true
-        } else if timestamp == current_ts {
+        let wins = match timestamp.cmp(&current_ts) {
+            std::cmp::Ordering::Greater => true,
             // Tie-break by actor_id
-            actor_id > current_writer
-        } else {
-            false
+            std::cmp::Ordering::Equal => actor_id > current_writer,
+            std::cmp::Ordering::Less => false,
         };
 
         if wins {
@@ -256,13 +254,9 @@ impl<T: Clone> LWWReg<T> {
         if other_ts > 0 {
             // Use set() which handles the comparison logic
             let current_ts = self.timestamp.load(Ordering::Acquire);
-            
-            // If we're also uninitialized (ts == 0), accept any write
-            if current_ts == 0 {
-                self.value = other_value;
-                self.timestamp.store(other_ts, Ordering::Release);
-                self.writer.store(other_writer, Ordering::Release);
-            } else if other_ts > current_ts {
+
+            // Accept any write if we're uninitialized (ts == 0), else newer wins
+            if current_ts == 0 || other_ts > current_ts {
                 self.value = other_value;
                 self.timestamp.store(other_ts, Ordering::Release);
                 self.writer.store(other_writer, Ordering::Release);
@@ -346,7 +340,7 @@ mod tests {
     #[test]
     fn test_lwwreg_set_newer_timestamp() {
         let mut reg = LWWReg::with_timestamp(10u32, 100, 1);
-        
+
         // Newer timestamp wins
         let updated = reg.set(20, 200, 2);
         assert!(updated);
@@ -358,7 +352,7 @@ mod tests {
     #[test]
     fn test_lwwreg_set_older_timestamp() {
         let mut reg = LWWReg::with_timestamp(10u32, 200, 1);
-        
+
         // Older timestamp is rejected
         let updated = reg.set(20, 100, 2);
         assert!(!updated);
@@ -369,7 +363,7 @@ mod tests {
     #[test]
     fn test_lwwreg_set_same_timestamp_higher_actor() {
         let mut reg = LWWReg::with_timestamp(10u32, 100, 1);
-        
+
         // Same timestamp, higher actor wins
         let updated = reg.set(20, 100, 5);
         assert!(updated);
@@ -380,7 +374,7 @@ mod tests {
     #[test]
     fn test_lwwreg_set_same_timestamp_lower_actor() {
         let mut reg = LWWReg::with_timestamp(10u32, 100, 5);
-        
+
         // Same timestamp, lower actor loses
         let updated = reg.set(20, 100, 1);
         assert!(!updated);
@@ -392,17 +386,17 @@ mod tests {
     fn test_lwwreg_merge_commutative() {
         let a = LWWReg::with_timestamp(10u32, 100, 1);
         let b = LWWReg::with_timestamp(20u32, 200, 2);
-        
+
         // Clone for comparison
         let mut a1 = a.clone();
         let mut b1 = b.clone();
-        
+
         // merge(a, b)
         a1.merge(&b);
-        
+
         // merge(b, a)
         b1.merge(&a);
-        
+
         // Assert commutativity
         assert_eq!(a1.snapshot(), b1.snapshot());
         assert_eq!(a1.get(), 20);
@@ -414,18 +408,18 @@ mod tests {
         let a = LWWReg::with_timestamp(10u32, 100, 1);
         let b = LWWReg::with_timestamp(20u32, 200, 2);
         let c = LWWReg::with_timestamp(30u32, 150, 3);
-        
+
         // (a merge b) merge c
         let mut ab_c = a.clone();
         ab_c.merge(&b);
         ab_c.merge(&c);
-        
+
         // a merge (b merge c)
         let mut bc = b.clone();
         bc.merge(&c);
         let mut a_bc = a.clone();
         a_bc.merge(&bc);
-        
+
         // Assert associativity
         assert_eq!(ab_c.snapshot(), a_bc.snapshot());
     }
@@ -434,11 +428,11 @@ mod tests {
     fn test_lwwreg_merge_idempotent() {
         let mut reg = LWWReg::with_timestamp(42u32, 100, 1);
         let before = reg.snapshot();
-        
+
         // merge with self
         let clone = reg.clone();
         reg.merge(&clone);
-        
+
         let after = reg.snapshot();
         assert_eq!(before, after);
     }
@@ -447,14 +441,14 @@ mod tests {
     fn test_lwwreg_concurrent_writes() {
         // Two concurrent writes with same timestamp
         let mut reg = LWWReg::new(0u32, 0);
-        
+
         // First write
         reg.set(10, 100, 1);
-        
+
         // Concurrent write with same timestamp but higher actor
         reg.set(20, 100, 5);
         assert_eq!(reg.get(), 20);
-        
+
         // Try lower actor - should be rejected
         reg.set(30, 100, 2);
         assert_eq!(reg.get(), 20);
@@ -484,7 +478,7 @@ mod tests {
     fn test_lwwreg_snapshot() {
         let reg = LWWReg::with_timestamp(42u32, 100, 5);
         let snap = reg.snapshot();
-        
+
         assert_eq!(snap.value, 42);
         assert_eq!(snap.timestamp, 100);
         assert_eq!(snap.writer, 5);
@@ -494,7 +488,7 @@ mod tests {
     fn test_lwwreg_clone() {
         let reg = LWWReg::with_timestamp(42u32, 100, 5);
         let clone = reg.clone();
-        
+
         assert_eq!(clone.get(), 42);
         assert_eq!(clone.timestamp(), 100);
         assert_eq!(clone.writer(), 5);
@@ -510,7 +504,7 @@ mod tests {
 
         let mut reg = LWWReg::new(Point { x: 0, y: 0 }, 1);
         reg.set(Point { x: 10, y: 20 }, 100, 1);
-        
+
         assert_eq!(reg.get(), Point { x: 10, y: 20 });
     }
 }
@@ -552,15 +546,15 @@ mod proptests {
         ) {
             let reg_a = LWWReg::with_timestamp(v1, ts1, a1);
             let reg_b = LWWReg::with_timestamp(v2, ts2, a2);
-            
+
             // merge(A, B)
             let mut ab = reg_a.clone();
             ab.merge(&reg_b);
-            
+
             // merge(B, A)
             let mut ba = reg_b.clone();
             ba.merge(&reg_a);
-            
+
             // Assert commutativity
             prop_assert_eq!(ab.snapshot(), ba.snapshot());
         }
@@ -580,18 +574,18 @@ mod proptests {
             let reg_a = LWWReg::with_timestamp(v1, ts1, a1);
             let reg_b = LWWReg::with_timestamp(v2, ts2, a2);
             let reg_c = LWWReg::with_timestamp(v3, ts3, a3);
-            
+
             // (A merge B) merge C
             let mut ab_c = reg_a.clone();
             ab_c.merge(&reg_b);
             ab_c.merge(&reg_c);
-            
+
             // A merge (B merge C)
             let mut bc = reg_b.clone();
             bc.merge(&reg_c);
             let mut a_bc = reg_a.clone();
             a_bc.merge(&bc);
-            
+
             // Assert associativity
             prop_assert_eq!(ab_c.snapshot(), a_bc.snapshot());
         }
@@ -604,10 +598,10 @@ mod proptests {
         ) {
             let reg = LWWReg::with_timestamp(v, ts, a);
             let before = reg.snapshot();
-            
+
             let mut reg_clone = reg.clone();
             reg_clone.merge(&reg);
-            
+
             let after = reg_clone.snapshot();
             prop_assert_eq!(before, after);
         }
@@ -620,12 +614,12 @@ mod proptests {
             )
         ) {
             let mut reg = LWWReg::new(0u32, 0);
-            
+
             // Apply all writes
             for (value, timestamp, actor) in &writes {
                 reg.set(*value, *timestamp, *actor);
             }
-            
+
             // Find the winning write
             let winner = writes.iter()
                 .max_by(|a, b| {
@@ -635,7 +629,7 @@ mod proptests {
                     }
                 })
                 .unwrap();
-            
+
             // Assert final value matches winner
             prop_assert_eq!(reg.get(), winner.0);
         }

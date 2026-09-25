@@ -94,11 +94,7 @@ impl OpusPayloadHeader {
         let (mode, bandwidth) = Self::decode_config(config);
 
         // Postcondition: config is bounded to 5 bits
-        debug_assert!(
-            config <= 31,
-            "Opus config {} exceeds max 31",
-            config
-        );
+        debug_assert!(config <= 31, "Opus config {} exceeds max 31", config);
 
         Ok(OpusPayloadHeader {
             config,
@@ -116,39 +112,19 @@ impl OpusPayloadHeader {
     /// and the audio bandwidth per RFC 6716 Section 3.1.
     fn decode_config(config: u8) -> (OpusMode, OpusBandwidth) {
         match config {
-            0..=3 => {
-                (OpusMode::Silk, OpusBandwidth::Narrowband)
-            }
-            4..=7 => {
-                (OpusMode::Silk, OpusBandwidth::Mediumband)
-            }
-            8..=11 => {
-                (OpusMode::Silk, OpusBandwidth::Wideband)
-            }
-            12..=13 => {
-                (OpusMode::Hybrid, OpusBandwidth::SuperWideband)
-            }
-            14..=15 => {
-                (OpusMode::Hybrid, OpusBandwidth::Fullband)
-            }
-            16..=19 => {
-                (OpusMode::Celt, OpusBandwidth::Narrowband)
-            }
-            20..=23 => {
-                (OpusMode::Celt, OpusBandwidth::Wideband)
-            }
-            24..=27 => {
-                (OpusMode::Celt, OpusBandwidth::SuperWideband)
-            }
-            28..=31 => {
-                (OpusMode::Celt, OpusBandwidth::Fullband)
-            }
+            0..=3 => (OpusMode::Silk, OpusBandwidth::Narrowband),
+            4..=7 => (OpusMode::Silk, OpusBandwidth::Mediumband),
+            8..=11 => (OpusMode::Silk, OpusBandwidth::Wideband),
+            12..=13 => (OpusMode::Hybrid, OpusBandwidth::SuperWideband),
+            14..=15 => (OpusMode::Hybrid, OpusBandwidth::Fullband),
+            16..=19 => (OpusMode::Celt, OpusBandwidth::Narrowband),
+            20..=23 => (OpusMode::Celt, OpusBandwidth::Wideband),
+            24..=27 => (OpusMode::Celt, OpusBandwidth::SuperWideband),
+            28..=31 => (OpusMode::Celt, OpusBandwidth::Fullband),
             // Config is 5 bits, so 0–31 is exhaustive.
             // This branch is unreachable but required by
             // the compiler.
-            _ => {
-                (OpusMode::Celt, OpusBandwidth::Fullband)
-            }
+            _ => (OpusMode::Celt, OpusBandwidth::Fullband),
         }
     }
 
@@ -190,10 +166,7 @@ mod tests {
         assert!(!hdr.stereo);
         assert_eq!(hdr.frame_count_code, 0);
         assert_eq!(hdr.mode, OpusMode::Silk);
-        assert_eq!(
-            hdr.bandwidth,
-            OpusBandwidth::Narrowband
-        );
+        assert_eq!(hdr.bandwidth, OpusBandwidth::Narrowband);
         assert!(hdr.is_keyframe());
         assert_eq!(hdr.header_len_bytes, 1);
     }
@@ -219,10 +192,7 @@ mod tests {
         let hdr = OpusPayloadHeader::parse(data).unwrap();
         assert_eq!(hdr.config, 12);
         assert_eq!(hdr.mode, OpusMode::Hybrid);
-        assert_eq!(
-            hdr.bandwidth,
-            OpusBandwidth::SuperWideband
-        );
+        assert_eq!(hdr.bandwidth, OpusBandwidth::SuperWideband);
     }
 
     #[test]
@@ -243,8 +213,7 @@ mod tests {
         // Every Opus packet is independently decodable
         for toc in 0..=255u8 {
             let data = [toc];
-            let hdr =
-                OpusPayloadHeader::parse(&data).unwrap();
+            let hdr = OpusPayloadHeader::parse(&data).unwrap();
             assert!(hdr.is_keyframe());
         }
     }

@@ -293,8 +293,12 @@ impl StreamHandler {
 
         // Write length prefix (u32 big-endian)
         let len = bytes.len() as u32;
-        assert!(len > 0);
-        assert!(len < 1024 * 1024); // Max 1MB message
+        if len == 0 || len >= 1024 * 1024 {
+            return Err(SignalError::InvalidMessage(format!(
+                "message length {} out of valid range (1..1MB)",
+                len
+            )));
+        }
 
         send.write_all(&len.to_be_bytes())
             .await
@@ -318,8 +322,12 @@ impl StreamHandler {
             .map_err(|e| SignalError::StreamCreationFailed(e.to_string()))?;
         let len = u32::from_be_bytes(len_bytes);
 
-        assert!(len > 0);
-        assert!(len < 1024 * 1024); // Max 1MB message
+        if len == 0 || len >= 1024 * 1024 {
+            return Err(SignalError::InvalidMessage(format!(
+                "received message length {} out of valid range (1..1MB)",
+                len
+            )));
+        }
 
         // Read message bytes
         let mut bytes = vec![0u8; len as usize];

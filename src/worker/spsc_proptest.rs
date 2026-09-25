@@ -8,11 +8,11 @@
 //! Property 2: Cross-Worker SPSC Routing
 //! Validates: Requirements 1.4
 
-use proptest::prelude::*;
 use proptest::collection::vec;
+use proptest::prelude::*;
 
-use nexus_transport::arena::PacketArena;
 use crate::worker::spsc::SpscChannel;
+use nexus_transport::arena::PacketArena;
 
 /// Operation on the SPSC channel for property testing.
 #[derive(Debug, Clone)]

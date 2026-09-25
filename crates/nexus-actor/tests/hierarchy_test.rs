@@ -27,9 +27,10 @@ fn create_test_distributed_state() -> Arc<nexus_state::DistributedState> {
 #[test]
 fn test_participant_belongs_to_room() {
     let state = create_test_distributed_state();
-    
+
     // Spawn room
-    let (room, _room_tx) = RoomActor::spawn(1, "Test Room".to_string(), 100, 0, now_ns(), state.clone());
+    let (room, _room_tx) =
+        RoomActor::spawn(1, "Test Room".to_string(), 100, 0, now_ns(), state.clone());
 
     // Spawn participant
     let (participant, _participant_tx) =
@@ -42,7 +43,7 @@ fn test_participant_belongs_to_room() {
 #[test]
 fn test_track_belongs_to_participant() {
     let state = create_test_distributed_state();
-    
+
     // Spawn participant
     let (participant, _participant_tx) =
         ParticipantActor::spawn(10, 1, "Alice".to_string(), 1000, 0, now_ns(), state);

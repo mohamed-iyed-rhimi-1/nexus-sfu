@@ -7,34 +7,29 @@
 //! that all other nexus-* crates depend on. It has zero external
 //! dependencies beyond std, serde, and thiserror.
 
-pub mod types;
-pub mod error;
 pub mod config;
+pub mod error;
+pub mod types;
 
 // Re-export all shared types at crate root for convenience.
 // Consumers can use `nexus_core::TrackId` instead of
 // `nexus_core::types::TrackId`.
 pub use types::{
-    TrackId, ParticipantId, RoomId, ConnectionId,
-    Ssrc, TimestampNs, BandwidthBps, MediaKind,
+    BandwidthBps, ConnectionId, MediaKind, ParticipantId, RoomId, Ssrc, TimestampNs, TrackId,
 };
 
 // Re-export all error types at crate root for convenience.
 // Consumers can use `nexus_core::SfuError` instead of
 // `nexus_core::error::SfuError`.
 pub use error::{
-    SfuError, TransportError, ParseError,
-    RtpError, RtcpError, ArenaError, WorkerError,
-    SignalingError, RoomError, SsrcError, ApiError,
-    signaling_error_codes,
+    signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
+    SfuError, SignalingError, SsrcError, TransportError, WorkerError,
 };
 
 // Re-export config primitives and validation trait.
 // The full NexusConfig aggregator stays in the root crate
 // because it depends on crate-specific configs (GossipConfig, etc.).
 pub use config::{
-    Validate, ConfigError,
-    TransportConfig, MemoryConfig, WorkerConfig,
-    RoomConfig, BweConfig, LoggingConfig, LogLevel,
-    SecurityConfig, ActorConfig, MetricsConfig,
+    ActorConfig, BweConfig, ConfigError, LogLevel, LoggingConfig, MemoryConfig, MetricsConfig,
+    RoomConfig, SecurityConfig, TransportConfig, Validate, WorkerConfig,
 };

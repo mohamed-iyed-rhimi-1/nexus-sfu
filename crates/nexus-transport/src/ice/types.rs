@@ -10,8 +10,8 @@
 //! - Compile-time assertions for invariants
 //! - No dynamic allocation
 
-use std::net::SocketAddr;
 use getrandom::getrandom;
+use std::net::SocketAddr;
 
 /// ICE Agent Role.
 ///
@@ -23,7 +23,7 @@ pub enum IceRole {
     /// Controlling agent (typically the offerer).
     /// Nominates candidate pairs for use.
     Controlling = 0,
-    
+
     /// Controlled agent (typically the answerer).
     /// Accepts nominations from controlling agent.
     Controlled = 1,
@@ -48,22 +48,22 @@ impl IceRole {
 pub enum IceConnectionState {
     /// Initial state, no checks performed.
     New = 0,
-    
+
     /// Connectivity checks in progress.
     Checking = 1,
-    
+
     /// At least one working pair found.
     Connected = 2,
-    
+
     /// ICE completed successfully with nominated pair.
     Completed = 3,
-    
+
     /// All connectivity checks failed.
     Failed = 4,
-    
+
     /// Previously connected, now disconnected.
     Disconnected = 5,
-    
+
     /// ICE agent closed.
     Closed = 6,
 }
@@ -88,31 +88,31 @@ impl IceConnectionState {
             // From New
             (Self::New, Self::Checking) => true,
             (Self::New, Self::Closed) => true,
-            
+
             // From Checking
             (Self::Checking, Self::Connected) => true,
             (Self::Checking, Self::Failed) => true,
             (Self::Checking, Self::Closed) => true,
-            
+
             // From Connected
             (Self::Connected, Self::Completed) => true,
             (Self::Connected, Self::Disconnected) => true,
             (Self::Connected, Self::Closed) => true,
-            
+
             // From Completed
             (Self::Completed, Self::Disconnected) => true,
             (Self::Completed, Self::Closed) => true,
-            
+
             // From Disconnected
             (Self::Disconnected, Self::Checking) => true,
             (Self::Disconnected, Self::Connected) => true,
             (Self::Disconnected, Self::Failed) => true,
             (Self::Disconnected, Self::Closed) => true,
-            
+
             // Terminal states cannot transition
             (Self::Failed, _) => false,
             (Self::Closed, _) => false,
-            
+
             _ => false,
         }
     }
@@ -126,10 +126,10 @@ impl IceConnectionState {
 pub enum IceGatheringState {
     /// Gathering not started.
     New = 0,
-    
+
     /// Gathering in progress.
     Gathering = 1,
-    
+
     /// Gathering complete.
     Complete = 2,
 }
@@ -142,7 +142,7 @@ pub enum IceGatheringState {
 pub struct IceCredentials {
     /// Local username fragment.
     pub local_ufrag: String,
-    
+
     /// Local password.
     pub local_pwd: String,
 }
@@ -155,7 +155,7 @@ impl IceCredentials {
             local_pwd: pwd.into(),
         }
     }
-    
+
     /// Generate random credentials.
     ///
     /// Uses alphanumeric charset only (no `+` or `/`) for maximum
@@ -163,21 +163,23 @@ impl IceCredentials {
     /// Password length is 32 characters per RFC 8445 recommendations.
     pub fn generate() -> Self {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        
+
         let mut ufrag_random = [0u8; 8];
         let mut pwd_random = [0u8; 32];
-        
+
         getrandom(&mut ufrag_random).expect("getrandom failed");
         getrandom(&mut pwd_random).expect("getrandom failed");
-        
-        let ufrag: String = ufrag_random.iter()
+
+        let ufrag: String = ufrag_random
+            .iter()
             .map(|&b| CHARSET[(b as usize) % CHARSET.len()] as char)
             .collect();
-        
-        let pwd: String = pwd_random.iter()
+
+        let pwd: String = pwd_random
+            .iter()
             .map(|&b| CHARSET[(b as usize) % CHARSET.len()] as char)
             .collect();
-        
+
         Self {
             local_ufrag: ufrag,
             local_pwd: pwd,
@@ -196,10 +198,10 @@ impl Default for IceCredentials {
 #[repr(u8)]
 pub enum TransportType {
     /// UDP transport (most common for WebRTC).
-    Udp = 17,  // IANA protocol number
-    
+    Udp = 17, // IANA protocol number
+
     /// TCP transport (fallback).
-    Tcp = 6,   // IANA protocol number
+    Tcp = 6, // IANA protocol number
 }
 
 impl TransportType {
@@ -227,15 +229,15 @@ impl TransportType {
 pub struct TurnServerConfig {
     /// TURN server address.
     pub address: SocketAddr,
-    
+
     /// Username for authentication.
     pub username: [u8; 64],
     pub username_len: u8,
-    
+
     /// Password for authentication.
     pub password: [u8; 64],
     pub password_len: u8,
-    
+
     /// Use TLS (TURNS).
     pub use_tls: bool,
 }
@@ -243,7 +245,7 @@ pub struct TurnServerConfig {
 impl TurnServerConfig {
     /// Maximum username length.
     pub const MAX_USERNAME_LEN: usize = 64;
-    
+
     /// Maximum password length.
     pub const MAX_PASSWORD_LEN: usize = 64;
 
@@ -252,12 +254,7 @@ impl TurnServerConfig {
     /// # Panics
     ///
     /// Panics if username or password exceeds maximum length.
-    pub fn new(
-        address: SocketAddr,
-        username: &str,
-        password: &str,
-        use_tls: bool,
-    ) -> Self {
+    pub fn new(address: SocketAddr, username: &str, password: &str, use_tls: bool) -> Self {
         assert!(
             username.len() <= Self::MAX_USERNAME_LEN,
             "username too long: {} > {}",
@@ -273,7 +270,7 @@ impl TurnServerConfig {
 
         let mut username_buf = [0u8; 64];
         let mut password_buf = [0u8; 64];
-        
+
         username_buf[..username.len()].copy_from_slice(username.as_bytes());
         password_buf[..password.len()].copy_from_slice(password.as_bytes());
 
@@ -291,18 +288,14 @@ impl TurnServerConfig {
     #[inline]
     pub fn username_str(&self) -> &str {
         // Safety: we only store valid UTF-8 from constructor
-        unsafe {
-            std::str::from_utf8_unchecked(&self.username[..self.username_len as usize])
-        }
+        unsafe { std::str::from_utf8_unchecked(&self.username[..self.username_len as usize]) }
     }
 
     /// Get password as string slice.
     #[inline]
     pub fn password_str(&self) -> &str {
         // Safety: we only store valid UTF-8 from constructor
-        unsafe {
-            std::str::from_utf8_unchecked(&self.password[..self.password_len as usize])
-        }
+        unsafe { std::str::from_utf8_unchecked(&self.password[..self.password_len as usize]) }
     }
 }
 
@@ -314,33 +307,33 @@ impl TurnServerConfig {
 pub struct IceConfig {
     /// STUN server addresses (up to 4).
     pub stun_servers: [Option<SocketAddr>; 4],
-    
+
     /// Number of configured STUN servers.
     pub stun_server_count: u8,
-    
+
     /// TURN server configurations (up to 2).
     pub turn_servers: [Option<TurnServerConfig>; 2],
-    
+
     /// Number of configured TURN servers.
     pub turn_server_count: u8,
-    
+
     /// Local username fragment.
     pub local_ufrag: [u8; 32],
     pub local_ufrag_len: u8,
-    
+
     /// Local password.
     pub local_pwd: [u8; 32],
     pub local_pwd_len: u8,
-    
+
     /// Use aggressive nomination.
     pub aggressive_nomination: bool,
-    
+
     /// Connectivity check timeout in milliseconds.
     pub check_timeout_ms: u32,
-    
+
     /// Connectivity check interval in milliseconds.
     pub check_interval_ms: u32,
-    
+
     /// Maximum retransmissions per check.
     pub max_retransmissions: u8,
 }
@@ -348,13 +341,13 @@ pub struct IceConfig {
 impl IceConfig {
     /// Maximum STUN servers.
     pub const MAX_STUN_SERVERS: usize = 4;
-    
+
     /// Maximum TURN servers.
     pub const MAX_TURN_SERVERS: usize = 2;
-    
+
     /// Maximum ufrag length.
     pub const MAX_UFRAG_LEN: usize = 32;
-    
+
     /// Maximum password length.
     pub const MAX_PWD_LEN: usize = 32;
 
@@ -389,7 +382,7 @@ impl IceConfig {
             (self.stun_server_count as usize) < Self::MAX_STUN_SERVERS,
             "too many STUN servers"
         );
-        
+
         self.stun_servers[self.stun_server_count as usize] = Some(addr);
         self.stun_server_count += 1;
     }
@@ -404,7 +397,7 @@ impl IceConfig {
             (self.turn_server_count as usize) < Self::MAX_TURN_SERVERS,
             "too many TURN servers"
         );
-        
+
         self.turn_servers[self.turn_server_count as usize] = Some(config);
         self.turn_server_count += 1;
     }
@@ -413,18 +406,14 @@ impl IceConfig {
     #[inline]
     pub fn local_ufrag_str(&self) -> &str {
         // Safety: we only store valid UTF-8
-        unsafe {
-            std::str::from_utf8_unchecked(&self.local_ufrag[..self.local_ufrag_len as usize])
-        }
+        unsafe { std::str::from_utf8_unchecked(&self.local_ufrag[..self.local_ufrag_len as usize]) }
     }
 
     /// Get local password as string slice.
     #[inline]
     pub fn local_pwd_str(&self) -> &str {
         // Safety: we only store valid UTF-8
-        unsafe {
-            std::str::from_utf8_unchecked(&self.local_pwd[..self.local_pwd_len as usize])
-        }
+        unsafe { std::str::from_utf8_unchecked(&self.local_pwd[..self.local_pwd_len as usize]) }
     }
 
     /// Generate random ICE ufrag.
@@ -433,17 +422,17 @@ impl IceConfig {
     fn generate_ufrag() -> ([u8; 32], u8) {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         const LEN: usize = 8;
-        
+
         let mut buf = [0u8; 32];
         let mut random = [0u8; LEN];
-        
+
         // Use getrandom for cryptographic randomness
         getrandom(&mut random).expect("getrandom failed");
-        
+
         for i in 0..LEN {
             buf[i] = CHARSET[(random[i] as usize) % CHARSET.len()];
         }
-        
+
         (buf, LEN as u8)
     }
 
@@ -454,16 +443,16 @@ impl IceConfig {
     fn generate_pwd() -> ([u8; 32], u8) {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         const LEN: usize = 32;
-        
+
         let mut buf = [0u8; 32];
         let mut random = [0u8; LEN];
-        
+
         getrandom(&mut random).expect("getrandom failed");
-        
+
         for i in 0..LEN {
             buf[i] = CHARSET[(random[i] as usize) % CHARSET.len()];
         }
-        
+
         (buf, LEN as u8)
     }
 }
@@ -471,13 +460,13 @@ impl IceConfig {
 impl Default for IceConfig {
     fn default() -> Self {
         let mut config = Self::new();
-        
+
         // Add Google's public STUN server as default
         // This is commonly used and reliable
         if let Ok(addr) = "74.125.250.129:19302".parse() {
             config.add_stun_server(addr);
         }
-        
+
         config
     }
 }
@@ -486,7 +475,7 @@ impl Default for IceConfig {
 const _: () = {
     // Ensure IceConfig is reasonably sized (config struct, not hot path)
     assert!(std::mem::size_of::<IceConfig>() <= 1024);
-    
+
     // Ensure states fit in u8
     assert!(std::mem::size_of::<IceRole>() == 1);
     assert!(std::mem::size_of::<IceConnectionState>() == 1);
@@ -501,25 +490,37 @@ const _: () = {
 /// Comprehensive compile-time validation for ICE types.
 const _ICE_TYPES_COMPILE_TIME_CHECKS: () = {
     // IceConfig field size constraints
-    assert!(IceConfig::MAX_STUN_SERVERS >= 1 && IceConfig::MAX_STUN_SERVERS <= 8,
-        "STUN server count should be 1-8");
-    assert!(IceConfig::MAX_TURN_SERVERS >= 1 && IceConfig::MAX_TURN_SERVERS <= 4,
-        "TURN server count should be 1-4");
-    assert!(IceConfig::MAX_UFRAG_LEN >= 8 && IceConfig::MAX_UFRAG_LEN <= 256,
-        "UFRAG max length should be 8-256");
-    assert!(IceConfig::MAX_PWD_LEN >= 24 && IceConfig::MAX_PWD_LEN <= 256,
-        "PWD max length should be 24-256");
-    
+    assert!(
+        IceConfig::MAX_STUN_SERVERS >= 1 && IceConfig::MAX_STUN_SERVERS <= 8,
+        "STUN server count should be 1-8"
+    );
+    assert!(
+        IceConfig::MAX_TURN_SERVERS >= 1 && IceConfig::MAX_TURN_SERVERS <= 4,
+        "TURN server count should be 1-4"
+    );
+    assert!(
+        IceConfig::MAX_UFRAG_LEN >= 8 && IceConfig::MAX_UFRAG_LEN <= 256,
+        "UFRAG max length should be 8-256"
+    );
+    assert!(
+        IceConfig::MAX_PWD_LEN >= 24 && IceConfig::MAX_PWD_LEN <= 256,
+        "PWD max length should be 24-256"
+    );
+
     // TurnServerConfig field size constraints
-    assert!(TurnServerConfig::MAX_USERNAME_LEN >= 1 && TurnServerConfig::MAX_USERNAME_LEN <= 128,
-        "TURN username max length should be 1-128");
-    assert!(TurnServerConfig::MAX_PASSWORD_LEN >= 1 && TurnServerConfig::MAX_PASSWORD_LEN <= 128,
-        "TURN password max length should be 1-128");
-    
+    assert!(
+        TurnServerConfig::MAX_USERNAME_LEN >= 1 && TurnServerConfig::MAX_USERNAME_LEN <= 128,
+        "TURN username max length should be 1-128"
+    );
+    assert!(
+        TurnServerConfig::MAX_PASSWORD_LEN >= 1 && TurnServerConfig::MAX_PASSWORD_LEN <= 128,
+        "TURN password max length should be 1-128"
+    );
+
     // Ensure enum discriminants are as expected
     assert!(IceRole::Controlling as u8 == 0);
     assert!(IceRole::Controlled as u8 == 1);
-    
+
     assert!(IceConnectionState::New as u8 == 0);
     assert!(IceConnectionState::Checking as u8 == 1);
     assert!(IceConnectionState::Connected as u8 == 2);
@@ -527,19 +528,21 @@ const _ICE_TYPES_COMPILE_TIME_CHECKS: () = {
     assert!(IceConnectionState::Failed as u8 == 4);
     assert!(IceConnectionState::Disconnected as u8 == 5);
     assert!(IceConnectionState::Closed as u8 == 6);
-    
+
     assert!(IceGatheringState::New as u8 == 0);
     assert!(IceGatheringState::Gathering as u8 == 1);
     assert!(IceGatheringState::Complete as u8 == 2);
-    
+
     // Transport type uses IANA protocol numbers
     assert!(TransportType::Tcp as u8 == 6, "TCP protocol number is 6");
     assert!(TransportType::Udp as u8 == 17, "UDP protocol number is 17");
-    
+
     // TurnServerConfig should be reasonably sized
-    assert!(std::mem::size_of::<TurnServerConfig>() <= 256,
-        "TurnServerConfig should not exceed 256 bytes");
-    
+    assert!(
+        std::mem::size_of::<TurnServerConfig>() <= 256,
+        "TurnServerConfig should not exceed 256 bytes"
+    );
+
     // IceCredentials uses String so can't check size, but ensure types compile
     // (validation is done at runtime for credentials)
 };
@@ -565,7 +568,7 @@ mod tests {
     #[test]
     fn test_ice_config_default() {
         let config = IceConfig::default();
-        
+
         assert!(config.local_ufrag_len >= 4);
         assert!(config.local_pwd_len >= 22);
         assert_eq!(config.stun_server_count, 1);
@@ -575,7 +578,7 @@ mod tests {
     fn test_turn_server_config() {
         let addr = "192.168.1.1:3478".parse().unwrap();
         let config = TurnServerConfig::new(addr, "user", "pass", false);
-        
+
         assert_eq!(config.username_str(), "user");
         assert_eq!(config.password_str(), "pass");
         assert!(!config.use_tls);
@@ -639,7 +642,11 @@ impl HighLevelTurnServerConfig {
     ///
     /// - Precondition assertion for URL format
     /// - Postcondition assertion for non-empty fields
-    pub fn new(url: impl Into<String>, username: impl Into<String>, credential: impl Into<String>) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        username: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
         let url = url.into();
         let username = username.into();
         let credential = credential.into();
@@ -648,8 +655,13 @@ impl HighLevelTurnServerConfig {
         assert!(!url.is_empty(), "TURN server URL must not be empty");
 
         // Postcondition: all fields populated
-        assert!(!username.is_empty() || !credential.is_empty() || url.starts_with("turn:") || url.starts_with("turns:"),
-            "TURN config should have valid URL format or credentials");
+        assert!(
+            !username.is_empty()
+                || !credential.is_empty()
+                || url.starts_with("turn:")
+                || url.starts_with("turns:"),
+            "TURN config should have valid URL format or credentials"
+        );
 
         Self {
             url,
@@ -739,7 +751,10 @@ impl IceServerConfig {
     pub fn effective_stun_servers(&self) -> Vec<String> {
         if !self.stun_servers.is_empty() {
             // Postcondition: return configured servers
-            assert!(!self.stun_servers.is_empty(), "Should return non-empty configured servers");
+            assert!(
+                !self.stun_servers.is_empty(),
+                "Should return non-empty configured servers"
+            );
             self.stun_servers.clone()
         } else if self.use_google_fallback {
             // Postcondition: return fallback servers
@@ -759,19 +774,31 @@ impl IceServerConfig {
     /// - Validates all nested configurations
     pub fn validate(&self) -> Result<(), String> {
         // Precondition: STUN server count must not exceed maximum
-        assert!(self.stun_servers.len() <= MAX_STUN_SERVERS_CONFIG,
-            "STUN server count must not exceed {}", MAX_STUN_SERVERS_CONFIG);
+        assert!(
+            self.stun_servers.len() <= MAX_STUN_SERVERS_CONFIG,
+            "STUN server count must not exceed {}",
+            MAX_STUN_SERVERS_CONFIG
+        );
 
         if self.stun_servers.len() > MAX_STUN_SERVERS_CONFIG {
-            return Err(format!("STUN servers must not exceed {} servers", MAX_STUN_SERVERS_CONFIG));
+            return Err(format!(
+                "STUN servers must not exceed {} servers",
+                MAX_STUN_SERVERS_CONFIG
+            ));
         }
 
         // Precondition: TURN server count must not exceed maximum
-        assert!(self.turn_servers.len() <= MAX_TURN_SERVERS_CONFIG,
-            "TURN server count must not exceed {}", MAX_TURN_SERVERS_CONFIG);
+        assert!(
+            self.turn_servers.len() <= MAX_TURN_SERVERS_CONFIG,
+            "TURN server count must not exceed {}",
+            MAX_TURN_SERVERS_CONFIG
+        );
 
         if self.turn_servers.len() > MAX_TURN_SERVERS_CONFIG {
-            return Err(format!("TURN servers must not exceed {} servers", MAX_TURN_SERVERS_CONFIG));
+            return Err(format!(
+                "TURN servers must not exceed {} servers",
+                MAX_TURN_SERVERS_CONFIG
+            ));
         }
 
         // Validate STUN server URLs
@@ -782,7 +809,10 @@ impl IceServerConfig {
 
             // STUN URLs should start with stun: or stuns:
             if !url.starts_with("stun:") && !url.starts_with("stuns:") {
-                return Err(format!("STUN server URL at index {} must start with 'stun:' or 'stuns:'", i));
+                return Err(format!(
+                    "STUN server URL at index {} must start with 'stun:' or 'stuns:'",
+                    i
+                ));
             }
         }
 
@@ -821,9 +851,8 @@ mod ice_server_config_tests {
 
     #[test]
     fn test_effective_stun_servers_with_primary() {
-        let config = IceServerConfig::with_stun_servers(vec![
-            "stun:stun.example.com:3478".to_string(),
-        ]);
+        let config =
+            IceServerConfig::with_stun_servers(vec!["stun:stun.example.com:3478".to_string()]);
         let servers = config.effective_stun_servers();
 
         assert_eq!(servers.len(), 1);
@@ -844,11 +873,7 @@ mod ice_server_config_tests {
 
     #[test]
     fn test_high_level_turn_server_config_validation() {
-        let valid = HighLevelTurnServerConfig::new(
-            "turn:turn.example.com:3478",
-            "user",
-            "pass",
-        );
+        let valid = HighLevelTurnServerConfig::new("turn:turn.example.com:3478", "user", "pass");
         assert!(valid.validate().is_ok());
 
         let invalid_scheme = HighLevelTurnServerConfig {
@@ -880,4 +905,3 @@ mod ice_server_config_tests {
         assert!(invalid_stun.validate().is_err());
     }
 }
-

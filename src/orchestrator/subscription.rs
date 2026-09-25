@@ -32,6 +32,12 @@ pub struct SubscriptionState {
     pub subscribed_tracks: Vec<(TrackId, SubState)>,
 }
 
+impl Default for SubscriptionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SubscriptionState {
     pub fn new() -> Self {
         Self {
@@ -71,13 +77,15 @@ impl SubscriptionManager {
 
     pub fn remove_participant(&mut self, participant_id: u64) {
         self.states.remove(&participant_id);
-        self.transport_to_participant.retain(|_, &mut pid| pid != participant_id);
+        self.transport_to_participant
+            .retain(|_, &mut pid| pid != participant_id);
     }
 
     /// Register the transport_id → participant_id mapping.
     /// Called by the dispatcher when NegotiationManager creates a transport.
     pub fn register_transport(&mut self, transport_id: u64, participant_id: u64) {
-        self.transport_to_participant.insert(transport_id, participant_id);
+        self.transport_to_participant
+            .insert(transport_id, participant_id);
     }
 
     // ── Subscribe ────────────────────────────────────────────────────
@@ -89,7 +97,9 @@ impl SubscriptionManager {
         negotiation: &mut NegotiationManager,
         sessions: &HashMap<u64, ParticipantHandle>,
     ) {
-        assert!(participant_id != 0);
+        if participant_id == 0 {
+            return;
+        }
 
         let state = match self.states.get_mut(&participant_id) {
             Some(s) => s,
@@ -101,42 +111,72 @@ impl SubscriptionManager {
             None => return,
         };
         if handle.room_id.is_none() {
-            send_error(sessions, participant_id, "NOT_IN_ROOM", "Must join a room first");
+            send_error(
+                sessions,
+                participant_id,
+                "NOT_IN_ROOM",
+                "Must join a room first",
+            );
             return;
         }
 
-        let mut accepted: Vec<u64> = Vec::with_capacity(track_ids.len().min(MAX_TRACKS_PER_PARTICIPANT as usize));
+        let mut accepted: Vec<u64> =
+            Vec::with_capacity(track_ids.len().min(MAX_TRACKS_PER_PARTICIPANT as usize));
         for &tid in track_ids {
-            if tid == 0 { continue; }
-            if state.subscribed_tracks.iter().any(|(t, _)| *t == tid) { continue; }
-            if accepted.contains(&tid) { continue; }
-            if accepted.len() >= MAX_TRACKS_PER_PARTICIPANT as usize { break; }
+            if tid == 0 {
+                continue;
+            }
+            if state.subscribed_tracks.iter().any(|(t, _)| *t == tid) {
+                continue;
+            }
+            if accepted.contains(&tid) {
+                continue;
+            }
+            if accepted.len() >= MAX_TRACKS_PER_PARTICIPANT as usize {
+                break;
+            }
             accepted.push(tid);
         }
-        if accepted.is_empty() { return; }
+        if accepted.is_empty() {
+            return;
+        }
 
         for &tid in &accepted {
             state.subscribed_tracks.push((tid, SubState::Negotiating));
         }
 
-        send_to(sessions, participant_id, SignalMessage::Subscribed {
-            track_ids: accepted.clone(),
-        });
+        send_to(
+            sessions,
+            participant_id,
+            SignalMessage::Subscribed {
+                track_ids: accepted.clone(),
+            },
+        );
 
-        info!("Participant {} subscribed to {} tracks (negotiating)", participant_id, accepted.len());
+        info!(
+            "Participant {} subscribed to {} tracks (negotiating)",
+            participant_id,
+            accepted.len()
+        );
 
-        // Trigger renegotiation or queue it
-        let neg_state = negotiation.states.get_mut(&participant_id);
-        let should_renegotiate = match neg_state {
+        // Renegotiate with the full current subscription set, or queue it until
+        // the outstanding offer is answered (the cache is what gets offered then).
+        let track_ids = self
+            .states
+            .get(&participant_id)
+            .map(|s| s.track_ids())
+            .unwrap_or_default();
+        let should_renegotiate = match negotiation.states.get_mut(&participant_id) {
             Some(ns) if ns.offer_pending => {
                 ns.renegotiation_needed = true;
+                ns.last_subscribed_track_ids = track_ids.clone();
                 false
             }
             Some(_) => true,
             None => false,
         };
         if should_renegotiate {
-            negotiation.trigger_subscriber_renegotiation(participant_id, sessions);
+            negotiation.trigger_subscriber_renegotiation(participant_id, &track_ids, sessions);
         }
     }
 
@@ -149,23 +189,41 @@ impl SubscriptionManager {
         negotiation: &mut NegotiationManager,
         sessions: &HashMap<u64, ParticipantHandle>,
     ) {
-        assert!(participant_id != 0);
+        if participant_id == 0 {
+            return;
+        }
 
         let state = match self.states.get_mut(&participant_id) {
             Some(s) => s,
             None => return,
         };
 
+        // LIMITATION: subscriber_id is truncated to u32. If two participants share
+        // the same lower 32 bits, their subscriber_ids will collide. This is acceptable
+        // for now since participant IDs are typically sequential and fit in 32 bits.
+        // TODO: Migrate worker pool APIs to accept u64 subscriber IDs.
         let subscriber_id = (participant_id & 0xFFFFFFFF) as u32;
         let mut removed: Vec<u64> = Vec::with_capacity(track_ids.len());
 
+        let mut negotiating_removed: Vec<u64> = Vec::new();
         for &tid in track_ids {
-            let was_active = state.subscribed_tracks.iter()
+            let was_active = state
+                .subscribed_tracks
+                .iter()
                 .any(|(t, s)| *t == tid && *s == SubState::Active);
+            let was_negotiating = state
+                .subscribed_tracks
+                .iter()
+                .any(|(t, s)| *t == tid && *s == SubState::Negotiating);
             if was_active {
                 let pool = self.worker_pool.read();
                 let _ = pool.remove_subscriber(tid, subscriber_id);
-                let _ = self.distributed_state.remove_subscription(tid, participant_id);
+                let _ = self
+                    .distributed_state
+                    .remove_subscription(tid, participant_id);
+            }
+            if was_negotiating {
+                negotiating_removed.push(tid);
             }
             let before = state.subscribed_tracks.len();
             state.subscribed_tracks.retain(|(t, _)| *t != tid);
@@ -173,17 +231,43 @@ impl SubscriptionManager {
                 removed.push(tid);
             }
         }
-        if removed.is_empty() { return; }
+        if removed.is_empty() {
+            return;
+        }
 
-        send_to(sessions, participant_id, SignalMessage::Unsubscribed { track_ids: removed });
+        // Clean pending_mid_map for tracks that were in Negotiating state
+        if !negotiating_removed.is_empty() {
+            if let Some(neg_state) = negotiation.states.get_mut(&participant_id) {
+                neg_state
+                    .pending_mid_map
+                    .retain(|(track_id, _)| !negotiating_removed.contains(track_id));
+            }
+        }
 
+        send_to(
+            sessions,
+            participant_id,
+            SignalMessage::Unsubscribed { track_ids: removed },
+        );
+
+        // Renegotiate with the full current subscription set, or queue it until
+        // the outstanding offer is answered (the cache is what gets offered then).
+        let track_ids = self
+            .states
+            .get(&participant_id)
+            .map(|s| s.track_ids())
+            .unwrap_or_default();
         let should_renegotiate = match negotiation.states.get_mut(&participant_id) {
-            Some(ns) if ns.offer_pending => { ns.renegotiation_needed = true; false }
+            Some(ns) if ns.offer_pending => {
+                ns.renegotiation_needed = true;
+                ns.last_subscribed_track_ids = track_ids.clone();
+                false
+            }
             Some(_) => true,
             None => false,
         };
         if should_renegotiate {
-            negotiation.trigger_subscriber_renegotiation(participant_id, sessions);
+            negotiation.trigger_subscriber_renegotiation(participant_id, &track_ids, sessions);
         }
     }
 
@@ -196,26 +280,38 @@ impl SubscriptionManager {
         pinned: &[u64],
         sessions: &HashMap<u64, ParticipantHandle>,
     ) {
-        assert!(participant_id != 0);
+        if participant_id == 0 {
+            return;
+        }
 
         let state = match self.states.get(&participant_id) {
             Some(s) => s,
             None => return,
         };
 
+        // LIMITATION: subscriber_id truncated to u32; see handle_unsubscribe for details.
         let subscriber_id = (participant_id & 0xFFFFFFFF) as u32;
         let visible_u32: Vec<u32> = visible.iter().map(|&id| id as u32).collect();
         let pinned_u32: Vec<u32> = pinned.iter().map(|&id| id as u32).collect();
         let pool = self.worker_pool.read();
 
         for &(track_id, _) in &state.subscribed_tracks {
-            let _ = pool.update_viewport(track_id, subscriber_id, visible_u32.clone(), pinned_u32.clone());
+            let _ = pool.update_viewport(
+                track_id,
+                subscriber_id,
+                visible_u32.clone(),
+                pinned_u32.clone(),
+            );
         }
 
-        send_to(sessions, participant_id, SignalMessage::ViewportUpdated {
-            visible_count: visible.len() as u32,
-            pinned_count: pinned.len() as u32,
-        });
+        send_to(
+            sessions,
+            participant_id,
+            SignalMessage::ViewportUpdated {
+                visible_count: visible.len() as u32,
+                pinned_count: pinned.len() as u32,
+            },
+        );
     }
 
     // ── Content Type ─────────────────────────────────────────────────
@@ -228,31 +324,51 @@ impl SubscriptionManager {
         negotiation: &NegotiationManager,
         sessions: &HashMap<u64, ParticipantHandle>,
     ) {
-        assert!(participant_id != 0);
+        if participant_id == 0 {
+            return;
+        }
 
         let content_type: u8 = match content {
-            "camera" => 0, "screen" => 1, "audio" => 2,
+            "camera" => 0,
+            "screen" => 1,
+            "audio" => 2,
             _ => {
-                send_error(sessions, participant_id, "INVALID_CONTENT", &format!("Unknown: {}", content));
+                send_error(
+                    sessions,
+                    participant_id,
+                    "INVALID_CONTENT",
+                    &format!("Unknown: {}", content),
+                );
                 return;
             }
         };
 
-        let owns_track = negotiation.states.get(&participant_id)
+        let owns_track = negotiation
+            .states
+            .get(&participant_id)
             .map(|s| s.published_tracks.contains(&track_id))
             .unwrap_or(false);
         if !owns_track {
-            send_error(sessions, participant_id, "NOT_OWNER", "Cannot set content on a track you don't own");
+            send_error(
+                sessions,
+                participant_id,
+                "NOT_OWNER",
+                "Cannot set content on a track you don't own",
+            );
             return;
         }
 
         let pool = self.worker_pool.read();
         let _ = pool.set_content_type(track_id, content_type);
 
-        send_to(sessions, participant_id, SignalMessage::ContentSet {
-            track_id,
-            content: content.to_string(),
-        });
+        send_to(
+            sessions,
+            participant_id,
+            SignalMessage::ContentSet {
+                track_id,
+                content: content.to_string(),
+            },
+        );
     }
 
     // ── Session Established (THE BUG FIX) ────────────────────────────
@@ -274,17 +390,23 @@ impl SubscriptionManager {
         };
 
         let pending_mid_map = negotiation.take_pending_mid_map(participant_id);
-        if pending_mid_map.is_empty() { return; }
+        if pending_mid_map.is_empty() {
+            return;
+        }
 
         let dest_addr = match negotiation.selected_remote_addr(participant_id) {
             Some(addr) => addr,
             None => {
-                warn!("No selected pair for participant {} after establishment", participant_id);
+                warn!(
+                    "No selected pair for participant {} after establishment",
+                    participant_id
+                );
                 return;
             }
         };
 
         let srtp_key_material = negotiation.get_srtp_key_material(participant_id);
+        // LIMITATION: subscriber_id truncated to u32; see handle_unsubscribe for details.
         let subscriber_id = (participant_id & 0xFFFFFFFF) as u32;
 
         let state = match self.states.get_mut(&participant_id) {
@@ -306,14 +428,20 @@ impl SubscriptionManager {
 
             let pool = self.worker_pool.read();
             if let Err(e) = pool.add_subscriber(
-                *track_id, subscriber_id, participant_id,
-                dest_addr, 0, srtp_ctx,
+                *track_id,
+                subscriber_id,
+                participant_id,
+                dest_addr,
+                0,
+                srtp_ctx,
             ) {
                 warn!("Failed to add subscriber for track {}: {:?}", track_id, e);
                 continue;
             }
 
-            let _ = self.distributed_state.add_subscription(*track_id, participant_id);
+            let _ = self
+                .distributed_state
+                .add_subscription(*track_id, participant_id);
 
             for (tid, sub_state) in state.subscribed_tracks.iter_mut() {
                 if *tid == *track_id && *sub_state == SubState::Negotiating {
@@ -322,7 +450,11 @@ impl SubscriptionManager {
             }
         }
 
-        info!("Media activated for participant {} ({} tracks)", participant_id, pending_mid_map.len());
+        info!(
+            "Media activated for participant {} ({} tracks)",
+            participant_id,
+            pending_mid_map.len()
+        );
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────
@@ -341,28 +473,49 @@ impl SubscriptionManager {
 
     pub fn cleanup_participant(&mut self, participant_id: u64) {
         if let Some(state) = self.states.remove(&participant_id) {
+            // LIMITATION: subscriber_id truncated to u32; see handle_unsubscribe for details.
             let subscriber_id = (participant_id & 0xFFFFFFFF) as u32;
             for (track_id, sub_state) in &state.subscribed_tracks {
-                if *sub_state == SubState::Active {
-                    let pool = self.worker_pool.read();
-                    let _ = pool.remove_subscriber(*track_id, subscriber_id);
-                    let _ = self.distributed_state.remove_subscription(*track_id, participant_id);
+                match sub_state {
+                    SubState::Active => {
+                        let pool = self.worker_pool.read();
+                        let _ = pool.remove_subscriber(*track_id, subscriber_id);
+                        let _ = self
+                            .distributed_state
+                            .remove_subscription(*track_id, participant_id);
+                    }
+                    SubState::Negotiating => {
+                        // Worker pool cleanup not needed (never added), but distributed state may have entries
+                        let _ = self
+                            .distributed_state
+                            .remove_subscription(*track_id, participant_id);
+                    }
                 }
             }
         }
-        self.transport_to_participant.retain(|_, &mut pid| pid != participant_id);
+        self.transport_to_participant
+            .retain(|_, &mut pid| pid != participant_id);
     }
 }
 
 fn send_to(sessions: &HashMap<u64, ParticipantHandle>, participant_id: u64, msg: SignalMessage) {
     if let Some(handle) = sessions.get(&participant_id) {
-        let _ = handle.outbound_tx.send(msg);
+        let _ = handle.outbound_tx.try_send(msg);
     }
 }
 
-fn send_error(sessions: &HashMap<u64, ParticipantHandle>, participant_id: u64, code: &str, message: &str) {
-    send_to(sessions, participant_id, SignalMessage::Error {
-        code: code.to_string(),
-        message: message.to_string(),
-    });
+fn send_error(
+    sessions: &HashMap<u64, ParticipantHandle>,
+    participant_id: u64,
+    code: &str,
+    message: &str,
+) {
+    send_to(
+        sessions,
+        participant_id,
+        SignalMessage::Error {
+            code: code.to_string(),
+            message: message.to_string(),
+        },
+    );
 }

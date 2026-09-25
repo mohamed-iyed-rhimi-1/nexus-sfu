@@ -78,33 +78,31 @@ impl QuicConnection {
 
     /// Transition to established state.
     pub fn mark_established(&mut self) {
-        assert!(
-            self.state == ConnectionState::Handshaking || self.state == ConnectionState::ZeroRtt
-        );
+        if self.state != ConnectionState::Handshaking && self.state != ConnectionState::ZeroRtt {
+            return;
+        }
         self.state = ConnectionState::Established;
     }
 
     /// Record stream creation.
     pub fn record_bi_stream(&self) {
-        let count = self.bi_stream_count.fetch_add(1, Ordering::Relaxed);
-        // Invariant: stream count should not overflow
-        assert!(count < u32::MAX, "Bidirectional stream count overflow");
+        self.bi_stream_count.fetch_add(1, Ordering::Relaxed);
         self.touch_activity();
     }
 
     pub fn record_uni_stream(&self) {
-        let count = self.uni_stream_count.fetch_add(1, Ordering::Relaxed);
-        // Invariant: stream count should not overflow
-        assert!(count < u32::MAX, "Unidirectional stream count overflow");
+        self.uni_stream_count.fetch_add(1, Ordering::Relaxed);
         self.touch_activity();
     }
 
-    /// Record connection migration.
-    pub fn record_migration(&self) {
+    /// Record connection migration. Returns false if limit exceeded.
+    pub fn record_migration(&self) -> bool {
         let count = self.migration_count.fetch_add(1, Ordering::Relaxed);
-        // Invariant: migration count should be bounded
-        assert!(count < 10, "Migration count exceeds maximum");
+        if count >= 10 {
+            return false;
+        }
         self.touch_activity();
+        true
     }
 
     /// Update last activity timestamp.

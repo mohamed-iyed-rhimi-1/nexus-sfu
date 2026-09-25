@@ -93,12 +93,7 @@ impl ForwardEntry {
     }
 
     /// Create a forward entry from IPv4 address components (stub).
-    pub fn from_ipv4(
-        dst_mac: [u8; 6],
-        ip_octets: [u8; 4],
-        port: u16,
-        ifindex: u32,
-    ) -> Self {
+    pub fn from_ipv4(dst_mac: [u8; 6], ip_octets: [u8; 4], port: u16, ifindex: u32) -> Self {
         let dst_ip = u32::from_be_bytes(ip_octets);
         let dst_port = port.to_be();
         Self::new(dst_mac, dst_ip, dst_port, ifindex)

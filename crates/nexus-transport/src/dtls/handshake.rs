@@ -29,10 +29,10 @@
 //! - Explicit types: u16 for lengths, u8 for counts
 //! - All functions ≤70 lines
 
+use super::crypto::{CipherSuite, SrtpProfile};
 use super::error::DtlsError;
 use super::types::{DtlsRole, HandshakeHeader, RetransmissionState};
-use super::crypto::{CipherSuite, SrtpProfile};
-use super::{DTLS_VERSION_1_2, MAX_HANDSHAKE_SIZE, MAX_FLIGHT_SIZE};
+use super::{DTLS_VERSION_1_2, MAX_FLIGHT_SIZE, MAX_HANDSHAKE_SIZE};
 use getrandom::getrandom;
 
 /// Maximum number of cipher suites in ClientHello.
@@ -125,81 +125,81 @@ pub enum HandshakeState {
     // =========== Common States ===========
     /// Initial state (before handshake starts).
     New = 0,
-    
+
     // =========== Client States ===========
     /// Client sent ClientHello, waiting for server flight.
     ClientHelloSent = 1,
-    
+
     // =========== Server States ===========
     /// Server received ClientHello.
     ClientHelloReceived = 2,
-    
+
     // =========== Shared States ===========
     /// ServerHelloDone received (client) or sent (server).
     ServerHelloDone = 3,
-    
+
     /// Client sent ClientKeyExchange.
     ClientKeyExchangeSent = 4,
-    
+
     /// Server received ClientKeyExchange.
     ClientKeyExchangeReceived = 5,
-    
+
     /// Client sent ChangeCipherSpec.
     ChangeCipherSpecSent = 6,
-    
+
     /// Server received ChangeCipherSpec.
     ChangeCipherSpecReceived = 7,
-    
+
     /// Client sent Finished.
     FinishedSent = 8,
-    
+
     /// Server received Finished.
     FinishedReceived = 9,
-    
+
     /// Handshake complete - secure connection established.
     Established = 10,
-    
+
     // =========== Terminal States ===========
     /// Handshake failed (timeout, verification, protocol error).
     Failed = 11,
-    
+
     /// Connection closed gracefully.
     Closed = 12,
-    
+
     // =========== Legacy States (for compatibility) ===========
     /// Waiting for HelloVerifyRequest (legacy).
     WaitingHelloVerifyRequest = 20,
-    
+
     /// Waiting for ServerHello (legacy).
     WaitingServerHello = 21,
-    
+
     /// Waiting for Certificate (legacy).
     WaitingCertificate = 22,
-    
+
     /// Waiting for ServerKeyExchange (legacy).
     WaitingServerKeyExchange = 23,
-    
+
     /// Waiting for CertificateRequest (legacy).
     WaitingCertificateRequest = 24,
-    
+
     /// Waiting for ServerHelloDone (legacy).
     WaitingServerHelloDone = 25,
-    
+
     /// Waiting for ClientKeyExchange (legacy).
     WaitingClientKeyExchange = 26,
-    
+
     /// Waiting for CertificateVerify (legacy).
     WaitingCertificateVerify = 27,
-    
+
     /// Waiting for ChangeCipherSpec (legacy).
     WaitingChangeCipherSpec = 28,
-    
+
     /// Waiting for Finished (legacy).
     WaitingFinished = 29,
-    
+
     /// Complete (legacy alias).
     Complete = 30,
-    
+
     /// Initial (legacy alias).
     Initial = 31,
 }
@@ -210,19 +210,22 @@ impl HandshakeState {
     pub const fn is_complete(self) -> bool {
         matches!(self, Self::Established | Self::Complete)
     }
-    
+
     /// Returns true if handshake has failed.
     #[inline]
     pub const fn is_failed(self) -> bool {
         matches!(self, Self::Failed)
     }
-    
+
     /// Returns true if state is terminal (no more transitions allowed).
     #[inline]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Failed | Self::Closed | Self::Established | Self::Complete)
+        matches!(
+            self,
+            Self::Failed | Self::Closed | Self::Established | Self::Complete
+        )
     }
-    
+
     /// Check if transition to next state is valid.
     ///
     /// Implements explicit state transition matrix per RFC 6347.
@@ -240,7 +243,7 @@ impl HandshakeState {
             (Self::Initial, Self::ClientHelloSent) => true,
             (Self::Initial, Self::WaitingServerHello) => true,
             (Self::Initial, Self::WaitingClientKeyExchange) => true,
-            
+
             // ClientHelloSent -> ServerHelloDone or Failed
             (Self::ClientHelloSent, Self::ServerHelloDone) => true,
             (Self::ClientHelloSent, Self::WaitingServerHello) => true,
@@ -248,39 +251,39 @@ impl HandshakeState {
             (Self::WaitingServerHello, Self::ServerHelloDone) => true,
             (Self::WaitingServerHello, Self::WaitingCertificate) => true,
             (Self::WaitingServerHello, Self::Failed) => true,
-            
+
             // ClientHelloReceived -> ServerHelloDone (server sends flight)
             (Self::ClientHelloReceived, Self::ServerHelloDone) => true,
             (Self::WaitingClientKeyExchange, Self::WaitingChangeCipherSpec) => true,
             (Self::WaitingClientKeyExchange, Self::ClientKeyExchangeReceived) => true,
-            
+
             // ServerHelloDone -> ClientKeyExchange states
             (Self::ServerHelloDone, Self::ClientKeyExchangeSent) => true,
             (Self::ServerHelloDone, Self::ClientKeyExchangeReceived) => true,
             (Self::ServerHelloDone, Self::WaitingClientKeyExchange) => true,
-            
+
             // ClientKeyExchange -> ChangeCipherSpec states
             (Self::ClientKeyExchangeSent, Self::ChangeCipherSpecSent) => true,
             (Self::ClientKeyExchangeReceived, Self::ChangeCipherSpecReceived) => true,
             (Self::ClientKeyExchangeReceived, Self::WaitingChangeCipherSpec) => true,
-            
+
             // ChangeCipherSpec -> Finished states
             (Self::ChangeCipherSpecSent, Self::FinishedSent) => true,
             (Self::ChangeCipherSpecReceived, Self::FinishedReceived) => true,
             (Self::WaitingChangeCipherSpec, Self::WaitingFinished) => true,
             (Self::WaitingChangeCipherSpec, Self::ChangeCipherSpecReceived) => true,
-            
+
             // Finished -> Established
             (Self::FinishedSent, Self::Established) => true,
             (Self::FinishedReceived, Self::Established) => true,
             (Self::WaitingFinished, Self::Established) => true,
             (Self::WaitingFinished, Self::Complete) => true,
             (Self::WaitingFinished, Self::FinishedReceived) => true,
-            
+
             // Established -> Closed
             (Self::Established, Self::Closed) => true,
             (Self::Complete, Self::Closed) => true,
-            
+
             // Any non-terminal -> Failed
             (Self::New, Self::Failed) => true,
             (Self::Initial, Self::Failed) => true,
@@ -301,12 +304,12 @@ impl HandshakeState {
             (Self::WaitingCertificateVerify, Self::Failed) => true,
             (Self::WaitingChangeCipherSpec, Self::Failed) => true,
             (Self::WaitingFinished, Self::Failed) => true,
-            
+
             // All other transitions are invalid
             _ => false,
         }
     }
-    
+
     /// Attempt to transition to next state with validation.
     ///
     /// # Returns
@@ -320,16 +323,17 @@ impl HandshakeState {
         // Precondition: check transition validity
         if !self.can_transition_to(next) {
             return Err(DtlsError::invalid_state(format!(
-                "invalid transition from {:?} to {:?}", *self, next
+                "invalid transition from {:?} to {:?}",
+                *self, next
             )));
         }
-        
+
         let old_state = *self;
         *self = next;
-        
+
         // Postcondition: state must have changed (or be idempotent)
         debug_assert!(old_state != next || old_state == next);
-        
+
         Ok(())
     }
 }
@@ -348,22 +352,22 @@ impl HandshakeState {
 pub struct Flight {
     /// Flight number (1-4 for DTLS handshake).
     pub number: u8,
-    
+
     /// Messages in this flight (up to MAX_FLIGHT_SIZE).
     pub messages: [[u8; 1500]; 8],
-    
+
     /// Length of each message.
     pub message_lengths: [u16; 8],
-    
+
     /// Number of messages in flight.
     pub message_count: u8,
-    
+
     /// Combined flight data for retransmission.
     pub combined: [u8; 8192],
-    
+
     /// Combined data length.
     pub combined_len: u16,
-    
+
     /// Retransmission state.
     pub retransmit: RetransmissionState,
 }
@@ -371,15 +375,15 @@ pub struct Flight {
 impl Flight {
     /// Maximum messages per flight.
     pub const MAX_MESSAGES: u8 = 8;
-    
+
     /// Maximum combined flight size.
     pub const MAX_SIZE: usize = 8192;
-    
+
     /// Create new empty flight.
     pub fn new(number: u8) -> Self {
         // Precondition: flight number must be 1-4
         assert!(number >= 1 && number <= 4, "flight number must be 1-4");
-        
+
         Self {
             number,
             messages: [[0u8; 1500]; 8],
@@ -390,7 +394,7 @@ impl Flight {
             retransmit: RetransmissionState::new(),
         }
     }
-    
+
     /// Add a message to the flight.
     ///
     /// # Returns
@@ -404,38 +408,38 @@ impl Flight {
         if self.message_count >= Self::MAX_MESSAGES {
             return Err(DtlsError::handshake_failed("flight full: max 8 messages"));
         }
-        
+
         // Precondition: message fits
         if message.len() > 1500 {
             return Err(DtlsError::handshake_failed("message too large for flight"));
         }
-        
+
         let idx = self.message_count as usize;
         self.messages[idx][..message.len()].copy_from_slice(message);
         self.message_lengths[idx] = message.len() as u16;
         self.message_count += 1;
-        
+
         // Update combined buffer
         let new_combined_len = self.combined_len as usize + message.len();
         if new_combined_len > Self::MAX_SIZE {
             return Err(DtlsError::handshake_failed("flight exceeds max size"));
         }
-        
+
         self.combined[self.combined_len as usize..new_combined_len].copy_from_slice(message);
         self.combined_len = new_combined_len as u16;
-        
+
         // Postcondition: message count increased
         assert!(self.message_count <= Self::MAX_MESSAGES);
-        
+
         Ok(())
     }
-    
+
     /// Get combined flight data for transmission.
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.combined[..self.combined_len as usize]
     }
-    
+
     /// Reset the flight for a new attempt.
     pub fn reset(&mut self) {
         self.message_count = 0;
@@ -459,25 +463,25 @@ const _: () = assert!(std::mem::size_of::<Flight>() < 32768);
 pub struct FragmentBuffer {
     /// Fragment data storage.
     pub fragments: [[u8; 1400]; 8],
-    
+
     /// Length of each fragment.
     pub fragment_lengths: [u16; 8],
-    
+
     /// Offset of each fragment in the original message.
     pub fragment_offsets: [u32; 8],
-    
+
     /// Number of fragments received.
     pub fragment_count: u8,
-    
+
     /// Total message length.
     pub total_length: u32,
-    
+
     /// Message sequence number.
     pub message_seq: u16,
-    
+
     /// Handshake message type.
     pub msg_type: u8,
-    
+
     /// Bitmap of received fragments (for gap detection).
     pub received_bitmap: u64,
 }
@@ -485,13 +489,13 @@ pub struct FragmentBuffer {
 impl FragmentBuffer {
     /// Maximum fragments allowed.
     pub const MAX_FRAGMENTS: u8 = 8;
-    
+
     /// Maximum bytes per fragment.
     pub const MAX_FRAGMENT_SIZE: usize = 1400;
-    
+
     /// Maximum total message size.
     pub const MAX_MESSAGE_SIZE: u32 = 4096;
-    
+
     /// Create new empty fragment buffer.
     pub fn new() -> Self {
         Self {
@@ -505,7 +509,7 @@ impl FragmentBuffer {
             received_bitmap: 0,
         }
     }
-    
+
     /// Add a fragment to the buffer.
     ///
     /// # Returns
@@ -525,23 +529,27 @@ impl FragmentBuffer {
         total_length: u32,
     ) -> Result<bool, DtlsError> {
         // Precondition: fragment data fits
-        assert!(fragment_data.len() <= Self::MAX_FRAGMENT_SIZE, 
-            "fragment exceeds max size");
-        
+        assert!(
+            fragment_data.len() <= Self::MAX_FRAGMENT_SIZE,
+            "fragment exceeds max size"
+        );
+
         // Precondition: offset + length <= total
-        assert!(fragment_offset + fragment_data.len() as u32 <= total_length,
-            "fragment extends beyond message");
-        
+        assert!(
+            fragment_offset + fragment_data.len() as u32 <= total_length,
+            "fragment extends beyond message"
+        );
+
         // Validate total length
         if total_length > Self::MAX_MESSAGE_SIZE {
             return Err(DtlsError::handshake_failed("handshake message too large"));
         }
-        
+
         // Check fragment count
         if self.fragment_count >= Self::MAX_FRAGMENTS {
             return Err(DtlsError::handshake_failed("too many fragments"));
         }
-        
+
         // Initialize or validate message identity
         if self.fragment_count == 0 {
             self.msg_type = msg_type;
@@ -550,23 +558,23 @@ impl FragmentBuffer {
         } else if self.message_seq != message_seq || self.total_length != total_length {
             return Err(DtlsError::handshake_failed("fragment sequence mismatch"));
         }
-        
+
         // Store fragment
         let idx = self.fragment_count as usize;
         self.fragments[idx][..fragment_data.len()].copy_from_slice(fragment_data);
         self.fragment_lengths[idx] = fragment_data.len() as u16;
         self.fragment_offsets[idx] = fragment_offset;
         self.fragment_count += 1;
-        
+
         // Check if complete
         let is_complete = self.is_complete();
-        
+
         // Postcondition: fragment count bounded
         assert!(self.fragment_count <= Self::MAX_FRAGMENTS);
-        
+
         Ok(is_complete)
     }
-    
+
     /// Check if all fragments have been received.
     ///
     /// Verifies coverage from offset 0 to total_length.
@@ -574,42 +582,43 @@ impl FragmentBuffer {
         if self.fragment_count == 0 || self.total_length == 0 {
             return false;
         }
-        
+
         // Sort fragments by offset and check coverage
         let mut coverage = 0u32;
         let mut sorted_indices: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-        
+
         // Simple bubble sort (max 8 elements, bounded)
         for i in 0..self.fragment_count as usize {
             for j in (i + 1)..self.fragment_count as usize {
-                if self.fragment_offsets[sorted_indices[j] as usize] 
-                   < self.fragment_offsets[sorted_indices[i] as usize] {
+                if self.fragment_offsets[sorted_indices[j] as usize]
+                    < self.fragment_offsets[sorted_indices[i] as usize]
+                {
                     sorted_indices.swap(i, j);
                 }
             }
         }
-        
+
         // Check coverage (bounded loop)
         for i in 0..self.fragment_count as usize {
             let idx = sorted_indices[i] as usize;
             let offset = self.fragment_offsets[idx];
             let length = self.fragment_lengths[idx] as u32;
-            
+
             // Gap detection
             if offset > coverage {
                 return false;
             }
-            
+
             // Extend coverage
             let new_coverage = offset + length;
             if new_coverage > coverage {
                 coverage = new_coverage;
             }
         }
-        
+
         coverage >= self.total_length
     }
-    
+
     /// Assemble complete message into output buffer.
     ///
     /// # Preconditions
@@ -621,29 +630,31 @@ impl FragmentBuffer {
     pub fn assemble(&self, output: &mut [u8]) -> Result<usize, DtlsError> {
         // Precondition: must be complete
         assert!(self.is_complete(), "cannot assemble incomplete message");
-        
+
         // Precondition: output buffer must be large enough
-        assert!(output.len() >= self.total_length as usize,
-            "output buffer too small");
-        
+        assert!(
+            output.len() >= self.total_length as usize,
+            "output buffer too small"
+        );
+
         // Copy fragments in order (bounded loop)
         for i in 0..self.fragment_count as usize {
             let offset = self.fragment_offsets[i] as usize;
             let length = self.fragment_lengths[i] as usize;
             let frag_data = &self.fragments[i][..length];
-            
+
             // Bounds check before copy
             if offset + length <= output.len() {
                 output[offset..offset + length].copy_from_slice(frag_data);
             }
         }
-        
+
         // Postcondition: return total length
         assert!(self.total_length <= Self::MAX_MESSAGE_SIZE);
-        
+
         Ok(self.total_length as usize)
     }
-    
+
     /// Reset the buffer for a new message.
     pub fn reset(&mut self) {
         self.fragment_count = 0;
@@ -671,7 +682,7 @@ const _: () = assert!(std::mem::size_of::<FragmentBuffer>() < 16384);
 pub struct Random {
     /// GMT Unix time.
     pub gmt_unix_time: u32,
-    
+
     /// Random bytes.
     pub random_bytes: [u8; 28],
 }
@@ -679,47 +690,47 @@ pub struct Random {
 impl Random {
     /// Size in bytes.
     pub const SIZE: usize = 32;
-    
+
     /// Generate new random.
     pub fn generate() -> Self {
         let gmt_unix_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as u32;
-        
+
         let mut random_bytes = [0u8; 28];
         getrandom(&mut random_bytes).expect("getrandom failed");
-        
+
         Self {
             gmt_unix_time,
             random_bytes,
         }
     }
-    
+
     /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < Self::SIZE {
             return None;
         }
-        
+
         let gmt_unix_time = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let mut random_bytes = [0u8; 28];
         random_bytes.copy_from_slice(&data[4..32]);
-        
+
         Some(Self {
             gmt_unix_time,
             random_bytes,
         })
     }
-    
+
     /// Encode to bytes.
     pub fn encode(&self, buf: &mut [u8]) {
         assert!(buf.len() >= Self::SIZE, "buffer too small");
-        
+
         buf[0..4].copy_from_slice(&self.gmt_unix_time.to_be_bytes());
         buf[4..32].copy_from_slice(&self.random_bytes);
     }
-    
+
     /// Get as 32-byte array.
     pub fn as_bytes(&self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -733,7 +744,7 @@ impl Random {
 pub struct SessionId {
     /// Session ID bytes.
     pub bytes: [u8; 32],
-    
+
     /// Length.
     pub len: u8,
 }
@@ -746,24 +757,24 @@ impl SessionId {
             len: 0,
         }
     }
-    
+
     /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
         if data.is_empty() {
             return None;
         }
-        
+
         let len = data[0] as usize;
         if data.len() < 1 + len || len > 32 {
             return None;
         }
-        
+
         let mut session_id = Self::empty();
         session_id.len = len as u8;
         if len > 0 {
             session_id.bytes[..len].copy_from_slice(&data[1..1 + len]);
         }
-        
+
         Some((session_id, 1 + len))
     }
 }
@@ -773,7 +784,7 @@ impl SessionId {
 pub struct Cookie {
     /// Cookie bytes.
     pub bytes: [u8; 255],
-    
+
     /// Length.
     pub len: u8,
 }
@@ -786,36 +797,36 @@ impl Cookie {
             len: 0,
         }
     }
-    
+
     /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Option<(Self, usize)> {
         if data.is_empty() {
             return None;
         }
-        
+
         let len = data[0] as usize;
         if data.len() < 1 + len {
             return None;
         }
-        
+
         let mut cookie = Self::empty();
         cookie.len = len as u8;
         if len > 0 {
             cookie.bytes[..len].copy_from_slice(&data[1..1 + len]);
         }
-        
+
         Some((cookie, 1 + len))
     }
-    
+
     /// Encode to bytes.
     pub fn encode(&self, buf: &mut [u8]) -> usize {
         assert!(buf.len() > self.len as usize, "buffer too small");
-        
+
         buf[0] = self.len;
         if self.len > 0 {
             buf[1..1 + self.len as usize].copy_from_slice(&self.bytes[..self.len as usize]);
         }
-        
+
         1 + self.len as usize
     }
 }
@@ -860,13 +871,13 @@ impl ClientHandshakeState {
     pub const fn is_complete(self) -> bool {
         matches!(self, Self::Complete)
     }
-    
+
     /// Returns true if handshake has failed.
     #[inline]
     pub const fn is_failed(self) -> bool {
         matches!(self, Self::Failed)
     }
-    
+
     /// Returns true if state is terminal.
     #[inline]
     pub const fn is_terminal(self) -> bool {
@@ -973,7 +984,7 @@ impl DtlsClientHandshake {
     pub const MAX_SRTP_PROFILES: usize = 4;
     /// Handshake timeout in milliseconds.
     pub const HANDSHAKE_TIMEOUT_MS: u64 = 5000;
-    
+
     /// Create a new DTLS client handshake.
     ///
     /// # TigerStyle
@@ -988,7 +999,7 @@ impl DtlsClientHandshake {
             .as_secs() as u32;
         client_random[0..4].copy_from_slice(&gmt_unix_time.to_be_bytes());
         getrandom(&mut client_random[4..]).expect("getrandom failed");
-        
+
         let handshake = Self {
             state: ClientHandshakeState::Initial,
             client_random,
@@ -1012,21 +1023,21 @@ impl DtlsClientHandshake {
             server_certificate: [0u8; 2048],
             server_certificate_len: 0,
         };
-        
+
         // Postcondition: state is Initial
         assert_eq!(handshake.state, ClientHandshakeState::Initial);
         // Postcondition: client random has non-zero bytes
         assert!(handshake.client_random[4..].iter().any(|&b| b != 0));
-        
+
         handshake
     }
-    
+
     /// Get current handshake state.
     #[inline]
     pub fn state(&self) -> ClientHandshakeState {
         self.state
     }
-    
+
     /// Set offered cipher suites.
     ///
     /// # TigerStyle
@@ -1035,15 +1046,15 @@ impl DtlsClientHandshake {
     pub fn set_cipher_suites(&mut self, suites: &[u16]) {
         // Precondition: not too many suites
         assert!(suites.len() <= Self::MAX_CIPHER_SUITES);
-        
+
         let count = suites.len().min(Self::MAX_CIPHER_SUITES);
         self.offered_cipher_suites[..count].copy_from_slice(&suites[..count]);
         self.offered_cipher_suite_count = count as u8;
-        
+
         // Postcondition: count is bounded
         assert!(self.offered_cipher_suite_count as usize <= Self::MAX_CIPHER_SUITES);
     }
-    
+
     /// Set offered SRTP profiles.
     ///
     /// # TigerStyle
@@ -1052,45 +1063,45 @@ impl DtlsClientHandshake {
     pub fn set_srtp_profiles(&mut self, profiles: &[u16]) {
         // Precondition: not too many profiles
         assert!(profiles.len() <= Self::MAX_SRTP_PROFILES);
-        
+
         let count = profiles.len().min(Self::MAX_SRTP_PROFILES);
         self.offered_srtp_profiles[..count].copy_from_slice(&profiles[..count]);
         self.offered_srtp_profile_count = count as u8;
-        
+
         // Postcondition: count is bounded
         assert!(self.offered_srtp_profile_count as usize <= Self::MAX_SRTP_PROFILES);
     }
-    
+
     /// Get transcript hash data.
     #[inline]
     pub fn transcript_data(&self) -> &[u8] {
         &self.transcript_hash[..self.transcript_len as usize]
     }
-    
+
     /// Get the selected cipher suite.
     #[inline]
     pub fn cipher_suite(&self) -> CipherSuite {
         self.cipher_suite
     }
-    
+
     /// Get the selected SRTP profile.
     #[inline]
     pub fn srtp_profile(&self) -> SrtpProfile {
         self.srtp_profile
     }
-    
+
     /// Get the client random.
     #[inline]
     pub fn client_random(&self) -> &[u8; 32] {
         &self.client_random
     }
-    
+
     /// Get the server random.
     #[inline]
     pub fn server_random(&self) -> &[u8; 32] {
         &self.server_random
     }
-    
+
     /// Derive SRTP keying material.
     ///
     /// Returns SRTP keys derived from the master secret.
@@ -1103,10 +1114,10 @@ impl DtlsClientHandshake {
         if !self.state.is_complete() {
             return Err(DtlsError::NotEstablished);
         }
-        
+
         // Precondition: master secret must be set
         assert!(self.master_secret.iter().any(|&b| b != 0));
-        
+
         // Export SRTP keying material using existing function
         let srtp_material = super::crypto::export_srtp_keys(
             &self.master_secret,
@@ -1114,13 +1125,13 @@ impl DtlsClientHandshake {
             &self.server_random,
             self.srtp_profile,
         );
-        
+
         // Convert to SrtpKeys format
         let mut keys = SrtpKeys::empty();
-        
+
         let key_len = self.srtp_profile.key_length().min(16);
         let salt_len = self.srtp_profile.salt_length().min(14);
-        
+
         keys.client_write_key[..key_len]
             .copy_from_slice(&srtp_material.client_master_key[..key_len]);
         keys.server_write_key[..key_len]
@@ -1129,12 +1140,12 @@ impl DtlsClientHandshake {
             .copy_from_slice(&srtp_material.client_master_salt[..salt_len]);
         keys.server_write_salt[..salt_len]
             .copy_from_slice(&srtp_material.server_master_salt[..salt_len]);
-        
+
         // Postcondition: keys are non-zero
         assert!(keys.client_write_key.iter().any(|&b| b != 0));
         // Postcondition: salts are non-zero
         assert!(keys.client_write_salt.iter().any(|&b| b != 0));
-        
+
         Ok(keys)
     }
 }
@@ -1166,61 +1177,61 @@ const _: () = {
 pub struct HandshakeContext {
     /// Our role.
     pub role: DtlsRole,
-    
+
     /// Current state.
     pub state: HandshakeState,
-    
+
     /// Client random.
     pub client_random: Random,
-    
+
     /// Server random.
     pub server_random: Random,
-    
+
     /// Cookie (for DTLS).
     pub cookie: Cookie,
-    
+
     /// Session ID.
     pub session_id: SessionId,
-    
+
     /// Selected cipher suite.
     pub cipher_suite: Option<CipherSuite>,
-    
+
     /// Message sequence (for handshake messages).
     pub message_seq: u16,
-    
+
     /// Expected message sequence.
     pub expected_seq: u16,
-    
+
     /// Handshake hash buffer.
     pub hash_buffer: [u8; 4096],
-    
+
     /// Handshake hash length.
     pub hash_len: usize,
-    
+
     /// Retransmission state.
     pub retransmit: RetransmissionState,
-    
+
     /// Last flight buffer.
     pub flight_buf: [u8; 4096],
-    
+
     /// Last flight length.
     pub flight_len: usize,
-    
+
     /// Current flight being assembled.
     pub current_flight: Option<Flight>,
-    
+
     /// Fragment buffer for reassembly.
     pub fragment_buffer: FragmentBuffer,
-    
+
     /// Buffered out-of-order messages.
     pub buffered_messages: [[u8; 1500]; 8],
-    
+
     /// Lengths of buffered messages.
     pub buffered_lengths: [u16; 8],
-    
+
     /// Sequence numbers of buffered messages.
     pub buffered_seqs: [u16; 8],
-    
+
     /// Count of buffered messages.
     pub buffered_count: u8,
 }
@@ -1234,13 +1245,13 @@ const _: () = assert!(std::mem::size_of::<HandshakeContext>() < 131072);
 impl HandshakeContext {
     /// Maximum cipher suites to negotiate.
     pub const MAX_CIPHER_SUITES: usize = MAX_CIPHER_SUITES;
-    
+
     /// Maximum extensions to parse.
     pub const MAX_EXTENSIONS: usize = MAX_EXTENSIONS;
-    
+
     /// Maximum SRTP profiles.
     pub const MAX_SRTP_PROFILES: usize = MAX_SRTP_PROFILES;
-    
+
     /// Create new handshake context.
     ///
     /// # TigerStyle
@@ -1251,7 +1262,7 @@ impl HandshakeContext {
             DtlsRole::Client => HandshakeState::Initial,
             DtlsRole::Server => HandshakeState::WaitingClientKeyExchange,
         };
-        
+
         Self {
             role,
             state,
@@ -1275,7 +1286,7 @@ impl HandshakeContext {
             buffered_count: 0,
         }
     }
-    
+
     /// Update handshake hash.
     ///
     /// # TigerStyle
@@ -1283,18 +1294,18 @@ impl HandshakeContext {
     pub fn update_hash(&mut self, data: &[u8]) {
         let remaining = self.hash_buffer.len() - self.hash_len;
         let copy_len = data.len().min(remaining);
-        
+
         self.hash_buffer[self.hash_len..self.hash_len + copy_len]
             .copy_from_slice(&data[..copy_len]);
         self.hash_len += copy_len;
     }
-    
+
     /// Get handshake hash data.
     #[inline]
     pub fn hash_data(&self) -> &[u8] {
         &self.hash_buffer[..self.hash_len]
     }
-    
+
     /// Increment message sequence.
     ///
     /// # TigerStyle
@@ -1305,13 +1316,13 @@ impl HandshakeContext {
         self.message_seq += 1;
         seq
     }
-    
+
     /// Check if message sequence is expected.
     #[inline]
     pub fn check_seq(&self, seq: u16) -> bool {
         seq == self.expected_seq
     }
-    
+
     /// Advance expected sequence.
     ///
     /// # TigerStyle
@@ -1320,7 +1331,7 @@ impl HandshakeContext {
         assert!(self.expected_seq < u16::MAX, "expected sequence overflow");
         self.expected_seq += 1;
     }
-    
+
     /// Buffer an out-of-order message for later processing.
     ///
     /// # Returns
@@ -1334,24 +1345,24 @@ impl HandshakeContext {
         if self.buffered_count >= MAX_BUFFERED_MESSAGES as u8 {
             return Err(DtlsError::handshake_failed("message buffer full"));
         }
-        
+
         // Precondition: message fits
         if data.len() > 1500 {
             return Err(DtlsError::handshake_failed("message too large to buffer"));
         }
-        
+
         let idx = self.buffered_count as usize;
         self.buffered_messages[idx][..data.len()].copy_from_slice(data);
         self.buffered_lengths[idx] = data.len() as u16;
         self.buffered_seqs[idx] = seq;
         self.buffered_count += 1;
-        
+
         // Postcondition: count bounded
         assert!(self.buffered_count <= MAX_BUFFERED_MESSAGES as u8);
-        
+
         Ok(())
     }
-    
+
     /// Get a buffered message by sequence number.
     ///
     /// # TigerStyle
@@ -1364,7 +1375,7 @@ impl HandshakeContext {
         }
         None
     }
-    
+
     /// Start a new flight.
     ///
     /// # TigerStyle
@@ -1373,12 +1384,12 @@ impl HandshakeContext {
         assert!(number >= 1 && number <= 4, "invalid flight number");
         self.current_flight = Some(Flight::new(number));
     }
-    
+
     /// Get current flight for modification.
     pub fn current_flight_mut(&mut self) -> Option<&mut Flight> {
         self.current_flight.as_mut()
     }
-    
+
     /// Finalize current flight and store for retransmission.
     ///
     /// # TigerStyle
@@ -1388,7 +1399,7 @@ impl HandshakeContext {
             if flight.combined_len as usize > self.flight_buf.len() {
                 return Err(DtlsError::handshake_failed("flight too large"));
             }
-            
+
             self.flight_buf[..flight.combined_len as usize]
                 .copy_from_slice(&flight.combined[..flight.combined_len as usize]);
             self.flight_len = flight.combined_len as usize;
@@ -1405,24 +1416,24 @@ pub fn build_client_hello(
     buf: &mut [u8],
 ) -> Result<usize, DtlsError> {
     assert!(buf.len() >= MAX_HANDSHAKE_SIZE, "buffer too small");
-    
+
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // Client version
     buf[offset..offset + 2].copy_from_slice(&DTLS_VERSION_1_2.to_be_bytes());
     offset += 2;
-    
+
     // Random
     ctx.client_random.encode(&mut buf[offset..]);
     offset += Random::SIZE;
-    
+
     // Session ID (empty for new connection)
     buf[offset] = 0;
     offset += 1;
-    
+
     // Cookie
     offset += ctx.cookie.encode(&mut buf[offset..]);
-    
+
     // Cipher suites
     let cipher_suites = [
         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 as u16,
@@ -1434,38 +1445,38 @@ pub fn build_client_hello(
         buf[offset..offset + 2].copy_from_slice(&suite.to_be_bytes());
         offset += 2;
     }
-    
+
     // Compression methods (null only)
     buf[offset] = 1;
     offset += 1;
     buf[offset] = 0; // No compression
     offset += 1;
-    
+
     // Extensions
     let extensions_start = offset;
     offset += 2; // Length placeholder
-    
+
     // SRTP extension (use_srtp)
     if !srtp_profiles.is_empty() {
         buf[offset..offset + 2].copy_from_slice(&14u16.to_be_bytes()); // use_srtp type
         offset += 2;
-        
+
         let srtp_ext_len = 2 + srtp_profiles.len() * 2 + 1;
         buf[offset..offset + 2].copy_from_slice(&(srtp_ext_len as u16).to_be_bytes());
         offset += 2;
-        
+
         buf[offset..offset + 2].copy_from_slice(&((srtp_profiles.len() * 2) as u16).to_be_bytes());
         offset += 2;
-        
+
         for profile in srtp_profiles {
             buf[offset..offset + 2].copy_from_slice(&profile.to_be_bytes());
             offset += 2;
         }
-        
+
         buf[offset] = 0; // No MKI
         offset += 1;
     }
-    
+
     // Signature algorithms extension
     buf[offset..offset + 2].copy_from_slice(&13u16.to_be_bytes()); // signature_algorithms
     offset += 2;
@@ -1475,7 +1486,7 @@ pub fn build_client_hello(
     offset += 2;
     buf[offset..offset + 2].copy_from_slice(&0x0403u16.to_be_bytes()); // ecdsa_secp256r1_sha256
     offset += 2;
-    
+
     // Supported groups extension
     buf[offset..offset + 2].copy_from_slice(&10u16.to_be_bytes()); // supported_groups
     offset += 2;
@@ -1485,11 +1496,12 @@ pub fn build_client_hello(
     offset += 2;
     buf[offset..offset + 2].copy_from_slice(&0x0017u16.to_be_bytes()); // secp256r1
     offset += 2;
-    
+
     // Fill in extensions length
     let extensions_len = offset - extensions_start - 2;
-    buf[extensions_start..extensions_start + 2].copy_from_slice(&(extensions_len as u16).to_be_bytes());
-    
+    buf[extensions_start..extensions_start + 2]
+        .copy_from_slice(&(extensions_len as u16).to_be_bytes());
+
     // Fill in handshake header
     let body_len = offset - HandshakeHeader::SIZE;
     let header = HandshakeHeader {
@@ -1500,10 +1512,10 @@ pub fn build_client_hello(
         fragment_length: body_len as u32,
     };
     header.encode(buf);
-    
+
     // Update handshake hash
     ctx.update_hash(&buf[..offset]);
-    
+
     Ok(offset)
 }
 
@@ -1517,25 +1529,25 @@ pub fn build_client_hello(
 pub struct ClientHelloData {
     /// Client random (32 bytes).
     pub random: Random,
-    
+
     /// Session ID.
     pub session_id: SessionId,
-    
+
     /// Cookie (DTLS).
     pub cookie: Cookie,
-    
+
     /// Cipher suites (bounded array).
     pub cipher_suites: [u16; MAX_CIPHER_SUITES],
-    
+
     /// Number of cipher suites.
     pub cipher_suite_count: u8,
-    
+
     /// SRTP profiles from use_srtp extension.
     pub srtp_profiles: [u16; MAX_SRTP_PROFILES],
-    
+
     /// Number of SRTP profiles.
     pub srtp_profile_count: u8,
-    
+
     /// DTLS version.
     pub version: u16,
 }
@@ -1544,7 +1556,10 @@ impl ClientHelloData {
     /// Create empty ClientHelloData.
     pub const fn empty() -> Self {
         Self {
-            random: Random { gmt_unix_time: 0, random_bytes: [0u8; 28] },
+            random: Random {
+                gmt_unix_time: 0,
+                random_bytes: [0u8; 28],
+            },
             session_id: SessionId::empty(),
             cookie: Cookie::empty(),
             cipher_suites: [0u16; MAX_CIPHER_SUITES],
@@ -1573,10 +1588,10 @@ impl ClientHelloData {
 /// - Bounded loops: max 20 cipher suites, max 10 extensions
 /// - ≥2 assertions
 pub fn parse_client_hello(data: &[u8]) -> Result<ClientHelloData, DtlsError> {
-    // Minimum ClientHello: version(2) + random(32) + session_id_len(1) + cookie_len(1) + 
+    // Minimum ClientHello: version(2) + random(32) + session_id_len(1) + cookie_len(1) +
     //                      cipher_suites_len(2) + compression_len(1) = 39 bytes after header
     const MIN_CLIENT_HELLO_SIZE: usize = HandshakeHeader::SIZE + 39;
-    
+
     // Precondition: minimum size
     if data.len() < MIN_CLIENT_HELLO_SIZE {
         return Err(DtlsError::RecordTooShort {
@@ -1584,136 +1599,169 @@ pub fn parse_client_hello(data: &[u8]) -> Result<ClientHelloData, DtlsError> {
             min: MIN_CLIENT_HELLO_SIZE,
         });
     }
-    
+
     // Parse handshake header
     let header = HandshakeHeader::parse(data)
         .ok_or(DtlsError::handshake_failed("invalid handshake header"))?;
-    
+
     // Assertion: must be ClientHello
     if header.msg_type != HandshakeType::ClientHello as u8 {
         return Err(DtlsError::InvalidHandshakeType(header.msg_type));
     }
-    
+
     let mut result = ClientHelloData::empty();
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // Version (2 bytes)
     if offset + 2 > data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 2 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 2,
+        });
     }
     result.version = u16::from_be_bytes([data[offset], data[offset + 1]]);
     offset += 2;
-    
+
     // Random (32 bytes)
     if offset + 32 > data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 32 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 32,
+        });
     }
-    result.random = Random::parse(&data[offset..])
-        .ok_or(DtlsError::handshake_failed("invalid random"))?;
+    result.random =
+        Random::parse(&data[offset..]).ok_or(DtlsError::handshake_failed("invalid random"))?;
     offset += 32;
-    
+
     // Session ID (variable, 1 byte length + data)
     if offset >= data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 1 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 1,
+        });
     }
     let (session_id, consumed) = SessionId::parse(&data[offset..])
         .ok_or(DtlsError::handshake_failed("invalid session ID"))?;
     result.session_id = session_id;
     offset += consumed;
-    
+
     // Cookie (variable, 1 byte length + data) - DTLS specific
     if offset >= data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 1 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 1,
+        });
     }
-    let (cookie, consumed) = Cookie::parse(&data[offset..])
-        .ok_or(DtlsError::handshake_failed("invalid cookie"))?;
+    let (cookie, consumed) =
+        Cookie::parse(&data[offset..]).ok_or(DtlsError::handshake_failed("invalid cookie"))?;
     result.cookie = cookie;
     offset += consumed;
-    
+
     // Cipher suites (2 byte length + array of u16)
     if offset + 2 > data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 2 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 2,
+        });
     }
     let cipher_suites_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
     offset += 2;
-    
+
     // Bounds check: cipher suites length
     if offset + cipher_suites_len > data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + cipher_suites_len });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + cipher_suites_len,
+        });
     }
-    
+
     // Parse cipher suites (bounded loop)
     let num_suites = cipher_suites_len / 2;
     // Assertion: bounded number of cipher suites
     assert!(num_suites <= MAX_CIPHER_SUITES, "too many cipher suites");
-    
+
     for i in 0..num_suites.min(MAX_CIPHER_SUITES) {
         let suite = u16::from_be_bytes([data[offset], data[offset + 1]]);
         result.cipher_suites[i] = suite;
         result.cipher_suite_count = (i + 1) as u8;
         offset += 2;
     }
-    
+
     // Compression methods (1 byte length + array)
     if offset >= data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 1 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 1,
+        });
     }
     let compression_len = data[offset] as usize;
     offset += 1;
-    
+
     if offset + compression_len > data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + compression_len });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + compression_len,
+        });
     }
     offset += compression_len; // Skip compression methods
-    
+
     // Extensions (optional)
     if offset + 2 <= data.len() {
         let extensions_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        
+
         let extensions_end = offset + extensions_len;
         if extensions_end > data.len() {
-            return Err(DtlsError::RecordTooShort { actual: data.len(), min: extensions_end });
+            return Err(DtlsError::RecordTooShort {
+                actual: data.len(),
+                min: extensions_end,
+            });
         }
-        
+
         // Parse extensions (bounded loop)
         let mut ext_count = 0u8;
         while offset + 4 <= extensions_end && ext_count < MAX_EXTENSIONS as u8 {
             let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let ext_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
-            
+
             if offset + ext_len > extensions_end {
                 break;
             }
-            
+
             // Handle use_srtp extension (type 14)
             if ext_type == 14 && ext_len >= 2 {
                 let profiles_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
                 let mut profile_offset = offset + 2;
                 let num_profiles = profiles_len / 2;
-                
+
                 for i in 0..num_profiles.min(MAX_SRTP_PROFILES) {
                     if profile_offset + 2 <= offset + ext_len {
-                        let profile = u16::from_be_bytes([data[profile_offset], data[profile_offset + 1]]);
+                        let profile =
+                            u16::from_be_bytes([data[profile_offset], data[profile_offset + 1]]);
                         result.srtp_profiles[i] = profile;
                         result.srtp_profile_count = (i + 1) as u8;
                         profile_offset += 2;
                     }
                 }
             }
-            
+
             offset += ext_len;
             ext_count += 1;
         }
     }
-    
+
     // Postcondition: random must be non-zero
-    assert!(result.random.random_bytes.iter().any(|&b| b != 0), 
-        "client random must be non-zero");
+    assert!(
+        result.random.random_bytes.iter().any(|&b| b != 0),
+        "client random must be non-zero"
+    );
     // Postcondition: at least one cipher suite
-    assert!(result.cipher_suite_count > 0, "no cipher suites in ClientHello");
-    
+    assert!(
+        result.cipher_suite_count > 0,
+        "no cipher suites in ClientHello"
+    );
+
     Ok(result)
 }
 
@@ -1739,36 +1787,39 @@ pub fn build_server_hello(
     buf: &mut [u8],
 ) -> Result<usize, DtlsError> {
     // Precondition: buffer must be large enough
-    assert!(buf.len() >= MAX_HANDSHAKE_SIZE, "buffer too small for ServerHello");
-    
+    assert!(
+        buf.len() >= MAX_HANDSHAKE_SIZE,
+        "buffer too small for ServerHello"
+    );
+
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // Server version (DTLS 1.2)
     buf[offset..offset + 2].copy_from_slice(&DTLS_VERSION_1_2.to_be_bytes());
     offset += 2;
-    
+
     // Server random (generate and store)
     ctx.server_random = Random::generate();
     ctx.server_random.encode(&mut buf[offset..]);
     offset += Random::SIZE;
-    
+
     // Session ID (empty for new session)
     buf[offset] = 0;
     offset += 1;
-    
+
     // Selected cipher suite
     buf[offset..offset + 2].copy_from_slice(&(selected_cipher_suite as u16).to_be_bytes());
     offset += 2;
     ctx.cipher_suite = Some(selected_cipher_suite);
-    
+
     // Compression method (null)
     buf[offset] = 0;
     offset += 1;
-    
+
     // Extensions
     let extensions_start = offset;
     offset += 2; // Length placeholder
-    
+
     // use_srtp extension (if SRTP profile selected)
     if let Some(profile) = selected_srtp_profile {
         buf[offset..offset + 2].copy_from_slice(&14u16.to_be_bytes()); // use_srtp type
@@ -1782,11 +1833,12 @@ pub fn build_server_hello(
         buf[offset] = 0; // No MKI
         offset += 1;
     }
-    
+
     // Fill in extensions length
     let extensions_len = offset - extensions_start - 2;
-    buf[extensions_start..extensions_start + 2].copy_from_slice(&(extensions_len as u16).to_be_bytes());
-    
+    buf[extensions_start..extensions_start + 2]
+        .copy_from_slice(&(extensions_len as u16).to_be_bytes());
+
     // Fill in handshake header
     let body_len = offset - HandshakeHeader::SIZE;
     let header = HandshakeHeader {
@@ -1797,14 +1849,14 @@ pub fn build_server_hello(
         fragment_length: body_len as u32,
     };
     header.encode(buf);
-    
+
     // Update handshake hash
     ctx.update_hash(&buf[..offset]);
-    
+
     // Postcondition: output length must be valid
     assert!(offset > 0, "ServerHello output length must be > 0");
     assert!(offset < MAX_HANDSHAKE_SIZE, "ServerHello exceeds max size");
-    
+
     Ok(offset)
 }
 
@@ -1831,28 +1883,31 @@ pub fn build_certificate(
     // Precondition: certificate size
     assert!(cert_der.len() <= 2048, "certificate too large");
     // Precondition: buffer size
-    assert!(buf.len() >= 4096, "buffer too small for Certificate message");
-    
+    assert!(
+        buf.len() >= 4096,
+        "buffer too small for Certificate message"
+    );
+
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // Certificates list length (3 bytes) - includes certificate length field
     let total_certs_len = 3 + cert_der.len(); // 3-byte length + cert data
     buf[offset] = ((total_certs_len >> 16) & 0xFF) as u8;
     buf[offset + 1] = ((total_certs_len >> 8) & 0xFF) as u8;
     buf[offset + 2] = (total_certs_len & 0xFF) as u8;
     offset += 3;
-    
+
     // Certificate length (3 bytes)
     let cert_len = cert_der.len();
     buf[offset] = ((cert_len >> 16) & 0xFF) as u8;
     buf[offset + 1] = ((cert_len >> 8) & 0xFF) as u8;
     buf[offset + 2] = (cert_len & 0xFF) as u8;
     offset += 3;
-    
+
     // Certificate DER bytes
     buf[offset..offset + cert_len].copy_from_slice(cert_der);
     offset += cert_len;
-    
+
     // Fill in handshake header
     let body_len = offset - HandshakeHeader::SIZE;
     let header = HandshakeHeader {
@@ -1863,13 +1918,16 @@ pub fn build_certificate(
         fragment_length: body_len as u32,
     };
     header.encode(buf);
-    
+
     // Update handshake hash
     ctx.update_hash(&buf[..offset]);
-    
+
     // Postcondition: total length must be bounded
-    assert!(offset < MAX_HANDSHAKE_SIZE, "Certificate message exceeds max size");
-    
+    assert!(
+        offset < MAX_HANDSHAKE_SIZE,
+        "Certificate message exceeds max size"
+    );
+
     Ok(offset)
 }
 
@@ -1894,43 +1952,50 @@ pub fn build_server_key_exchange(
     buf: &mut [u8],
 ) -> Result<usize, DtlsError> {
     // Precondition: public key format
-    assert_eq!(ecdhe_public_key.len(), 65, "ECDHE public key must be 65 bytes");
-    assert_eq!(ecdhe_public_key[0], 0x04, "ECDHE public key must be uncompressed");
+    assert_eq!(
+        ecdhe_public_key.len(),
+        65,
+        "ECDHE public key must be 65 bytes"
+    );
+    assert_eq!(
+        ecdhe_public_key[0], 0x04,
+        "ECDHE public key must be uncompressed"
+    );
     // Precondition: buffer size
     assert!(buf.len() >= MAX_HANDSHAKE_SIZE, "buffer too small");
-    
+
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // EC curve type: named_curve (3)
     buf[offset] = 3;
     offset += 1;
-    
+
     // Named curve: secp256r1 (0x0017)
     buf[offset..offset + 2].copy_from_slice(&0x0017u16.to_be_bytes());
     offset += 2;
-    
+
     // Public key length (1 byte)
     buf[offset] = 65;
     offset += 1;
-    
+
     // Public key (65 bytes)
     buf[offset..offset + 65].copy_from_slice(ecdhe_public_key);
     offset += 65;
-    
+
     // Signature algorithm: ecdsa_secp256r1_sha256 (0x0403)
     buf[offset..offset + 2].copy_from_slice(&0x0403u16.to_be_bytes());
     offset += 2;
-    
+
     // Signature length (2 bytes)
     let sig_len = signature.len();
     assert!(sig_len <= 256, "signature too large");
     buf[offset..offset + 2].copy_from_slice(&(sig_len as u16).to_be_bytes());
     offset += 2;
-    
+
     // Signature bytes
     buf[offset..offset + sig_len].copy_from_slice(signature);
     offset += sig_len;
-    
+
     // Fill in handshake header
     let body_len = offset - HandshakeHeader::SIZE;
     let header = HandshakeHeader {
@@ -1941,13 +2006,16 @@ pub fn build_server_key_exchange(
         fragment_length: body_len as u32,
     };
     header.encode(buf);
-    
+
     // Update handshake hash
     ctx.update_hash(&buf[..offset]);
-    
+
     // Postcondition: output must be bounded
-    assert!(offset < MAX_HANDSHAKE_SIZE, "ServerKeyExchange exceeds max size");
-    
+    assert!(
+        offset < MAX_HANDSHAKE_SIZE,
+        "ServerKeyExchange exceeds max size"
+    );
+
     Ok(offset)
 }
 
@@ -1970,8 +2038,11 @@ pub fn build_server_hello_done(
     buf: &mut [u8],
 ) -> Result<usize, DtlsError> {
     // Precondition: buffer size
-    assert!(buf.len() >= HandshakeHeader::SIZE, "buffer too small for ServerHelloDone");
-    
+    assert!(
+        buf.len() >= HandshakeHeader::SIZE,
+        "buffer too small for ServerHelloDone"
+    );
+
     // ServerHelloDone has empty body
     let header = HandshakeHeader {
         msg_type: HandshakeType::ServerHelloDone as u8,
@@ -1981,13 +2052,17 @@ pub fn build_server_hello_done(
         fragment_length: 0,
     };
     header.encode(buf);
-    
+
     // Update handshake hash
     ctx.update_hash(&buf[..HandshakeHeader::SIZE]);
-    
+
     // Postcondition: output length is exactly header size
-    assert_eq!(HandshakeHeader::SIZE, 12, "HandshakeHeader::SIZE must be 12");
-    
+    assert_eq!(
+        HandshakeHeader::SIZE,
+        12,
+        "HandshakeHeader::SIZE must be 12"
+    );
+
     Ok(HandshakeHeader::SIZE)
 }
 
@@ -2014,45 +2089,59 @@ pub fn parse_client_key_exchange(data: &[u8]) -> Result<[u8; 65], DtlsError> {
             min: HandshakeHeader::SIZE + 1,
         });
     }
-    
+
     // Parse handshake header
     let header = HandshakeHeader::parse(data)
         .ok_or(DtlsError::handshake_failed("invalid handshake header"))?;
-    
+
     // Assertion: must be ClientKeyExchange
     if header.msg_type != HandshakeType::ClientKeyExchange as u8 {
         return Err(DtlsError::InvalidHandshakeType(header.msg_type));
     }
-    
+
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // Public key length (1 byte)
     if offset >= data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 1 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 1,
+        });
     }
     let key_len = data[offset] as usize;
     offset += 1;
-    
+
     // Bounds check: key length must be 65 (uncompressed P-256)
     if key_len != 65 {
         return Err(DtlsError::handshake_failed(format!(
-            "invalid ECDHE public key length: expected 65, got {}", key_len)));
+            "invalid ECDHE public key length: expected 65, got {}",
+            key_len
+        )));
     }
-    
+
     // Bounds check: data must contain full key
     if offset + 65 > data.len() {
-        return Err(DtlsError::RecordTooShort { actual: data.len(), min: offset + 65 });
+        return Err(DtlsError::RecordTooShort {
+            actual: data.len(),
+            min: offset + 65,
+        });
     }
-    
+
     // Parse public key
     let mut public_key = [0u8; 65];
     public_key.copy_from_slice(&data[offset..offset + 65]);
-    
+
     // Postcondition: first byte must be 0x04 (uncompressed marker)
-    assert_eq!(public_key[0], 0x04, "ECDHE public key must be uncompressed format");
+    assert_eq!(
+        public_key[0], 0x04,
+        "ECDHE public key must be uncompressed format"
+    );
     // Postcondition: key must be non-zero
-    assert!(public_key[1..].iter().any(|&b| b != 0), "ECDHE public key must be non-zero");
-    
+    assert!(
+        public_key[1..].iter().any(|&b| b != 0),
+        "ECDHE public key must be non-zero"
+    );
+
     Ok(public_key)
 }
 
@@ -2076,14 +2165,17 @@ pub fn build_finished(
     buf: &mut [u8],
 ) -> Result<usize, DtlsError> {
     // Precondition: buffer size
-    assert!(buf.len() >= HandshakeHeader::SIZE + 12, "buffer too small for Finished");
-    
+    assert!(
+        buf.len() >= HandshakeHeader::SIZE + 12,
+        "buffer too small for Finished"
+    );
+
     let mut offset = HandshakeHeader::SIZE;
-    
+
     // Verify data (12 bytes)
     buf[offset..offset + 12].copy_from_slice(verify_data);
     offset += 12;
-    
+
     // Fill in handshake header
     let header = HandshakeHeader {
         msg_type: HandshakeType::Finished as u8,
@@ -2093,13 +2185,17 @@ pub fn build_finished(
         fragment_length: 12,
     };
     header.encode(buf);
-    
+
     // Update handshake hash
     ctx.update_hash(&buf[..offset]);
-    
+
     // Postcondition: output length must be exactly header + verify_data
-    assert_eq!(offset, HandshakeHeader::SIZE + 12, "Finished message must be exactly 24 bytes");
-    
+    assert_eq!(
+        offset,
+        HandshakeHeader::SIZE + 12,
+        "Finished message must be exactly 24 bytes"
+    );
+
     Ok(offset)
 }
 
@@ -2125,33 +2221,35 @@ pub fn verify_finished(data: &[u8], expected_verify_data: &[u8; 12]) -> Result<(
             min: HandshakeHeader::SIZE + 12,
         });
     }
-    
+
     // Parse handshake header
     let header = HandshakeHeader::parse(data)
         .ok_or(DtlsError::handshake_failed("invalid handshake header"))?;
-    
+
     // Assertion: must be Finished
     if header.msg_type != HandshakeType::Finished as u8 {
         return Err(DtlsError::InvalidHandshakeType(header.msg_type));
     }
-    
+
     // Extract verify data
     let offset = HandshakeHeader::SIZE;
     let received_verify_data = &data[offset..offset + 12];
-    
+
     // Constant-time comparison (security critical!)
     let mut diff = 0u8;
     for i in 0..12 {
         diff |= received_verify_data[i] ^ expected_verify_data[i];
     }
-    
+
     if diff != 0 {
-        return Err(DtlsError::verification_failed("Finished verify_data mismatch"));
+        return Err(DtlsError::verification_failed(
+            "Finished verify_data mismatch",
+        ));
     }
-    
+
     // Postcondition: if we get here, verification passed
     assert_eq!(diff, 0, "verify_data comparison failed");
-    
+
     Ok(())
 }
 
@@ -2169,28 +2267,38 @@ pub fn compute_verify_data(
     is_client: bool,
 ) -> [u8; 12] {
     use super::crypto::prf_sha256;
-    use sha2::{Sha256, Digest};
-    
+    use sha2::{Digest, Sha256};
+
     // Precondition: master secret must be 48 bytes
     assert_eq!(master_secret.len(), 48, "master secret must be 48 bytes");
     // Precondition: handshake hash must be non-empty
-    assert!(!handshake_hash.is_empty(), "handshake hash must not be empty");
-    
+    assert!(
+        !handshake_hash.is_empty(),
+        "handshake hash must not be empty"
+    );
+
     // Compute SHA-256 hash of handshake messages
     let mut hasher = Sha256::new();
     hasher.update(handshake_hash);
     let hash = hasher.finalize();
-    
+
     // Label: "client finished" or "server finished"
-    let label = if is_client { b"client finished" } else { b"server finished" };
-    
+    let label = if is_client {
+        b"client finished"
+    } else {
+        b"server finished"
+    };
+
     // PRF output (12 bytes)
     let mut verify_data = [0u8; 12];
     prf_sha256(master_secret, label, &hash, &mut verify_data);
-    
+
     // Postcondition: verify_data must be non-zero
-    assert!(verify_data.iter().any(|&b| b != 0), "verify_data must be non-zero");
-    
+    assert!(
+        verify_data.iter().any(|&b| b != 0),
+        "verify_data must be non-zero"
+    );
+
     verify_data
 }
 
@@ -2206,10 +2314,10 @@ mod tests {
     fn test_random_generate() {
         let r1 = Random::generate();
         let r2 = Random::generate();
-        
+
         // Should be different
         assert_ne!(r1.random_bytes, r2.random_bytes);
-        
+
         // GMT time should be recent
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2231,31 +2339,31 @@ mod tests {
         let mut cookie = Cookie::empty();
         cookie.bytes[0..4].copy_from_slice(b"test");
         cookie.len = 4;
-        
+
         let mut buf = [0u8; 10];
         let len = cookie.encode(&mut buf);
         assert_eq!(len, 5);
-        
+
         let (parsed, consumed) = Cookie::parse(&buf).unwrap();
         assert_eq!(consumed, 5);
         assert_eq!(parsed.len, 4);
         assert_eq!(&parsed.bytes[0..4], b"test");
     }
-    
+
     #[test]
     fn test_build_server_hello_done() {
         let mut ctx = HandshakeContext::new(DtlsRole::Server);
         let mut buf = [0u8; 64];
-        
+
         let len = build_server_hello_done(&mut ctx, &mut buf).unwrap();
         assert_eq!(len, HandshakeHeader::SIZE);
-        
+
         // Verify header
         let header = HandshakeHeader::parse(&buf).unwrap();
         assert_eq!(header.msg_type, HandshakeType::ServerHelloDone as u8);
         assert_eq!(header.length, 0);
     }
-    
+
     #[test]
     fn test_client_hello_data_empty() {
         let data = ClientHelloData::empty();
@@ -2280,7 +2388,10 @@ mod tests {
     fn test_handshake_state_is_terminal() {
         assert!(matches!(HandshakeState::Failed, HandshakeState::Failed));
         assert!(matches!(HandshakeState::Closed, HandshakeState::Closed));
-        assert!(!matches!(HandshakeState::Established, HandshakeState::Failed));
+        assert!(!matches!(
+            HandshakeState::Established,
+            HandshakeState::Failed
+        ));
     }
 
     // ========================================================================
@@ -2290,7 +2401,7 @@ mod tests {
     #[test]
     fn test_retransmission_state_initial() {
         let state = RetransmissionState::new();
-        
+
         assert_eq!(state.count, 0);
         assert!(state.rto_ms >= 1000, "Initial RTO should be >= 1000ms");
     }
@@ -2306,7 +2417,10 @@ mod tests {
 
     #[test]
     fn test_max_buffered_messages_constant() {
-        assert_eq!(MAX_BUFFERED_MESSAGES, 8, "MAX_BUFFERED_MESSAGES should be 8");
+        assert_eq!(
+            MAX_BUFFERED_MESSAGES, 8,
+            "MAX_BUFFERED_MESSAGES should be 8"
+        );
     }
 
     // ========================================================================
@@ -2315,14 +2429,21 @@ mod tests {
 
     #[test]
     fn test_max_fragment_size_constant() {
-        assert_eq!(MAX_FRAGMENT_SIZE, 1400, "MAX_FRAGMENT_SIZE should be 1400 for MTU compliance");
+        assert_eq!(
+            MAX_FRAGMENT_SIZE, 1400,
+            "MAX_FRAGMENT_SIZE should be 1400 for MTU compliance"
+        );
     }
 
     #[test]
     fn test_max_handshake_size_constant() {
         // Should be defined in parent module
-        assert!(super::super::MAX_HANDSHAKE_SIZE >= 4096, 
-            "MAX_HANDSHAKE_SIZE should be at least 4KB");
+        const {
+            assert!(
+                super::super::MAX_HANDSHAKE_SIZE >= 4096,
+                "MAX_HANDSHAKE_SIZE should be at least 4KB"
+            )
+        };
     }
 
     // ========================================================================
@@ -2334,13 +2455,25 @@ mod tests {
         assert_eq!(HandshakeType::from_u8(0), Some(HandshakeType::HelloRequest));
         assert_eq!(HandshakeType::from_u8(1), Some(HandshakeType::ClientHello));
         assert_eq!(HandshakeType::from_u8(2), Some(HandshakeType::ServerHello));
-        assert_eq!(HandshakeType::from_u8(3), Some(HandshakeType::HelloVerifyRequest));
+        assert_eq!(
+            HandshakeType::from_u8(3),
+            Some(HandshakeType::HelloVerifyRequest)
+        );
         assert_eq!(HandshakeType::from_u8(11), Some(HandshakeType::Certificate));
-        assert_eq!(HandshakeType::from_u8(12), Some(HandshakeType::ServerKeyExchange));
-        assert_eq!(HandshakeType::from_u8(14), Some(HandshakeType::ServerHelloDone));
-        assert_eq!(HandshakeType::from_u8(16), Some(HandshakeType::ClientKeyExchange));
+        assert_eq!(
+            HandshakeType::from_u8(12),
+            Some(HandshakeType::ServerKeyExchange)
+        );
+        assert_eq!(
+            HandshakeType::from_u8(14),
+            Some(HandshakeType::ServerHelloDone)
+        );
+        assert_eq!(
+            HandshakeType::from_u8(16),
+            Some(HandshakeType::ClientKeyExchange)
+        );
         assert_eq!(HandshakeType::from_u8(20), Some(HandshakeType::Finished));
-        
+
         // Invalid types
         assert_eq!(HandshakeType::from_u8(100), None);
         assert_eq!(HandshakeType::from_u8(255), None);
@@ -2360,7 +2493,10 @@ mod tests {
     fn test_cookie_max_size() {
         let cookie = Cookie::empty();
         // Cookie should have bounded size
-        assert!(cookie.bytes.len() <= 255, "Cookie must fit in single byte length");
+        assert!(
+            cookie.bytes.len() <= 255,
+            "Cookie must fit in single byte length"
+        );
     }
 
     // ========================================================================
@@ -2370,11 +2506,11 @@ mod tests {
     #[test]
     fn test_handshake_context_sequence_increment() {
         let mut ctx = HandshakeContext::new(DtlsRole::Client);
-        
+
         let seq1 = ctx.next_seq();
         let seq2 = ctx.next_seq();
         let seq3 = ctx.next_seq();
-        
+
         assert_eq!(seq1, 0);
         assert_eq!(seq2, 1);
         assert_eq!(seq3, 2);
@@ -2388,7 +2524,7 @@ mod tests {
     fn test_verify_finished_too_short() {
         let short_data = [0u8; 10];
         let expected = [0u8; 12];
-        
+
         let result = verify_finished(&short_data, &expected);
         assert!(result.is_err());
     }
@@ -2398,7 +2534,7 @@ mod tests {
         // Create data with wrong handshake type
         let mut data = [0u8; 36];
         data[0] = HandshakeType::ClientHello as u8; // Wrong type
-        
+
         let expected = [0u8; 12];
         let result = verify_finished(&data, &expected);
         assert!(result.is_err());
@@ -2439,10 +2575,10 @@ mod tests {
     fn test_compute_verify_data_deterministic() {
         let master_secret = [0x42u8; 48];
         let handshake_hash = b"test handshake hash data";
-        
+
         let vd1 = compute_verify_data(&master_secret, handshake_hash, true);
         let vd2 = compute_verify_data(&master_secret, handshake_hash, true);
-        
+
         assert_eq!(vd1, vd2, "verify_data should be deterministic");
     }
 
@@ -2450,11 +2586,14 @@ mod tests {
     fn test_compute_verify_data_client_vs_server() {
         let master_secret = [0x42u8; 48];
         let handshake_hash = b"test handshake hash data";
-        
+
         let client_vd = compute_verify_data(&master_secret, handshake_hash, true);
         let server_vd = compute_verify_data(&master_secret, handshake_hash, false);
-        
-        assert_ne!(client_vd, server_vd, "client and server verify_data should differ");
+
+        assert_ne!(
+            client_vd, server_vd,
+            "client and server verify_data should differ"
+        );
     }
 
     // ========================================================================
@@ -2463,7 +2602,11 @@ mod tests {
 
     #[test]
     fn test_handshake_header_size() {
-        assert_eq!(HandshakeHeader::SIZE, 12, "Handshake header should be 12 bytes");
+        assert_eq!(
+            HandshakeHeader::SIZE,
+            12,
+            "Handshake header should be 12 bytes"
+        );
     }
 
     // ========================================================================
@@ -2476,7 +2619,7 @@ mod tests {
         let mut valid_key = [0u8; 65];
         valid_key[0] = 0x04; // Uncompressed point marker
         valid_key[1] = 0x01; // Non-zero coordinate
-        
+
         // This verifies the format expectations
         assert_eq!(valid_key[0], 0x04);
         assert!(valid_key[1..].iter().any(|&b| b != 0));
@@ -2491,9 +2634,9 @@ mod tests {
         let mut ctx = HandshakeContext::new(DtlsRole::Client);
         let verify_data = [0u8; 12];
         let mut buf = [0u8; 64];
-        
+
         let len = build_finished(&mut ctx, &verify_data, &mut buf).unwrap();
-        
+
         // Should be exactly handshake header + verify data
         assert_eq!(len, HandshakeHeader::SIZE + 12);
     }

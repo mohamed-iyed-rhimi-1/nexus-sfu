@@ -200,7 +200,7 @@ impl GossipTransport {
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
-                    &size as *const _ as *const libc::c_void,
+                    std::ptr::from_ref(&size).cast::<libc::c_void>(),
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
                 if result < 0 {
@@ -211,7 +211,7 @@ impl GossipTransport {
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVBUF,
-                    &size as *const _ as *const libc::c_void,
+                    std::ptr::from_ref(&size).cast::<libc::c_void>(),
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
                 if result < 0 {
@@ -288,7 +288,10 @@ impl GossipTransport {
     ///
     /// # Panics
     /// Panics if `messages.len() > MAX_BATCH_SIZE`
-    pub fn send_batch(&mut self, messages: &[(GossipMessage, SocketAddr)]) -> Result<u32, GossipError> {
+    pub fn send_batch(
+        &mut self,
+        messages: &[(GossipMessage, SocketAddr)],
+    ) -> Result<u32, GossipError> {
         assert!(
             messages.len() <= MAX_BATCH_SIZE,
             "batch size {} exceeds MAX_BATCH_SIZE {}",
@@ -313,7 +316,10 @@ impl GossipTransport {
 
     /// Send batch using sendmmsg on Linux.
     #[cfg(target_os = "linux")]
-    fn send_batch_sendmmsg(&mut self, messages: &[(GossipMessage, SocketAddr)]) -> Result<u32, GossipError> {
+    fn send_batch_sendmmsg(
+        &mut self,
+        messages: &[(GossipMessage, SocketAddr)],
+    ) -> Result<u32, GossipError> {
         let num_messages = messages.len();
 
         // Encode all messages
@@ -337,7 +343,8 @@ impl GossipTransport {
             iovecs.push(iov);
 
             // Create sockaddr for destination
-            let mut storage: libc::sockaddr_storage = unsafe { MaybeUninit::zeroed().assume_init() };
+            let mut storage: libc::sockaddr_storage =
+                unsafe { MaybeUninit::zeroed().assume_init() };
             let sockaddr_len = match dest {
                 SocketAddr::V4(addr) => {
                     let sa = &mut storage as *mut _ as *mut libc::sockaddr_in;
@@ -391,7 +398,9 @@ impl GossipTransport {
 
         if result < 0 {
             let err = io::Error::last_os_error();
-            self.stats.send_errors.fetch_add(num_messages as u64, Ordering::Relaxed);
+            self.stats
+                .send_errors
+                .fetch_add(num_messages as u64, Ordering::Relaxed);
             return Err(GossipError::Transport(err));
         }
 
@@ -403,24 +412,31 @@ impl GossipTransport {
         for i in 0..(sent as usize) {
             total_bytes += encoded_messages[i].len() as u64;
         }
-        self.stats.messages_sent.fetch_add(sent as u64, Ordering::Relaxed);
-        self.stats.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
-        self.stats.send_errors.fetch_add(failed as u64, Ordering::Relaxed);
+        self.stats
+            .messages_sent
+            .fetch_add(sent as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_sent
+            .fetch_add(total_bytes, Ordering::Relaxed);
+        self.stats
+            .send_errors
+            .fetch_add(failed as u64, Ordering::Relaxed);
 
         Ok(sent)
     }
 
     /// Send batch using individual sendto calls (fallback for non-Linux).
     #[cfg(not(target_os = "linux"))]
-    fn send_batch_sendto(&mut self, messages: &[(GossipMessage, SocketAddr)]) -> Result<u32, GossipError> {
+    fn send_batch_sendto(
+        &mut self,
+        messages: &[(GossipMessage, SocketAddr)],
+    ) -> Result<u32, GossipError> {
         let mut sent = 0u32;
 
         for (msg, dest) in messages {
-            match self.send(msg, *dest) {
-                Ok(()) => sent += 1,
-                Err(_) => {
-                    // Continue with remaining messages
-                }
+            // Count successes; keep going past individual failures
+            if self.send(msg, *dest).is_ok() {
+                sent += 1;
             }
         }
 
@@ -440,8 +456,11 @@ impl GossipTransport {
 
                 self.stats.record_recv(size as u64);
 
-                let msg = GossipMessage::decode(&self.recv_buffer[..size])
-                    .map_err(|e| GossipError::InvalidMessage { reason: e.to_string() })?;
+                let msg = GossipMessage::decode(&self.recv_buffer[..size]).map_err(|e| {
+                    GossipError::InvalidMessage {
+                        reason: e.to_string(),
+                    }
+                })?;
 
                 Ok((msg, source))
             }
@@ -462,7 +481,10 @@ impl GossipTransport {
     /// # Returns
     /// `Ok((message, source_addr))` if a message was received,
     /// `Err` if timeout or error.
-    pub fn recv_timeout(&mut self, timeout_ms: u64) -> Result<(GossipMessage, SocketAddr), GossipError> {
+    pub fn recv_timeout(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Result<(GossipMessage, SocketAddr), GossipError> {
         // Set timeout
         let timeout = Duration::from_millis(timeout_ms);
         self.socket.set_read_timeout(Some(timeout))?;
@@ -669,7 +691,7 @@ mod tests {
         let mut transport = GossipTransport::new(localhost_addr()).unwrap();
         let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let messages: Vec<(GossipMessage, SocketAddr)> = (0..MAX_BATCH_SIZE + 1)
+        let messages: Vec<(GossipMessage, SocketAddr)> = (0..=MAX_BATCH_SIZE)
             .map(|i| (GossipMessage::Dead { actor_id: i as u64 }, dest))
             .collect();
 

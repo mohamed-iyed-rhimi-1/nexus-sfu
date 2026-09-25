@@ -24,7 +24,7 @@ impl TransportId {
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
-    
+
     /// Get raw ID value.
     #[inline]
     pub const fn value(self) -> u64 {
@@ -95,7 +95,9 @@ impl DtlsFingerprint {
     /// Create SHA-256 fingerprint from hex-colon string (e.g. "AB:CD:EF:...").
     pub fn sha256(hex_value: &str) -> Option<Self> {
         let sdp_str = format!("sha-256 {}", hex_value);
-        SdpFingerprint::parse(&sdp_str).ok().map(|inner| Self { inner })
+        SdpFingerprint::parse(&sdp_str)
+            .ok()
+            .map(|inner| Self { inner })
     }
 
     /// Create from SDP format string (e.g., "sha-256 AB:CD:EF:...").
@@ -146,7 +148,7 @@ impl DtlsParameters {
             fingerprint_count: 0,
         }
     }
-    
+
     /// Add fingerprint. Returns self for chaining.
     pub fn with_fingerprint(mut self, fp: DtlsFingerprint) -> Self {
         if (self.fingerprint_count as usize) < MAX_DTLS_FINGERPRINTS {
@@ -280,9 +282,15 @@ impl std::fmt::Debug for TransportStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransportStats")
             .field("bytes_sent", &self.bytes_sent.load(Ordering::Relaxed))
-            .field("bytes_received", &self.bytes_received.load(Ordering::Relaxed))
+            .field(
+                "bytes_received",
+                &self.bytes_received.load(Ordering::Relaxed),
+            )
             .field("packets_sent", &self.packets_sent.load(Ordering::Relaxed))
-            .field("packets_received", &self.packets_received.load(Ordering::Relaxed))
+            .field(
+                "packets_received",
+                &self.packets_received.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -325,9 +333,8 @@ mod tests {
     #[test]
     fn test_dtls_parameters() {
         let fp = DtlsFingerprint::sha256("AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99").unwrap();
-        let params = DtlsParameters::new(DtlsRole::Client)
-            .with_fingerprint(fp);
-        
+        let params = DtlsParameters::new(DtlsRole::Client).with_fingerprint(fp);
+
         assert_eq!(params.role, DtlsRole::Client);
         assert_eq!(params.fingerprint_count(), 1);
         assert!(params.fingerprint(0).is_some());

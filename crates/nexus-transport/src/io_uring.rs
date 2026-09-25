@@ -259,7 +259,6 @@ pub enum IoUringReceiveMode {
     Recvmmsg,
 }
 
-
 /// io_uring-based UDP transport.
 ///
 /// Provides high-performance UDP I/O using Linux io_uring with:
@@ -327,18 +326,16 @@ impl IoUringTransport {
         })?;
 
         // Create and bind the socket
-        let socket = std::net::UdpSocket::bind(addr).map_err(|source| {
-            TransportError::BindFailed { addr, source }
-        })?;
+        let socket = std::net::UdpSocket::bind(addr)
+            .map_err(|source| TransportError::BindFailed { addr, source })?;
 
-        socket.set_nonblocking(true).map_err(|source| {
-            TransportError::SetSockOptFailed { source }
-        })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|source| TransportError::SetSockOptFailed { source })?;
 
         // Configure high-performance socket (16MB buffers, GRO, GSO)
-        let socket_info = crate::socket_config::configure_high_performance_socket(
-            socket.as_raw_fd()
-        ).ok();
+        let socket_info =
+            crate::socket_config::configure_high_performance_socket(socket.as_raw_fd()).ok();
 
         // Initialize io_uring with SQPOLL if requested
         let ring = Self::init_io_uring(&config)?;
@@ -407,11 +404,10 @@ impl IoUringTransport {
         }
 
         // Fall back to standard io_uring without SQPOLL
-        let ring = IoUring::new(config.sq_entries).map_err(|e| {
-            TransportError::IoUringInitFailed {
+        let ring =
+            IoUring::new(config.sq_entries).map_err(|e| TransportError::IoUringInitFailed {
                 message: format!("io_uring initialization failed: {}", e),
-            }
-        })?;
+            })?;
 
         // Assertion: ring created
         assert!(ring.params().sq_entries() > 0, "ring must have SQ entries");
@@ -439,9 +435,7 @@ impl IoUringTransport {
             return false;
         }
 
-        let release = unsafe {
-            std::ffi::CStr::from_ptr(uname.release.as_ptr()).to_string_lossy()
-        };
+        let release = unsafe { std::ffi::CStr::from_ptr(uname.release.as_ptr()).to_string_lossy() };
 
         let parts: Vec<&str> = release.split('.').collect();
         // Assertion: kernel version has at least major.minor
@@ -450,7 +444,12 @@ impl IoUringTransport {
         }
 
         let major: u32 = parts[0].parse().unwrap_or(0);
-        let minor: u32 = parts[1].split('-').next().unwrap_or("0").parse().unwrap_or(0);
+        let minor: u32 = parts[1]
+            .split('-')
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
 
         // RecvMulti requires kernel 5.19+
         let supported = major > 5 || (major == 5 && minor >= 19);
@@ -496,18 +495,19 @@ impl IoUringTransport {
             .user_data(idx as u64);
 
             unsafe {
-                self.ring
-                    .submission()
-                    .push(&provide_buf)
-                    .map_err(|_| TransportError::IoUringInitFailed {
+                self.ring.submission().push(&provide_buf).map_err(|_| {
+                    TransportError::IoUringInitFailed {
                         message: "failed to submit provide_buffers".to_string(),
-                    })?;
+                    }
+                })?;
             }
         }
 
-        self.ring.submit().map_err(|e| TransportError::IoUringInitFailed {
-            message: format!("failed to submit buffer registration: {}", e),
-        })?;
+        self.ring
+            .submit()
+            .map_err(|e| TransportError::IoUringInitFailed {
+                message: format!("failed to submit buffer registration: {}", e),
+            })?;
 
         // Wait for completions
         self.ring.submit_and_wait(NUM_PROVIDED_BUFFERS).ok();
@@ -563,17 +563,18 @@ impl IoUringTransport {
             .user_data(RECV_MULTI_USER_DATA);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&recv_multi)
-                .map_err(|_| TransportError::IoUringInitFailed {
+            self.ring.submission().push(&recv_multi).map_err(|_| {
+                TransportError::IoUringInitFailed {
                     message: "failed to submit recv_multi".to_string(),
-                })?;
+                }
+            })?;
         }
 
-        self.ring.submit().map_err(|e| TransportError::IoUringInitFailed {
-            message: format!("failed to submit multishot recv: {}", e),
-        })?;
+        self.ring
+            .submit()
+            .map_err(|e| TransportError::IoUringInitFailed {
+                message: format!("failed to submit multishot recv: {}", e),
+            })?;
 
         self.multishot_initialized.store(true, Ordering::Release);
         self.multishot_state = MultishotState::Active;
@@ -611,17 +612,18 @@ impl IoUringTransport {
             .user_data(RECV_MULTI_USER_DATA);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&recv_multi)
-                .map_err(|_| TransportError::IoUringInitFailed {
+            self.ring.submission().push(&recv_multi).map_err(|_| {
+                TransportError::IoUringInitFailed {
                     message: "failed to submit recv_multi re-arm".to_string(),
-                })?;
+                }
+            })?;
         }
 
-        self.ring.submit().map_err(|e| TransportError::IoUringInitFailed {
-            message: format!("failed to submit multishot re-arm: {}", e),
-        })?;
+        self.ring
+            .submit()
+            .map_err(|e| TransportError::IoUringInitFailed {
+                message: format!("failed to submit multishot re-arm: {}", e),
+            })?;
 
         self.multishot_state = MultishotState::Active;
         self.multishot_rearms.fetch_add(1, Ordering::Relaxed);
@@ -788,8 +790,7 @@ impl IoUringTransport {
         for i in 0..max_packets {
             let mut msghdr: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
             msghdr.msg_name = &mut sockaddrs[i] as *mut _ as *mut libc::c_void;
-            msghdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             msghdr.msg_iov = &mut iovecs[i];
             msghdr.msg_iovlen = 1;
 
@@ -1056,17 +1057,14 @@ impl IoUringTransport {
             "recv_buffer_size_bytes must be > 0"
         );
 
-        tracing::warn!(
-            "io_uring not available, using recvmmsg fallback"
-        );
+        tracing::warn!("io_uring not available, using recvmmsg fallback");
 
-        let socket = std::net::UdpSocket::bind(addr).map_err(|source| {
-            TransportError::BindFailed { addr, source }
-        })?;
+        let socket = std::net::UdpSocket::bind(addr)
+            .map_err(|source| TransportError::BindFailed { addr, source })?;
 
-        socket.set_nonblocking(true).map_err(|source| {
-            TransportError::SetSockOptFailed { source }
-        })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|source| TransportError::SetSockOptFailed { source })?;
 
         let recv_buffers = vec![[0u8; MAX_PACKET_SIZE_BYTES]; MAX_BATCH_SIZE];
 
@@ -1233,18 +1231,24 @@ mod tests {
         assert!(config.validate().is_ok());
 
         // Test with non-power-of-2 sq_entries (validation should fail)
-        let mut config = IoUringConfig::default();
-        config.sq_entries = 1000;
+        let config = IoUringConfig {
+            sq_entries: 1000,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         // Test with zero recv_buffer_size
-        let mut config = IoUringConfig::default();
-        config.recv_buffer_size_bytes = 0;
+        let config = IoUringConfig {
+            recv_buffer_size_bytes: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         // Test with zero send_buffer_size
-        let mut config = IoUringConfig::default();
-        config.send_buffer_size_bytes = 0;
+        let config = IoUringConfig {
+            send_buffer_size_bytes: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

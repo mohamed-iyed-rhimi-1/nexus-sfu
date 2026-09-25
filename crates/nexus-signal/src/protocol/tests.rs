@@ -84,7 +84,9 @@ mod roundtrip_tests {
             join.set_participant_name("alice");
         });
         let msg_reader = reader.read_signal_message(&bytes).unwrap();
-        let msg = msg_reader.get_root::<signaling_capnp::signal_message::Reader>().unwrap();
+        let msg = msg_reader
+            .get_root::<signaling_capnp::signal_message::Reader>()
+            .unwrap();
         assert!(msg.has_join());
 
         // Test Offer
@@ -93,7 +95,9 @@ mod roundtrip_tests {
             offer.set_sdp("v=0...");
         });
         let msg_reader = reader.read_signal_message(&bytes).unwrap();
-        let msg = msg_reader.get_root::<signaling_capnp::signal_message::Reader>().unwrap();
+        let msg = msg_reader
+            .get_root::<signaling_capnp::signal_message::Reader>()
+            .unwrap();
         assert!(msg.has_offer());
 
         // Test Answer
@@ -102,7 +106,9 @@ mod roundtrip_tests {
             answer.set_sdp("v=0...");
         });
         let msg_reader = reader.read_signal_message(&bytes).unwrap();
-        let msg = msg_reader.get_root::<signaling_capnp::signal_message::Reader>().unwrap();
+        let msg = msg_reader
+            .get_root::<signaling_capnp::signal_message::Reader>()
+            .unwrap();
         assert!(msg.has_answer());
 
         // Test IceCandidate
@@ -113,7 +119,9 @@ mod roundtrip_tests {
             ice.set_sdp_mline_index(0);
         });
         let msg_reader = reader.read_signal_message(&bytes).unwrap();
-        let msg = msg_reader.get_root::<signaling_capnp::signal_message::Reader>().unwrap();
+        let msg = msg_reader
+            .get_root::<signaling_capnp::signal_message::Reader>()
+            .unwrap();
         assert!(msg.has_ice_candidate());
 
         // Test Leave - use which() to check for Leave variant
@@ -121,7 +129,9 @@ mod roundtrip_tests {
             msg.set_leave(());
         });
         let msg_reader = reader.read_signal_message(&bytes).unwrap();
-        let msg = msg_reader.get_root::<signaling_capnp::signal_message::Reader>().unwrap();
+        let msg = msg_reader
+            .get_root::<signaling_capnp::signal_message::Reader>()
+            .unwrap();
         match msg.which().unwrap() {
             signaling_capnp::signal_message::Which::Leave(()) => {}
             _ => panic!("Expected Leave variant"),

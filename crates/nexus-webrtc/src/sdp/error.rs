@@ -8,59 +8,59 @@ pub enum SdpError {
     /// Invalid SDP format.
     #[error("invalid SDP format: {reason}")]
     InvalidFormat { reason: &'static str },
-    
+
     /// Missing required field.
     #[error("missing required field: {field}")]
     MissingField { field: &'static str },
-    
+
     /// Invalid version.
     #[error("invalid SDP version: {version}")]
     InvalidVersion { version: u8 },
-    
+
     /// Invalid media type.
     #[error("invalid media type: {media_type}")]
     InvalidMediaType { media_type: String },
-    
+
     /// Invalid transport protocol.
     #[error("invalid transport: {transport}")]
     InvalidTransport { transport: String },
-    
+
     /// Invalid attribute.
     #[error("invalid attribute: {name}={value}")]
     InvalidAttribute { name: String, value: String },
-    
+
     /// Too many media sections.
     #[error("too many media sections: {count} > {max}")]
     TooManyMedia { count: usize, max: usize },
-    
+
     /// Too many codecs.
     #[error("too many codecs: {count} > {max}")]
     TooManyCodecs { count: usize, max: usize },
-    
+
     /// Too many candidates.
     #[error("too many ICE candidates: {count} > {max}")]
     TooManyCandidates { count: usize, max: usize },
-    
+
     /// Invalid ICE candidate.
     #[error("invalid ICE candidate: {reason}")]
     InvalidCandidate { reason: &'static str },
-    
+
     /// Invalid DTLS fingerprint.
     #[error("invalid DTLS fingerprint: {reason}")]
     InvalidFingerprint { reason: &'static str },
-    
+
     /// Invalid connection info.
     #[error("invalid connection info: {reason}")]
     InvalidConnection { reason: &'static str },
-    
+
     /// Parse error.
     #[error("parse error at line {line}: {message}")]
     ParseError { line: usize, message: String },
-    
+
     /// SDP too large.
     #[error("SDP too large: {size} > {max}")]
     TooLarge { size: usize, max: usize },
-    
+
     /// Unsupported feature.
     #[error("unsupported feature: {feature}")]
     Unsupported { feature: &'static str },
@@ -98,9 +98,9 @@ pub enum SdpError {
 impl SdpError {
     /// Check if this is a recoverable error.
     pub fn is_recoverable(&self) -> bool {
-        matches!(self, 
-            SdpError::InvalidAttribute { .. } |
-            SdpError::InvalidCandidate { .. }
+        matches!(
+            self,
+            SdpError::InvalidAttribute { .. } | SdpError::InvalidCandidate { .. }
         )
     }
 
@@ -149,12 +149,12 @@ mod tests {
 
     #[test]
     fn test_is_recoverable() {
-        let err = SdpError::InvalidAttribute { 
-            name: "foo".to_string(), 
-            value: "bar".to_string() 
+        let err = SdpError::InvalidAttribute {
+            name: "foo".to_string(),
+            value: "bar".to_string(),
         };
         assert!(err.is_recoverable());
-        
+
         let err = SdpError::InvalidVersion { version: 1 };
         assert!(!err.is_recoverable());
     }

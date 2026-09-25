@@ -85,16 +85,16 @@ impl PacketType {
 
         let first_byte = data[0];
 
-        // DTLS check: content type 20-25 (change_cipher_spec=20, alert=21, 
+        // DTLS check: content type 20-25 (change_cipher_spec=20, alert=21,
         // handshake=22, application_data=23, heartbeat=24, tls12_cid=25)
-        // DTLS records have: content_type (1) + version (2) + epoch (2) + 
+        // DTLS records have: content_type (1) + version (2) + epoch (2) +
         // sequence (6) + length (2) = 13 bytes minimum
         if (20..=25).contains(&first_byte) && data.len() >= 13 {
             return PacketType::Dtls;
         }
 
         // STUN check: magic cookie at bytes 4-7 (0x2112A442)
-        // STUN messages have: type (2) + length (2) + magic (4) + 
+        // STUN messages have: type (2) + length (2) + magic (4) +
         // transaction_id (12) = 20 bytes minimum
         if data.len() >= 20 {
             let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
@@ -111,7 +111,7 @@ impl PacketType {
 
         let second_byte = data[1];
 
-        // RTCP: payload type 200-206 (SR=200, RR=201, SDES=202, BYE=203, 
+        // RTCP: payload type 200-206 (SR=200, RR=201, SDES=202, BYE=203,
         // APP=204, RTPFB=205, PSFB=206)
         // RTCP packets have: V/P/RC (1) + PT (1) + length (2) + SSRC (4) = 8 bytes minimum
         if (200..=206).contains(&second_byte) && data.len() >= 8 {
@@ -119,7 +119,7 @@ impl PacketType {
         }
 
         // RTP: valid payload type (0-34 static, 96-127 dynamic)
-        // RTP packets have: V/P/X/CC (1) + M/PT (1) + seq (2) + 
+        // RTP packets have: V/P/X/CC (1) + M/PT (1) + seq (2) +
         // timestamp (4) + SSRC (4) = 12 bytes minimum
         let pt = second_byte & 0x7F;
         if (pt <= 34 || (96..=127).contains(&pt)) && data.len() >= 12 {
@@ -485,13 +485,10 @@ impl XdpPacketProcessor {
     /// # Errors
     ///
     /// Returns `XdpError` if registration fails.
-    pub fn register_track(
-        &self,
-        ssrc: u32,
-        destinations: &[ForwardEntry],
-    ) -> Result<(), XdpError> {
-        // Assertion: SSRC must be non-zero
-        assert!(ssrc != 0, "SSRC must be non-zero");
+    pub fn register_track(&self, ssrc: u32, destinations: &[ForwardEntry]) -> Result<(), XdpError> {
+        if ssrc == 0 {
+            return Err(XdpError::InvalidConfig("SSRC must be non-zero".into()));
+        }
 
         // Register each destination
         // WHY: In a real SFU, one SSRC may be forwarded to multiple subscribers.
@@ -516,7 +513,9 @@ impl XdpPacketProcessor {
     /// Returns `XdpError` if unregistration fails.
     pub fn unregister_track(&self, ssrc: u32) -> Result<(), XdpError> {
         self.forward_table.remove(ssrc)?;
-        self.stats.tracks_unregistered.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .tracks_unregistered
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -575,19 +574,15 @@ impl XdpPacketProcessor {
     /// - ≥2 assertions
     /// - Bounded loop (max 64 packets)
     pub fn process_xdp_batch(&mut self, packets: &[AfXdpPacket]) -> u32 {
-        // Precondition assertions
-        assert!(packets.len() <= 64, "batch size must not exceed 64");
-
         let mut processed = 0u32;
 
-        // Bounded loop (TigerStyle: explicit upper bound)
+        // Bounded loop (TigerStyle: explicit upper bound, capped at 64)
         for packet in packets.iter().take(64) {
             self.process_packet(packet);
             processed += 1;
         }
 
-        // Postcondition assertion
-        assert!(processed <= 64, "processed count must not exceed 64");
+        debug_assert!(processed <= 64, "processed count must not exceed 64");
 
         processed
     }
@@ -606,13 +601,10 @@ impl XdpPacketProcessor {
     /// # Errors
     ///
     /// Returns `XdpError` if registration fails.
-    pub fn register_track_single(
-        &self,
-        ssrc: u32,
-        entry: ForwardEntry,
-    ) -> Result<(), XdpError> {
-        // Assertion: SSRC must be non-zero
-        assert!(ssrc != 0, "SSRC must be non-zero");
+    pub fn register_track_single(&self, ssrc: u32, entry: ForwardEntry) -> Result<(), XdpError> {
+        if ssrc == 0 {
+            return Err(XdpError::InvalidConfig("SSRC must be non-zero".into()));
+        }
 
         self.forward_table.insert(ssrc, entry)?;
         self.stats.tracks_registered.fetch_add(1, Ordering::Relaxed);
@@ -644,14 +636,31 @@ impl XdpPacketProcessor {
             }
         };
 
-        // Skip Ethernet + IP + UDP headers (14 + 20 + 8 = 42 bytes minimum)
-        // WHY: AF_XDP receives raw frames including all headers
+        // Skip Ethernet + IP + UDP headers.
+        // WHY: AF_XDP receives raw frames including all headers.
+        // Use the IHL (Internet Header Length) field from the IP header to
+        // compute the actual IP header size instead of hardcoding 20 bytes,
+        // since IP options may extend the header beyond the minimum.
         const ETH_HEADER_SIZE: usize = 14;
-        const IP_HEADER_SIZE: usize = 20;
         const UDP_HEADER_SIZE: usize = 8;
-        const MIN_HEADER_SIZE: usize = ETH_HEADER_SIZE + IP_HEADER_SIZE + UDP_HEADER_SIZE;
-        
-        if data.len() < MIN_HEADER_SIZE {
+        const MIN_IP_HEADER_SIZE: usize = 20;
+        const MIN_FRAME_SIZE: usize = ETH_HEADER_SIZE + MIN_IP_HEADER_SIZE + UDP_HEADER_SIZE;
+
+        if data.len() < MIN_FRAME_SIZE {
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // IHL is the low 4 bits of the first byte of the IP header, in 32-bit words
+        let ihl = (data[ETH_HEADER_SIZE] & 0x0F) as usize;
+        let ip_header_size = ihl * 4;
+        if ip_header_size < MIN_IP_HEADER_SIZE {
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let total_header_size = ETH_HEADER_SIZE + ip_header_size + UDP_HEADER_SIZE;
+        if data.len() < total_header_size {
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -659,12 +668,12 @@ impl XdpPacketProcessor {
         // Extract source address from IP/UDP headers
         // IP header starts at offset 14 (after Ethernet header)
         // Source IP is at offset 12-15 within IP header
-        // UDP header starts at offset 34 (14 + 20)
+        // UDP header starts at ETH_HEADER_SIZE + ip_header_size
         // Source port is at offset 0-1 within UDP header
         let source_addr = Self::extract_source_addr(&data[ETH_HEADER_SIZE..]);
 
-        // Extract UDP payload (skip headers)
-        let payload = &data[MIN_HEADER_SIZE..];
+        // Extract UDP payload (skip headers using actual IP header length)
+        let payload = &data[total_header_size..];
 
         // Classify and dispatch with source address
         let ptype = Self::classify_packet(payload);
@@ -727,81 +736,68 @@ impl XdpPacketProcessor {
     /// - ≤70 lines
     /// - ≥2 assertions (implicit via bounds checks)
     fn extract_source_addr(ip_data: &[u8]) -> Option<std::net::SocketAddr> {
-        // IP header minimum size is 20 bytes
-        if ip_data.len() < 28 {
-            // Need at least IP header (20) + UDP header (8)
+        if ip_data.is_empty() {
             return None;
         }
 
-        // Check IP version (must be 4)
         let version = (ip_data[0] >> 4) & 0x0F;
-        if version != 4 {
-            return None;
+
+        if version == 4 {
+            // IPv4: minimum IP header (20) + UDP header (8) = 28 bytes
+            if ip_data.len() < 28 {
+                return None;
+            }
+
+            // Get IP header length (IHL field, in 32-bit words)
+            let ihl = (ip_data[0] & 0x0F) as usize * 4;
+            if ihl < 20 || ip_data.len() < ihl + 8 {
+                return None;
+            }
+
+            // Extract source IP (bytes 12-15 of IP header)
+            let src_ip =
+                std::net::Ipv4Addr::new(ip_data[12], ip_data[13], ip_data[14], ip_data[15]);
+
+            // Extract source port (bytes 0-1 of UDP header, after IP header)
+            let src_port = u16::from_be_bytes([ip_data[ihl], ip_data[ihl + 1]]);
+
+            Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                src_ip, src_port,
+            )))
+        } else if version == 6 {
+            // IPv6: fixed header (40) + UDP header (8) = 48 bytes
+            if ip_data.len() < 48 {
+                return None;
+            }
+
+            // Extract source IP (bytes 8-23 of IPv6 header)
+            let src_ip = std::net::Ipv6Addr::new(
+                u16::from_be_bytes([ip_data[8], ip_data[9]]),
+                u16::from_be_bytes([ip_data[10], ip_data[11]]),
+                u16::from_be_bytes([ip_data[12], ip_data[13]]),
+                u16::from_be_bytes([ip_data[14], ip_data[15]]),
+                u16::from_be_bytes([ip_data[16], ip_data[17]]),
+                u16::from_be_bytes([ip_data[18], ip_data[19]]),
+                u16::from_be_bytes([ip_data[20], ip_data[21]]),
+                u16::from_be_bytes([ip_data[22], ip_data[23]]),
+            );
+
+            // Extract source port (bytes 0-1 of UDP header, after IPv6 header at offset 40)
+            let src_port = u16::from_be_bytes([ip_data[40], ip_data[41]]);
+
+            Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                src_ip, src_port, 0, 0,
+            )))
+        } else {
+            None
         }
-
-        // Get IP header length (IHL field, in 32-bit words)
-        let ihl = (ip_data[0] & 0x0F) as usize * 4;
-        if ihl < 20 || ip_data.len() < ihl + 8 {
-            return None;
-        }
-
-        // Extract source IP (bytes 12-15 of IP header)
-        let src_ip = std::net::Ipv4Addr::new(
-            ip_data[12],
-            ip_data[13],
-            ip_data[14],
-            ip_data[15],
-        );
-
-        // Extract source port (bytes 0-1 of UDP header, after IP header)
-        let src_port = u16::from_be_bytes([ip_data[ihl], ip_data[ihl + 1]]);
-
-        Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(src_ip, src_port)))
     }
 
     /// Classify a UDP payload as RTP, RTCP, DTLS, or STUN.
+    /// Delegates to `PacketType::classify()` to avoid code duplication.
+    #[inline]
     fn classify_packet(data: &[u8]) -> PacketType {
-        if data.is_empty() {
-            return PacketType::Unknown;
-        }
-
-        let first_byte = data[0];
-
-        // DTLS check: content type 20-25
-        if (20..=25).contains(&first_byte) && data.len() >= 13 {
-            return PacketType::Dtls;
-        }
-
-        // STUN check: magic cookie at bytes 4-7
-        if data.len() >= 20 {
-            let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-            if magic == 0x2112A442 {
-                return PacketType::Stun;
-            }
-        }
-
-        // RTP/RTCP check: version must be 2
-        let version = (first_byte >> 6) & 0x03;
-        if version != 2 || data.len() < 2 {
-            return PacketType::Unknown;
-        }
-
-        let second_byte = data[1];
-
-        // RTCP: payload type 200-206
-        if (200..=206).contains(&second_byte) && data.len() >= 8 {
-            return PacketType::Rtcp;
-        }
-
-        // RTP: valid payload type (0-34 or 96-127)
-        let pt = second_byte & 0x7F;
-        if pt <= 34 || (96..=127).contains(&pt) {
-            if data.len() >= 12 {
-                return PacketType::Rtp;
-            }
-        }
-
-        PacketType::Unknown
+        PacketType::classify(data)
     }
 
     /// Extract SSRC from RTP packet.
@@ -867,11 +863,7 @@ impl XdpPacketProcessor {
     }
 
     /// Register a single track (stub - always fails).
-    pub fn register_track_single(
-        &self,
-        _ssrc: u32,
-        _entry: ForwardEntry,
-    ) -> Result<(), XdpError> {
+    pub fn register_track_single(&self, _ssrc: u32, _entry: ForwardEntry) -> Result<(), XdpError> {
         Err(XdpError::NotAvailable)
     }
 
@@ -909,36 +901,39 @@ impl XdpPacketProcessor {
     }
 }
 
+/// Maximum batch size for fallback packet processing (TigerStyle: fixed bound).
+pub const MAX_FALLBACK_BATCH: usize = 64;
+
 /// Process a batch of packets from fallback (standard) transport.
 ///
-/// Classifies each packet and returns classification results with SSRCs.
+/// Classifies each packet and writes results into a caller-provided buffer.
 /// This function is used when XDP is not available.
 ///
 /// # Arguments
 ///
 /// * `packets` - Slice of received packets from UDP transport
 /// * `stats` - Statistics to update
+/// * `results` - Caller-provided buffer for results (must be at least MAX_FALLBACK_BATCH)
 ///
 /// # Returns
 ///
-/// Vector of (PacketType, Option<SSRC>, packet_index) tuples.
+/// Number of results written to the buffer.
 ///
 /// # TigerStyle Compliance
 ///
 /// - ≤70 lines
 /// - ≥2 assertions
 /// - Bounded loop (max 64 packets)
+/// - Zero allocation on hot path
 pub fn process_fallback_batch(
     packets: &[crate::transport::RecvPacket],
     stats: &XdpProcessorStats,
-) -> Vec<(PacketType, Option<u32>, usize)> {
-    // Precondition assertion
-    assert!(packets.len() <= 64, "batch size must not exceed 64");
-
-    let mut results = Vec::with_capacity(packets.len());
+    results: &mut [(PacketType, Option<u32>, usize); MAX_FALLBACK_BATCH],
+) -> usize {
+    let mut count = 0usize;
 
     // Bounded loop (TigerStyle: explicit upper bound)
-    for (idx, packet) in packets.iter().enumerate().take(64) {
+    for (idx, packet) in packets.iter().enumerate().take(MAX_FALLBACK_BATCH) {
         stats.packets_received.fetch_add(1, Ordering::Relaxed);
 
         let ptype = PacketType::classify(&packet.data);
@@ -965,13 +960,16 @@ pub fn process_fallback_batch(
             }
         };
 
-        results.push((ptype, ssrc, idx));
+        results[count] = (ptype, ssrc, idx);
+        count += 1;
     }
 
-    // Postcondition assertion
-    assert!(results.len() <= 64, "results count must not exceed 64");
+    debug_assert!(
+        count <= MAX_FALLBACK_BATCH,
+        "results count must not exceed batch size"
+    );
 
-    results
+    count
 }
 
 #[cfg(test)]
@@ -989,8 +987,7 @@ mod tests {
             0x00, 0x01, 0x00, 0x00, // Type + Length
             0x21, 0x12, 0xA4, 0x42, // Magic cookie
             0x00, 0x00, 0x00, 0x00, // Transaction ID (12 bytes)
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(PacketType::classify(&stun_packet), PacketType::Stun);
 
@@ -1012,7 +1009,7 @@ mod tests {
         // Test RTP SSRC extraction
         let rtp_packet = [
             0x80, 96, 0, 1, // V=2, PT=96, seq=1
-            0, 0, 0, 0,    // Timestamp
+            0, 0, 0, 0, // Timestamp
             0x12, 0x34, 0x56, 0x78, // SSRC = 0x12345678
         ];
         assert_eq!(PacketType::extract_rtp_ssrc(&rtp_packet), Some(0x12345678));
@@ -1022,7 +1019,10 @@ mod tests {
             0x80, 200, 0, 6, // V=2, PT=200 (SR), length=6
             0xAB, 0xCD, 0xEF, 0x01, // SSRC = 0xABCDEF01
         ];
-        assert_eq!(PacketType::extract_rtcp_ssrc(&rtcp_packet), Some(0xABCDEF01));
+        assert_eq!(
+            PacketType::extract_rtcp_ssrc(&rtcp_packet),
+            Some(0xABCDEF01)
+        );
 
         // Test too short packet
         let short_packet = [0x80, 96, 0, 1];

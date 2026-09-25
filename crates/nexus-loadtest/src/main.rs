@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use nexus_loadtest::cli::{Cli, Command, OutputFormat};
+use nexus_loadtest::cli::{Cli, Command};
 use nexus_loadtest::config::{ConferenceConfig, StressConfig, TestConfig, WebinarConfig};
 use nexus_loadtest::runner::TestRunner;
 use tracing::level_filters::LevelFilter;
@@ -29,12 +29,31 @@ async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_max_level(log_level)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(log_level.into()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(log_level.into()),
         )
         .init();
 
     tracing::info!("nexus-loadtest v{}", env!("CARGO_PKG_VERSION"));
+
+    let connection = cli.connection_options();
+    if connection.auth_token.is_none() && connection.jwt_secret.is_none() {
+        tracing::warn!(
+            "No --token or --jwt-secret given; the SFU will reject unauthenticated clients"
+        );
+    }
+
+    // Options shared by every scenario
+    let verbose = cli.verbose;
+    let base_config = |sfu_url, duration, output_format, report_file, prometheus_port| TestConfig {
+        sfu_url,
+        duration: Duration::from_secs(duration),
+        output_format,
+        report_file,
+        connection_timeout: Duration::from_secs(30),
+        verbose,
+        prometheus_port,
+        connection: connection.clone(),
+    };
 
     // Dispatch to appropriate test scenario based on command
     let result = match cli.command {
@@ -47,7 +66,8 @@ async fn main() -> ExitCode {
             report_file,
             prometheus_port,
         } => {
-            run_webinar(sfu_url, room, viewers, duration, output, report_file, prometheus_port, cli.verbose).await
+            let base = base_config(sfu_url, duration, output, report_file, prometheus_port);
+            run_webinar(base, room, viewers).await
         }
         Command::Conference {
             sfu_url,
@@ -58,8 +78,8 @@ async fn main() -> ExitCode {
             report_file,
             prometheus_port,
         } => {
-            run_conference(sfu_url, room, participants, duration, output, report_file, prometheus_port, cli.verbose)
-                .await
+            let base = base_config(sfu_url, duration, output, report_file, prometheus_port);
+            run_conference(base, room, participants).await
         }
         Command::Stress {
             sfu_url,
@@ -70,17 +90,8 @@ async fn main() -> ExitCode {
             report_file,
             prometheus_port,
         } => {
-            run_stress(
-                sfu_url,
-                rooms,
-                participants_per_room,
-                duration,
-                output,
-                report_file,
-                prometheus_port,
-                cli.verbose,
-            )
-            .await
+            let base = base_config(sfu_url, duration, output, report_file, prometheus_port);
+            run_stress(base, rooms, participants_per_room).await
         }
     };
 
@@ -106,14 +117,9 @@ async fn main() -> ExitCode {
 ///
 /// **Validates: Requirements 3.1, 3.2, 7.1, 7.2, 7.3**
 async fn run_webinar(
-    sfu_url: String,
+    base: TestConfig,
     room: String,
     viewers: u32,
-    duration: u64,
-    output: OutputFormat,
-    report_file: Option<String>,
-    prometheus_port: u16,
-    verbose: bool,
 ) -> Result<bool, nexus_loadtest::error::LoadTestError> {
     tracing::info!(
         "Starting webinar scenario: 1 broadcaster + {} viewers in room '{}'",
@@ -122,15 +128,7 @@ async fn run_webinar(
     );
 
     let config = WebinarConfig {
-        base: TestConfig {
-            sfu_url,
-            duration: Duration::from_secs(duration),
-            output_format: output,
-            report_file,
-            connection_timeout: Duration::from_secs(30),
-            verbose,
-            prometheus_port,
-        },
+        base,
         room,
         viewer_count: viewers,
     };
@@ -143,14 +141,9 @@ async fn run_webinar(
 ///
 /// **Validates: Requirements 4.1, 4.2, 4.3, 7.1, 7.2, 7.3**
 async fn run_conference(
-    sfu_url: String,
+    base: TestConfig,
     room: String,
     participants: u32,
-    duration: u64,
-    output: OutputFormat,
-    report_file: Option<String>,
-    prometheus_port: u16,
-    verbose: bool,
 ) -> Result<bool, nexus_loadtest::error::LoadTestError> {
     tracing::info!(
         "Starting conference scenario: {} participants in room '{}'",
@@ -159,15 +152,7 @@ async fn run_conference(
     );
 
     let config = ConferenceConfig {
-        base: TestConfig {
-            sfu_url,
-            duration: Duration::from_secs(duration),
-            output_format: output,
-            report_file,
-            connection_timeout: Duration::from_secs(30),
-            verbose,
-            prometheus_port,
-        },
+        base,
         room,
         participant_count: participants,
     };
@@ -180,14 +165,9 @@ async fn run_conference(
 ///
 /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4, 7.1, 7.2, 7.3**
 async fn run_stress(
-    sfu_url: String,
+    base: TestConfig,
     rooms: u32,
     participants_per_room: u32,
-    duration: u64,
-    output: OutputFormat,
-    report_file: Option<String>,
-    prometheus_port: u16,
-    verbose: bool,
 ) -> Result<bool, nexus_loadtest::error::LoadTestError> {
     tracing::info!(
         "Starting stress scenario: {} rooms with {} participants each (total: {})",
@@ -197,15 +177,7 @@ async fn run_stress(
     );
 
     let config = StressConfig {
-        base: TestConfig {
-            sfu_url,
-            duration: Duration::from_secs(duration),
-            output_format: output,
-            report_file,
-            connection_timeout: Duration::from_secs(30),
-            verbose,
-            prometheus_port,
-        },
+        base,
         room_count: rooms,
         participants_per_room,
     };

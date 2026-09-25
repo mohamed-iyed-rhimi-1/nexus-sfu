@@ -71,7 +71,10 @@ impl SessionStore {
         }
 
         let ticket_id = self.next_ticket_id.fetch_add(1, Ordering::Relaxed);
-        let now_ns = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now_ns = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
 
         let ticket = SessionTicket {
             ticket_id,
@@ -87,7 +90,10 @@ impl SessionStore {
     /// Retrieve and validate a session ticket.
     pub fn retrieve(&self, ticket_id: u64) -> Option<SessionTicket> {
         let ticket = self.tickets.get(&ticket_id)?;
-        let now_ns = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now_ns = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
 
         if ticket.is_expired(now_ns) {
             drop(ticket);

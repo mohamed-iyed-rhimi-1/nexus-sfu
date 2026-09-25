@@ -92,8 +92,10 @@ const _: () = {
 /// - Dead → Alive: When peer resurrects with higher incarnation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum PeerState {
     /// Peer is healthy and responding to pings
+    #[default]
     Alive = 0,
     /// Peer is suspected of failure (indirect probes sent)
     Suspect = 1,
@@ -133,12 +135,6 @@ impl PeerState {
             2 => Some(PeerState::Dead),
             _ => None,
         }
-    }
-}
-
-impl Default for PeerState {
-    fn default() -> Self {
-        PeerState::Alive
     }
 }
 
@@ -310,7 +306,7 @@ impl PeerInfo {
 ///
 /// Used in StateUpdate for track metadata propagation.
 /// Includes `owner_node` for cascade: identifies which SFU node owns this track.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrackInfo {
     /// Track type (0 = audio, 1 = video)
     pub track_type: u8,
@@ -325,9 +321,11 @@ pub struct TrackInfo {
     pub owner_node: u64,
 }
 
-/// Content type constants for `TrackInfo.content_type`.
+/// Content type constants for `TrackInfo.content_type`: camera video.
 pub const CONTENT_CAMERA: u8 = 0;
+/// Screen-share video.
 pub const CONTENT_SCREEN: u8 = 1;
+/// Audio.
 pub const CONTENT_AUDIO: u8 = 2;
 
 impl TrackInfo {
@@ -354,8 +352,7 @@ impl TrackInfo {
         let codec = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
         let bitrate_kbps = u32::from_be_bytes([data[6], data[7], data[8], data[9]]);
         let owner_node = u64::from_be_bytes([
-            data[10], data[11], data[12], data[13],
-            data[14], data[15], data[16], data[17],
+            data[10], data[11], data[12], data[13], data[14], data[15], data[16], data[17],
         ]);
         Some((
             Self {
@@ -367,18 +364,6 @@ impl TrackInfo {
             },
             18,
         ))
-    }
-}
-
-impl Default for TrackInfo {
-    fn default() -> Self {
-        Self {
-            track_type: 0,
-            content_type: 0,
-            codec: 0,
-            bitrate_kbps: 0,
-            owner_node: 0,
-        }
     }
 }
 
@@ -471,15 +456,30 @@ const MAX_STATE_UPDATE_SIZE: usize = 64;
 #[inline]
 fn decode_dot_at(data: &[u8], offset: usize) -> Option<Dot> {
     // Precondition: data must have enough bytes
-    assert!(data.len() >= offset + 16, "insufficient data for Dot decode");
-    
+    assert!(
+        data.len() >= offset + 16,
+        "insufficient data for Dot decode"
+    );
+
     let actor_id = u64::from_be_bytes([
-        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
     ]);
     let clock = u64::from_be_bytes([
-        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
-        data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15],
+        data[offset + 8],
+        data[offset + 9],
+        data[offset + 10],
+        data[offset + 11],
+        data[offset + 12],
+        data[offset + 13],
+        data[offset + 14],
+        data[offset + 15],
     ]);
 
     // Validate actor_id range
@@ -506,23 +506,30 @@ fn decode_participant_update(data: &[u8], is_add: bool) -> Option<(StateUpdate, 
     if data.len() < 29 {
         return None;
     }
-    
+
     let room_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
     let participant_id = u64::from_be_bytes([
-        data[5], data[6], data[7], data[8],
-        data[9], data[10], data[11], data[12],
+        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
     ]);
     let dot = decode_dot_at(data, 13)?;
 
     // Postcondition: IDs must be reasonable
     assert!(room_id <= u32::MAX / 2, "room_id overflow protection");
-    
+
     let update = if is_add {
-        StateUpdate::ParticipantAdded { room_id, participant_id, dot }
+        StateUpdate::ParticipantAdded {
+            room_id,
+            participant_id,
+            dot,
+        }
     } else {
-        StateUpdate::ParticipantRemoved { room_id, participant_id, dot }
+        StateUpdate::ParticipantRemoved {
+            room_id,
+            participant_id,
+            dot,
+        }
     };
-    
+
     Some((update, 29))
 }
 
@@ -537,20 +544,28 @@ fn decode_subscription_update(data: &[u8], is_add: bool) -> Option<(StateUpdate,
     if data.len() < 25 {
         return None;
     }
-    
+
     let track_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
     let participant_id = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
     let dot = decode_dot_at(data, 9)?;
 
     // Postcondition: IDs must be reasonable
     assert!(track_id <= u32::MAX / 2, "track_id overflow protection");
-    
+
     let update = if is_add {
-        StateUpdate::SubscriptionAdded { track_id: track_id.into(), participant_id: participant_id.into(), dot }
+        StateUpdate::SubscriptionAdded {
+            track_id: track_id.into(),
+            participant_id: participant_id.into(),
+            dot,
+        }
     } else {
-        StateUpdate::SubscriptionRemoved { track_id: track_id.into(), participant_id: participant_id.into(), dot }
+        StateUpdate::SubscriptionRemoved {
+            track_id: track_id.into(),
+            participant_id: participant_id.into(),
+            dot,
+        }
     };
-    
+
     Some((update, 25))
 }
 
@@ -562,20 +577,24 @@ fn decode_relay_update(data: &[u8], is_subscribe: bool) -> Option<(StateUpdate, 
         return None;
     }
     let track_id = u64::from_be_bytes([
-        data[1], data[2], data[3], data[4],
-        data[5], data[6], data[7], data[8],
+        data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
     ]);
     let requester_node = u64::from_be_bytes([
-        data[9], data[10], data[11], data[12],
-        data[13], data[14], data[15], data[16],
+        data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
     ]);
     assert!(track_id > 0, "track_id must be non-zero");
     assert!(requester_node > 0, "requester_node must be non-zero");
 
     let update = if is_subscribe {
-        StateUpdate::RelaySubscribe { track_id, requester_node }
+        StateUpdate::RelaySubscribe {
+            track_id,
+            requester_node,
+        }
     } else {
-        StateUpdate::RelayUnsubscribe { track_id, requester_node }
+        StateUpdate::RelayUnsubscribe {
+            track_id,
+            requester_node,
+        }
     };
     Some((update, 17))
 }
@@ -591,25 +610,36 @@ fn decode_track_update(data: &[u8]) -> Option<(StateUpdate, usize)> {
     if data.len() < 30 {
         return None;
     }
-    
+
     let track_id = u64::from_be_bytes([
-        data[1], data[2], data[3], data[4],
-        data[5], data[6], data[7], data[8],
+        data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
     ]);
     let (info, info_len) = TrackInfo::decode(&data[9..])?;
     let offset = 9 + info_len;
-    
+
     if data.len() < offset + 16 {
         return None;
     }
-    
+
     let timestamp = u64::from_be_bytes([
-        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
     ]);
     let actor = u64::from_be_bytes([
-        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
-        data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15],
+        data[offset + 8],
+        data[offset + 9],
+        data[offset + 10],
+        data[offset + 11],
+        data[offset + 12],
+        data[offset + 13],
+        data[offset + 14],
+        data[offset + 15],
     ]);
 
     // Validate actor range
@@ -621,7 +651,12 @@ fn decode_track_update(data: &[u8]) -> Option<(StateUpdate, usize)> {
     assert!(track_id <= u64::MAX / 2, "track_id overflow protection");
 
     Some((
-        StateUpdate::TrackUpdated { track_id, info, timestamp, actor },
+        StateUpdate::TrackUpdated {
+            track_id,
+            info,
+            timestamp,
+            actor,
+        },
         offset + 16,
     ))
 }
@@ -639,7 +674,11 @@ impl StateUpdate {
         );
 
         match self {
-            StateUpdate::ParticipantAdded { room_id, participant_id, dot } => {
+            StateUpdate::ParticipantAdded {
+                room_id,
+                participant_id,
+                dot,
+            } => {
                 let participant_id_u64: u64 = *participant_id;
                 buffer[0] = 0; // type
                 buffer[1..5].copy_from_slice(&room_id.to_be_bytes());
@@ -648,7 +687,11 @@ impl StateUpdate {
                 buffer[21..29].copy_from_slice(&dot.clock().to_be_bytes());
                 29
             }
-            StateUpdate::ParticipantRemoved { room_id, participant_id, dot } => {
+            StateUpdate::ParticipantRemoved {
+                room_id,
+                participant_id,
+                dot,
+            } => {
                 let participant_id_u64: u64 = *participant_id;
                 buffer[0] = 1;
                 buffer[1..5].copy_from_slice(&room_id.to_be_bytes());
@@ -695,13 +738,19 @@ impl StateUpdate {
                 buffer[25..33].copy_from_slice(&dot.clock().to_be_bytes());
                 33
             }
-            StateUpdate::RelaySubscribe { track_id, requester_node } => {
+            StateUpdate::RelaySubscribe {
+                track_id,
+                requester_node,
+            } => {
                 buffer[0] = 5;
                 buffer[1..9].copy_from_slice(&track_id.to_be_bytes());
                 buffer[9..17].copy_from_slice(&requester_node.to_be_bytes());
                 17
             }
-            StateUpdate::RelayUnsubscribe { track_id, requester_node } => {
+            StateUpdate::RelayUnsubscribe {
+                track_id,
+                requester_node,
+            } => {
                 buffer[0] = 6;
                 buffer[1..9].copy_from_slice(&track_id.to_be_bytes());
                 buffer[9..17].copy_from_slice(&requester_node.to_be_bytes());
@@ -729,13 +778,13 @@ impl StateUpdate {
         // Dispatch to type-specific helper functions
         // TigerStyle: centralize control flow, push logic to helpers
         match update_type {
-            0 => decode_participant_update(data, true),  // ParticipantAdded
+            0 => decode_participant_update(data, true), // ParticipantAdded
             1 => decode_participant_update(data, false), // ParticipantRemoved
-            2 => decode_track_update(data),              // TrackUpdated
+            2 => decode_track_update(data),             // TrackUpdated
             3 => decode_subscription_update(data, true), // SubscriptionAdded
             4 => decode_subscription_update(data, false), // SubscriptionRemoved
-            5 => decode_relay_update(data, true),         // RelaySubscribe
-            6 => decode_relay_update(data, false),        // RelayUnsubscribe
+            5 => decode_relay_update(data, true),       // RelaySubscribe
+            6 => decode_relay_update(data, false),      // RelayUnsubscribe
             _ => None,
         }
     }
@@ -841,6 +890,8 @@ impl GossipMessage {
     ///
     /// # Panics
     /// Panics if the encoded size exceeds MAX_MESSAGE_SIZE
+    // One arm per message type keeps the wire layout readable in one place.
+    #[allow(clippy::too_many_lines)]
     #[inline]
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
@@ -904,16 +955,22 @@ impl GossipMessage {
                 let mut addr_buffer = [0u8; 32];
                 let addr_len = encode_socket_addr(*target_addr, &mut addr_buffer);
                 buffer.extend_from_slice(&addr_buffer[..addr_len]);
-                
+
                 let requester_len = encode_socket_addr(*requester_addr, &mut addr_buffer);
                 buffer.extend_from_slice(&addr_buffer[..requester_len]);
             }
-            GossipMessage::Suspect { actor_id, incarnation } => {
+            GossipMessage::Suspect {
+                actor_id,
+                incarnation,
+            } => {
                 buffer.push(MSG_TYPE_SUSPECT);
                 buffer.extend_from_slice(&actor_id.to_be_bytes());
                 buffer.extend_from_slice(&incarnation.to_be_bytes());
             }
-            GossipMessage::Alive { actor_id, incarnation } => {
+            GossipMessage::Alive {
+                actor_id,
+                incarnation,
+            } => {
                 buffer.push(MSG_TYPE_ALIVE);
                 buffer.extend_from_slice(&actor_id.to_be_bytes());
                 buffer.extend_from_slice(&incarnation.to_be_bytes());
@@ -922,7 +979,10 @@ impl GossipMessage {
                 buffer.push(MSG_TYPE_DEAD);
                 buffer.extend_from_slice(&actor_id.to_be_bytes());
             }
-            GossipMessage::ForwardedAck { target, incarnation } => {
+            GossipMessage::ForwardedAck {
+                target,
+                incarnation,
+            } => {
                 buffer.push(MSG_TYPE_FORWARDED_ACK);
                 buffer.extend_from_slice(&target.to_be_bytes());
                 buffer.extend_from_slice(&incarnation.to_be_bytes());
@@ -936,11 +996,11 @@ impl GossipMessage {
                 buffer.push(MSG_TYPE_STATE_SNAPSHOT);
                 buffer.extend_from_slice(&from.to_be_bytes());
                 buffer.extend_from_slice(&incarnation.to_be_bytes());
-                
+
                 // Encode member count (bounded by MAX_PEERS)
                 let member_count = members.len().min(MAX_PEERS);
                 buffer.extend_from_slice(&(member_count as u16).to_be_bytes());
-                
+
                 for (i, (actor_id, inc, state)) in members.iter().enumerate() {
                     if i >= MAX_PEERS {
                         break;
@@ -949,11 +1009,11 @@ impl GossipMessage {
                     buffer.extend_from_slice(&inc.to_be_bytes());
                     buffer.push(*state);
                 }
-                
+
                 // Encode state updates
                 let update_count = updates.len().min(MAX_PIGGYBACK_UPDATES);
                 buffer.extend_from_slice(&(update_count as u16).to_be_bytes());
-                
+
                 let mut update_buffer = [0u8; MAX_STATE_UPDATE_SIZE];
                 for (i, update) in updates.iter().enumerate() {
                     if i >= MAX_PIGGYBACK_UPDATES {
@@ -1038,9 +1098,8 @@ impl GossipMessage {
                 return Err("piggyback update truncated");
             }
 
-            let (update, _) =
-                StateUpdate::decode(&data[offset..offset + update_len])
-                    .ok_or("invalid piggyback update")?;
+            let (update, _) = StateUpdate::decode(&data[offset..offset + update_len])
+                .ok_or("invalid piggyback update")?;
             piggyback.push(update);
             offset += update_len;
         }
@@ -1089,9 +1148,8 @@ impl GossipMessage {
                 return Err("piggyback update truncated");
             }
 
-            let (update, _) =
-                StateUpdate::decode(&data[offset..offset + update_len])
-                    .ok_or("invalid piggyback update")?;
+            let (update, _) = StateUpdate::decode(&data[offset..offset + update_len])
+                .ok_or("invalid piggyback update")?;
             piggyback.push(update);
             offset += update_len;
         }
@@ -1126,10 +1184,10 @@ impl GossipMessage {
 
         let (target_addr, target_addr_len) =
             decode_socket_addr(&data[16..]).ok_or("invalid target_addr in ping_req")?;
-        
+
         let requester_offset = 16 + target_addr_len;
-        let (requester_addr, _) =
-            decode_socket_addr(&data[requester_offset..]).ok_or("invalid requester_addr in ping_req")?;
+        let (requester_addr, _) = decode_socket_addr(&data[requester_offset..])
+            .ok_or("invalid requester_addr in ping_req")?;
 
         Ok(GossipMessage::PingReq {
             from,
@@ -1156,7 +1214,10 @@ impl GossipMessage {
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
-        Ok(GossipMessage::Suspect { actor_id, incarnation })
+        Ok(GossipMessage::Suspect {
+            actor_id,
+            incarnation,
+        })
     }
 
     fn decode_alive(data: &[u8]) -> Result<Self, &'static str> {
@@ -1176,7 +1237,10 @@ impl GossipMessage {
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
-        Ok(GossipMessage::Alive { actor_id, incarnation })
+        Ok(GossipMessage::Alive {
+            actor_id,
+            incarnation,
+        })
     }
 
     fn decode_dead(data: &[u8]) -> Result<Self, &'static str> {
@@ -1212,7 +1276,10 @@ impl GossipMessage {
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
-        Ok(GossipMessage::ForwardedAck { target, incarnation })
+        Ok(GossipMessage::ForwardedAck {
+            target,
+            incarnation,
+        })
     }
 
     fn decode_state_snapshot(data: &[u8]) -> Result<Self, &'static str> {
@@ -1245,16 +1312,28 @@ impl GossipMessage {
                 return Err("member data truncated");
             }
             let actor_id = u64::from_be_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
             ]);
             let inc = u64::from_be_bytes([
-                data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
-                data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15],
+                data[offset + 8],
+                data[offset + 9],
+                data[offset + 10],
+                data[offset + 11],
+                data[offset + 12],
+                data[offset + 13],
+                data[offset + 14],
+                data[offset + 15],
             ]);
             let state = data[offset + 16];
             offset += 17;
-            
+
             if actor_id < MAX_ACTORS as u64 && state <= 2 {
                 members.push((actor_id, inc, state));
             }
@@ -1505,7 +1584,7 @@ mod tests {
                 bitrate_kbps: 256,
                 owner_node: 0,
             },
-            timestamp: 123456789,
+            timestamp: 123_456_789,
             actor: 7,
         };
 

@@ -70,7 +70,7 @@ pub mod error_codes {
             TRANSPORT_ERROR,
             CONFIG_ERROR,
         ];
-        
+
         let mut i = 0;
         while i < codes.len() {
             let mut j = i + 1;
@@ -80,11 +80,14 @@ pub mod error_codes {
             }
             i += 1;
         }
-        
+
         // Ensure all codes are in valid range
         let mut k = 0;
         while k < codes.len() {
-            assert!(codes[k] >= 2001 && codes[k] <= 2020, "Error code out of range");
+            assert!(
+                codes[k] >= 2001 && codes[k] <= 2020,
+                "Error code out of range"
+            );
             k += 1;
         }
     };
@@ -270,9 +273,7 @@ impl CrdtError {
     pub const fn is_input_error(&self) -> bool {
         matches!(
             self,
-            Self::InvalidActorId { .. }
-                | Self::InvalidTimestamp { .. }
-                | Self::InvalidDot { .. }
+            Self::InvalidActorId { .. } | Self::InvalidTimestamp { .. } | Self::InvalidDot { .. }
         )
     }
 }
@@ -287,10 +288,10 @@ mod tests {
     #[test]
     fn test_error_codes_in_range() {
         // Assert all error codes are in expected range
-        assert!(error_codes::CAPACITY_EXHAUSTED >= 2001);
-        assert!(error_codes::CAPACITY_EXHAUSTED <= 2010);
-        assert!(error_codes::INVALID_STATE >= 2001);
-        assert!(error_codes::INVALID_STATE <= 2010);
+        const { assert!(error_codes::CAPACITY_EXHAUSTED >= 2001) };
+        const { assert!(error_codes::CAPACITY_EXHAUSTED <= 2010) };
+        const { assert!(error_codes::INVALID_STATE >= 2001) };
+        const { assert!(error_codes::INVALID_STATE <= 2010) };
     }
 
     #[test]
@@ -316,7 +317,11 @@ mod tests {
     fn test_is_input_error() {
         assert!(CrdtError::InvalidActorId { actor_id: 999 }.is_input_error());
         assert!(CrdtError::InvalidTimestamp { timestamp: 0 }.is_input_error());
-        assert!(CrdtError::InvalidDot { actor_id: 0, clock: 0 }.is_input_error());
+        assert!(CrdtError::InvalidDot {
+            actor_id: 0,
+            clock: 0
+        }
+        .is_input_error());
         assert!(!CrdtError::CapacityExhausted { capacity: 100 }.is_input_error());
     }
 
@@ -333,7 +338,7 @@ mod tests {
         let err1 = CrdtError::CapacityExhausted { capacity: 100 };
         let err2 = CrdtError::CapacityExhausted { capacity: 100 };
         let err3 = CrdtError::CapacityExhausted { capacity: 200 };
-        
+
         assert_eq!(err1, err2);
         assert_ne!(err1, err3);
     }

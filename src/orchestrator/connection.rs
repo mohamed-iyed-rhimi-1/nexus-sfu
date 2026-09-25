@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::time::{Interval, interval, Duration};
+use tokio::time::{interval, Duration, Interval};
 use tracing::{debug, info};
 
 use nexus_webrtc::webrtc::{SessionState, TransportId, WebRtcTransport};
@@ -54,10 +54,7 @@ pub struct ConnectionMonitor {
 }
 
 impl ConnectionMonitor {
-    pub fn new(
-        webrtc_transport: Arc<WebRtcTransport>,
-        packet_sender: PacketSender,
-    ) -> Self {
+    pub fn new(webrtc_transport: Arc<WebRtcTransport>, packet_sender: PacketSender) -> Self {
         Self {
             webrtc_transport,
             packet_sender,
@@ -73,11 +70,9 @@ impl ConnectionMonitor {
     /// Returns any session lifecycle events triggered by the packet.
     pub fn process_incoming(&mut self, packet: ColdPathPacket) -> Vec<SessionEvent> {
         let mut out_buf = [0u8; 2048];
-        let result = self.webrtc_transport.process_packet(
-            &packet.data,
-            packet.source_addr,
-            &mut out_buf,
-        );
+        let result =
+            self.webrtc_transport
+                .process_packet(&packet.data, packet.source_addr, &mut out_buf);
 
         match result {
             Ok(Some((session_id, incoming_data))) => {
@@ -100,7 +95,10 @@ impl ConnectionMonitor {
             }
             Ok(None) => Vec::new(),
             Err(e) => {
-                debug!("Cold-path packet error from {}: {:?}", packet.source_addr, e);
+                debug!(
+                    "Cold-path packet error from {}: {:?}",
+                    packet.source_addr, e
+                );
                 Vec::new()
             }
         }
@@ -112,15 +110,17 @@ impl ConnectionMonitor {
         let mut events = Vec::new();
 
         for session_id in session_ids {
-            let poll_result = self.webrtc_transport.with_session_mut(session_id, |session| {
-                let (packets, dtls_flight) = session.poll_ice_outbound();
-                let remote = session.remote_addr();
-                if !packets.is_empty() || dtls_flight.is_some() {
-                    Some((packets, dtls_flight, remote))
-                } else {
-                    None
-                }
-            });
+            let poll_result = self
+                .webrtc_transport
+                .with_session_mut(session_id, |session| {
+                    let (packets, dtls_flight) = session.poll_ice_outbound();
+                    let remote = session.remote_addr();
+                    if !packets.is_empty() || dtls_flight.is_some() {
+                        Some((packets, dtls_flight, remote))
+                    } else {
+                        None
+                    }
+                });
 
             if let Some(Some((packets, dtls_flight, remote))) = poll_result {
                 for (dest_addr, stun_request) in &packets {
@@ -143,9 +143,9 @@ impl ConnectionMonitor {
         let mut events = Vec::new();
 
         for session_id in session_ids {
-            let dtls_result = self.webrtc_transport.with_session_mut(session_id, |session| {
-                session.poll_dtls_retransmit()
-            });
+            let dtls_result = self
+                .webrtc_transport
+                .with_session_mut(session_id, |session| session.poll_dtls_retransmit());
 
             if let Some(Some((dest_addr, data))) = dtls_result {
                 self.packet_sender.send(&data, dest_addr);
@@ -156,6 +156,9 @@ impl ConnectionMonitor {
     }
 
     /// Send consent keepalives to all established sessions (RFC 7675).
+    ///
+    /// Uses STUN Binding Requests with proper credentials per RFC 7675 §5.1.
+    /// Falls back to Binding Indications if credentials are unavailable.
     pub fn poll_consent(&mut self) -> Vec<SessionEvent> {
         let failed = self.webrtc_transport.check_consent_freshness();
         let mut events = Vec::new();
@@ -170,18 +173,49 @@ impl ConnectionMonitor {
             });
         }
 
-        // Send STUN binding indications to healthy established sessions
+        // Send STUN binding requests to healthy established sessions
         let session_ids = self.webrtc_transport.session_ids();
         for sid in session_ids {
-            let remote_addr = self.webrtc_transport.with_session(sid, |session| {
+            let consent_info = self.webrtc_transport.with_session(sid, |session| {
+                if session.state() != SessionState::Established {
+                    return None;
+                }
+                let remote = session.remote_addr()?;
+                let local_creds = session.local_ice_credentials();
+                let remote_ufrag = session.remote_ice_ufrag()?.to_string();
+                let remote_pwd = session.remote_ice_pwd()?.to_string();
+                Some((
+                    remote,
+                    local_creds.local_ufrag.clone(),
+                    remote_ufrag,
+                    remote_pwd,
+                ))
+            });
+
+            if let Some(Some((remote, local_ufrag, remote_ufrag, remote_pwd))) = consent_info {
+                // RFC 7675: Use Binding Request with proper USERNAME and MESSAGE-INTEGRITY
+                let username = format!("{}:{}", remote_ufrag, local_ufrag);
+                let txn: [u8; 12] = rand::random();
+                let mut buf = [0u8; 256];
+                let len = nexus_transport::ice::stun::server::create_binding_request(
+                    &mut buf,
+                    &txn,
+                    &username,
+                    0,     // Priority: not relevant for consent
+                    false, // SFU is controlled agent
+                    0,     // Tie-breaker: not relevant for consent
+                    false, // No USE-CANDIDATE for consent
+                    &remote_pwd,
+                );
+                self.packet_sender.send(&buf[..len], remote);
+            } else if let Some(Some(remote)) = self.webrtc_transport.with_session(sid, |session| {
                 if session.state() == SessionState::Established {
                     session.remote_addr()
                 } else {
                     None
                 }
-            });
-
-            if let Some(Some(remote)) = remote_addr {
+            }) {
+                // Fallback: Binding Indication if credentials not yet available
                 let mut buf = [0u8; 20];
                 let txn: [u8; 12] = rand::random();
                 let len = nexus_transport::ice::stun::create_binding_indication(&mut buf, &txn);
@@ -193,7 +227,9 @@ impl ConnectionMonitor {
 
     /// Remove idle sessions and emit Disconnected events.
     pub fn cleanup_idle(&mut self) -> Vec<SessionEvent> {
-        let removed = self.webrtc_transport.cleanup_idle_sessions(SESSION_IDLE_TIMEOUT_SECS);
+        let removed = self
+            .webrtc_transport
+            .cleanup_idle_sessions(SESSION_IDLE_TIMEOUT_SECS);
         let mut events = Vec::with_capacity(removed.len());
 
         for session_id in removed {

@@ -117,10 +117,8 @@ impl Vp9PayloadHeader {
             }
             // |TID|U|SID|D|
             let layer_byte = data[offset];
-            temporal_layer =
-                Some((layer_byte >> 5) & 0x07);
-            spatial_layer =
-                Some((layer_byte >> 1) & 0x07);
+            temporal_layer = Some((layer_byte >> 5) & 0x07);
+            spatial_layer = Some((layer_byte >> 1) & 0x07);
             offset += 1;
 
             // In non-flexible mode, skip TL0PICIDX byte
@@ -213,8 +211,7 @@ impl Vp9PayloadHeader {
                         });
                     }
                     let pg = data[offset];
-                    let r_count =
-                        ((pg >> 2) & 0x03) as usize;
+                    let r_count = ((pg >> 2) & 0x03) as usize;
                     offset += 1 + r_count;
                 }
             }

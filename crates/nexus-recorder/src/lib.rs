@@ -40,13 +40,13 @@
 //! 10. All code compiles warning-free with deny(warnings)
 
 pub mod format;
-pub mod writer;
-pub mod sink;
-pub mod session;
 pub mod manager;
+pub mod session;
+pub mod sink;
+pub mod writer;
 
 pub use format::{FileHeader, FormatError, PacketRecordHeader, MAX_RECORD_PAYLOAD};
-pub use writer::{DiskWriter, WriteCommand, WriterStats};
-pub use sink::RecordingSink;
-pub use session::{RecordingSession, SessionState};
 pub use manager::{RecorderError, RecordingInfo, RecordingManager};
+pub use session::{RecordingSession, SessionState};
+pub use sink::RecordingSink;
+pub use writer::{DiskWriter, WriteCommand, WriterStats};

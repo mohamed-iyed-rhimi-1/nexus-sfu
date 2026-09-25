@@ -45,14 +45,15 @@ mod session;
 mod transport;
 mod types;
 
-pub use demux::{PacketType, quick_classify, demux_and_validate, ValidationResult, RecoveryHint, RecoveryAction};
+pub use demux::{
+    demux_and_validate, quick_classify, PacketType, RecoveryAction, RecoveryHint, ValidationResult,
+};
 pub use error::WebRtcError;
-pub use session::{WebRtcSession, SessionConfig, SessionState, IncomingData, MAX_SESSIONS};
-pub use transport::{WebRtcTransport, TransportConfig, TransportState};
+pub use session::{IncomingData, SessionConfig, SessionState, WebRtcSession, MAX_SESSIONS};
+pub use transport::{TransportConfig, TransportState, WebRtcTransport};
 pub use types::{
-    TransportId, MediaType, TransportStats,
-    IceParameters, DtlsParameters, DtlsFingerprint, DtlsRole,
-    FingerprintAlgorithm,
+    DtlsFingerprint, DtlsParameters, DtlsRole, FingerprintAlgorithm, IceParameters, MediaType,
+    TransportId, TransportStats,
 };
 
 // ============================================================================
@@ -86,7 +87,7 @@ mod tests {
     fn test_constants() {
         assert_eq!(MAX_PACKET_SIZE, 1500);
         assert_eq!(MAX_ICE_CANDIDATES, 32);
-        assert!(DTLS_HANDSHAKE_TIMEOUT_MS > 0);
-        assert!(ICE_CHECK_TIMEOUT_MS > 0);
+        const { assert!(DTLS_HANDSHAKE_TIMEOUT_MS > 0) };
+        const { assert!(ICE_CHECK_TIMEOUT_MS > 0) };
     }
 }

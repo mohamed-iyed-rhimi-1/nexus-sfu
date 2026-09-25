@@ -1,8 +1,8 @@
 //! RTCP packet type parsing: Sender Reports, Receiver Reports,
 //! PLI, NACK, FIR, REMB, Transport-CC, and Sender Report generation.
 
-use nexus_core::RtcpError;
 use super::header::RTCP_VERSION;
+use nexus_core::RtcpError;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,36 +76,25 @@ impl SenderReport {
 
         let pt = data[1];
         if pt != 200 {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type: pt,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type: pt });
         }
 
         // Parse SSRC (bytes 4-7)
-        let ssrc = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
+        let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
         // Parse NTP timestamp (bytes 8-15)
         let ntp_timestamp = u64::from_be_bytes([
-            data[8], data[9], data[10], data[11],
-            data[12], data[13], data[14], data[15],
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
         // Parse RTP timestamp (bytes 16-19)
-        let rtp_timestamp = u32::from_be_bytes([
-            data[16], data[17], data[18], data[19],
-        ]);
+        let rtp_timestamp = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
 
         // Parse packet count (bytes 20-23)
-        let packet_count = u32::from_be_bytes([
-            data[20], data[21], data[22], data[23],
-        ]);
+        let packet_count = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
 
         // Parse octet count (bytes 24-27)
-        let octet_count = u32::from_be_bytes([
-            data[24], data[25], data[26], data[27],
-        ]);
+        let octet_count = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
 
         Ok(SenderReport {
             ssrc,
@@ -163,55 +152,43 @@ impl ReceiverReportBlock {
         }
 
         // Parse SSRC (bytes 0-3)
-        let ssrc = u32::from_be_bytes([
-            data[0], data[1], data[2], data[3],
-        ]);
+        let ssrc = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
 
         // Parse fraction lost (byte 4)
         let fraction_lost = data[4];
 
         // Parse cumulative lost (bytes 5-7, 24-bit signed)
         // Sign-extend from 24 bits to 32 bits
-        let cumulative_lost_bytes =
-            [data[5], data[6], data[7]];
-        let cumulative_lost =
-            if cumulative_lost_bytes[0] & 0x80 != 0 {
-                // Negative: sign extend
-                i32::from_be_bytes([
-                    0xFF,
-                    cumulative_lost_bytes[0],
-                    cumulative_lost_bytes[1],
-                    cumulative_lost_bytes[2],
-                ])
-            } else {
-                // Positive
-                i32::from_be_bytes([
-                    0x00,
-                    cumulative_lost_bytes[0],
-                    cumulative_lost_bytes[1],
-                    cumulative_lost_bytes[2],
-                ])
-            };
+        let cumulative_lost_bytes = [data[5], data[6], data[7]];
+        let cumulative_lost = if cumulative_lost_bytes[0] & 0x80 != 0 {
+            // Negative: sign extend
+            i32::from_be_bytes([
+                0xFF,
+                cumulative_lost_bytes[0],
+                cumulative_lost_bytes[1],
+                cumulative_lost_bytes[2],
+            ])
+        } else {
+            // Positive
+            i32::from_be_bytes([
+                0x00,
+                cumulative_lost_bytes[0],
+                cumulative_lost_bytes[1],
+                cumulative_lost_bytes[2],
+            ])
+        };
 
         // Parse highest sequence number (bytes 8-11)
-        let highest_seq = u32::from_be_bytes([
-            data[8], data[9], data[10], data[11],
-        ]);
+        let highest_seq = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
         // Parse jitter (bytes 12-15)
-        let jitter = u32::from_be_bytes([
-            data[12], data[13], data[14], data[15],
-        ]);
+        let jitter = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
 
         // Parse last SR (bytes 16-19)
-        let last_sr = u32::from_be_bytes([
-            data[16], data[17], data[18], data[19],
-        ]);
+        let last_sr = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
 
         // Parse delay since last SR (bytes 20-23)
-        let delay_since_sr = u32::from_be_bytes([
-            data[20], data[21], data[22], data[23],
-        ]);
+        let delay_since_sr = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
 
         Ok(ReceiverReportBlock {
             ssrc,
@@ -291,30 +268,25 @@ impl PliPacket {
         // Validate packet type (must be 206 = PayloadFeedback)
         let packet_type = data[1];
         if packet_type != RTCP_PSFB_PT {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type });
         }
 
         // Validate FMT (should be 1 for PLI)
         let fmt = data[0] & 0x1F;
         if fmt != 1 {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type: fmt,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type: fmt });
         }
 
         // Parse sender SSRC (bytes 4-7)
-        let sender_ssrc = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
+        let sender_ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
         // Parse media SSRC (bytes 8-11)
-        let media_ssrc = u32::from_be_bytes([
-            data[8], data[9], data[10], data[11],
-        ]);
+        let media_ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
-        Ok(PliPacket { sender_ssrc, media_ssrc })
+        Ok(PliPacket {
+            sender_ssrc,
+            media_ssrc,
+        })
     }
 
     /// Build PLI packet bytes.
@@ -390,49 +362,33 @@ impl NackPacket {
         // Validate packet type (must be 205 = TransportFeedback)
         let packet_type = data[1];
         if packet_type != RTCP_RTPFB_PT {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type });
         }
 
         // Validate FMT (should be 1 for Generic NACK)
         let fmt = data[0] & 0x1F;
         if fmt != 1 {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type: fmt,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type: fmt });
         }
 
         // Parse sender SSRC (bytes 4-7)
-        let sender_ssrc = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
+        let sender_ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
         // Parse media SSRC (bytes 8-11)
-        let media_ssrc = u32::from_be_bytes([
-            data[8], data[9], data[10], data[11],
-        ]);
+        let media_ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
         // Parse FCI (Feedback Control Information) entries
         let mut lost_packets = Vec::new();
         let mut offset = 12;
 
         // Bounded iteration: max 64 packets
-        while offset + 4 <= data.len()
-            && lost_packets.len() < MAX_NACK_PACKETS
-        {
+        while offset + 4 <= data.len() && lost_packets.len() < MAX_NACK_PACKETS {
             // Parse PID (Packet ID) — bytes 0-1 of FCI entry
-            let pid = u16::from_be_bytes([
-                data[offset],
-                data[offset + 1],
-            ]);
+            let pid = u16::from_be_bytes([data[offset], data[offset + 1]]);
             lost_packets.push(pid);
 
             // Parse BLP (Bitmask of Lost Packets) — bytes 2-3
-            let blp = u16::from_be_bytes([
-                data[offset + 2],
-                data[offset + 3],
-            ]);
+            let blp = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
 
             // Decode bitmask: bit N set means packet
             // (PID + N + 1) is lost
@@ -461,6 +417,10 @@ impl NackPacket {
         })
     }
 
+    /// Maximum FCI entries per NACK. MAX_NACK_PACKETS=64, each FCI covers up to 17 packets,
+    /// so worst case is ceil(64/1)=64, but in practice much less. 32 is generous.
+    const MAX_FCI_ENTRIES: usize = 32;
+
     /// Build NACK packet bytes.
     ///
     /// # Returns
@@ -469,8 +429,8 @@ impl NackPacket {
     #[inline]
     pub fn build(&self) -> Vec<u8> {
         // Group lost packets into FCI entries (PID + BLP pairs)
-        let fci_entries = self.encode_fci_entries();
-        let fci_len = fci_entries.len() * 4;
+        let (fci_entries, fci_count) = self.encode_fci_entries();
+        let fci_len = fci_count * 4;
         let packet_len = 12 + fci_len;
 
         let mut packet = vec![0u8; packet_len];
@@ -491,7 +451,7 @@ impl NackPacket {
         packet[8..12].copy_from_slice(&self.media_ssrc.to_be_bytes());
 
         // FCI entries
-        for (i, (pid, blp)) in fci_entries.iter().enumerate() {
+        for (i, (pid, blp)) in fci_entries[..fci_count].iter().enumerate() {
             let offset = 12 + i * 4;
             packet[offset..offset + 2].copy_from_slice(&pid.to_be_bytes());
             packet[offset + 2..offset + 4].copy_from_slice(&blp.to_be_bytes());
@@ -501,23 +461,29 @@ impl NackPacket {
     }
 
     /// Encode lost packets into FCI entries (PID + BLP pairs).
-    fn encode_fci_entries(&self) -> Vec<(u16, u16)> {
+    /// Returns a fixed-size array and the number of valid entries (zero-allocation).
+    fn encode_fci_entries(&self) -> ([(u16, u16); Self::MAX_FCI_ENTRIES], usize) {
+        let mut entries = [(0u16, 0u16); Self::MAX_FCI_ENTRIES];
+        let mut count = 0usize;
+
         if self.lost_packets.is_empty() {
-            return Vec::new();
+            return (entries, 0);
         }
 
-        let mut entries = Vec::new();
-        let mut sorted = self.lost_packets.clone();
-        sorted.sort();
+        // Sort in-place on a stack copy (MAX_NACK_PACKETS=64, fits on stack)
+        let mut sorted = [0u16; MAX_NACK_PACKETS];
+        let len = self.lost_packets.len().min(MAX_NACK_PACKETS);
+        sorted[..len].copy_from_slice(&self.lost_packets[..len]);
+        sorted[..len].sort();
 
         let mut i = 0;
-        while i < sorted.len() {
+        while i < len && count < Self::MAX_FCI_ENTRIES {
             let pid = sorted[i];
             let mut blp: u16 = 0;
 
             // Look for packets that can be encoded in the BLP
             let mut j = i + 1;
-            while j < sorted.len() {
+            while j < len {
                 let diff = sorted[j].wrapping_sub(pid);
                 if (1..=16).contains(&diff) {
                     blp |= 1 << (diff - 1);
@@ -529,11 +495,12 @@ impl NackPacket {
                 }
             }
 
-            entries.push((pid, blp));
+            entries[count] = (pid, blp);
+            count += 1;
             i = j;
         }
 
-        entries
+        (entries, count)
     }
 }
 
@@ -597,29 +564,22 @@ impl SenderReportGenerator {
         packet[3] = 6; // Length = 6 words (28 bytes / 4 - 1)
 
         // SSRC of sender (bytes 4-7)
-        packet[4..8]
-            .copy_from_slice(&self.sender_ssrc.to_be_bytes());
+        packet[4..8].copy_from_slice(&self.sender_ssrc.to_be_bytes());
 
         // NTP timestamp (bytes 8-15)
         let ntp_timestamp = self.calculate_ntp_timestamp();
-        packet[8..16]
-            .copy_from_slice(&ntp_timestamp.to_be_bytes());
+        packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
 
         // RTP timestamp (bytes 16-19)
-        packet[16..20]
-            .copy_from_slice(&rtp_timestamp.to_be_bytes());
+        packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
 
         // Sender's packet count (bytes 20-23)
-        let pkt_count =
-            self.packet_count.load(Ordering::Relaxed);
-        packet[20..24]
-            .copy_from_slice(&pkt_count.to_be_bytes());
+        let pkt_count = self.packet_count.load(Ordering::Relaxed);
+        packet[20..24].copy_from_slice(&pkt_count.to_be_bytes());
 
         // Sender's octet count (bytes 24-27)
-        let oct_count =
-            self.octet_count.load(Ordering::Relaxed);
-        packet[24..28]
-            .copy_from_slice(&oct_count.to_be_bytes());
+        let oct_count = self.octet_count.load(Ordering::Relaxed);
+        packet[24..28].copy_from_slice(&oct_count.to_be_bytes());
 
         // Postcondition assertions
         debug_assert_eq!(packet.len(), SENDER_REPORT_SIZE_BYTES);
@@ -638,10 +598,8 @@ impl SenderReportGenerator {
     #[inline]
     pub fn update_stats(&self, packet_size: usize) {
         self.packet_count.fetch_add(1, Ordering::Relaxed);
-        self.octet_count.fetch_add(
-            packet_size as u32,
-            Ordering::Relaxed,
-        );
+        self.octet_count
+            .fetch_add(packet_size as u32, Ordering::Relaxed);
     }
 
     /// Calculate NTP timestamp from current system time.
@@ -658,9 +616,7 @@ impl SenderReportGenerator {
         let ntp_seconds = now.as_secs() + NTP_EPOCH_OFFSET;
 
         // Convert fractional seconds to NTP fraction
-        let ntp_fraction =
-            ((now.subsec_nanos() as u64) << 32)
-            / 1_000_000_000;
+        let ntp_fraction = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
 
         (ntp_seconds << 32) | ntp_fraction
     }
@@ -731,14 +687,22 @@ impl RembPacket {
             return Err(RtcpError::InvalidPacketType { packet_type: 0 });
         }
 
-        // Parse num SSRCs (byte 16)
-        let num_ssrcs = data[16] as usize;
+        // Parse num SSRCs (byte 16), capped to prevent unbounded allocation from untrusted input
+        let num_ssrcs = (data[16] as usize).min(32);
+
+        // Validate that data is long enough for declared SSRCs
+        let required_len = 20 + num_ssrcs * 4;
+        if data.len() < required_len {
+            return Err(RtcpError::TooShort {
+                actual_bytes: data.len(),
+                min_bytes: required_len,
+            });
+        }
 
         // Parse bitrate exponent and mantissa (bytes 17-19)
         let exp = (data[17] >> 2) & 0x3F;
-        let mantissa = (((data[17] & 0x03) as u32) << 16)
-            | ((data[18] as u32) << 8)
-            | (data[19] as u32);
+        let mantissa =
+            (((data[17] & 0x03) as u32) << 16) | ((data[18] as u32) << 8) | (data[19] as u32);
         let bitrate_bps = (mantissa as u64) << exp;
 
         // Parse SSRCs
@@ -938,7 +902,6 @@ impl TransportCcFeedback {
     }
 }
 
-
 // ---------------------------------------------------------------
 // Transport-CC Feedback Builder
 // ---------------------------------------------------------------
@@ -1029,9 +992,11 @@ impl TwccFeedbackBuilder {
 
         // Recv deltas for received packets
         for i in 0..packet_count {
-            if !received[i] { continue; }
+            if !received[i] {
+                continue;
+            }
             let d = delta_250us[i];
-            if d >= 0 && d <= 255 {
+            if (0..=255).contains(&d) {
                 buf.push(d as u8);
             } else {
                 buf.extend_from_slice(&d.to_be_bytes());
@@ -1049,9 +1014,9 @@ impl TwccFeedbackBuilder {
 
         Some(buf)
     }
-}// ---------------------------------------------------------------
-// Receiver Report
-// ---------------------------------------------------------------
+} // ---------------------------------------------------------------
+  // Receiver Report
+  // ---------------------------------------------------------------
 
 /// Receiver Report packet (PT=201).
 ///
@@ -1086,15 +1051,11 @@ impl ReceiverReport {
 
         let pt = data[1];
         if pt != 201 {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type: pt,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type: pt });
         }
 
         let rc = (data[0] & 0x1F) as usize;
-        let ssrc = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
+        let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
         let blocks_start = 8;
         let needed = blocks_start + rc * RECEIVER_REPORT_BLOCK_SIZE_BYTES;
@@ -1146,6 +1107,81 @@ pub struct FirPacket {
 /// RTCP FIR FMT value.
 const RTCP_PSFB_FMT_FIR: u8 = 4;
 
+/// Per-SSRC FIR sequence number tracker (RFC 5104 §4.3.1).
+///
+/// Each FIR request for a given media SSRC must carry an incrementing
+/// sequence number so the receiver can distinguish retransmissions from
+/// new requests. This tracker maintains per-SSRC counters.
+pub struct FirSeqTracker {
+    /// Per-SSRC sequence numbers. Bounded to MAX_FIR_TRACKED_SSRCS entries.
+    seq_nrs: [(u32, u8); Self::MAX_TRACKED],
+    /// Number of tracked SSRCs.
+    len: usize,
+}
+
+impl Default for FirSeqTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FirSeqTracker {
+    const MAX_TRACKED: usize = 64;
+
+    /// Create a new tracker.
+    pub fn new() -> Self {
+        Self {
+            seq_nrs: [(0, 0); Self::MAX_TRACKED],
+            len: 0,
+        }
+    }
+
+    /// Get the next sequence number for a given SSRC and increment.
+    ///
+    /// Returns the sequence number to use in the FIR entry.
+    pub fn next_seq_nr(&mut self, ssrc: u32) -> u8 {
+        // Search for existing entry
+        for i in 0..self.len {
+            if self.seq_nrs[i].0 == ssrc {
+                let seq = self.seq_nrs[i].1;
+                self.seq_nrs[i].1 = seq.wrapping_add(1);
+                return seq;
+            }
+        }
+
+        // New SSRC — add entry if space available
+        if self.len < Self::MAX_TRACKED {
+            self.seq_nrs[self.len] = (ssrc, 1); // next call will get 1
+            self.len += 1;
+            return 0; // first request starts at 0
+        }
+
+        // Table full — evict oldest (index 0) and shift
+        for i in 1..Self::MAX_TRACKED {
+            self.seq_nrs[i - 1] = self.seq_nrs[i];
+        }
+        self.seq_nrs[Self::MAX_TRACKED - 1] = (ssrc, 1);
+        0
+    }
+
+    /// Build a FIR packet with correctly tracked sequence numbers.
+    pub fn build_fir(&mut self, sender_ssrc: u32, target_ssrcs: &[u32]) -> FirPacket {
+        let entries: Vec<FirEntry> = target_ssrcs
+            .iter()
+            .take(31) // RC field is 5 bits
+            .map(|&ssrc| FirEntry {
+                ssrc,
+                seq_nr: self.next_seq_nr(ssrc),
+            })
+            .collect();
+
+        FirPacket {
+            sender_ssrc,
+            entries,
+        }
+    }
+}
+
 impl FirPacket {
     /// Parse FIR packet from RTCP bytes.
     ///
@@ -1173,14 +1209,10 @@ impl FirPacket {
 
         let fmt = data[0] & 0x1F;
         if fmt != RTCP_PSFB_FMT_FIR {
-            return Err(RtcpError::InvalidPacketType {
-                packet_type: fmt,
-            });
+            return Err(RtcpError::InvalidPacketType { packet_type: fmt });
         }
 
-        let sender_ssrc = u32::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-        ]);
+        let sender_ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
         // FCI entries start at byte 12 (after sender + media SSRC)
         // Each entry: 4 bytes SSRC + 1 byte seq_nr + 3 bytes reserved = 8 bytes
@@ -1230,8 +1262,7 @@ impl FirPacket {
         // FCI entries
         for (i, entry) in self.entries.iter().enumerate() {
             let offset = 12 + i * 8;
-            packet[offset..offset + 4]
-                .copy_from_slice(&entry.ssrc.to_be_bytes());
+            packet[offset..offset + 4].copy_from_slice(&entry.ssrc.to_be_bytes());
             packet[offset + 4] = entry.seq_nr;
             // bytes 5-7 are reserved (already 0)
         }
@@ -1333,5 +1364,44 @@ mod tests {
         assert_eq!(tcc.packet_status_count, 10);
         assert_eq!(tcc.reference_time, 0x010203);
         assert_eq!(tcc.feedback_packet_count, 5);
+    }
+
+    #[test]
+    fn test_fir_seq_tracker_increments() {
+        let mut tracker = FirSeqTracker::new();
+        let ssrc = 0xAABBCCDD;
+
+        // First three requests for same SSRC should increment: 0, 1, 2
+        assert_eq!(tracker.next_seq_nr(ssrc), 0);
+        assert_eq!(tracker.next_seq_nr(ssrc), 1);
+        assert_eq!(tracker.next_seq_nr(ssrc), 2);
+    }
+
+    #[test]
+    fn test_fir_seq_tracker_per_ssrc() {
+        let mut tracker = FirSeqTracker::new();
+
+        // Different SSRCs get independent counters
+        assert_eq!(tracker.next_seq_nr(0x1111), 0);
+        assert_eq!(tracker.next_seq_nr(0x2222), 0);
+        assert_eq!(tracker.next_seq_nr(0x1111), 1);
+        assert_eq!(tracker.next_seq_nr(0x2222), 1);
+    }
+
+    #[test]
+    fn test_fir_seq_tracker_build_fir() {
+        let mut tracker = FirSeqTracker::new();
+
+        // First FIR for these SSRCs
+        let fir = tracker.build_fir(0xAAAA, &[0x1111, 0x2222]);
+        assert_eq!(fir.sender_ssrc, 0xAAAA);
+        assert_eq!(fir.entries.len(), 2);
+        assert_eq!(fir.entries[0].seq_nr, 0);
+        assert_eq!(fir.entries[1].seq_nr, 0);
+
+        // Second FIR — seq_nrs should increment
+        let fir2 = tracker.build_fir(0xAAAA, &[0x1111, 0x2222]);
+        assert_eq!(fir2.entries[0].seq_nr, 1);
+        assert_eq!(fir2.entries[1].seq_nr, 1);
     }
 }

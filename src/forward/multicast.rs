@@ -42,10 +42,10 @@
 //! - Requirement 8.6: Promote cold to hot on packet request
 //! - Requirement 8.7: Track statistics for hot/cold transitions
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::forward::selective::ViewportFilter;
 use crate::types::ParticipantId;
 
 /// Default cold timeout in nanoseconds (5 seconds).
@@ -54,108 +54,8 @@ pub const DEFAULT_COLD_TIMEOUT_NS: u64 = 5_000_000_000;
 /// Maximum subscribers per track (TigerStyle: fixed loop bound).
 pub const MAX_SUBSCRIBERS_PER_TRACK: usize = 1000;
 
-/// Viewport filter for selective forwarding.
-///
-/// Determines which packets should be forwarded to a subscriber based on
-/// their viewport (visible participants) and pinned participants.
-///
-/// Note: This is a placeholder implementation. Full implementation is in Task 12.
-#[derive(Debug, Clone, Default)]
-pub struct ViewportFilter {
-    /// Set of visible participant IDs.
-    visible_participants: HashSet<u32>,
-    /// Pinned participants (always forward regardless of viewport).
-    pinned_participants: HashSet<u32>,
-}
-
-impl ViewportFilter {
-    /// Create an empty viewport filter.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Update visible participants.
-    ///
-    /// # Arguments
-    ///
-    /// * `participants` - Slice of participant IDs that are visible
-    ///
-    /// # Assertions
-    /// - participants.len() <= 1000
-    pub fn set_visible(&mut self, participants: &[u32]) {
-        // TigerStyle: Assert preconditions
-        assert!(
-            participants.len() <= MAX_SUBSCRIBERS_PER_TRACK,
-            "visible participants must not exceed {}",
-            MAX_SUBSCRIBERS_PER_TRACK
-        );
-
-        self.visible_participants.clear();
-        self.visible_participants.extend(participants.iter().copied());
-    }
-
-    /// Pin a participant (always forward their packets).
-    pub fn pin(&mut self, participant_id: u32) {
-        self.pinned_participants.insert(participant_id);
-    }
-
-    /// Unpin a participant.
-    pub fn unpin(&mut self, participant_id: u32) {
-        self.pinned_participants.remove(&participant_id);
-    }
-
-    /// Check if packets from a source should be forwarded.
-    ///
-    /// Returns true if:
-    /// - Source is pinned, OR
-    /// - Source is in the visible set
-    ///
-    /// # Arguments
-    ///
-    /// * `source_participant_id` - Participant ID of the packet source
-    ///
-    /// # Assertions
-    /// - source_participant_id != 0
-    #[inline(always)]
-    pub fn should_forward(&self, source_participant_id: u32) -> bool {
-        // TigerStyle: Assert preconditions
-        assert!(source_participant_id != 0, "source_participant_id must not be 0");
-
-        // Pinned participants always get forwarded
-        if self.pinned_participants.contains(&source_participant_id) {
-            return true;
-        }
-
-        // Check if in visible set
-        self.visible_participants.contains(&source_participant_id)
-    }
-
-    /// Check if a participant is pinned.
-    pub fn is_pinned(&self, participant_id: u32) -> bool {
-        self.pinned_participants.contains(&participant_id)
-    }
-
-    /// Check if a participant is visible.
-    pub fn is_visible(&self, participant_id: u32) -> bool {
-        self.visible_participants.contains(&participant_id)
-    }
-
-    /// Get the number of visible participants.
-    pub fn visible_count(&self) -> usize {
-        self.visible_participants.len()
-    }
-
-    /// Get the number of pinned participants.
-    pub fn pinned_count(&self) -> usize {
-        self.pinned_participants.len()
-    }
-
-    /// Clear all viewport state.
-    pub fn clear(&mut self) {
-        self.visible_participants.clear();
-        self.pinned_participants.clear();
-    }
-}
+// ViewportFilter is imported from crate::forward::selective, which correctly
+// handles source_participant_id == 0 by returning true (unbound tracks).
 
 /// Subscriber with hot/cold classification.
 ///
@@ -454,10 +354,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "source_participant_id must not be 0")]
     fn test_viewport_filter_should_forward_zero_id() {
+        // ViewportFilter from selective.rs gracefully handles participant_id 0
+        // by returning true (unbound tracks from AssignTrack are always forwarded).
         let filter = ViewportFilter::new();
-        let _ = filter.should_forward(0);
+        assert!(filter.should_forward(0));
     }
 
     // === Subscriber Tests ===
@@ -583,7 +484,6 @@ mod tests {
         assert!(!subscriber.should_forward(50));
     }
 }
-
 
 /// Statistics for subscriber list hot/cold transitions.
 ///
@@ -711,7 +611,10 @@ impl SubscriberList {
     /// - cold_timeout_ns > 0
     pub fn new(cold_timeout_ns: u64) -> Self {
         // TigerStyle: Assert preconditions
-        assert!(cold_timeout_ns > 0, "cold_timeout_ns must be greater than 0");
+        assert!(
+            cold_timeout_ns > 0,
+            "cold_timeout_ns must be greater than 0"
+        );
 
         Self {
             hot: Vec::new(),
@@ -865,7 +768,10 @@ impl SubscriberList {
     /// - current_time_ns > 0
     pub fn demote_inactive(&mut self, current_time_ns: u64) -> usize {
         // TigerStyle: Assert preconditions
-        assert!(current_time_ns > 0, "current_time_ns must be greater than 0");
+        assert!(
+            current_time_ns > 0,
+            "current_time_ns must be greater than 0"
+        );
 
         let mut demoted_count = 0usize;
         let timeout = self.cold_timeout_ns;
@@ -966,7 +872,19 @@ impl Clone for SubscriberList {
             hot: self.hot.clone(),
             cold: self.cold.clone(),
             cold_timeout_ns: self.cold_timeout_ns,
-            stats: SubscriberListStats::new(), // Fresh stats for cloned list
+            stats: self.stats.clone(),
+        }
+    }
+}
+
+// Implement Clone for SubscriberListStats (snapshot atomic values with Relaxed ordering)
+impl Clone for SubscriberListStats {
+    fn clone(&self) -> Self {
+        Self {
+            promotions: AtomicU64::new(self.promotions.load(Ordering::Relaxed)),
+            demotions: AtomicU64::new(self.demotions.load(Ordering::Relaxed)),
+            subscribers_added: AtomicU64::new(self.subscribers_added.load(Ordering::Relaxed)),
+            subscribers_removed: AtomicU64::new(self.subscribers_removed.load(Ordering::Relaxed)),
         }
     }
 }
@@ -1185,9 +1103,9 @@ mod subscriber_list_tests {
         assert_eq!(cloned.counts(), (2, 0));
         assert_eq!(cloned.cold_timeout_ns(), 5_000_000_000);
 
-        // Stats should be fresh in cloned list
+        // Stats should be preserved in cloned list
         let stats = cloned.stats().snapshot();
-        assert_eq!(stats.subscribers_added, 0);
+        assert_eq!(stats.subscribers_added, 2);
     }
 
     #[test]

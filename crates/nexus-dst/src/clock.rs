@@ -32,9 +32,10 @@ impl VirtualClock {
 
     /// Advance the clock forward by the given number of nanoseconds.
     pub fn advance_by(&mut self, delta_ns: u64) {
-        self.now_ns = self.now_ns.checked_add(delta_ns).expect(
-            "VirtualClock overflow: advance_by would exceed u64::MAX",
-        );
+        self.now_ns = self
+            .now_ns
+            .checked_add(delta_ns)
+            .expect("VirtualClock overflow: advance_by would exceed u64::MAX");
     }
 }
 
