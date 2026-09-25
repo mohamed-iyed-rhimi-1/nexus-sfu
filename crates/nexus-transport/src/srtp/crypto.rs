@@ -775,21 +775,14 @@ impl AesCmHmacCipher {
         // Constant-time comparison of truncated tag
         let received_tag = &packet[ciphertext_end..packet_len];
         if !constant_time_eq(&expected_tag[..self.tag_len], received_tag) {
-            // Debug: dump diagnostic info for first few failures
-            tracing::warn!(
+            // Never log keys, salts or the expected tag: the expected tag for
+            // an attacker-chosen packet is a forgery oracle. Trace level
+            // because a peer can trigger this once per packet.
+            tracing::trace!(
                 ssrc = header.ssrc,
                 seq = header.sequence_number,
                 roc = index.roc(),
-                index_value = index.value(),
                 packet_len,
-                tag_len = self.tag_len,
-                header_len = header.header_len,
-                ciphertext_end,
-                expected_tag = ?&expected_tag[..self.tag_len],
-                received_tag = ?received_tag,
-                auth_key_prefix = ?&self.rtp_auth_key[..4],
-                rtp_key_prefix = ?&self.rtp_key[..4],
-                rtp_salt_prefix = ?&self.rtp_salt[..4],
                 "SRTP auth tag mismatch"
             );
             return Err(SrtpError::AuthenticationFailed);
