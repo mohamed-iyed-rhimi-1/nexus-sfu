@@ -27,7 +27,7 @@
 //!     ..Default::default()
 //! };
 //!
-//! let server = SignalingServer::new(config, shutdown, orchestrator_tx);
+//! let server = SignalingServer::new(config, shutdown, orchestrator_tx)?;
 //! server.run().await?; // Tries QUIC first, falls back to WebSocket
 //! ```
 

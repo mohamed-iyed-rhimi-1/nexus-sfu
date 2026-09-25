@@ -82,8 +82,10 @@ COPY --chown=nonroot:nonroot \
     /etc/nexus-sfu/config.toml
 
 # Note: TLS certificates are NOT bundled in the image for security reasons
-# They must be mounted at runtime via volume mount to /etc/nexus-sfu/tls/
-# See README.md for mounting instructions
+# Mount them at runtime as /etc/nexus/tls/cert.pem and key.pem (the paths in
+# production.toml), or point NEXUS_TLS_CERT_PATH / NEXUS_TLS_KEY_PATH at them.
+# Startup fails if they are configured but missing: signaling never falls
+# back to unencrypted WebSocket.
 
 # Expose ports with explicit protocol
 # TigerStyle: document why each port exists

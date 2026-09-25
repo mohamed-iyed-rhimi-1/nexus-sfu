@@ -409,11 +409,18 @@ async fn run(config: NexusConfig) -> ExitCode {
     );
 
     // Create signaling server
-    let signaling_server = SignalingServer::new(
+    // Fails on a configured-but-broken TLS setup: never downgrade to plain WS.
+    let signaling_server = match SignalingServer::new(
         signaling_config,
         sfu.shared_shutdown().clone(),
         orchestrator_tx.clone(),
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to set up signaling: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Start signaling server in background
     let signaling_handle = tokio::spawn(async move {

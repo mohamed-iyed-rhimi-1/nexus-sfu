@@ -90,12 +90,12 @@ pub struct SignalingServer {
     config: SignalingConfig,
     /// Shared shutdown signal.
     shutdown: Arc<AtomicBool>,
-    /// Orchestrator event sender.
-    orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
     /// Active transport state.
     active_transport: Arc<std::sync::atomic::AtomicU8>,
     /// Total active connections across all transports.
     total_connections: Arc<AtomicU32>,
+    /// WebSocket server, built up front so a TLS failure stops startup.
+    ws_server: WebSocketServer,
 }
 
 impl SignalingServer {
@@ -106,23 +106,37 @@ impl SignalingServer {
     /// * `config` - Server configuration
     /// * `shutdown` - Shared shutdown signal
     /// * `orchestrator_tx` - Channel to send events to the orchestrator
+    ///
+    /// # Errors
+    ///
+    /// Fails if TLS paths are configured but the certificate or key cannot
+    /// be loaded, or if only one of the two paths is set.
     pub fn new(
         config: SignalingConfig,
         shutdown: Arc<AtomicBool>,
         orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         assert!(
             !config.jwt_secret.is_empty(),
             "JWT secret must not be empty"
         );
 
-        Self {
+        let ws_server = WebSocketServer::new(
+            config.ws_addr,
+            Arc::new(JwtValidator::new(&config.jwt_secret)),
+            shutdown.clone(),
+            orchestrator_tx,
+            &config.tls_cert_path,
+            &config.tls_key_path,
+        )?;
+
+        Ok(Self {
             config,
             shutdown,
-            orchestrator_tx,
             active_transport: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             total_connections: Arc::new(AtomicU32::new(0)),
-        }
+            ws_server,
+        })
     }
 
     /// Get the currently active transport.
@@ -156,8 +170,6 @@ impl SignalingServer {
             Ok(quic_server) => {
                 info!(addr = %self.config.quic_addr, "QUIC signaling started successfully");
 
-                // When QUIC is available (TLS certs configured), WS fallback also uses TLS.
-                let ws_server = self.create_websocket_server();
                 self.active_transport.store(3, Ordering::Release); // Both
 
                 info!(
@@ -167,7 +179,7 @@ impl SignalingServer {
                 );
 
                 // Run both servers
-                self.run_both(quic_server, ws_server).await
+                self.run_both(quic_server).await
             }
             Err(e) => {
                 warn!(
@@ -176,12 +188,11 @@ impl SignalingServer {
                 );
 
                 // Fall back to WebSocket only
-                let ws_server = self.create_websocket_server();
                 self.active_transport.store(2, Ordering::Release); // WebSocket
 
                 info!(addr = %self.config.ws_addr, "WebSocket signaling started (fallback)");
 
-                self.run_websocket(ws_server).await
+                self.run_websocket().await
             }
         }
     }
@@ -218,32 +229,17 @@ impl SignalingServer {
             .map_err(|e| format!("Failed to create QUIC server: {}", e))
     }
 
-    /// Create WebSocket server.
-    fn create_websocket_server(&self) -> WebSocketServer {
-        WebSocketServer::new(
-            self.config.ws_addr,
-            Arc::new(JwtValidator::new(&self.config.jwt_secret)),
-            self.shutdown.clone(),
-            self.orchestrator_tx.clone(),
-            &self.config.tls_cert_path,
-            &self.config.tls_key_path,
-        )
-    }
-
     /// Run WebSocket server only.
-    async fn run_websocket(self, server: WebSocketServer) -> Result<(), String> {
-        server
+    async fn run_websocket(self) -> Result<(), String> {
+        self.ws_server
             .run()
             .await
             .map_err(|e| format!("WebSocket server error: {}", e))
     }
 
     /// Run both QUIC and WebSocket servers.
-    async fn run_both(
-        self,
-        quic_server: Arc<QuicSignaling>,
-        ws_server: WebSocketServer,
-    ) -> Result<(), String> {
+    async fn run_both(self, quic_server: Arc<QuicSignaling>) -> Result<(), String> {
+        let ws_server = self.ws_server;
         let shutdown_quic = self.shutdown.clone();
         let shutdown_ws = self.shutdown.clone();
 

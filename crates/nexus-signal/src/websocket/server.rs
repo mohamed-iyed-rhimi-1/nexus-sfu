@@ -80,6 +80,11 @@ pub struct WebSocketServer {
 }
 
 impl WebSocketServer {
+    /// Create the server.
+    ///
+    /// TLS is all or nothing: with both paths empty the server speaks plain
+    /// WS (development only); with both set, a certificate that fails to
+    /// load is an error, never a silent downgrade to plain WS.
     pub fn new(
         bind_addr: SocketAddr,
         jwt_validator: Arc<JwtValidator>,
@@ -87,34 +92,36 @@ impl WebSocketServer {
         orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
         tls_cert_path: &str,
         tls_key_path: &str,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // Precondition assertions
         assert!(bind_addr.port() > 0, "bind port must be > 0");
 
-        let tls_acceptor = if !tls_cert_path.is_empty() && !tls_key_path.is_empty() {
-            match Self::build_tls_acceptor(tls_cert_path, tls_key_path) {
-                Ok(acceptor) => {
-                    info!("TLS enabled for WebSocket signaling");
-                    Some(acceptor)
-                }
-                Err(e) => {
-                    warn!("TLS init failed, falling back to plain WS: {}", e);
-                    None
-                }
+        let tls_acceptor = match (tls_cert_path.is_empty(), tls_key_path.is_empty()) {
+            (true, true) => {
+                warn!("TLS not configured: WebSocket signaling is UNENCRYPTED (development only)");
+                None
             }
-        } else {
-            info!("TLS not configured, using plain WS (development mode)");
-            None
+            (false, false) => {
+                let acceptor = Self::build_tls_acceptor(tls_cert_path, tls_key_path)
+                    .map_err(|e| format!("WebSocket TLS init failed: {}", e))?;
+                info!("TLS enabled for WebSocket signaling");
+                Some(acceptor)
+            }
+            _ => {
+                return Err(
+                    "tls_cert_path and tls_key_path must both be set or both be empty".to_string(),
+                )
+            }
         };
 
-        Self {
+        Ok(Self {
             bind_addr,
             jwt_validator,
             shared_shutdown,
             active_connections: Arc::new(AtomicU32::new(0)),
             orchestrator_tx,
             tls_acceptor,
-        }
+        })
     }
 
     /// Build TLS acceptor from PEM certificate and key files.
@@ -556,5 +563,42 @@ impl Drop for ConnectionCleanup {
             .try_send(OrchestratorEvent::Disconnected {
                 participant_id: self.participant_id,
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build(cert: &str, key: &str) -> Result<WebSocketServer, String> {
+        let (tx, _rx) = mpsc::channel(1);
+        WebSocketServer::new(
+            "127.0.0.1:8080".parse().unwrap(),
+            Arc::new(JwtValidator::new("test-secret-at-least-32-characters-long")),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            cert,
+            key,
+        )
+    }
+
+    #[test]
+    fn test_no_tls_paths_gives_plain_ws() {
+        let server = build("", "").expect("plain WS is allowed without TLS paths");
+        assert!(server.tls_acceptor.is_none());
+    }
+
+    #[test]
+    fn test_missing_cert_files_fail_instead_of_downgrading() {
+        let err = build("/nonexistent/cert.pem", "/nonexistent/key.pem")
+            .err()
+            .expect("a configured but missing certificate must be an error");
+        assert!(err.contains("TLS init failed"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_only_one_tls_path_is_rejected() {
+        assert!(build("/etc/cert.pem", "").is_err());
+        assert!(build("", "/etc/key.pem").is_err());
     }
 }

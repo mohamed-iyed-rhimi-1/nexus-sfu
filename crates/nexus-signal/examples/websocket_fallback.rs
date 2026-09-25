@@ -17,7 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (orchestrator_tx, mut _orchestrator_rx) =
         tokio::sync::mpsc::channel::<OrchestratorEvent>(4096);
 
-    let server = WebSocketServer::new(bind_addr, jwt_validator, shutdown, orchestrator_tx, "", "");
+    let server = WebSocketServer::new(bind_addr, jwt_validator, shutdown, orchestrator_tx, "", "")
+        .expect("plain WS needs no TLS setup");
 
     println!("WebSocket server listening on {}", bind_addr);
     println!("Press Ctrl+C to stop");
