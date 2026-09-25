@@ -2,131 +2,123 @@
 
 ## Project Overview
 
-Nexus SFU is a high-performance WebRTC Selective Forwarding Unit written in Rust. It forwards media packets between participants in real-time video/audio sessions with zero-allocation hot paths, CRDT-based distributed state (no Redis/Postgres), and optional XDP kernel bypass.
+Nexus SFU is a WebRTC Selective Forwarding Unit written in Rust. It forwards media packets
+between participants in real-time video/audio sessions.
 
-**Status:** v0.1.0 - incomplete, under active development. Performance benchmarks not yet validated.
+**Status:** v0.1.0 — incomplete. The data plane is being redesigned; performance and memory
+targets are not met yet.
 **License:** AGPL-3.0-only (binary), Apache-2.0 (library crates)
+
+## Start here
+
+| Document | What it is |
+|----------|-----------|
+| `architecture.md` | What the code does **today**: live path, what is broken, dead code, measured baseline |
+| `docs/dataplane-design.md` | The data-plane redesign: decisions (D1-D10), targets, phases |
+| `docs/plans/phase-N.md` | The plan for the current phase, with a **Status** section and session log |
+| `docs/design/*.md` | Detailed designs, written before the phase that needs them |
+| `docs/architecture-vision.md` | The original design, for reference only; much of it is not implemented or cannot work |
+
+**Current phase: 0** (`docs/plans/phase-0.md`).
+
+Working on a phase:
+1. Read the phase plan's Status section first; pick the next part that is not done.
+2. Keep to the design's decisions. If one has to change, propose a revision to
+   `docs/dataplane-design.md` (revision log) instead of silently diverging.
+3. Before ending a session, update the plan's Status table and add a session-log line
+   (what was done, what is left), so the next session can continue from the documents.
+
+Do not trust comments or the vision document about what runs: many describe code that is
+never called. Check `architecture.md` Part 2, or trace from `src/main.rs`.
 
 ## Tech Stack
 
 - **Language:** Rust 1.83.0 (edition 2021) - pinned in `rust-toolchain.toml`
-- **Async runtime:** Tokio 1.44 (multi-threaded, full features)
+- **Async runtime:** Tokio 1.44 (control plane only)
 - **HTTP:** Axum 0.7
-- **Serialization:** Cap'n Proto 0.19 (signaling), Protobuf/prost 0.13 (API), serde_json (WebSocket)
-- **Crypto:** ring 0.17, OpenSSL (vendored), rustls 0.22
+- **Signaling:** WebSocket + JSON (the only transport the SDK and loadtest use)
+- **Crypto:** OpenSSL (vendored) for DTLS; RustCrypto (aes, ctr, hmac, sha1, aes-gcm) for SRTP; rustls for TLS
 - **Client SDK:** TypeScript 5.3.3, bundled with tsup (dual ESM/CJS)
 
 ## Build & Run
 
 ### Prerequisites
 
-- Rust 1.83+ (install via `rustup`)
+- Rust 1.83+ (install via `rustup`); cargo lives in `~/.cargo/bin`
 - Cap'n Proto compiler: `capnp`
 - Protocol Buffers compiler: `protoc`
-- Linux only: `liburing-dev` for io_uring support
 
 ### Commands
 
 ```bash
 # Build
 cargo build --release
-cargo build --release --features xdp    # Linux only, with kernel bypass
 
 # Run
-cargo run -- --config config/development.toml    # Development
-./target/release/nexus-sfu --config config/production.toml  # Production
+cargo run -- --config config/development.toml    # Development (needs certs/dev-{cert,key}.pem)
+./target/release/nexus-sfu --config config/production.toml
 
 # Test
-cargo test --workspace                   # All tests
-cargo bench --workspace                  # Benchmarks
-cargo run -p nexus-dst -- run scenarios/basic.toml   # Deterministic simulation
-cargo run -p nexus-loadtest -- webinar --viewers 100 --sfu-url ws://localhost:7880
+cargo test --workspace                   # All tests (only in-crate tests and top-level tests/*.rs compile)
+cargo bench --bench real_path            # Real ingress/egress path cost
+cargo bench --bench memory               # Heap per participant; NEXUS_MEM_BUDGET_KB=<n> makes it a check
 
 # Lint
 cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # SDK (TypeScript)
-cd sdk && npm run build                  # Build SDK
-cd sdk && npm run dev                    # Watch mode
+cd sdk && npm run build
 ```
+
+On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto` and
+`protobuf-compiler` installed, the repo mounted, and named volumes for `target/` and the
+cargo registry. Many paths differ on Linux (io_uring, `recvmmsg`, core pinning,
+`panic = "abort"` in release), and CI is the only other Linux environment.
 
 ### Docker
 
 ```bash
-cd deploy/docker && ./build.sh && ./run.sh
+cd deploy/docker && ./build.sh && ./run.sh     # run.sh: TLS_CERT/TLS_KEY, NEXUS_JWT_SECRET, *_PORT overrides
 ```
 
-## Architecture
+## Architecture (today)
 
-### Control Plane vs Data Plane
+See `architecture.md` for the full picture. The essentials:
 
-**Data plane (hot path)** - zero allocation, pinned CPU core:
-```
-UDP recv -> classify (1 byte) -> RTP/RTCP (inline) -> SRTP decrypt -> SSRC route -> worker forward -> batch send (sendmmsg)
-```
+- **Ingress:** one busy loop on the main thread (`Sfu::run_packet_loop`, `src/sfu.rs`)
+  receives, classifies, decrypts (under a per-session mutex) and routes every packet.
+- **Workers:** pinned threads (`src/worker/pool.rs`) own tracks; per subscriber they copy,
+  rewrite, SRTP-encrypt and `sendmmsg`.
+- **Control plane:** Tokio. WebSocket signaling → `SessionOrchestrator`
+  (`src/orchestrator/`: room, negotiation, subscription, connection) which also runs DTLS
+  handshakes and ICE timers. REST API on Axum with JWT.
 
-**Control plane** - Tokio async:
-- Signaling (QUIC primary on :4433, WebSocket fallback on :8080)
-- Session orchestrator (`tokio::select!` loop) with 4 modules:
-  - `RoomManager` - room CRUD, join/leave
-  - `NegotiationManager` - SDP offer/answer, ICE gathering, track registration
-  - `SubscriptionManager` - subscribe/unsubscribe, viewport filtering
-  - `ConnectionMonitor` - STUN/DTLS, ICE pacing, consent checks
-- REST API (Axum on :8081 with JWT auth)
+The redesign replaces ingress and workers with per-session shards
+(`docs/dataplane-design.md`).
 
 ### Workspace Structure
 
 ```
-nexus-sfu/
-  src/               # Binary crate - main SFU orchestrator (~22K LoC)
-    main.rs          # Entry point, CLI args, startup sequence
-    sfu.rs           # Top-level Sfu struct, component initialization
-    config/          # TOML config loading, validation, hot-reload
-    forward/         # Hot-path packet forwarding (processor, router, selective)
-    orchestrator/    # Control plane (room, connection, negotiation, subscription)
-    signal/          # Signaling server coordination
-    worker/          # Worker pool, sharding, SPSC channels
-    transport/       # Transport abstraction (io_uring, kqueue, recvmmsg)
-    state/           # Forward table, distributed state integration
-  crates/
-    nexus-core/      # Shared types, config primitives
-    nexus-transport/ # UDP, ICE, DTLS, SRTP, arena allocator (largest crate ~1.2M)
-    nexus-media/     # RTP/RTCP parsing (SIMD: NEON/SSE/AVX), codec detection
-    nexus-webrtc/    # WebRTC state machine, SDP negotiation, packet demux
-    nexus-state/     # CRDTs (Orswot, LWWReg, GCounter), SWIM gossip
-    nexus-actor/     # Actor-per-track with supervision, migration, registry
-    nexus-signal/    # QUIC 0-RTT signaling + WebSocket fallback
-    nexus-bwe/       # GCC bandwidth estimation, REMB, probing
-    nexus-api/       # REST API with JWT auth
-    nexus-metrics/   # Prometheus metrics, per-worker stats
-    nexus-recorder/  # Track recording to disk
-    nexus-dst/       # Deterministic simulation testing
-    nexus-loadtest/  # Load testing framework
-  sdk/               # TypeScript client SDK (@nexus-sfu/sdk)
-    src/client.ts    # NexusClient - WebRTC + signaling
-    src/signaling.ts # WebSocket transport with reconnection
-    src/messages.ts  # Message type definitions
-    src/errors.ts    # NexusError class
-  proto/             # Schema definitions
-    signaling.capnp  # Real-time signaling (Cap'n Proto)
-    api.proto        # REST API (Protocol Buffers)
-  config/            # TOML config files (development, production, loadtest)
-  tests/             # Integration, stress, unit, validation tests
-  benches/           # Criterion benchmarks (forwarding, packet_processing, crdt_sync)
-  deploy/            # Docker + Grafana dashboard
-  bpf/               # eBPF/XDP kernel bypass (Linux)
-  scripts/           # Dev utilities (run, build, verify scripts)
-```
-
-### Key Features
-
-```
-io_uring       - Default on Linux, kernel async I/O
-xdp            - Optional Linux kernel bypass (10M+ pps)
-capnp          - Cap'n Proto signaling codec
-production     - Compile-time production guards
-sim            - Deterministic simulation mode (no-op I/O, clock abstraction)
+src/                 Binary crate: main.rs, sfu.rs (packet loop), orchestrator/, worker/,
+                     forward/ (router.rs is live), config/, signal/, transport/
+crates/
+  nexus-core/        Shared types, config primitives
+  nexus-transport/   UDP, io_uring, ICE, DTLS (OpenSSL), SRTP, arena, ring buffer
+  nexus-media/       RTP/RTCP parsing, codec detection
+  nexus-webrtc/      WebRTC session state machine, SDP, packet demux
+  nexus-signal/      WebSocket signaling (QUIC module is a stub)
+  nexus-bwe/         GCC, REMB (not fed by the live path)
+  nexus-api/         REST API with JWT
+  nexus-metrics/     Prometheus metrics
+  nexus-state/       CRDTs, SWIM gossip
+  nexus-actor/       Actor system; only config limits and migration types are used
+  nexus-recorder/    Unused (removed in Phase 0)
+  nexus-dst/         Deterministic simulation; does not exercise the server
+  nexus-loadtest/    Load generator with webrtc-rs clients
+sdk/                 TypeScript client SDK
+benches/             real_path, memory (trusted); forwarding, packet_processing, crdt_sync
+deploy/              Docker, Grafana dashboard
 ```
 
 ## Code Style & Conventions
@@ -144,54 +136,49 @@ sim            - Deterministic simulation mode (no-op I/O, clock abstraction)
 
 - Hot path: `Option<T>` for recoverable, drop packet on failure, never panic
 - Control path: `Result<T, SfuError>` with typed error hierarchy
-- Startup: panic (fail fast) on invalid configuration
-- Actor failures: supervised with restart policies
+- Startup: fail fast on invalid configuration (`main` returns `ExitCode::FAILURE`)
 
 ### Concurrency
 
-- Lock-free SPSC channels between packet loop and workers
-- `DashMap` for SSRC routing (concurrent hash map)
-- `AtomicBool`/`AtomicU64` for hot/cold subscriber state
-- `arc-swap` for atomic Arc updates
+- **Never add locks or allocations to the packet forwarding hot path.** The current path
+  has both (see `architecture.md` 1.2); the redesign removes them. Do not add more.
 - `parking_lot` mutexes only on control path
-- **Never add locks or allocations to the packet forwarding hot path**
 
 ## Configuration
 
-Config files in `config/` (TOML format). Precedence: CLI args > env vars (`NEXUS_*`) > config file > defaults.
+Config files in `config/` (TOML). Precedence: CLI args > env vars (`NEXUS_*`) > config file > defaults.
 
-- `config/development.toml` - 2 workers, 32MB arena, DEBUG logging, no CPU affinity
-- `config/production.toml` - auto workers, 1GB arena, CPU pinning, RT priority
+- `config/development.toml` - 2 workers, small arena, DEBUG logging, no CPU affinity
+- `config/production.toml` - auto workers, 1 GB arena, CPU pinning; needs `NEXUS_JWT_SECRET` and TLS files at `/etc/nexus/tls/`
 - `config/loadtest.toml` - tuned for load testing
 
-Hot-reloadable: logging, metrics, room timeouts, BWE settings.
-Requires restart: memory, workers, transport.
+If TLS paths are set but the files do not load, the SFU refuses to start.
 
 ## Testing
 
-- **Unit tests:** `tests/unit/` - NACK, REMB, simulcast
-- **Integration:** `tests/integration/` - actor system, e2e signaling, ICE/DTLS/SRTP, SDP exchange
-- **Stress:** `tests/stress/` - concurrent sessions, replay window, resource limits
-- **Validation:** `tests/validation/` - RFC compliance, TigerStyle assertions
-- **Property-based:** proptest for SPSC channel correctness
-- **Benchmarks:** Criterion in `benches/` - forwarding throughput, packet parsing, CRDT sync
-- **DST:** `nexus-dst` crate - deterministic simulation with fault injection
+- Unit tests live in each crate (`#[cfg(test)]`).
+- `tests/` subdirectories (`integration/`, `stress/`, `unit/`, `validation/`) are **not
+  compiled** by cargo and are stale; they are deleted in Phase 0. Only top-level
+  `tests/*.rs` files are compiled.
+- End-to-end tests with real WebRTC clients: `tests/e2e.rs` (added in Phase 0).
+- Benchmarks: `real_path` and `memory` measure the live path; CI runs them as a smoke test
+  and enforces a memory budget.
 
 ## PR Checklist
 
 - `cargo test --workspace` passes
-- `cargo clippy --workspace -- -D warnings` has no warnings
-- `cargo fmt --check` passes
+- `cargo clippy --workspace --all-targets -- -D warnings` has no warnings
+- `cargo fmt --all --check` passes
 - New code has assertions for preconditions and postconditions
-- Hot path changes include benchmark results
-- No allocations or locks added to the packet forwarding hot path
+- Hot path changes include `real_path` benchmark results
+- Phase work updates the phase plan's Status section
 
-## Ports (defaults)
+## Ports (defaults in `config/development.toml` / `config/production.toml`)
 
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 7880 | UDP | Media (RTP/RTCP) |
-| 7881 | TCP | WebSocket signaling |
-| 4433 | UDP | QUIC signaling |
-| 8081 | TCP | REST API |
-| 9090 | TCP | Prometheus metrics |
+| Port (dev / prod) | Protocol | Purpose |
+|-------------------|----------|---------|
+| 10000 / 10000 | UDP | Media (RTP/RTCP, STUN, DTLS) |
+| 8080 / 443 | TCP | WebSocket signaling (WSS when TLS is configured) |
+| 8443 / 443 | UDP | QUIC signaling (stub) |
+| 8081 / 8081 | TCP | REST API, `/health`, `/ready` |
+| 9090 / 9090 | TCP | Prometheus metrics |

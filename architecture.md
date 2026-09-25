@@ -1,264 +1,279 @@
 # Nexus SFU Architecture
 
-This document describes the architecture **as it exists in the code today**, what is
-**planned but not built**, and what in the original design **needs redesign** because it
-cannot work as specified. The original design document is preserved in
-[`docs/architecture-vision.md`](docs/architecture-vision.md).
+This document describes the architecture **as it exists in the code today**: what runs,
+what is broken on the live path, what is planned but not built, and what in the original
+design cannot work as specified.
+
+- The original design: [`docs/architecture-vision.md`](docs/architecture-vision.md).
+- The replacement data plane: [`docs/dataplane-design.md`](docs/dataplane-design.md), with
+  the phase plans in [`docs/plans/`](docs/plans/).
 
 Status legend:
 
 | Mark | Meaning |
 |------|---------|
-| ✅ Implemented | Runs in the binary started by `src/main.rs` |
-| 🟡 Partial | Code exists but is not wired in, or only part of it is on the live path |
+| ✅ Implemented | Runs in the binary started by `src/main.rs` and works |
+| 🟡 Partial | Code exists but is not wired in, or runs but does not work (see Part 2) |
 | ⬜ Planned | Described in the vision, no implementation |
 | ❌ Needs redesign | The design as written is incompatible with WebRTC or with other requirements |
 
-Line references are as of v0.1.0 and will drift; prefer the file paths.
+Findings are as of commit `062e668` (v0.1.0). Line references will drift; prefer the file
+paths.
 
 ---
 
-## Part 1 — Implemented
+## Part 1 — What runs
 
 ### 1.1 Process layout
 
 One binary, one node. `main.rs` (`#[tokio::main]`) starts:
 
 ```
+main thread (root future of the tokio runtime)
+└── Ingress packet loop      Sfu::run_packet_loop — busy loop, all media ingress for the process
+
 tokio runtime (multi-thread)
-├── Signaling server         QUIC (quinn, Cap'n Proto) + WebSocket fallback (serde_json)
+├── Signaling server         WebSocket + JSON (used by SDK and loadtest); QUIC listener (stub, see 2.1)
 ├── SessionOrchestrator      tokio::select! loop: Room / Negotiation / Subscription / ConnectionMonitor
-├── REST API                 Axum + JWT
-├── Metrics                  Prometheus
-├── SWIM gossip              probe cycle + CRDT delta sync (nexus-state)
-└── Ingress packet loop      Sfu::run_packet_loop — a single async task
+│                            also runs every DTLS handshake and ICE/consent timer
+├── REST API                 Axum + JWT, /health, /ready, /metrics
+└── Metrics                  Prometheus
 
 std threads
-└── Worker pool              N workers (num_cpus by default), optionally CPU-pinned + SCHED_FIFO
+├── Worker pool              N workers (num_cpus by default), CPU-pinned if worker.cpu_affinity,
+│                            SCHED_FIFO if worker.realtime_priority
+└── Gossip                   SWIM probe cycle + CRDT sync (nexus-state), bound to a random port
 ```
 
-### 1.2 Media data path (actual)
+### 1.2 Media data path
 
 ```
-media UDP socket
-  │  recvmmsg (Linux) / recv_from per packet (macOS, Linux without io_uring)
+media UDP socket (one for the process)
+  │  recvmmsg (Linux; io_uring is tried first but its multishot receive is never armed)
+  │  kqueue + recv_from per packet (macOS)
   ▼
-Ingress task (ONE tokio task for the whole process, not pinned)      src/sfu.rs  run_packet_loop
-  ├── classify first byte (STUN / DTLS / RTP / RTCP)
-  ├── STUN, DTLS  ──► mpsc channel ──► orchestrator (cold path)
+Ingress loop (main thread)                                          src/sfu.rs  step_once
+  ├── classify first byte (RFC 7983)
+  ├── STUN, DTLS  ──► to_vec ──► tokio mpsc ──► orchestrator (cold path)
   └── RTP / RTCP
-        ├── session lookup (ArcSwap map + DashMap + session Mutex)   nexus-webrtc transport.rs
-        ├── SRTP unprotect (RustCrypto AES-CM/HMAC-SHA1 or AES-GCM)
-        ├── SSRC → (track, worker) lookup (DashMap)                  src/forward/router.rs
-        ├── copy into arena slot                                     nexus-transport arena.rs
-        └── crossbeam bounded MPMC try_send ──► worker               src/worker/pool.rs
+        ├── session: ArcSwap addr map → DashMap → session Mutex     nexus-webrtc transport.rs
+        ├── SRTP unprotect inside the lock (3 copies + memset)
+        ├── SsrcRouter DashMap lookup                               src/forward/router.rs
+        ├── send_publisher_srtcp_if_needed: 2nd session Mutex,
+        │   key extraction (Vec alloc), SipHash, static DashMap      src/sfu.rs  (every packet)
+        ├── arena alloc (CAS + Box) and copy                        nexus-transport arena.rs
+        └── RwLock<WorkerPool> read → HashMap → crossbeam try_send  src/worker/pool.rs
                                                      │
 Worker thread (pinned, spin-polling)                 ▼
-  ├── per-track state (TrackActorState in a HashMap)
-  ├── retransmission ring (RingBuffer<2048>, holds arena slots)
-  ├── simulcast layer selection, TWCC recording, NACK / PLI handling
+  ├── per-track state (TrackActorState in a HashMap, 4 lookups per packet)
+  ├── retransmission ring (RingBuffer<2048> of arena slots, audio included)
   └── per subscriber:
-        ├── allocate slot + copy payload
-        ├── inject MID / RID header extensions
-        ├── rewrite seq / timestamp / PT / SSRC
-        ├── SRTP protect with the subscriber's own keys
-        └── BatchSender.queue ──► sendmmsg (flush at 64 packets or 1 ms)
+        ├── arena alloc (CAS + Box) + copy
+        ├── inject MID / RID extensions, rewrite seq / timestamp / PT
+        ├── SRTP protect with that (subscriber, track)'s own context
+        └── BatchSender (HashMap<SocketAddr, Vec>) ──► sendmmsg at 64 packets or 1 ms
 ```
 
-Key facts about this path:
+Key facts:
 
-- **Receiving is single-threaded.** Receive, SRTP decrypt and routing for all
-  publishers run in one task (`src/sfu.rs` `run_packet_loop`), so adding cores does not
-  raise the ingress limit.
-- **Fan-out is copy + encrypt per subscriber.** Each subscriber has its own DTLS-SRTP keys,
-  so every forwarded packet is copied and re-encrypted (`src/worker/pool.rs`
-  `forward_to_subscribers_static`).
-- **Worker handoff is crossbeam MPMC**, not the SPSC channel in `src/worker/spsc.rs`.
-- **Retransmission** is served from the per-track ring buffer on the worker. It is not
-  correct yet: NACKs carry the subscriber's rewritten sequence numbers, but the ring is
-  looked up by its own push counter; the cached packet is re-sent without the subscriber's
-  seq / timestamp / SSRC rewrite; and the NACK sender SSRC is matched against the internal
-  subscriber id.
+- **Ingress is one thread for the whole process**, and it sleeps with `std::thread::sleep`
+  inside async code when idle (`src/spin.rs`). Adding cores does not raise the ingress limit.
+- **Fan-out is copy + encrypt per subscriber**, because every subscriber has its own
+  DTLS-SRTP keys (`forward_to_subscribers_static`).
+- **Worker handoff is crossbeam MPMC.** The SPSC mesh in `src/worker/spsc.rs` is created
+  and drained but has no production sender.
+- **Per-packet cost on the ingress thread:** 2 session mutex locks, 4 DashMap reads,
+  1 RwLock, 2 ArcSwap loads, about 2 heap allocations per packet plus 5 per batch.
+- **Workers never touch sessions.** Everything reaches them as `WorkerMessage`s; subscriber
+  addresses and SRTP contexts are copied in once and never updated.
 
 ### 1.3 Control plane
 
 | Component | Status | Location |
 |-----------|--------|----------|
 | Session orchestrator (room, negotiation, subscription, connection monitor) | ✅ | `src/orchestrator/` |
-| SDP offer/answer, ICE (host candidates, consent), DTLS via OpenSSL | ✅ | `crates/nexus-webrtc`, `crates/nexus-transport/src/{ice,dtls}` |
-| DTLS peer certificate checked against the SDP `a=fingerprint` (RFC 8122); media blocked until it matches | ✅ | `WebRtcSession::set_remote_fingerprint` |
+| SDP offer/answer (SFU always offers) | ✅ | `crates/nexus-webrtc/src/sdp`, `src/orchestrator/negotiation.rs` |
+| ICE: one host candidate, consent checks, full ICE (controlling) | 🟡 | Candidate is the bind address, see 2.1 |
+| DTLS via OpenSSL, peer certificate checked against SDP `a=fingerprint` (RFC 8122) | 🟡 | Handshake works; no retransmission timer, see 2.1 |
 | SRTP / SRTCP (AES-CM-HMAC-SHA1-80, AES-GCM) | ✅ | `crates/nexus-transport/src/srtp` |
-| QUIC signaling with Cap'n Proto | ✅ | `crates/nexus-signal/src/quic` |
-| WebSocket signaling with JSON (used by the TypeScript SDK) | ✅ | `crates/nexus-signal/src/websocket` |
-| REST API with JWT | ✅ | `crates/nexus-api` |
+| WebSocket signaling with JSON (SDK, loadtest) | ✅ | `crates/nexus-signal/src/websocket` |
+| TLS for signaling, refuses to start if configured TLS fails | ✅ | `WebSocketServer::new` |
+| QUIC signaling with Cap'n Proto | 🟡 | Echo stub, see 2.1 |
+| REST API with JWT, `/health`, `/ready` | ✅ | `crates/nexus-api` |
 | Prometheus metrics + Grafana dashboard | ✅ | `crates/nexus-metrics`, `deploy/grafana` |
-| GCC bandwidth estimation, REMB, probing | ✅ | `crates/nexus-bwe` |
+| GCC bandwidth estimation, REMB | 🟡 | Runs, never receives input, see 2.1 |
 | Config loading, validation, hot-reload | ✅ | `src/config/` |
-| TypeScript client SDK | ✅ | `sdk/` |
-| Docker image | ✅ | `deploy/docker` |
+| TypeScript client SDK (WebSocket + JSON only) | ✅ | `sdk/` |
+| Docker image, `deploy/docker/run.sh` | ✅ | `deploy/docker` |
 
 ### 1.4 Distributed state
 
 | Component | Status | Notes |
 |-----------|--------|-------|
 | CRDTs: ORSWOT, LWWReg, GCounter | ✅ | `crates/nexus-state/src/crdt`. Guarded by `std::sync::RwLock` |
-| SWIM membership + gossip | ✅ | Started in `src/sfu.rs` (`SwimProtocol::new`, `run_probe_cycle`) |
+| SWIM membership + gossip | 🟡 | Thread runs, but binds `0.0.0.0:0` (a random port), so other nodes cannot use it as a seed |
 | No Redis / no database | ✅ | |
-| Subscription graph in CRDT | 🟡 | ORSWOT capacity is 10,000 entries; `add_subscription` errors are discarded (`src/orchestrator/subscription.rs`), so large rooms silently lose entries |
-| Cross-node relay (cascade) | 🟡 | `src/relay/` exists and relay events are gossiped, but `set_relay_manager` is never called, so no packets are relayed |
+| Subscription graph in CRDT | 🟡 | ORSWOT capacity is 10,000 entries; `add_subscription` errors are discarded, so large rooms silently lose entries |
+| Cross-node relay (cascade) | 🟡 | `set_relay_manager` is never called and nothing creates a relay request, so no packets are relayed |
 
-### 1.5 Memory model (actual)
+### 1.5 Memory model
 
-- Global `PacketArena` of 1500-byte slots (1 GB in `config/production.toml`), plus a
-  per-worker arena in `src/worker/pool.rs`.
-- Slot free list is a lock-free stack. **Each slot also heap-allocates its refcount**
-  (`Box<AtomicU32>` in `PacketSlot::new`), so there is one malloc/free per slot.
-- Per track: `RingBuffer<2048>` keeping up to 2,048 packets for retransmission (~3 MB of
-  arena per track once full).
-- Per track: subscriber `Vec` pre-reserved for 100 subscribers (~450 KB), each entry with
-  its own `SrtpContext`.
-- Per session: OpenSSL context, key and certificate, DTLS buffers, a pure-Rust
-  `DtlsSession` fallback and the ICE agent, all kept for the life of the session.
+- Global `PacketArena` of 1500-byte slots of `memory.arena_size_mb`, plus per-worker arenas
+  of `arena_size_mb / num_workers`: about 2× the configured size is mapped.
+  `arena_size_mb / num_workers` panics when there are more workers than megabytes.
+- Each slot heap-allocates its refcount (`Box<AtomicU32>` in `PacketSlot::new`).
+- Per track: `RingBuffer<2048>` holding up to 2,048 ingest slots (≈ 3 MB once full), for
+  audio as well as video.
+- Per track: subscriber `Vec` pre-reserved for 100 subscribers (≈ 220 KB or more).
+- Per subscriber per track: an `SrtpContext` and a `seq_map: [u16; 1024]` that is written
+  but never read.
+- Per session: OpenSSL context, key and certificate, DTLS buffers, an unused pure-Rust
+  `DtlsSession` and the ICE agent, all kept for the life of the session.
 
 ---
 
-## Part 2 — Planned, not built
+## Part 2 — What is broken or unused on the live path
 
-These appear in the vision document but have no implementation, or only unreachable code.
+### 2.1 Features that do not work
+
+| Feature | Why | Where |
+|---------|-----|-------|
+| **Connecting from another machine** | The only ICE candidate is the bind address (`0.0.0.0:10000` in every shipped config). No announced/public IP setting. Works only with client and SFU on one host. | `negotiation.rs` `start_ice_gathering` |
+| **NACK retransmission** | Subscriber matched by `s.id == sender_ssrc` (participant id vs RTCP SSRC); ring looked up by its push counter, not RTP seq; `seq_map` never read; retransmits skip the rewrite; upstream NACK uses the subscriber's seq space; `nack` is never offered to publishers. | `pool.rs` `retransmit_from_ring_buffer`, `handle_rtcp_nack`; `negotiator.rs` |
+| **Simulcast** | Each simulcast SSRC becomes its own track; layer messages are never sent; no `a=rid`/`a=simulcast` offered. | `pool.rs`, `negotiation.rs` |
+| **Bandwidth estimation** | Worker GCC inputs are never sent; TWCC ext id stays 0; REMB always advertises the 1 Mbps constant. | `pool.rs` `BandwidthCoordinator`; `negotiation.rs` |
+| **Keyframe on join** | No PLI when a subscriber is added; FIR ignored. PLI forwarding from subscribers works. | `pool.rs` `add_subscriber`; `sfu.rs` RTCP dispatch |
+| **MID per subscriber** | One MID value per track (last subscriber wins); injection skips packets already carrying MID id 1. | `pool.rs` `SetTrackMid`, `inject_mid_extension` |
+| **Address changes** | Subscriber destination fixed at subscribe time; NAT rebinding and ICE restart never reach workers. | `subscription.rs`; `pool.rs` `add_subscriber` |
+| **DTLS retransmission** | The 200 ms timer polls the unused custom DTLS engine; OpenSSL's timer is never driven. The SFU offers `actpass`, so browsers usually take the DTLS client role and their own retransmissions cover most losses; when the SFU is the client, a lost flight stalls the handshake. | `session.rs` `poll_dtls_retransmit`; `openssl_backend.rs` |
+| **QUIC signaling** | Accepts connections and echoes the offer back as the answer; never talks to the orchestrator. | `crates/nexus-signal/src/quic/streams.rs` |
+
+### 2.2 Security risks
+
+- **SRTCP nonce reuse toward publishers.** Each published track gets its own SRTCP context
+  (`SetPublisherSrtcp`), all derived from the same key and each starting its SRTCP index at
+  0. REMB is sent from each video track's context with sender SSRC 1, and forwarded PLI/NACK
+  keep the subscriber's sender SSRC, so two tracks of one publisher can emit the same
+  (key, SSRC, index) and AES-CM reuses keystream.
+
+### 2.3 Code not reachable from `main.rs`
+
+About 17,000 lines, plus 5,600 lines of tests that are never compiled:
+
+| Code | Lines | Note |
+|------|------:|------|
+| `XdpPacketLoop` (`src/sfu.rs`) | ~1,000 | Never constructed |
+| `src/forward/{multicast,selective,processor}.rs` | ~3,100 | Used by the XDP loop, re-exports and one bench |
+| `src/relay/`, relay plumbing in workers | ~450 + | See 1.4 |
+| `nexus-actor` runtime | ~5,900 | `ActorManager` built, only `room_count()` used; migration drivers never called |
+| `nexus-recorder` | ~1,300 | Routes never mounted, no media fed |
+| TURN (`crates/nexus-transport/src/turn`) | ~3,900 | Only re-exported |
+| `nexus-signal` `SignalingHandler` | ~1,200 | Never constructed |
+| `src/track_registry.rs` | 113 | Created and dropped in `main.rs` |
+| `tests/{integration,stress,unit,validation,common}` | ~5,600 | No `[[test]]` entries; imports that no longer exist |
+
+`nexus-dst` builds and runs, but models the actor system and does not exercise the server.
+
+---
+
+## Part 3 — Planned, not built
 
 | Item | Status | What exists today |
 |------|--------|-------------------|
-| Multi-threaded ingress (each pinned worker owns a socket, e.g. `SO_REUSEPORT`) | ⬜ | Single ingress task |
-| io_uring multishot recv with registered buffers | 🟡 | `init_multishot_recv` exists in `crates/nexus-transport/src/io_uring.rs` but is never called; the multishot path also has a source-address bug (`MSG_PEEK` on the next packet) |
-| UDP GRO / GSO | 🟡 | `crates/nexus-transport/src/{gro,gso}.rs` exist, not used by the live path |
-| SPSC ingress → worker channels | 🟡 | `src/worker/spsc.rs` exists, not used |
-| Lock-free copy-on-write subscriber set (`ArcSwap<SubscriberSet>`) | ⬜ | Plain `Vec<ActorSubscriber>` |
-| Actor-per-track runtime (`nexus-actor` supervision) | 🟡 | `spawn_track` / `spawn_participant` are only called from tests; live per-track state is `TrackActorState` in the worker pool |
-| Track migration by subscriber location | 🟡 | `WorkerPool::migrate_track` exists, nothing calls it |
-| Consistent-hash track assignment, work stealing | ⬜ | |
+| Multi-threaded ingress | ⬜ | Single ingress loop; see the redesign |
+| io_uring multishot recv with registered buffers | 🟡 | `init_multishot_recv` exists, never called |
+| UDP GRO / GSO | 🟡 | `crates/nexus-transport/src/{gro,gso}.rs`, not on the live path |
+| SPSC ingress → worker channels | 🟡 | `src/worker/spsc.rs`, no production sender |
+| Actor-per-track runtime (`nexus-actor` supervision) | 🟡 | See 2.3 |
+| Track migration, consistent hashing, work stealing | 🟡 | `migrate_track` has no caller; assignment is FNV-1a modulo |
 | Cross-node forwarding | 🟡 | See 1.4 |
-| QUIC 0-RTT resume | ⬜ | |
+| QUIC 0-RTT signaling | 🟡 | See 2.1 |
 | gRPC API | ⬜ | REST only |
-| Edge layer (anycast, PoPs) | ⬜ | Single node binary |
-| Kubernetes manifests, HPA, autoscaler, Terraform | ⬜ | `deploy/` has only `docker/` and `grafana/` |
-| Stateless workers / spot-instance tolerance | ⬜ | All session state (ICE, DTLS, SRTP, rings) lives in one process; losing a node drops its calls |
+| Edge layer (anycast, PoPs), Kubernetes manifests, autoscaler, Terraform | ⬜ | `deploy/` has `docker/` and `grafana/` |
+| Stateless workers / spot-instance tolerance | ⬜ | All session state lives in one process |
 | DPDK | ⬜ | |
-| `src/forward/{multicast,selective,processor}.rs` | 🟡 | Present, not on the live path |
 
 ---
 
-## Part 3 — Needs redesign
+## Part 4 — Needs redesign
 
-These parts of the vision cannot work as written, whatever the implementation effort.
+These parts of the vision cannot work as written. The replacement data plane is
+[`docs/dataplane-design.md`](docs/dataplane-design.md).
 
-### 3.1 Zero-copy fan-out conflicts with per-subscriber SRTP
+### 4.1 Zero-copy fan-out conflicts with per-subscriber SRTP
 
-The vision's `forward_packet` pushes `clone_shallow()` of one buffer to every subscriber
-(~200 ns per packet). In WebRTC every subscriber negotiates its own DTLS-SRTP keys, and the
-SFU also rewrites SSRC / sequence / timestamp and header extensions per subscriber. Each
-outgoing packet therefore needs its own buffer and its own encryption.
+The vision's `forward_packet` pushes `clone_shallow()` of one buffer to every subscriber.
+In WebRTC every subscriber has its own DTLS-SRTP keys, and the SFU rewrites SSRC, sequence,
+timestamp and header extensions per subscriber. Each outgoing packet needs its own buffer
+and its own encryption; the redesign budgets for that cost instead of avoiding it.
 
-Redesign direction:
-- Accept one copy + one encrypt per subscriber-packet as the base cost and budget for it.
-- Reduce the constant: cache the AES key schedule and HMAC state per SRTP context
-  (currently rebuilt per packet), prefer AES-GCM, and use GSO for sends.
-- Share an SRTP context per subscriber rather than per subscribed track.
-
-### 3.2 XDP / eBPF forwarding of RTP
+### 4.2 XDP / eBPF forwarding of RTP
 
 `bpf/xdp_sfu.c` rewrites IP/port and redirects the publisher's packet. That forwards the
 publisher's SRTP ciphertext, which subscribers cannot decrypt, and the map holds one
-destination per SSRC, so it cannot fan out. The "90% of packets in XDP" model is not
-possible for WebRTC media.
+destination per SSRC, so it cannot fan out. AF_XDP remains possible as a faster userspace
+socket, with SRTP still in userspace.
 
-Additional state: `XdpPacketLoop` (`src/sfu.rs`) is never constructed, AF_XDP ring
-operations in `src/transport/af_xdp.rs` are placeholders, and nothing loads the BPF
-program.
+### 4.3 "Zero locks, zero allocation" hot path
 
-Redesign direction: use AF_XDP only as a faster **userspace** socket (zero-copy RX/TX
-rings), with SRTP still done in userspace; or drop XDP from scope.
+Sound as a principle; unreachable with the current ownership (1.2). It requires session and
+SRTP state owned by the thread that receives the packet.
 
-### 3.3 "Zero locks, zero allocation" hot path
+### 4.4 Memory per participant
 
-The design principle is sound, but the live path currently takes DashMap shard locks, a
-session `Mutex` (twice per packet), a `RwLock` over the whole `WorkerPool`, and allocates
-per packet (`to_vec` on receive, `Vec`s per `recvmmsg` poll, `get_srtp_key_material()`,
-the arena refcount `Box`, `BatchSender`'s per-destination `Vec`s). Meeting the principle
-requires restructuring ownership, not local tweaks: session and SRTP state owned by the
-thread that receives the packet, and pre-allocated batch buffers.
+Measured ≈ 1.5 MB heap plus ≈ 6 MB arena per audio+video publisher (Part 5), against a
+100 KB target. The redesign restates the target: 100 KB fixed per participant, with video
+retransmission history (≈ 310 KB per second of 2.5 Mbps video) reported separately.
 
-### 3.4 Memory per participant
+### 4.5 Distributed subscription state
 
-The vision targets < 100 KB per participant. Measured heap today is ~1.5 MB for an
-audio+video publisher, plus ~6 MB of arena held by retransmission rings. Reaching the
-target requires changing design choices, not only tuning:
-- size retransmission buffers by time (hundreds of ms), not 2,048 packets;
-- do not pre-reserve subscriber capacity;
-- free the DTLS fallback and ICE agent once connected; share one OpenSSL context;
-- one SRTP context per subscriber, not per subscribed track.
-
-Also note that with a 1 GB arena and 2,048-packet rings, a node holds about 349 tracks
-(~174 audio+video publishers), which contradicts the capacity and cost figures in the
-vision.
-
-### 3.5 Distributed subscription state
-
-A subscription graph stored as a single ORSWOT grows as O(participants²) per room
-(~250K entries for a 500-person room) and is capped at 10,000 entries. It needs
-per-room or per-track partitioning, and insert failures must be surfaced.
+A subscription graph in one ORSWOT grows as O(participants²) per room (≈ 250K entries for
+500 people) and is capped at 10,000 entries. It needs per-room or per-track partitioning,
+and insert failures must be surfaced. Out of scope for the data-plane redesign.
 
 ---
 
-## Performance targets
+## Part 5 — Performance baseline
 
-There is one set of targets: the table in [`README.md`](README.md#performance-targets).
-The figures in `docs/architecture-vision.md` (1M+ pps, 800K pps, P99 < 15 ms) and the
-500 KB figure in `src/lib.rs` are superseded.
+There is one set of targets: the table in [`README.md`](README.md#performance-targets),
+restated with measurement methods in the redesign. **None are met or validated yet.**
 
-**None of the targets are validated yet.** The real-path numbers below come from
-`benches/real_path.rs` and `benches/memory.rs`. Numbers are Linux (Docker, arm64, Apple M2
-Pro host), single core, loopback sockets. They exclude the kernel receive syscall and the
-NIC transmit path, so a real deployment will be somewhat slower.
+Measured at commit `062e668` on Linux arm64 (Docker Desktop VM, 6 vCPUs, Apple M2 Pro host)
+with `cargo bench --bench real_path` and `--bench memory`. Criterion medians; runs vary by
+±10% (more on single-subscriber cases), so the 100-subscriber rows are used. Loopback
+sockets; no NIC.
 
-Browsers negotiate `SRTP_AES128_CM_HMAC_SHA1_80` today: the SFU lists it first in
-`use_srtp` (crates/nexus-transport/src/dtls/openssl_backend.rs).
+**Per-packet cost**
 
-Egress, per forwarded packet (real `MediaWorker`, per-subscriber SRTP, `sendmmsg`):
+| Stage | AES-CM-HMAC-SHA1-80 | AES-GCM |
+|-------|--------------------:|--------:|
+| SRTP protect, 1,200-byte video | 0.73 µs | 2.04 µs |
+| SRTP protect, 160-byte audio | 0.21 µs | 0.40 µs |
+| Ingress, video (socket buffer → worker queue) | 2.47 µs | 3.78 µs |
+| Ingress, audio | 1.91 µs | 2.08 µs |
+| Egress per subscriber, video (100 subscribers, incl. `sendmmsg`) | 2.19 µs | 3.13 µs |
+| Egress per subscriber, audio (100 subscribers) | 1.22 µs | 1.25 µs |
 
-| Media | SRTP profile | Per packet | Packets/sec/core |
-|-------|--------------|-----------|------------------|
-| Audio (100 B) | AES-CM + HMAC-SHA1 | ~1.3 µs | ~770K |
-| Audio (100 B) | AES-GCM | ~1.25 µs | ~800K |
-| Video (1100 B) | AES-CM + HMAC-SHA1 | ~2.0 µs | ~500K |
-| Video (1100 B) | AES-GCM | ~3.2 µs | ~310K |
+- **Egress:** ≈ 455K video subscriber-packets/s per worker core with AES-CM (≈ 320K with GCM).
+- **Ingress:** one thread for the process, ≈ 400K incoming video packets/s at most, shared
+  with STUN, DTLS and RTCP.
+- **Combined:** a video packet fanned out to 10 subscribers costs ≈ 24 µs of CPU, ≈ 2.4 µs
+  per subscriber-packet; beyond that, the ingress thread is the limit.
+- Browsers negotiate AES-CM today (listed first in `use_srtp`). AES-GCM is slow with the
+  RustCrypto backend; the redesign picks the backend by benchmark.
 
-Ingress, per published packet (session lookup, SRTP decrypt, routing, handoff). This runs
-on one thread for the whole process, so it is a server-wide limit, not per core:
+**Memory** (heap via counting allocator; arena slots separately)
 
-| Media | AES-CM + HMAC-SHA1 | AES-GCM |
-|-------|--------------------|---------|
-| Audio | ~2.1 µs (~475K/s) | ~2.4 µs (~420K/s) |
-| Video | ~2.8 µs (~360K/s) | ~4.2 µs (~240K/s) |
+| Item | Rust allocator | All malloc (incl. OpenSSL) |
+|------|---------------:|---------------------------:|
+| Session created | 69 KB | 102 KB |
+| Session after DTLS handshake | 127 KB | 268 KB |
+| Published track (worker state) | 578 KB | — |
+| Subscriber 1-100 on a track | 0 (pre-reserved in the track) | — |
+| Subscriber 101-200 | 4.4 KB | — |
+| Retransmit ring, full | 3,000 KB of arena | — |
+| **A+V publisher, no subscriptions** | **1,526 KB** + 6,000 KB arena | — |
+| **+ subscribed to 10 A+V publishers** | **1,615 KB** + 6,000 KB arena | — |
 
-SRTP on arm64 uses the ARMv8 AES and SHA-1 instructions (`.cargo/config.toml`, and the
-`sha1` `asm` feature in crates/nexus-transport/Cargo.toml). Cipher key schedules and
-keyed HMAC state are built once per context, not per packet.
-
-What dominates now:
-- **AES-GCM on Linux arm64 is still slow** (~2.3 µs for 1.1 KB, ~0.5 GB/s): the
-  RustCrypto GHASH only reaches hardware speed when PMULL is enabled at compile time,
-  which slows the CM profile. A GCM implementation with runtime-dispatched assembly
-  (e.g. `ring`, already a dependency) would fix both; then prefer GCM in `use_srtp`.
-- **Ingress has ~1.6 µs of non-crypto overhead per packet:** locks, lookups, the per-packet
-  key-material `Vec`, the 7 KB buffer memset and the copies.
-
-Memory per audio+video publisher: **~1.5 MB heap** (session ~100 KB, DTLS handshake
-~265 KB, ~580 KB per track, mostly the pre-reserved subscriber list) **plus ~6 MB of
-arena** held by two 2048-packet retransmission rings. Each subscription beyond the
-reservation costs ~4.4 KB.
-
-Known gaps in measurement:
-- No benchmark covers kernel receive or a real NIC; profile the running binary with `perf`.
-- No latency (P50/P99) measurement under load.
-- "Packets/sec" must state whether it counts ingress (published) or egress (forwarded)
-  packets; with fan-out these differ by the subscriber count.
+Known gaps: no benchmark covers kernel receive, a real NIC, or latency (P50/P99) under
+load. "Packets/sec" always needs to say ingress (published) or egress (forwarded).
