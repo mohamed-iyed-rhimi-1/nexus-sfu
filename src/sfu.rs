@@ -1621,6 +1621,7 @@ impl Sfu {
             num_workers,
             config.memory.arena_size_mb / num_workers.max(1),
             socket_fd,
+            config.worker.cpu_affinity,
             config.worker.realtime_priority,
             config.worker.realtime_priority_level,
         )

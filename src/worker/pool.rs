@@ -3680,8 +3680,8 @@ pub struct WorkerPool {
 impl WorkerPool {
     /// Create a new worker pool.
     ///
-    /// Spawns one worker per CPU core (or specified number) and pins
-    /// each worker to its corresponding core. Creates N×(N-1) SPSC channels
+    /// Spawns one worker per CPU core (or specified number) and, when
+    /// `cpu_affinity` is set, pins each worker to its corresponding core. Creates N×(N-1) SPSC channels
     /// for cross-worker packet forwarding (Requirement 1.3). Waits for all
     /// workers to initialize successfully before returning.
     ///
@@ -3690,6 +3690,7 @@ impl WorkerPool {
     /// * `num_workers` - Number of workers (1-64, or 0 for auto-detect)
     /// * `arena_size_mb` - Size of packet arena per worker in MB
     /// * `socket_fd` - Socket file descriptor for batch senders
+    /// * `cpu_affinity` - Whether to pin each worker thread to a CPU core
     /// * `realtime_priority` - Whether to attempt SCHED_FIFO real-time scheduling
     /// * `realtime_priority_level` - SCHED_FIFO priority (1-99, default 80)
     ///
@@ -3711,6 +3712,7 @@ impl WorkerPool {
         num_workers: u32,
         arena_size_mb: u32,
         socket_fd: i32,
+        cpu_affinity: bool,
         realtime_priority: bool,
         realtime_priority_level: u32,
     ) -> Result<Self, WorkerError> {
@@ -3749,8 +3751,13 @@ impl WorkerPool {
 
         let track_hasher = ConsistentHash::new(num_workers);
 
-        // Get available CPU cores
-        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        // Cores to pin to. Empty means no pinning: with cpu_affinity off the
+        // scheduler places worker threads freely.
+        let core_ids = if cpu_affinity {
+            core_affinity::get_core_ids().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         // Relay output channel — all workers share the sender.
         // SFU main loop drains relay_out_rx → RelayManager.
@@ -3894,7 +3901,13 @@ impl WorkerPool {
                 .spawn(move || {
                     // Pin to CPU core if available
                     if let Some(core) = affinity_core_id {
-                        let _ = core_affinity::set_for_current(core);
+                        if !core_affinity::set_for_current(core) {
+                            tracing::warn!(
+                                worker_id = worker_id,
+                                core = core.id,
+                                "Failed to pin worker to CPU core, running unpinned"
+                            );
+                        }
                     }
 
                     // Attempt real-time scheduling if configured (Linux only)
@@ -4086,9 +4099,9 @@ impl WorkerPool {
     /// Create a worker pool with default settings.
     ///
     /// Uses auto-detected number of workers and default arena size.
-    /// Real-time scheduling is disabled by default.
+    /// CPU pinning and real-time scheduling are disabled by default.
     pub fn with_defaults(socket_fd: i32) -> Result<Self, WorkerError> {
-        Self::new(0, DEFAULT_ARENA_SIZE_MB, socket_fd, false, 0)
+        Self::new(0, DEFAULT_ARENA_SIZE_MB, socket_fd, false, false, 0)
     }
 
     /// Get the number of workers.
@@ -4964,7 +4977,7 @@ mod tests {
     #[test]
     fn test_worker_pool_new() {
         let socket_fd = create_test_socket();
-        let pool = WorkerPool::new(2, 1, socket_fd, false, 0).unwrap();
+        let pool = WorkerPool::new(2, 1, socket_fd, false, false, 0).unwrap();
 
         assert_eq!(pool.num_workers(), 2);
         assert!(!pool.is_shutdown());
@@ -4975,7 +4988,7 @@ mod tests {
     #[test]
     fn test_worker_pool_assign_track() {
         let socket_fd = create_test_socket();
-        let mut pool = WorkerPool::new(4, 1, socket_fd, false, 0).unwrap();
+        let mut pool = WorkerPool::new(4, 1, socket_fd, false, false, 0).unwrap();
 
         let (track_id, worker_id) = pool.assign_track(12345, MediaKind::Video).unwrap();
         assert_eq!(track_id, 1);
@@ -4990,7 +5003,7 @@ mod tests {
     #[test]
     fn test_worker_pool_least_loaded() {
         let socket_fd = create_test_socket();
-        let pool = WorkerPool::new(4, 1, socket_fd, false, 0).unwrap();
+        let pool = WorkerPool::new(4, 1, socket_fd, false, false, 0).unwrap();
 
         // Initially all workers have 0 tracks
         let least = pool.least_loaded_worker();
@@ -5000,7 +5013,7 @@ mod tests {
     #[test]
     fn test_worker_pool_shutdown() {
         let socket_fd = create_test_socket();
-        let mut pool = WorkerPool::new(2, 1, socket_fd, false, 0).unwrap();
+        let mut pool = WorkerPool::new(2, 1, socket_fd, false, false, 0).unwrap();
 
         // Workers should already be running after new()
         assert!(pool.all_workers_healthy());
@@ -5019,13 +5032,13 @@ mod tests {
     #[should_panic(expected = "num_workers must be <= 64")]
     fn test_worker_pool_too_many_workers() {
         let socket_fd = create_test_socket();
-        let _ = WorkerPool::new(100, 1, socket_fd, false, 0);
+        let _ = WorkerPool::new(100, 1, socket_fd, false, false, 0);
     }
 
     #[test]
     fn test_worker_pool_get_worker() {
         let socket_fd = create_test_socket();
-        let pool = WorkerPool::new(4, 1, socket_fd, false, 0).unwrap();
+        let pool = WorkerPool::new(4, 1, socket_fd, false, false, 0).unwrap();
 
         assert!(pool.get_worker(0).is_some());
         assert!(pool.get_worker(3).is_some());
@@ -5042,7 +5055,7 @@ mod tests {
     #[test]
     fn test_worker_pool_remove_track() {
         let socket_fd = create_test_socket();
-        let mut pool = WorkerPool::new(2, 1, socket_fd, false, 0).unwrap();
+        let mut pool = WorkerPool::new(2, 1, socket_fd, false, false, 0).unwrap();
 
         let (track_id, _) = pool.assign_track(12345, MediaKind::Video).unwrap();
 
@@ -5058,7 +5071,7 @@ mod tests {
     #[test]
     fn test_worker_pool_running_count() {
         let socket_fd = create_test_socket();
-        let pool = WorkerPool::new(3, 1, socket_fd, false, 0).unwrap();
+        let pool = WorkerPool::new(3, 1, socket_fd, false, false, 0).unwrap();
 
         assert_eq!(pool.running_worker_count(), 3);
         assert!(pool.all_workers_healthy());
