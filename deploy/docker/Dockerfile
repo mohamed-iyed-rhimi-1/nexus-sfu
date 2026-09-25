@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # =============================================================================
 # Build Stage - Compile Rust binary with all optimizations
 # =============================================================================
@@ -8,69 +9,41 @@ FROM rust:1.83.0-bookworm AS builder
 # capnproto: Cap'n Proto schema compiler
 # protobuf-compiler: Protocol Buffers compiler (if needed)
 # pkg-config: Build configuration helper
+# Not pinned to exact Debian revisions: bookworm replaces them with security
+# updates (and capnproto 0.10.2-1 never existed in bookworm), which broke the
+# build. The base image tag pins the Debian release.
 RUN apt-get update && \
-    apt-get install -y \
-        liburing-dev=2.3-3 \
-        capnproto=0.10.2-1 \
-        protobuf-compiler=3.21.12-3 \
-        pkg-config=1.8.1-1 \
+    apt-get install -y --no-install-recommends \
+        liburing-dev \
+        capnproto \
+        protobuf-compiler \
+        pkg-config \
     && \
     rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /build
 
-# Copy dependency manifests first for layer caching
-# TigerStyle: minimize scope - only copy what's needed for dependency resolution
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY build.rs ./
-COPY crates/nexus-state/Cargo.toml ./crates/nexus-state/
-COPY crates/nexus-actor/Cargo.toml ./crates/nexus-actor/
-COPY crates/nexus-signal/Cargo.toml ./crates/nexus-signal/
-COPY crates/nexus-metrics/Cargo.toml ./crates/nexus-metrics/
-
-# Copy Cap'n Proto schemas (required by build.rs)
+# Copy the workspace. Cargo validates every declared target (benches,
+# examples) when loading the manifest, so those directories are needed even
+# though only the binary is built. `.cargo/` carries the target rustflags
+# that enable ARMv8 AES/PMULL for SRTP on arm64.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY .cargo/ ./.cargo/
 COPY proto/ ./proto/
-
-# Create dummy source files to cache dependencies
-# TigerStyle: explicit bounds - exactly 4 crates + main
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    mkdir -p crates/nexus-state/src && \
-    echo "pub fn dummy() {}" > crates/nexus-state/src/lib.rs && \
-    mkdir -p crates/nexus-actor/src && \
-    echo "pub fn dummy() {}" > crates/nexus-actor/src/lib.rs && \
-    mkdir -p crates/nexus-signal/src && \
-    echo "pub fn dummy() {}" > crates/nexus-signal/src/lib.rs && \
-    mkdir -p crates/nexus-metrics/src && \
-    echo "pub fn dummy() {}" > crates/nexus-metrics/src/lib.rs
-
-# Build dependencies only (cached layer)
-# TigerStyle: explicit flags, no defaults
-RUN cargo build \
-    --release \
-    --locked \
-    --target-dir /build/target
-
-# Remove dummy source files
-# TigerStyle: clean state before real build
-RUN rm -rf src crates/*/src
-
-# Copy actual source code
 COPY src/ ./src/
 COPY crates/ ./crates/
+COPY benches/ ./benches/
+COPY examples/ ./examples/
 
-# Build actual binary with maximum optimizations
-# Profile settings from Cargo.toml:
-# - opt-level = 3 (maximum optimization)
-# - lto = "fat" (full link-time optimization)
-# - codegen-units = 1 (single codegen unit for best optimization)
-# - panic = "abort" (smaller binary, faster panics)
-# - strip = true (remove debug symbols)
-RUN cargo build \
-    --release \
-    --locked \
-    --target-dir /build/target
+# Build the binary with the release profile from Cargo.toml
+# (opt-level 3, fat LTO, codegen-units 1, panic = abort, strip).
+# Cache mounts keep the registry and build artifacts between image builds.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/cache \
+    cargo build --release --locked --bin nexus-sfu --target-dir /build/cache && \
+    mkdir -p /build/target/release && \
+    cp /build/cache/release/nexus-sfu /build/target/release/nexus-sfu
 
 # Strip binary explicitly (defense in depth, even though Cargo.toml has strip=true)
 # TigerStyle: assert what we expect
@@ -124,21 +97,14 @@ EXPOSE 443/tcp
 EXPOSE 8080/tcp
 # 9090/tcp: Prometheus metrics endpoint
 EXPOSE 9090/tcp
+# 8081/tcp: REST API, including /health and /ready probes
+EXPOSE 8081/tcp
 
-# Health check configuration
-# TigerStyle: explicit intervals and timeouts
-# Check /health endpoint every 10 seconds
-# Timeout after 3 seconds
-# Start checking after 5 seconds (startup grace period)
-# Fail after 3 consecutive failures
-HEALTHCHECK \
-    --interval=10s \
-    --timeout=3s \
-    --start-period=5s \
-    --retries=3 \
-    CMD ["/busybox/wget", "-q", "-O", "-", "http://127.0.0.1:3000/health"]
-
-# Note: distroless/cc includes busybox for health checks
+# Health: probe from outside the container. distroless/cc has no shell or
+# HTTP client (busybox is only in the :debug variant), so an in-image
+# HEALTHCHECK cannot run. Use the API endpoints on port 8081:
+#   liveness:  GET http://<pod>:8081/health
+#   readiness: GET http://<pod>:8081/ready
 # The health endpoint returns 200 OK when healthy, non-200 when unhealthy
 
 # Run as non-root user (distroless nonroot user)

@@ -1,49 +1,26 @@
 name: CI
 
 on:
+  # Every branch, not just main: work happens on feature/version branches
+  # (e.g. v0.1.0), and a Linux-only build break went unnoticed there.
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # Do not set RUSTFLAGS here. It replaces the target rustflags in
+  # .cargo/config.toml, which enable ARMv8 AES/PMULL for SRTP. Warnings are
+  # already errors via #![deny(warnings)] and `clippy -D warnings`.
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liburing-dev capnproto protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liburing-dev capnproto protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.83.0"
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -52,26 +29,78 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.83.0"
           components: clippy
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liburing-dev capnproto protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y capnproto protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  bench:
-    name: Benchmarks
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  test:
+    name: Test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          # arm64 builds the code behind aarch64 cfgs (ARMv8 AES / PMULL /
+          # SHA-1), which an x86_64-only CI never compiles.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.83.0"
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liburing-dev capnproto protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y capnproto protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo bench --workspace --no-run
+      - run: cargo build --release --locked --bin nexus-sfu
+      - run: cargo test --workspace --locked
+
+  bench-smoke:
+    name: Bench smoke (${{ matrix.arch }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.83.0"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y capnproto protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      # Runs every real-path benchmark once to check it still works (not a
+      # timing measurement: shared CI runners are too noisy for that).
+      - run: cargo bench --bench real_path -- --test
+      # Fails if an audio+video publisher's heap grows past the budget.
+      # Measured ~1.55 MB at v0.1.0; lower this as memory work lands.
+      - run: cargo bench --bench memory
+        env:
+          NEXUS_MEM_BUDGET_KB: "1700"
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
