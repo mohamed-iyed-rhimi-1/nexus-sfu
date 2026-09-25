@@ -460,6 +460,10 @@ pub struct WebRtcSession {
     /// before the DTLS handshake starts.
     dtls_fingerprint_cache: [u8; 32],
 
+    /// SHA-256 certificate fingerprint the peer signalled in SDP. The DTLS
+    /// handshake is not trusted until the peer's certificate matches it.
+    remote_fingerprint: Option<[u8; 32]>,
+
     /// SRTP inbound context — keyed with the remote peer's keys (for unprotect).
     srtp_session: Option<SrtpContext>,
 
@@ -573,6 +577,7 @@ impl WebRtcSession {
             dtls_session: None,
             openssl_dtls,
             dtls_fingerprint_cache,
+            remote_fingerprint: None,
             srtp_session: None,
             srtp_outbound: None,
             remote_addr: None,
@@ -1481,6 +1486,22 @@ impl WebRtcSession {
         let dtls_state = self.dtls_session.as_ref().unwrap().state();
 
         if dtls_state == DtlsState::Established {
+            match self.check_remote_fingerprint() {
+                FingerprintCheck::Match => {}
+                // The browser can finish DTLS before its SDP answer reaches
+                // us. Stay in DtlsHandshaking (media is dropped) until
+                // `set_remote_fingerprint` supplies it.
+                FingerprintCheck::Pending => return Ok(()),
+                FingerprintCheck::Mismatch => {
+                    tracing::error!(
+                        session_id = self.config.id.0,
+                        "DTLS peer certificate does not match SDP fingerprint"
+                    );
+                    self.transition_state(SessionState::Failed)?;
+                    return Err(WebRtcError::DtlsFingerprintMismatch);
+                }
+            }
+
             self.initialize_srtp()?;
 
             // Transition to Established
@@ -1494,6 +1515,56 @@ impl WebRtcSession {
         }
 
         Ok(())
+    }
+
+    /// Record the peer's certificate fingerprint from its SDP (RFC 8122).
+    ///
+    /// If the DTLS handshake already finished, this completes it: the
+    /// session becomes Established on a match and Failed on a mismatch.
+    /// A later SDP (renegotiation) must carry the same fingerprint.
+    pub fn set_remote_fingerprint(&mut self, fingerprint: [u8; 32]) -> Result<(), WebRtcError> {
+        assert!(
+            fingerprint.iter().any(|&b| b != 0),
+            "remote fingerprint must not be all zeros"
+        );
+        if let Some(existing) = self.remote_fingerprint {
+            if existing != fingerprint {
+                tracing::error!(
+                    session_id = self.config.id.0,
+                    "SDP fingerprint changed without a DTLS restart"
+                );
+                self.transition_state(SessionState::Failed)?;
+                return Err(WebRtcError::DtlsFingerprintMismatch);
+            }
+            return Ok(());
+        }
+        self.remote_fingerprint = Some(fingerprint);
+        let handshake_done = self
+            .dtls_session
+            .as_ref()
+            .is_some_and(|d| d.state() == DtlsState::Established);
+        if self.state == SessionState::DtlsHandshaking && handshake_done {
+            self.check_dtls_completion()?;
+        }
+        assert_eq!(self.remote_fingerprint, Some(fingerprint));
+        Ok(())
+    }
+
+    /// Compare the peer certificate with the SDP fingerprint. Fails closed:
+    /// without the OpenSSL engine there is no peer certificate to check.
+    fn check_remote_fingerprint(&self) -> FingerprintCheck {
+        let expected = match self.remote_fingerprint {
+            Some(fp) => fp,
+            None => return FingerprintCheck::Pending,
+        };
+        match self
+            .openssl_dtls
+            .as_ref()
+            .and_then(|e| e.peer_fingerprint())
+        {
+            Some(actual) if *actual == expected => FingerprintCheck::Match,
+            _ => FingerprintCheck::Mismatch,
+        }
     }
 
     /// Check if DTLS needs retransmission and return the data to send.
@@ -2769,6 +2840,15 @@ impl WebRtcSession {
 
         Ok(())
     }
+}
+
+/// Outcome of comparing the DTLS peer certificate with the SDP fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FingerprintCheck {
+    Match,
+    Mismatch,
+    /// The peer's SDP has not arrived yet.
+    Pending,
 }
 
 // ============================================================================

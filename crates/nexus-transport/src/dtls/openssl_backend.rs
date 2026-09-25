@@ -154,6 +154,8 @@ pub struct OpenSslDtlsEngine {
     pending_output: Vec<u8>,
     /// Handshake started flag.
     started: bool,
+    /// SHA-256 of the peer's certificate (populated after handshake).
+    peer_fingerprint: Option<[u8; 32]>,
 }
 
 impl OpenSslDtlsEngine {
@@ -276,9 +278,15 @@ impl OpenSslDtlsEngine {
             ))
             .map_err(|e| DtlsError::handshake_failed(format!("srtp ext: {}", e)))?;
 
-        // Verify mode: request peer cert but don't fail if missing
-        // (WebRTC uses fingerprint verification via SDP, not CA chain)
-        ctx_builder.set_verify(SslVerifyMode::NONE);
+        // Require the peer's certificate (RFC 8827 §6.5: both sides present
+        // one). It is self-signed, so skip CA-chain validation here; the
+        // session checks its SHA-256 against the SDP a=fingerprint instead
+        // (see `peer_fingerprint`). Without PEER a server never requests the
+        // client certificate and there is nothing to verify.
+        ctx_builder.set_verify_callback(
+            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+            |_preverify_ok, _store| true,
+        );
 
         // Disable session tickets (not needed for DTLS-SRTP)
         ctx_builder.set_options(SslOptions::NO_TICKET);
@@ -297,6 +305,7 @@ impl OpenSslDtlsEngine {
             srtp_profile: None,
             pending_output: Vec::with_capacity(MAX_BIO_READ),
             started: false,
+            peer_fingerprint: None,
         })
     }
 
@@ -321,6 +330,33 @@ impl OpenSslDtlsEngine {
     /// Whether the handshake is complete.
     pub fn is_established(&self) -> bool {
         self.established
+    }
+
+    /// SHA-256 of the peer's certificate, available once the handshake is
+    /// complete. Callers must compare it with the fingerprint signalled in
+    /// SDP before trusting the connection.
+    pub fn peer_fingerprint(&self) -> Option<&[u8; 32]> {
+        self.peer_fingerprint.as_ref()
+    }
+
+    /// Hash the peer certificate from the completed handshake.
+    fn record_peer_fingerprint(&mut self) -> Result<(), DtlsError> {
+        let stream = self
+            .stream
+            .as_ref()
+            .expect("stream must exist after handshake");
+        let cert = stream
+            .ssl()
+            .peer_certificate()
+            .ok_or_else(|| DtlsError::handshake_failed("peer sent no certificate".to_string()))?;
+        let digest = cert
+            .digest(MessageDigest::sha256())
+            .map_err(|e| DtlsError::handshake_failed(format!("peer digest: {}", e)))?;
+        assert_eq!(digest.len(), 32, "SHA-256 digest must be 32 bytes");
+        let mut fingerprint = [0u8; 32];
+        fingerprint.copy_from_slice(&digest);
+        self.peer_fingerprint = Some(fingerprint);
+        Ok(())
     }
 
     /// Get exported SRTP key material (after handshake).
@@ -354,6 +390,7 @@ impl OpenSslDtlsEngine {
                 let output = stream.get_mut().take_outgoing();
                 self.stream = Some(stream);
                 self.established = true;
+                self.record_peer_fingerprint()?;
                 self.export_srtp_material()?;
                 Ok(output)
             }
@@ -395,6 +432,7 @@ impl OpenSslDtlsEngine {
                     let output = stream.get_mut().take_outgoing();
                     self.stream = Some(stream);
                     self.established = true;
+                    self.record_peer_fingerprint()?;
                     self.export_srtp_material()?;
                     Ok(output)
                 }

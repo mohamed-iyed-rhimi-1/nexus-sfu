@@ -1233,4 +1233,116 @@ mod tests {
         // No sessions are established yet
         assert_eq!(transport.connected_session_count(), 0);
     }
+
+    // ── DTLS fingerprint verification (RFC 8122 / RFC 8827) ────────────
+
+    use super::super::session::SessionState;
+    use nexus_transport::dtls::{DtlsRole as EngineRole, OpenSslDtlsEngine};
+
+    const PEER: &str = "127.0.0.1:41000";
+
+    /// A running transport with one server-role session at `PEER`, past ICE.
+    fn session_awaiting_dtls() -> (WebRtcTransport, TransportId) {
+        let transport = WebRtcTransport::new(TransportConfig::default()).unwrap();
+        transport.start().unwrap();
+        let id = transport
+            .create_session(DtlsParameters::new(DtlsRole::Server))
+            .unwrap();
+        transport.associate_address(PEER.parse().unwrap(), id);
+        transport.with_session_mut(id, |s| {
+            s.force_state_for_testing(SessionState::IceConnecting);
+            s.inject_ice_completion_for_testing();
+        });
+        (transport, id)
+    }
+
+    /// Drive a handshake from an OpenSSL client (the browser). Returns
+    /// whether the client completed it.
+    fn run_handshake(transport: &WebRtcTransport, client: &mut OpenSslDtlsEngine) -> bool {
+        let mut flight = client.start_handshake().unwrap();
+        let mut out = [0u8; 2048];
+        for _ in 0..16 {
+            if flight.is_empty() {
+                break;
+            }
+            let reply = match transport.process_packet(&flight, PEER.parse().unwrap(), &mut out) {
+                Ok(Some((_, IncomingData::Dtls(reply)))) => reply,
+                _ => Vec::new(),
+            };
+            flight = if reply.is_empty() {
+                Vec::new()
+            } else {
+                client.process(&reply).unwrap()
+            };
+        }
+        client.is_established()
+    }
+
+    fn state(transport: &WebRtcTransport, id: TransportId) -> SessionState {
+        transport.with_session(id, |s| s.state()).unwrap()
+    }
+
+    #[test]
+    fn test_dtls_fingerprint_match_establishes() {
+        let (transport, id) = session_awaiting_dtls();
+        let mut client = OpenSslDtlsEngine::new(EngineRole::Client).unwrap();
+        let fp = *client.fingerprint();
+        transport
+            .with_session_mut(id, |s| s.set_remote_fingerprint(fp))
+            .unwrap()
+            .unwrap();
+
+        assert!(run_handshake(&transport, &mut client));
+        assert_eq!(state(&transport, id), SessionState::Established);
+    }
+
+    #[test]
+    fn test_dtls_fingerprint_mismatch_fails() {
+        let (transport, id) = session_awaiting_dtls();
+        let mut client = OpenSslDtlsEngine::new(EngineRole::Client).unwrap();
+        let mut wrong = *client.fingerprint();
+        wrong[0] ^= 0xFF;
+        transport
+            .with_session_mut(id, |s| s.set_remote_fingerprint(wrong))
+            .unwrap()
+            .unwrap();
+
+        // The server refuses its final flight, so the client never completes.
+        assert!(!run_handshake(&transport, &mut client));
+        assert_eq!(state(&transport, id), SessionState::Failed);
+        let srtp = transport
+            .with_session(id, |s| s.get_srtp_context().is_some())
+            .unwrap();
+        assert!(
+            !srtp,
+            "no SRTP keys may be installed for an unverified peer"
+        );
+    }
+
+    #[test]
+    fn test_dtls_fingerprint_after_handshake() {
+        // The browser can finish DTLS before its SDP answer is processed.
+        let (transport, id) = session_awaiting_dtls();
+        let mut client = OpenSslDtlsEngine::new(EngineRole::Client).unwrap();
+        assert!(run_handshake(&transport, &mut client));
+        assert_eq!(state(&transport, id), SessionState::DtlsHandshaking);
+
+        let fp = *client.fingerprint();
+        transport
+            .with_session_mut(id, |s| s.set_remote_fingerprint(fp))
+            .unwrap()
+            .unwrap();
+        assert_eq!(state(&transport, id), SessionState::Established);
+    }
+
+    #[test]
+    fn test_dtls_fingerprint_mismatch_after_handshake() {
+        let (transport, id) = session_awaiting_dtls();
+        let mut client = OpenSslDtlsEngine::new(EngineRole::Client).unwrap();
+        assert!(run_handshake(&transport, &mut client));
+
+        let result = transport.with_session_mut(id, |s| s.set_remote_fingerprint([7u8; 32]));
+        assert_eq!(result, Some(Err(WebRtcError::DtlsFingerprintMismatch)));
+        assert_eq!(state(&transport, id), SessionState::Failed);
+    }
 }

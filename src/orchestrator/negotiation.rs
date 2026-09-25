@@ -463,6 +463,30 @@ impl NegotiationManager {
             });
         }
 
+        // Pin the peer's DTLS certificate. Until this is set the session
+        // will not trust the handshake; on mismatch it fails.
+        match Self::extract_fingerprint(&answer) {
+            Some(fingerprint) => {
+                let result = self
+                    .webrtc_transport
+                    .with_session_mut(transport_id, |ws| ws.set_remote_fingerprint(fingerprint));
+                if let Some(Err(e)) = result {
+                    warn!(
+                        "DTLS fingerprint check failed for participant {}: {}",
+                        participant_id, e
+                    );
+                    return;
+                }
+            }
+            None => {
+                warn!(
+                    "Answer from participant {} has no SHA-256 fingerprint",
+                    participant_id
+                );
+                return;
+            }
+        }
+
         // Register published tracks from the m-lines this offer added for publishing
         // (subscription m-lines in the same answer are not the participant's media).
         let publish_mids = std::mem::take(&mut state.unregistered_publish_mids);
@@ -521,6 +545,22 @@ impl NegotiationManager {
         }
 
         info!("Answer processed from participant {}", participant_id);
+    }
+
+    /// SHA-256 DTLS fingerprint from the session level, else the first
+    /// m-line that has one (bundled m-lines share one transport).
+    fn extract_fingerprint(sdp: &nexus_webrtc::sdp::SessionDescription) -> Option<[u8; 32]> {
+        let session_fp = sdp.fingerprint.as_ref();
+        let media_fp = (0..(sdp.media_count as usize).min(8))
+            .filter_map(|i| sdp.media[i].as_ref())
+            .find_map(|m| m.fingerprint.as_ref());
+        let fp = session_fp.or(media_fp)?;
+        if fp.algorithm != nexus_webrtc::sdp::FingerprintAlgorithm::Sha256 || fp.value_len != 32 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&fp.value[..32]);
+        Some(out)
     }
 
     fn extract_ice_creds(
