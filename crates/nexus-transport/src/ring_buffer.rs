@@ -91,7 +91,10 @@ impl<const N: usize> RingBuffer<N> {
         let seq = self.push(packet);
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) > limit {
+        // With limit == N, push() already overwrote the packet leaving the
+        // window. Evicting here would hit (head - N - 1) & mask, which is the
+        // slot just written, and drop the newest packet on every push.
+        if (limit as usize) < N && head.wrapping_sub(tail) > limit {
             let evict = (head.wrapping_sub(limit + 1) & Self::mask()) as usize;
             // Same single-owner access as push(); drops the slot's arena reference
             unsafe {
@@ -131,19 +134,22 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     /// Peek at a packet by sequence number.
+    ///
+    /// Only the last `N` pushes can still be stored; older sequence numbers
+    /// return `None` rather than the newer packet that overwrote their slot.
     pub fn peek(&self, seq: u32) -> Option<&PacketSlot> {
         let head_seq = self.head_seq.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Acquire);
-        let count = head.wrapping_sub(tail);
-        let tail_seq = head_seq.wrapping_sub(count);
-        let seq_offset = seq.wrapping_sub(tail_seq);
-        let head_offset = head_seq.wrapping_sub(tail_seq);
-        if seq_offset >= head_offset {
+        let count = head.wrapping_sub(tail).min(N as u32);
+        let oldest_seq = head_seq.wrapping_sub(count);
+        let offset = seq.wrapping_sub(oldest_seq);
+        if offset >= count {
             return None;
         }
-        let slot_offset = seq.wrapping_sub(tail_seq);
-        let index = (tail.wrapping_add(slot_offset) & Self::mask()) as usize;
+        let oldest = head.wrapping_sub(count);
+        let index = (oldest.wrapping_add(offset) & Self::mask()) as usize;
+        debug_assert!(index < N, "index must be within the ring");
         unsafe {
             let slots = &*self.slots.get();
             slots[index].as_ref()
@@ -265,6 +271,44 @@ mod tests {
         assert!(buffer.peek(last_seq).is_some());
         assert!(buffer.peek(last_seq - 1).is_some());
         assert!(buffer.peek(last_seq - 2).is_none());
+    }
+
+    #[test]
+    fn test_push_bounded_full_window_keeps_newest() {
+        // Production uses limit == N. Retention must stay at N after the ring
+        // wraps, and the newest packets must be the ones kept.
+        let arena = PacketArena::new(1).unwrap();
+        let free_before = arena.free_count();
+        let buffer: RingBuffer<8> = RingBuffer::new();
+
+        let mut last_seq = 0;
+        for i in 0..24u8 {
+            last_seq = buffer.push_bounded(create_test_packet(&arena, i), 8);
+        }
+
+        assert_eq!(free_before - arena.free_count(), 8);
+        for back in 0..8u32 {
+            let packet = buffer.peek(last_seq - back).expect("within window");
+            assert_eq!(packet.data()[0], 23 - back as u8);
+        }
+        assert!(buffer.peek(last_seq - 8).is_none());
+    }
+
+    #[test]
+    fn test_peek_rejects_overwritten_seq() {
+        // A lapped sequence number must not return the packet that replaced it.
+        let arena = PacketArena::new(1).unwrap();
+        let buffer: RingBuffer<4> = RingBuffer::new();
+        let seqs: Vec<u32> = (0..6u8)
+            .map(|i| buffer.push(create_test_packet(&arena, i)))
+            .collect();
+
+        assert!(buffer.peek(seqs[0]).is_none());
+        assert!(buffer.peek(seqs[1]).is_none());
+        for (i, &seq) in seqs.iter().enumerate().skip(2) {
+            assert_eq!(buffer.peek(seq).expect("within window").data()[0], i as u8);
+        }
+        assert!(buffer.peek(seqs[5] + 1).is_none());
     }
 
     #[test]
