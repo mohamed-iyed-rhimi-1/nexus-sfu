@@ -566,9 +566,10 @@ mod tests {
         let packets: Vec<&[u8]> = vec![&data1, &data2];
         assert!(sender.can_use_gso(&packets));
 
-        // Different size packets - not eligible
+        // A smaller packet before the last one - not eligible (only the last
+        // GSO segment may be shorter)
         let data3 = vec![3u8; 50];
-        let mixed: Vec<&[u8]> = vec![&data1, &data3];
+        let mixed: Vec<&[u8]> = vec![&data1, &data3, &data2];
         assert!(!sender.can_use_gso(&mixed));
 
         // Single packet - not eligible

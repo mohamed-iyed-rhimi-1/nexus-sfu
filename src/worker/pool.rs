@@ -87,8 +87,8 @@ pub fn has_cap_sys_nice() -> bool {
     // CAP_SYS_NICE is bit 23 in the capabilities bitmask
     const CAP_SYS_NICE_BIT: u32 = 23;
 
-    // Precondition: bit position is valid for u64 bitmask
-    assert!(CAP_SYS_NICE_BIT < 64, "CAP_SYS_NICE bit must be < 64");
+    // Precondition: bit position is valid for u64 bitmask (checked at compile time)
+    const _: () = assert!(CAP_SYS_NICE_BIT < 64, "CAP_SYS_NICE bit must be < 64");
 
     let file = match File::open("/proc/self/status") {
         Ok(f) => f,
@@ -98,15 +98,9 @@ pub fn has_cap_sys_nice() -> bool {
     let reader = BufReader::new(file);
 
     // TigerStyle: Fixed loop bound
-    const MAX_LINES: u32 = 100;
-    let mut line_count: u32 = 0;
+    const MAX_LINES: usize = 100;
 
-    for line_result in reader.lines() {
-        if line_count >= MAX_LINES {
-            break;
-        }
-        line_count += 1;
-
+    for line_result in reader.lines().take(MAX_LINES) {
         let line = match line_result {
             Ok(l) => l,
             Err(_) => continue,

@@ -284,8 +284,6 @@ pub struct IoUringTransport {
     multishot_active: bool,
     /// Provided buffers for multishot receive.
     provided_buffers: Vec<[u8; MAX_PACKET_SIZE_BYTES]>,
-    /// Buffer availability bitmap (1 = available, 0 = in use).
-    buffer_available: [u64; 4], // 256 bits for 256 buffers
     /// Transport statistics.
     stats: IoUringStats,
     /// Whether multishot recv has been initialized.
@@ -354,7 +352,6 @@ impl IoUringTransport {
             sqpoll_enabled,
             multishot_active,
             provided_buffers,
-            buffer_available: [u64::MAX; 4],
             stats: IoUringStats::new(),
             multishot_initialized: AtomicBool::new(false),
             multishot_state: MultishotState::Uninitialized,
@@ -689,20 +686,29 @@ impl IoUringTransport {
         let max_iter = max_packets as u32;
         let mut multishot_terminated = false;
 
-        for cqe in self.ring.completion() {
+        // Copy completions out first: the completion queue borrows the ring
+        // mutably, and processing needs `&mut self`. Entries not taken stay
+        // queued for the next call.
+        let completions: Vec<(u64, u32, i32)> = self
+            .ring
+            .completion()
+            .take(max_packets)
+            .map(|cqe| (cqe.user_data(), cqe.flags(), cqe.result()))
+            .collect();
+
+        for (user_data, flags, result) in completions {
             if processed >= max_iter {
                 break;
             }
 
             // Check if this is a multishot completion
-            let is_multishot = cqe.user_data() == RECV_MULTI_USER_DATA;
+            let is_multishot = user_data == RECV_MULTI_USER_DATA;
 
             // Check IORING_CQE_F_MORE flag - if not set, multishot terminated
-            if is_multishot && (cqe.flags() & IORING_CQE_F_MORE) == 0 {
+            if is_multishot && (flags & IORING_CQE_F_MORE) == 0 {
                 multishot_terminated = true;
             }
 
-            let result = cqe.result();
             if result < 0 {
                 self.stats.record_recv_error();
                 continue;
@@ -713,8 +719,14 @@ impl IoUringTransport {
                 continue;
             }
 
+            // A buffer ID is only present when the kernel selected a buffer
+            if flags & IORING_CQE_F_BUFFER == 0 {
+                self.stats.record_recv_error();
+                continue;
+            }
+
             // Extract buffer ID from completion flags (upper 16 bits)
-            let buffer_id = (cqe.flags() >> 16) as usize;
+            let buffer_id = (flags >> 16) as usize;
             if buffer_id >= NUM_PROVIDED_BUFFERS {
                 self.stats.record_recv_error();
                 continue;
@@ -1217,6 +1229,20 @@ pub fn create_transport_with_fallback(
 mod tests {
     use super::*;
 
+    /// Bind, or skip the test when the kernel or sandbox refuses io_uring
+    /// (e.g. Docker's default seccomp profile returns EPERM). Production
+    /// falls back to recvmmsg in `MediaTransport::bind` in that case.
+    fn bind_or_skip(addr: SocketAddr, config: IoUringConfig) -> Option<IoUringTransport> {
+        match IoUringTransport::bind(addr, config) {
+            Ok(transport) => Some(transport),
+            Err(e @ TransportError::IoUringInitFailed { .. }) => {
+                eprintln!("skipping: io_uring unavailable here ({e})");
+                None
+            }
+            Err(e) => panic!("bind failed: {e:?}"),
+        }
+    }
+
     #[test]
     fn test_io_uring_config_default() {
         let config = IoUringConfig::default();
@@ -1286,10 +1312,9 @@ mod tests {
         let config = IoUringConfig::default();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let transport = IoUringTransport::bind(addr, config);
-        assert!(transport.is_ok());
-
-        let transport = transport.unwrap();
+        let Some(transport) = bind_or_skip(addr, config) else {
+            return;
+        };
         assert!(transport.local_addr().is_ok());
     }
 
@@ -1299,11 +1324,13 @@ mod tests {
 
         // Create sender
         let sender_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let sender = IoUringTransport::bind(sender_addr, config.clone()).unwrap();
+        let Some(sender) = bind_or_skip(sender_addr, config.clone()) else {
+            return;
+        };
 
         // Create receiver
         let recv_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut receiver = IoUringTransport::bind(recv_addr, config).unwrap();
+        let mut receiver = bind_or_skip(recv_addr, config).expect("io_uring worked for sender");
         let recv_local = receiver.local_addr().unwrap();
 
         // Send a packet
@@ -1331,14 +1358,13 @@ mod tests {
         let config = IoUringConfig::default();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let transport = IoUringTransport::bind(addr, config).unwrap();
-        let mode = transport.receive_mode();
+        let Some(transport) = bind_or_skip(addr, config) else {
+            return;
+        };
 
-        // On non-Linux or without io_uring feature, should be Recvmmsg
-        #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
-        {
-            assert_eq!(mode, IoUringReceiveMode::Recvmmsg);
-        }
+        // Recvmmsg everywhere: on Linux, multishot receive is only used after
+        // `init_multishot_recv`, which `bind` does not call.
+        assert_eq!(transport.receive_mode(), IoUringReceiveMode::Recvmmsg);
     }
 
     #[test]
@@ -1346,7 +1372,13 @@ mod tests {
         let config = IoUringConfig::default();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let transport = create_transport_with_fallback(addr, config);
-        assert!(transport.is_ok());
+        // Despite its name this does not fall back (MediaTransport::bind does).
+        match create_transport_with_fallback(addr, config) {
+            Ok(transport) => assert!(transport.local_addr().is_ok()),
+            Err(e @ TransportError::IoUringInitFailed { .. }) => {
+                eprintln!("skipping: io_uring unavailable here ({e})");
+            }
+            Err(e) => panic!("bind failed: {e:?}"),
+        }
     }
 }

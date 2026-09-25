@@ -347,7 +347,7 @@ impl GossipTransport {
                 unsafe { MaybeUninit::zeroed().assume_init() };
             let sockaddr_len = match dest {
                 SocketAddr::V4(addr) => {
-                    let sa = &mut storage as *mut _ as *mut libc::sockaddr_in;
+                    let sa = std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in>();
                     unsafe {
                         (*sa).sin_family = libc::AF_INET as libc::sa_family_t;
                         (*sa).sin_port = addr.port().to_be();
@@ -356,7 +356,7 @@ impl GossipTransport {
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
                 }
                 SocketAddr::V6(addr) => {
-                    let sa = &mut storage as *mut _ as *mut libc::sockaddr_in6;
+                    let sa = std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in6>();
                     unsafe {
                         (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                         (*sa).sin6_port = addr.port().to_be();
@@ -373,14 +373,14 @@ impl GossipTransport {
 
         // Build mmsghdr array
         for i in 0..iovecs.len() {
-            let mut msghdr: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
-            msghdr.msg_name = &mut sockaddrs[i] as *mut _ as *mut libc::c_void;
-            msghdr.msg_namelen = sockaddr_lens[i];
-            msghdr.msg_iov = &mut iovecs[i];
-            msghdr.msg_iovlen = 1;
+            let mut hdr: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
+            hdr.msg_name = std::ptr::addr_of_mut!(sockaddrs[i]).cast::<libc::c_void>();
+            hdr.msg_namelen = sockaddr_lens[i];
+            hdr.msg_iov = &mut iovecs[i];
+            hdr.msg_iovlen = 1;
 
             let mmsghdr = libc::mmsghdr {
-                msg_hdr: msghdr,
+                msg_hdr: hdr,
                 msg_len: 0,
             };
             msghdrs.push(mmsghdr);
@@ -404,23 +404,24 @@ impl GossipTransport {
             return Err(GossipError::Transport(err));
         }
 
-        let sent = result as u32;
+        // Non-negative here: the error case returned above.
+        let sent = result.unsigned_abs();
         let failed = (num_messages as u32).saturating_sub(sent);
 
         // Update statistics
         let mut total_bytes = 0u64;
-        for i in 0..(sent as usize) {
-            total_bytes += encoded_messages[i].len() as u64;
+        for message in encoded_messages.iter().take(sent as usize) {
+            total_bytes += message.len() as u64;
         }
         self.stats
             .messages_sent
-            .fetch_add(sent as u64, Ordering::Relaxed);
+            .fetch_add(u64::from(sent), Ordering::Relaxed);
         self.stats
             .bytes_sent
             .fetch_add(total_bytes, Ordering::Relaxed);
         self.stats
             .send_errors
-            .fetch_add(failed as u64, Ordering::Relaxed);
+            .fetch_add(u64::from(failed), Ordering::Relaxed);
 
         Ok(sent)
     }

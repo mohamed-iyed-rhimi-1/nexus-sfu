@@ -366,11 +366,20 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let fd = socket.as_raw_fd();
 
-        let info = configure_socket_buffers(fd, Some(1024 * 1024), Some(1024 * 1024)).unwrap();
+        let requested: i32 = 1024 * 1024;
+        let info = configure_socket_buffers(fd, Some(requested), Some(requested)).unwrap();
 
-        // Kernel may double the requested size
-        assert!(info.actual_recv >= 1024 * 1024 / 2);
-        assert!(info.actual_send >= 1024 * 1024 / 2);
+        // Linux caps the size at net.core.{r,w}mem_max (~208 KB by default)
+        // and reports double the stored value; other kernels grant it.
+        let expected = |sysctl: &str| -> i32 {
+            let cap = std::fs::read_to_string(sysctl)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(requested);
+            requested.min(cap) / 2
+        };
+        assert!(info.actual_recv >= expected("/proc/sys/net/core/rmem_max"));
+        assert!(info.actual_send >= expected("/proc/sys/net/core/wmem_max"));
     }
 
     #[test]
