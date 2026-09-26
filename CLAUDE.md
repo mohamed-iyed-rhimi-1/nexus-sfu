@@ -19,9 +19,9 @@ targets are not met yet.
 | `docs/design/*.md` | Detailed designs, written before the phase that needs them |
 | `docs/architecture-vision.md` | The original design, for reference only; much of it is not implemented or cannot work |
 
-**Current step: write the Phase 1 plan** (`docs/plans/phase-1.md`) from the approved design
-note `docs/design/dataplane-v1.md` (its §16 lists the parts and order). Phase 0 is complete
-(`docs/plans/phase-0.md`). Phase 1 code goes on a `phase-1` branch. The goal is to ship v1 of the new data plane
+**Current phase: 1** (`docs/plans/phase-1.md`, from the approved design note
+`docs/design/dataplane-v1.md`). Work on the `phase-1` branch; it merges into `main` (the
+trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
 soon (scope in `docs/dataplane-design.md` §2); the old data plane is replaced, not fixed, so
 do not spend time on bugs in `src/worker/`, `src/forward/` or the packet loop in `src/sfu.rs`.
 
