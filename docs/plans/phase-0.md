@@ -1,12 +1,16 @@
 # Phase 0 — Ground work
 
+**State: complete** (2026-09-26), except the x86_64 benchmark numbers, which need CI. Part
+0.1d was dropped by the ship-first revision (design revision log): the old data plane is
+replaced in Phase 1, not fixed.
+
 **Design:** [`docs/dataplane-design.md`](../dataplane-design.md) §5, Phase 0.
 **Current state:** [`architecture.md`](../../architecture.md).
 **Branch:** `v0.1.0` (or a `phase-0/*` branch per part, merged back).
 
 Phase 0 changes the **current** code only. Nothing here depends on the new data plane, and
 nothing here is thrown away by it: the fixes are in code that stays (ICE candidates, DTLS,
-signaling) or that runs until Phase 6 (the SRTCP fix), and the harness and measurements
+signaling) or that ran until its replacement (the SRTCP fix), and the harness and measurements
 are what every later phase is judged by.
 
 ## Exit criteria
@@ -145,7 +149,14 @@ keeps the index; a test that the cache entry is gone after `RemoveTrack`.
 
 ---
 
-#### d) SRTP keystream reuse on re-subscribe
+#### d) SRTP keystream reuse on re-subscribe — dropped
+
+**Dropped** by the ship-first revision: the project has no deployments, so this is not
+fixed on the old data plane, which Phase 1 deletes. The new data plane has one outbound
+SRTP context per session, so the bug cannot occur there, and Phase 1's exit criteria
+include an e2e unsubscribe → resubscribe test that fails on any repeated (SSRC, packet
+index). The original analysis is kept below for that test.
+
 
 **Problem** (found in the Phase 0 review): a subscription's `SrtpContext` is built fresh in
 `handle_session_established` (`src/orchestrator/subscription.rs`) from the subscriber
@@ -292,7 +303,7 @@ running in CI on every push. Every later phase adds its exit checks here.
 | 0.1c SRTCP nonce reuse | Done | Phase 0 commit | Per-track `rtcp_sender_ssrc` on REMB/TWCC/PLI/NACK; same key keeps the context; cache entry removed with the track |
 | 0.2 Dead code | Done | Phase 0 commit | 21,700 lines removed, 3,900 added across all of Phase 0; `tests/pps_pipeline.rs` rewritten without `ActorManager` |
 | 0.3 E2E harness | Done | Phase 0 commit | `src/server.rs` (`start` → `ServerHandle`), `tests/e2e.rs`: 3 tests, ~10 s on macOS |
-| 0.1d SRTP reuse on re-subscribe | Not started | | Found in review; see 0.1d |
+| 0.1d SRTP reuse on re-subscribe | Dropped | | Old path not fixed; Phase 1 e2e test covers it |
 | 0.4 Measurements | Done (x86_64 left for CI) | Phase 0 commit + results commit | Linux arm64: GCM → ring (0.24 µs), CM → RustCrypto (0.77 µs), `sendmmsg` floor 1.06 µs; 500K/core confirmed for AES-GCM (design revision log). x86_64 runs when the CI billing lock is cleared |
 
 ### Session log
@@ -331,3 +342,5 @@ Add one line per working session: date, part, what was done, what is left.
   warning instead of failing the session (`negotiation.rs`); `SRTCP_SENT_CACHE` can keep a
   stale entry if a packet races `forget_publisher_srtcp` (bounded). New: 0.1d.
   Left in Phase 0: 0.1d, x86_64 numbers.
+- 2026-09-26: ship-first revision of the design. 0.1d dropped (old path is replaced, not
+  fixed). Phase 0 complete except x86_64 numbers. Next: `docs/design/dataplane-v1.md`.

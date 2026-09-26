@@ -25,11 +25,11 @@ entry in the revision log (§8). Everything else lives elsewhere:
 | D3 | **Cross-shard fan-out by handle.** The publisher's shard decrypts once and passes a refcounted plaintext buffer to each shard that has subscribers; that shard encrypts per subscriber. One hop per (packet, shard), not per subscriber. | Every packet hops from ingest thread to a track worker. |
 | D4 | **No shared mutable state on the packet path.** Control plane talks to shards with bounded command/event queues. No DashMap, Mutex, RwLock or ArcSwap per packet. | 2 session mutex locks, 4 DashMap reads, 1 RwLock, 2 ArcSwap loads per packet. |
 | D5 | **One SRTP context per session per direction**, holding per-SSRC state. | One context per (subscriber, track) and per publisher track, sharing a key. |
-| D6 | **NACK, keyframe requests and SR translation are part of the core path**, built in the first multi-shard phase and covered by end-to-end tests. | Present in code, not working. |
+| D6 | **NACK, keyframe requests and SR translation are part of the core path and of v1** (SR translation in Phase 1, NACK and keyframes in Phase 3), each covered by end-to-end tests. | Present in code, not working. |
 | D7 | **Crypto backend chosen by benchmark**, OpenSSL EVP as the expected winner (already vendored for DTLS). Prefer AES-GCM when the benchmark confirms it. | RustCrypto, AES-CM preferred. |
 | D8 | **Memory is sized to traffic, not to maxima.** Buffers sized by packet, NACK history by time window, no pre-reserved subscriber arrays, OpenSSL state freed after the handshake. | Fixed 1500-byte slots, 2048-slot ring per track (audio too), 100 subscribers reserved per track. |
 | D9 | **Linux is the production target** (`recvmmsg`/`sendmmsg`, busy-poll with `epoll` fallback). A portable `std::net` shard keeps macOS development working. io_uring and AF_XDP are later, benchmark-gated options. | io_uring default (multishot never armed), XDP/eBPF path that cannot work for SRTP. |
-| D10 | **New crate `nexus-dataplane`** replaces `src/worker/`, `src/forward/` and the packet loop in `src/sfu.rs`. Built beside the old path, switched over per phase, old path deleted at the end. | — |
+| D10 | **New crate `nexus-dataplane` replaces the old data plane outright** (`src/worker/`, `src/forward/`, the packet loop in `src/sfu.rs`). No parallel engines and no switch: the project has no deployments to protect, so the new path lands when it passes the end-to-end tests and the old code is deleted in the same phase (Phase 1). Fixes to the old path are not made. | — |
 
 ---
 
@@ -59,12 +59,29 @@ references, are in [`architecture.md`](../architecture.md); in short:
 3. Memory that follows traffic, with a budget checked in CI.
 4. Every data-plane feature covered by an end-to-end test with real WebRTC clients.
 
-### Non-goals for this redesign
+### v1 scope
+
+The aim is to ship the new data plane as soon as it is correct, not to build every feature
+first. v1 is the release that replaces the old data plane.
+
+| In v1 | After v1 |
+|-------|----------|
+| Per-session shards on multiple cores, port per shard (§3.1-3.3) | Simulcast (§3.7). **Open decision:** moving it into v1 adds one phase between Phases 3 and the release |
+| SRTP one context per session per direction; AES-GCM on ring, offered first after a browser check (§3.4) | Bandwidth estimation, TWCC, automatic layer selection (§3.8) |
+| RTP rewrite, header extension mapping, SR translation for lip sync (§3.5, §3.6) | Single-port mode (§3.1) |
+| NACK retransmission, PLI/FIR forwarding, keyframe on join, RR to publishers (§3.6) | RTX (RFC 4588) |
+| Announced IP, consent, NAT rebinding (§3.9) | io_uring / AF_XDP evaluation (§3.12) |
+| End-to-end tests: two-party, multi-party, loss, late join, rejoin, unsubscribe/resubscribe, address change | Automated browser tests (Playwright) |
+
+Without simulcast every subscriber receives the publisher's full-quality stream: fine for
+small meetings, poor for large rooms or weak connections.
+
+### Non-goals
 
 - Multi-node media relay, recording, XDP/eBPF forwarding, QUIC signaling. They stay out of
   the binary until they have their own design; code is kept in git history, not in the tree.
 - TURN server, TCP media candidates.
-- SVC (VP9/AV1 layer dropping). Simulcast is in scope; SVC is a later extension of §3.7.
+- SVC (VP9/AV1 layer dropping); a later extension of §3.7.
 
 ### Targets and how they are measured
 
@@ -247,7 +264,7 @@ the publisher negotiated NACK for it. Memory is bitrate × window, not slots × 
 to publishers and subscribers. RTX (RFC 4588) is a later step; in-band retransmission
 works with current browsers.
 
-### 3.7 Simulcast
+### 3.7 Simulcast (after v1)
 
 - A published video track has up to 3 layers, identified by `a=rid`/`a=simulcast` or SSRC
   groups; RTX SSRCs are recognised as such and never become tracks.
@@ -258,7 +275,7 @@ works with current browsers.
 - Seq and timestamp offsets are adjusted at the switch (§3.5) so the subscriber sees one
   continuous stream.
 
-### 3.8 Bandwidth estimation (later phase)
+### 3.8 Bandwidth estimation (after v1)
 
 - SFU writes `transport-cc` sequence numbers per subscriber session, receives TWCC feedback,
   and runs the existing GCC from `nexus-bwe` per subscriber session on its shard.
@@ -275,10 +292,10 @@ works with current browsers.
   ufrag updates the session's address on the shard itself. No command round-trip, so media
   resumes immediately.
 - **ICE role:** ICE-lite on the SFU side is worth considering; it removes the need to send
-  checks at all. Decided in `docs/design/shard-runtime.md` (today it is full ICE, controlling).
+  checks at all. Decided in `docs/design/dataplane-v1.md` (today it is full ICE, controlling).
 - **DTLS retransmission:** the control plane drives OpenSSL's DTLS timer
-  (`DTLS_CTRL_GET_TIMEOUT` / `DTLS_CTRL_HANDLE_TIMEOUT`) for handshaking sessions. Fixed in
-  the current code in Phase 0, since this code stays.
+  (`DTLS_CTRL_GET_TIMEOUT` / `DTLS_CTRL_HANDLE_TIMEOUT`) for handshaking sessions. Done in
+  Phase 0; this code stays.
 
 ### 3.10 Signaling scope
 
@@ -309,7 +326,7 @@ Shard-level fixed memory (buffer pool, queues) is configured and reported separa
 - macOS: a portable shard using non-blocking `std::net::UdpSocket` and `kqueue`; correct, not
   fast. CI runs the end-to-end tests on both.
 - io_uring and AF_XDP (as a faster userspace socket, not XDP forwarding) are evaluated after
-  Phase 6 against the `recvmmsg` numbers and adopted only if they win.
+  v1 against the `recvmmsg` numbers and adopted only if they win.
 
 ---
 
@@ -322,10 +339,10 @@ Shard-level fixed memory (buffer pool, queues) is configured and reported separa
 | `nexus-transport`: `arena`, `ring_buffer`, `batch`, `io_uring`, `media_transport` | **Replace** by `nexus-dataplane` buffers and I/O |
 | `nexus-webrtc`: SDP | **Reuse** and extend (rid/simulcast, rtcp-fb, extmap) |
 | `nexus-webrtc`: `WebRtcTransport` session map, `process_packet` | **Split**: DTLS/ICE negotiation stays in control plane, packet handling moves to shards |
-| `nexus-bwe` GCC and allocation | **Reuse** in Phase 5 |
+| `nexus-bwe` GCC and allocation | **Reuse** after v1 (§3.8) |
 | `src/orchestrator`, `nexus-signal` (WS), `nexus-api`, `nexus-metrics`, config | **Keep**, adapted to the command interface |
-| `src/worker/`, `src/forward/`, packet loop and XDP loop in `src/sfu.rs` | **Delete** after cut-over |
-| Dead code (architecture.md 2.3) | **Delete** in Phase 0 (recoverable from git), except `nexus-actor`: removed from startup in Phase 0, crate deleted with the worker pool in Phase 6 |
+| `src/worker/`, `src/forward/`, the packet loop in `src/sfu.rs`, `nexus-actor` | **Delete** in Phase 1, when the new path lands |
+| Dead code (architecture.md 2.3) | **Deleted** in Phase 0 (recoverable from git) |
 | `nexus-state` gossip thread | **Keep off by default** (`cluster.enabled`); it serves no media purpose today |
 | `benches/real_path.rs`, `benches/memory.rs` | **Port** to the new API, keep the same scenarios so numbers stay comparable |
 | `tests/*/` (uncompiled) | **Delete**; coverage replaced by §6 |
@@ -334,21 +351,18 @@ Shard-level fixed memory (buffer pool, queues) is configured and reported separa
 
 ## 5. Plan
 
-Each phase ends with its exit criteria met on Linux arm64 and x86_64 CI. Phases 1-4 run
-the new data plane beside the old one behind `dataplane.engine = "legacy" | "shard"`, so
-`main` always has a working SFU.
+Each phase ends with its exit criteria met on macOS and Linux (arm64 locally, x86_64 in CI
+once it runs). There is one data plane at a time: Phase 1 replaces the old one.
 
 | Phase | Content | Exit criteria |
 |-------|---------|---------------|
-| **0. Ground work** | Fix the live bugs (DTLS retransmission, `announced_ip`, SRTCP nonce reuse); delete dead code (architecture.md 2.3); build the end-to-end harness (§6); SRTP backend benchmark (§3.4); kernel `sendmmsg` floor (§2) | E2E test passes on the legacy path with 2 clients A+V both ways; backend chosen; §2 target confirmed or revised from the measured floor |
-| **1. Single shard** | `nexus-dataplane` crate, one shard, own socket, sessions, SRTP in/out, fan-out, rewrite (seq/ts/ssrc/pt/ext map), SR translation, consent and NAT rebinding | E2E: 2-10 clients A+V, address change mid-call; 0 allocs per packet; memory budget §3.11 (fixed part) |
-| **2. Multi-shard** | Port per shard, placement, cross-shard queues and buffer return | E2E across shards; throughput and scaling targets on the bench |
-| **3. Loss and joins** | NACK history and retransmit, upstream NACK, PLI on join, PLI/FIR forwarding, RR to publishers | E2E with 5% injected loss: frozen-frame count and recovered packets within thresholds; late joiner gets a keyframe within 1 s |
-| **4. Simulcast** | Layers, keyframe-gated switching, explicit layer requests | E2E: subscriber switches layers without freeze or seq gaps |
-| **5. Congestion control** | TWCC out, GCC per subscriber, automatic layer selection, REMB/TWCC toward publishers | E2E with bandwidth cap: layer drops, no sustained loss |
-| **6. Cut-over** | Make `shard` the default, delete the legacy path and its benches, update `architecture.md` | Legacy code removed; all benches and E2E on the new path only |
+| **0. Ground work** (done) | Live bug fixes, dead code removed, end-to-end harness, SRTP backends and kernel send floor measured | Met, except x86_64 numbers (CI) |
+| **1. New data plane, one shard** | `nexus-dataplane` with one shard and its own socket; sessions with SRTP in/out (one context per direction, ring for GCM); fan-out; rewrite (seq/ts/ssrc/pt/extensions); SR translation; consent and NAT rebinding; orchestrator moved to the command interface (§3.2). The old path, `nexus-actor` and the replaced `nexus-transport` modules are deleted; `real_path`/`memory` benches ported | E2E: the Phase 0 tests plus 10 clients A+V, address change mid-call, and unsubscribe → resubscribe with no repeated (SSRC, packet index) on the wire; 0 allocations per packet; §3.11 fixed memory budget in CI; manual Chrome and Firefox call with AES-GCM offered first |
+| **2. Multiple shards** | Port per shard, placement, cross-shard queues and buffer return | E2E with participants on different shards; §2 throughput and scaling targets on `benches/dataplane.rs` |
+| **3. Loss and joins** | NACK history and retransmit, upstream NACK, PLI on join, PLI/FIR forwarding, RR to publishers | E2E with 5% injected loss: packets recovered, no sustained freeze; a late joiner gets a keyframe within 1 s |
+| **Release v1** | `architecture.md` rewritten for the new path, README targets updated with measured numbers, version tag | All of the above green; manual browser check (Chrome, Firefox, Safari) |
 
-Phases 3 and 4 are independent once Phase 2 is done.
+After v1, in order of value: simulcast, bandwidth estimation, single-port mode, RTX.
 
 **Detailed designs** are written, reviewed and committed before the phase that needs them.
 The sections above are the constraints they must satisfy; where a detailed design has to
@@ -356,12 +370,9 @@ break one, it proposes a revision to this document instead.
 
 | Design note | Before phase | Covers |
 |-------------|--------------|--------|
-| `docs/design/shard-runtime.md` | 1 | Shard loop, command/event types, buffer pool and ownership, timers, ICE-lite decision, macOS shard, `dataplane.engine` switch |
-| `docs/design/rtp-rewrite.md` | 1 | Per-subscription rewrite state, header extension mapping, SR translation |
-| `docs/design/cross-shard.md` | 2 | Placement policy, queues, buffer return, backpressure, port range config |
+| `docs/design/dataplane-v1.md` | 1 | Shard loop, command/event types, buffer pool and ownership, timers, ICE-lite decision, macOS shard, per-subscription rewrite state, header extension mapping, SR translation, and the cross-shard interfaces Phase 2 builds on (placement, queues, buffer return, port range config) |
 | `docs/design/loss-recovery.md` | 3 | NACK history, retransmit, upstream NACK, keyframe requests, RR |
-| `docs/design/simulcast.md` | 4 | Layer model, keyframe detection, switching, SDP |
-| `docs/design/congestion-control.md` | 5 | TWCC, per-subscriber GCC, allocation across subscriptions |
+| `docs/design/simulcast.md`, `docs/design/congestion-control.md` | after v1 | Written when those phases start |
 
 Each phase has a plan in `docs/plans/phase-N.md` with tasks, files, tests and a status
 section updated at the end of every working session.
@@ -370,11 +381,12 @@ section updated at the end of every working session.
 
 ## 6. Testing and benchmarks
 
-- **End-to-end harness** (new, `tests/e2e/`): starts the SFU in-process on ephemeral ports,
-  drives `webrtc-rs` clients (the loadtest already has the client code) through WebSocket
-  signaling, and asserts on what clients receive: packets per track, decodable keyframe
-  timing, retransmissions, sequence continuity. Loss and bandwidth limits are injected by a
-  UDP proxy in the harness, so it runs without root and on macOS.
+- **End-to-end harness** (`tests/e2e.rs`, built in Phase 0): starts the SFU in-process on
+  ephemeral ports, drives `webrtc-rs` clients from `nexus-loadtest` through WebSocket
+  signaling, and asserts on what clients receive: exactly the peer's streams, packet rate,
+  sequence continuity, timestamps. Loss is injected on a client's own socket
+  (`nexus_loadtest::lossy`), so it runs without root and on macOS. Each phase adds its exit
+  checks here.
 - **Benchmarks:**
   - `benches/dataplane.rs`: shard throughput with N subscribers, 1 to 4 shards, reports
     subscriber-packets/s/core and allocations per packet.
@@ -385,7 +397,7 @@ section updated at the end of every working session.
   on throughput).
 - **Deterministic simulation:** `nexus-dst` today does not exercise the server. Once shards
   exist, a shard can run against an in-memory socket and clock, which is the natural place
-  to plug DST in. Out of scope until Phase 6 is done.
+  to plug DST in. Out of scope until after v1.
 
 ---
 
@@ -400,7 +412,12 @@ section updated at the end of every working session.
   one shard; fan-out spreads across shards by handle. The hop cost per remote shard is
   small, but a single publisher's decrypt stays on one core. Acceptable: ingress per track
   is at most a few thousand packets/s.
-- **ICE-lite vs full ICE.** Decided in `docs/design/shard-runtime.md`.
+- **ICE-lite vs full ICE.** Decided in `docs/design/dataplane-v1.md`.
+- **One core until Phase 2.** After Phase 1 the SFU runs on a single shard. Acceptable
+  because nothing is deployed; the release waits for Phase 2.
+- **No safety net of a working old path.** With direct replacement, `main` has no working
+  SFU between the start of Phase 1 work and its end if the work is merged early. Phase 1 is
+  developed on a branch and merged only when its exit criteria pass.
 - **Browser coverage.** `webrtc-rs` clients prove protocol correctness, not browser
   behaviour. A manual Chrome/Firefox/Safari check is part of each phase's exit until an
   automated browser test (Playwright) is added.
@@ -414,3 +431,4 @@ section updated at the end of every working session.
 | 2026-09-25 | First version. Findings and baseline moved to `architecture.md`. |
 | 2026-09-26 | Phase 0.4, partial (macOS arm64 only; Linux runs and the `sendmmsg` floor still to do, so §2's 500K/core target is **not yet confirmed or revised**). Provisional backend per profile (§3.4, D7): AES-128-GCM → ring (≈ 0.28 µs per 1,200-byte packet vs 0.81 µs RustCrypto; OpenSSL EVP 0.30 µs), AES-CM-HMAC-SHA1-80 → keep RustCrypto (no alternative was faster). Profile order in `use_srtp` unchanged (AES-CM first) until AES-GCM, now RFC 7714-correct after two interop fixes, is checked against a browser. With GCM at ≈ 0.3 µs, the 2 µs budget holds if kernel send stays ≤ ≈ 1.2 µs per datagram (the §2 rule). |
 | 2026-09-26 | Phase 0.4, Linux arm64 (architecture.md Part 5). **Backends (D7):** AES-128-GCM → ring (0.24 µs per 1,200-byte packet; OpenSSL EVP 0.29 µs; RustCrypto 2.2 µs); AES-CM-HMAC-SHA1-80 → keep RustCrypto (0.77 µs, fastest tested). **Target (§2):** kernel `sendmmsg` to 100 destinations costs 1.06 µs per datagram (loopback upper bound). With GCM on ring, send + encrypt = 1.30 µs, leaving ≈ 0.7 µs of the 2 µs budget for the SFU's own work: **500K subscriber-packets/s per core is confirmed as the target, for AES-GCM**. With AES-CM (1.83 µs) the ceiling is ≈ 450K/core, so reaching the target requires offering GCM first in `use_srtp`, which waits for a browser interop check of the fixed GCM code (Phase 1 exit). x86_64 not measured yet. |
+| 2026-09-26 | Ship-first revision: the project has no deployments, so the old data plane is replaced directly instead of run beside the new one (D10), fixes to the old path stop (Phase 0 part 0.1d dropped; its bug is covered by a Phase 1 test), phases 4-6 become "after v1", and the six design notes become one (`dataplane-v1.md`) plus `loss-recovery.md`. v1 scope in §2; simulcast is after v1 unless decided otherwise. |

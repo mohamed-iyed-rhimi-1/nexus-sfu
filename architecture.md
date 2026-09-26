@@ -168,9 +168,10 @@ covered by `tests/e2e.rs`.
   `SrtpContext` from the subscriber session's key, with the publisher's SSRC (not
   rewritten) and a sequence counter starting at 0. `Unsubscribe` then `Subscribe` for the
   same track on the same session repeats the (key, SSRC, packet index) sequence: keystream
-  reuse on media with AES-CM, nonce reuse with AES-GCM. Any client can trigger it. Plan:
-  `docs/plans/phase-0.md` 0.1d; removed by construction in Phase 1 (one outbound context
-  per session).
+  reuse on media with AES-CM, nonce reuse with AES-GCM. Any client can trigger it. Not
+  fixed on this data plane (nothing is deployed and Phase 1 replaces it); the new data plane
+  removes it by construction (one outbound context per session), checked by a Phase 1 e2e
+  test.
 - **Subscriber SR contexts** share the same weakness: the per-subscription context also
   protects the SRs sent to that subscriber, so they restart at SRTCP index 0 on
   re-subscribe. Covered by the same fix.

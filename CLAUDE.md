@@ -19,7 +19,10 @@ targets are not met yet.
 | `docs/design/*.md` | Detailed designs, written before the phase that needs them |
 | `docs/architecture-vision.md` | The original design, for reference only; much of it is not implemented or cannot work |
 
-**Current phase: 0** (`docs/plans/phase-0.md`).
+**Current step: design note for Phase 1** (`docs/design/dataplane-v1.md`, not written yet).
+Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
+soon (scope in `docs/dataplane-design.md` §2); the old data plane is replaced, not fixed, so
+do not spend time on bugs in `src/worker/`, `src/forward/` or the packet loop in `src/sfu.rs`.
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -100,7 +103,7 @@ See `architecture.md` for the full picture. The essentials:
   (`src/orchestrator/`: room, negotiation, subscription, connection) which also runs DTLS
   handshakes and ICE timers. REST API on Axum with JWT.
 
-The redesign replaces ingress and workers with per-session shards
+The redesign replaces ingress and workers outright with per-session shards in Phase 1
 (`docs/dataplane-design.md`).
 
 ### Workspace Structure
