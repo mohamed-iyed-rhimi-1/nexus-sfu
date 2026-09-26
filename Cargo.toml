@@ -180,6 +180,9 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.polyval]
 opt-level = 3
+# AES-128-GCM (the SRTP profile offered first) runs on ring.
+[profile.dev.package.ring]
+opt-level = 3
 # Generic cipher code (ctr over aes) is instantiated in nexus-transport, so it
 # needs optimizing too. opt-level 1 keeps debug info and readable backtraces.
 [profile.dev.package.nexus-transport]

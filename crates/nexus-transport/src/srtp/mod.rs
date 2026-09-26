@@ -25,6 +25,18 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! # Backends and contexts
+//!
+//! - AES-128-GCM (RFC 7714) on `ring`; AES-256-GCM and AES-128-CM +
+//!   HMAC-SHA1 (RFC 3711) on RustCrypto (`crypto.rs`).
+//! - `SrtpInbound` / `SrtpOutbound` (`direction.rs`): one context per
+//!   direction with fixed per-SSRC tables, for the shard's packet path.
+//! - `SrtpContext` (`context.rs`): the older `HashMap`-based context, used by
+//!   the old path, tests and benches as the reference.
+//! - The RFC 3711 index estimate is shared by both (`index.rs`).
+//!
+//! No function here panics on packet contents; bad input is an error.
+//!
 //! # Zero-Copy Design
 //!
 //! All operations work in-place on buffers to avoid allocations
@@ -33,15 +45,23 @@
 
 mod context;
 mod crypto;
+mod direction;
 mod error;
+mod index;
 mod keys;
 mod replay;
 #[cfg(test)]
 mod rfc_vectors;
+#[cfg(test)]
+mod robustness;
 mod types;
 
 pub use context::{PoolStats, SrtpContext, SrtpSession, SrtpSessionPool, SrtpStats};
 pub use crypto::{AesCmHmacCipher, AesGcmCipher, CipherSuite, SrtpCipher};
+pub use direction::{
+    SrtpInbound, SrtpOutbound, INBOUND_IDLE_EVICT_S, INBOUND_PINNED_MAX, INBOUND_SSRC_SLOTS,
+    OUTBOUND_SSRC_SLOTS,
+};
 pub use error::SrtpError;
 pub use keys::{KeyDerivation, KeyMaterial, SrtpKeys};
 pub use replay::ReplayProtection;

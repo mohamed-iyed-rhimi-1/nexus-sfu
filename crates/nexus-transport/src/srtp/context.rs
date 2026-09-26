@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use super::crypto::SrtpCipher;
 use super::error::SrtpError;
+use super::index::RocState;
 use super::keys::{KeyDerivation, KeyMaterial, SrtpKeys};
 use super::replay::ReplayProtection;
 use super::types::{PacketIndex, ProtectionProfile, RtpHeader, SrtpPolicy};
@@ -23,9 +24,7 @@ use super::{MAX_PACKET_SIZE, RTP_HEADER_SIZE};
 /// Per-SSRC RTP state for ROC tracking and replay protection.
 #[derive(Debug)]
 struct SsrcState {
-    roc: u32,
-    highest_seq: u16,
-    roc_initialized: bool,
+    roc: RocState,
     replay: ReplayProtection,
     /// Per-SSRC SRTCP index counter (RFC 3711 §3.4).
     /// Each SSRC has its own SRTCP crypto context with an independent index.
@@ -108,7 +107,7 @@ impl SrtpContext {
     /// Get current ROC for the first known SSRC (for testing/stats).
     #[inline]
     pub fn roc(&self) -> u32 {
-        self.ssrc_states.values().next().map_or(0, |s| s.roc)
+        self.ssrc_states.values().next().map_or(0, |s| s.roc.roc())
     }
 
     /// Get statistics.
@@ -127,9 +126,7 @@ impl SrtpContext {
                 ReplayProtection::with_window_size(window_size)
             };
             SsrcState {
-                roc: 0,
-                highest_seq: 0,
-                roc_initialized: false,
+                roc: RocState::new(),
                 replay,
                 srtcp_index: 0,
             }
@@ -142,39 +139,9 @@ impl SrtpContext {
     /// exceed `u32::MAX`, which means the SRTP context must be renegotiated
     /// (RFC 3711 §3.3.1).
     fn estimate_index_for_ssrc(&self, ssrc: u32, seq: u16) -> Result<PacketIndex, SrtpError> {
-        let state = match self.ssrc_states.get(&ssrc) {
-            Some(s) => s,
-            None => return Ok(PacketIndex::new(0, seq)),
-        };
-
-        if !state.roc_initialized {
-            return Ok(PacketIndex::new(0, seq));
-        }
-
-        let s_l = state.highest_seq;
-        let roc = state.roc;
-
-        // RFC 3711 Appendix A — signed arithmetic index estimation
-        if s_l < 32768 {
-            if seq.wrapping_sub(s_l) > 32768 {
-                if roc > 0 {
-                    Ok(PacketIndex::new(roc - 1, seq))
-                } else {
-                    Ok(PacketIndex::new(0, seq))
-                }
-            } else {
-                Ok(PacketIndex::new(roc, seq))
-            }
-        } else {
-            // s_l >= 32768: check if s_l - 32768 > seq (NOT wrapping_sub)
-            if s_l - 32768 > seq {
-                if roc == u32::MAX {
-                    return Err(SrtpError::RocOverflow);
-                }
-                Ok(PacketIndex::new(roc + 1, seq))
-            } else {
-                Ok(PacketIndex::new(roc, seq))
-            }
+        match self.ssrc_states.get(&ssrc) {
+            Some(state) => state.roc.estimate_index(seq),
+            None => Ok(PacketIndex::new(0, seq)),
         }
     }
 
@@ -184,34 +151,7 @@ impl SrtpContext {
     /// exceed `u32::MAX` (RFC 3711 §3.3.1). Caller must tear down and
     /// renegotiate the SRTP session.
     fn update_roc_for_ssrc(&mut self, ssrc: u32, seq: u16) -> Result<(), SrtpError> {
-        let state = self.get_ssrc_state(ssrc);
-
-        if !state.roc_initialized {
-            state.highest_seq = seq;
-            state.roc_initialized = true;
-            return Ok(());
-        }
-
-        let s_l = state.highest_seq;
-
-        // RFC 3711 Section 3.3.1 — update ROC and s_l after authentication
-        if s_l < 32768 {
-            if seq.wrapping_sub(s_l) <= 32768 && seq > s_l {
-                state.highest_seq = seq;
-            }
-        } else {
-            // s_l >= 32768: check if s_l - 32768 > seq (wrap detected)
-            if s_l - 32768 > seq {
-                if state.roc == u32::MAX {
-                    return Err(SrtpError::RocOverflow);
-                }
-                state.roc = state.roc.wrapping_add(1);
-                state.highest_seq = seq;
-            } else if seq > s_l {
-                state.highest_seq = seq;
-            }
-        }
-        Ok(())
+        self.get_ssrc_state(ssrc).roc.update(seq)
     }
 
     /// Parse and validate RTP header.
@@ -220,8 +160,9 @@ impl SrtpContext {
         packet: &[u8],
         packet_len: usize,
     ) -> Result<RtpHeader, SrtpError> {
-        assert!(packet_len >= RTP_HEADER_SIZE);
+        assert!(packet.len() >= packet_len);
 
+        // RtpHeader::parse rejects anything shorter than 12 bytes.
         let header = RtpHeader::parse(&packet[..packet_len]).ok_or(SrtpError::InvalidRtpHeader)?;
 
         if self.policy.ssrc != 0 && header.ssrc != self.policy.ssrc {
@@ -246,16 +187,17 @@ impl SrtpContext {
         packet_len: usize,
     ) -> Result<usize, SrtpError> {
         let tag_len = self.cipher.tag_len();
-        // Preconditions
-        assert!(packet_len > 0, "packet length must be positive");
-        assert!(
-            packet_len <= MAX_PACKET_SIZE as usize,
-            "packet exceeds maximum size"
-        );
-        assert!(
-            packet.len() >= packet_len + tag_len,
-            "buffer must have room for auth tag"
-        );
+        // Packet contents never panic: bad lengths are errors.
+        assert!(packet.len() >= packet_len, "length beyond buffer");
+        if packet_len < RTP_HEADER_SIZE {
+            return Err(SrtpError::PacketTooShort);
+        }
+        if packet_len > MAX_PACKET_SIZE as usize {
+            return Err(SrtpError::PacketTooLarge);
+        }
+        if packet.len() < packet_len + tag_len {
+            return Err(SrtpError::BufferTooSmall);
+        }
 
         let result = self.protect_rtp_impl(packet, packet_len)?;
 
@@ -303,18 +245,13 @@ impl SrtpContext {
         packet_len: usize,
     ) -> Result<usize, SrtpError> {
         let tag_len = self.cipher.tag_len();
-        // Preconditions
-        assert!(
-            packet_len >= RTP_HEADER_SIZE + tag_len,
-            "packet too short for SRTP"
-        );
-        assert!(
-            packet_len <= MAX_PACKET_SIZE as usize,
-            "packet exceeds maximum size"
-        );
-
+        // Packet contents never panic: bad lengths are errors.
+        assert!(packet.len() >= packet_len, "length beyond buffer");
         if packet_len < RTP_HEADER_SIZE + tag_len {
             return Err(SrtpError::PacketTooShort);
+        }
+        if packet_len > MAX_PACKET_SIZE as usize {
+            return Err(SrtpError::PacketTooLarge);
         }
 
         let result = self.unprotect_rtp_impl(packet, packet_len)?;
@@ -368,7 +305,10 @@ impl SrtpContext {
         packet_len: usize,
     ) -> Result<usize, SrtpError> {
         // Extract SSRC from RTCP header (bytes 4-7).
-        assert!(packet_len >= 8, "RTCP packet must be at least 8 bytes");
+        assert!(packet.len() >= packet_len, "length beyond buffer");
+        if packet_len < super::RTCP_HEADER_SIZE {
+            return Err(SrtpError::PacketTooShort);
+        }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
         // Get per-SSRC SRTCP index (RFC 3711 §3.4)
@@ -402,7 +342,10 @@ impl SrtpContext {
     ) -> Result<usize, SrtpError> {
         // Extract SSRC from RTCP header (bytes 4-7) before decryption.
         // The RTCP header is in the clear even in SRTCP.
-        assert!(packet_len >= 8, "SRTCP packet must be at least 8 bytes");
+        assert!(packet.len() >= packet_len, "length beyond buffer");
+        if packet_len < super::RTCP_HEADER_SIZE {
+            return Err(SrtpError::PacketTooShort);
+        }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
         let (result, index) = self.cipher.unprotect_rtcp(packet, packet_len)?;
@@ -465,7 +408,7 @@ impl SrtpContext {
             .ssrc_states
             .values()
             .next()
-            .map_or((0, 0), |s| (s.roc, s.highest_seq));
+            .map_or((0, 0), |s| (s.roc.roc(), s.roc.highest_seq()));
 
         SrtpStats {
             rtp_protected: self.rtp_count,
@@ -924,13 +867,12 @@ mod tests {
         recv_ctx.unprotect_rtp(&mut packet, plen).unwrap();
 
         // Now SSRC state exists and is initialized
-        assert!(
-            recv_ctx
-                .ssrc_states
-                .get(&0x12345678)
-                .unwrap()
-                .roc_initialized
-        );
+        assert!(recv_ctx
+            .ssrc_states
+            .get(&0x12345678)
+            .unwrap()
+            .roc
+            .initialized());
     }
 
     // ========================================================================
@@ -1059,9 +1001,7 @@ mod tests {
         // Initialize SSRC state and set ROC to u32::MAX
         {
             let state = ctx.get_ssrc_state(ssrc);
-            state.roc = u32::MAX;
-            state.highest_seq = 40000; // s_l >= 32768
-            state.roc_initialized = true;
+            state.roc = RocState::at(u32::MAX, 40000); // s_l >= 32768
         }
 
         // seq < s_l - 32768 triggers ROC increment → should return RocOverflow
@@ -1293,11 +1233,11 @@ mod tests {
         let mut packet = vec![0u8; 16]; // No room for 16-byte tag
         packet[0] = 0x80;
 
-        // Should fail assertion or return error
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.protect_rtp(&mut packet, 16)
-        }));
-        assert!(result.is_err()); // Panics due to assertion
+        // A buffer without room for the tag is an error, not a panic.
+        assert_eq!(
+            ctx.protect_rtp(&mut packet, 16),
+            Err(SrtpError::BufferTooSmall)
+        );
     }
 
     // ========================================================================

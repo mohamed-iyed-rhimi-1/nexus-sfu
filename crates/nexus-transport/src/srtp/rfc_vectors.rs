@@ -12,7 +12,7 @@
 
 use super::{
     AesCmHmacCipher, AesGcmCipher, KeyDerivation, KeyMaterial, PacketIndex, ProtectionProfile,
-    SrtpCipher, SrtpContext, SrtpKeys, SrtpPolicy,
+    SrtpCipher, SrtpContext, SrtpInbound, SrtpKeys, SrtpOutbound, SrtpPolicy,
 };
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -95,11 +95,16 @@ const CM_PROTECTED: &str = "800f1234decafbadcafebabe\
                             4e55dc4ce79978d88ca4d215949d2402\
                             b78d6acc99ea179b8dbb";
 
-fn cm_context() -> SrtpContext {
+fn cm_material() -> KeyMaterial {
     let mut material = unhex(CM_MASTER_KEY);
     material.extend_from_slice(&unhex(CM_MASTER_SALT));
     let profile = ProtectionProfile::Aes128CmHmacSha1_80;
-    let km = KeyMaterial::from_dtls_export(&material, profile).expect("key material");
+    KeyMaterial::from_dtls_export(&material, profile).expect("key material")
+}
+
+fn cm_context() -> SrtpContext {
+    let km = cm_material();
+    let profile = km.profile;
     let policy = SrtpPolicy {
         profile,
         ..SrtpPolicy::default()
@@ -139,14 +144,17 @@ const GCM_KEY: &str = "000102030405060708090a0b0c0d0e0f";
 /// "Quid pro quo"
 const GCM_SALT: &str = "517569642070726f2071756f";
 
-fn gcm_cipher() -> AesGcmCipher {
-    let keys = session_keys(
+fn gcm_keys() -> SrtpKeys {
+    session_keys(
         ProtectionProfile::AeadAes128Gcm,
         &unhex(GCM_KEY),
         &unhex(GCM_SALT),
         &[],
-    );
-    AesGcmCipher::new(&keys).expect("cipher")
+    )
+}
+
+fn gcm_cipher() -> AesGcmCipher {
+    AesGcmCipher::new(&gcm_keys()).expect("cipher")
 }
 
 /// §16.1: RTP header 8040f17b 8041f8d3 5501a0b2, ROC 0, seq 0xf17b,
@@ -263,4 +271,80 @@ fn aead_kdf_matches_webrtc_srtp() {
         .expect("protect");
     let expected = theirs.encrypt_rtp(&plain).expect("webrtc protect");
     assert_eq!(&buf[..len], &expected[..]);
+}
+
+// ============================================================================
+// The same vectors through SrtpInbound / SrtpOutbound (Phase 1.1)
+// ============================================================================
+
+#[test]
+fn direction_rfc3711_b2_keystream() {
+    let key = unhex("2B7E151628AED2A6ABF7158809CF4F3C");
+    let salt = unhex("F0F1F2F3F4F5F6F7F8F9FAFBFCFD");
+    let keys = session_keys(
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        &key,
+        &salt,
+        &[0u8; 20],
+    );
+    let mut packet = [0u8; 12 + 48 + 10];
+    packet[0] = 0x80; // V=2, SSRC 0, seq 0: first packet has index 0
+    let mut out = SrtpOutbound::from_keys(&keys, 0).expect("outbound");
+    out.register(0).expect("register");
+    assert_eq!(out.protect_rtp(&mut packet, 60), Some(70));
+    let keystream = unhex(
+        "E03EAD0935C95E80E166B16DD92B4EB4
+         D23513162B02D0F72A43A2FE4A5F97AB
+         41E95B3BB0A2E8DD477901E4FCA894C0",
+    );
+    assert_eq!(&packet[12..60], &keystream[..]);
+}
+
+#[test]
+fn direction_aes_cm_hmac_sha1_80_packet() {
+    let plain = unhex(CM_PLAIN);
+    let expected = unhex(CM_PROTECTED);
+    let mut buf = [0u8; 64];
+    buf[..plain.len()].copy_from_slice(&plain);
+    let mut out = SrtpOutbound::new(&cm_material(), 0xcafe_babe).expect("outbound");
+    out.register(0xcafe_babe).expect("register");
+    let len = out.protect_rtp(&mut buf, plain.len()).expect("protect");
+    assert_eq!(&buf[..len], &expected[..]);
+
+    let mut inbound = SrtpInbound::new(&cm_material()).expect("inbound");
+    let len = inbound.unprotect_rtp(&mut buf, len, 0).expect("unprotect");
+    assert_eq!(&buf[..len], &plain[..]);
+}
+
+#[test]
+fn direction_rfc7714_16_1_rtp() {
+    let plain = unhex(GCM_RTP_PLAIN);
+    let expected = unhex(GCM_RTP_PROTECTED);
+    let mut buf = [0u8; 128];
+    buf[..plain.len()].copy_from_slice(&plain);
+    let mut out = SrtpOutbound::from_keys(&gcm_keys(), 0).expect("outbound");
+    out.register(0x5501_a0b2).expect("register");
+    let len = out.protect_rtp(&mut buf, plain.len()).expect("protect");
+    assert_eq!(&buf[..len], &expected[..]);
+
+    let mut inbound = SrtpInbound::from_keys(&gcm_keys()).expect("inbound");
+    let len = inbound.unprotect_rtp(&mut buf, len, 0).expect("unprotect");
+    assert_eq!(&buf[..len], &plain[..]);
+}
+
+#[test]
+fn direction_rfc7714_16_2_rtcp() {
+    let plain = unhex(GCM_RTCP_PLAIN);
+    let expected = unhex(GCM_RTCP_PROTECTED);
+    let mut buf = [0u8; 128];
+    buf[..plain.len()].copy_from_slice(&plain);
+    let mut out = SrtpOutbound::from_keys(&gcm_keys(), 0).expect("outbound");
+    out.register(0x4d61_7273).expect("register");
+    out.set_srtcp_index(0x4d61_7273, GCM_RTCP_INDEX);
+    let len = out.protect_rtcp(&mut buf, plain.len()).expect("protect");
+    assert_eq!(&buf[..len], &expected[..]);
+
+    let mut inbound = SrtpInbound::from_keys(&gcm_keys()).expect("inbound");
+    let len = inbound.unprotect_rtcp(&mut buf, len, 0).expect("unprotect");
+    assert_eq!(&buf[..len], &plain[..]);
 }

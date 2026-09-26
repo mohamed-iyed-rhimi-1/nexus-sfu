@@ -5,12 +5,19 @@
 //!
 //! | Profile | Backend | What it is |
 //! |---------|---------|------------|
-//! | both | `rustcrypto-ctx` | `SrtpContext` as used today: per-SSRC `HashMap`, ROC, replay |
+//! | both | `rustcrypto-ctx` | `SrtpContext`: per-SSRC `HashMap`, ROC, replay |
 //! | both | `rustcrypto` | `SrtpCipher` alone, index given (the transform cost) |
 //! | CM | `openssl` | EVP `aes-128-ctr` + HMAC-SHA1 from OpenSSL SHA-1 digests |
 //! | CM | `openssl-ctr+ring-hmac` | EVP `aes-128-ctr` + `ring` HMAC-SHA1 |
 //! | GCM | `openssl` | EVP `aes-128-gcm` |
 //! | GCM | `ring` | `LessSafeKey::seal_in_place_separate_tag` / `open_in_place` |
+//!
+//! Since Phase 1.1, `SrtpCipher` runs AES-128-GCM on `ring`, so the two
+//! `rustcrypto*` ids measure ring for GCM (RustCrypto for AES-CM). The ids are
+//! kept so numbers stay comparable with architecture.md Part 5. For GCM the
+//! byte-for-byte check below is then ring against ring; the independent check
+//! against RustCrypto's AES-GCM is `gcm_ring_matches_rustcrypto_*` in
+//! `nexus-transport/src/srtp/crypto.rs`.
 //!
 //! Every backend is a full SRTP transform (RFC 3711 IV and HMAC over header,
 //! ciphertext and ROC; RFC 7714 IV with the RTP header as AAD), keyed once

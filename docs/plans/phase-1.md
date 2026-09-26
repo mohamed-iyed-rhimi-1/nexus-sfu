@@ -145,6 +145,43 @@ replay.rs, mod.rs, rfc_vectors.rs}`, root `Cargo.toml` (dev profile), `benches/s
 - The old path keeps working: it builds its contexts through `SrtpContext`, which now uses
   the ring GCM cipher. The e2e tests negotiate AES-CM until 1.5b, so the GCM change is
   covered by the vectors and the bench check until then.
+- Found while implementing (2026-09-26):
+  - Three more asserts on packet contents: `crypto.rs:701` (CM `protect_rtp` `len ≥ 12`),
+    `:858` (CM `unprotect_rtcp` `len > 4`, before its graceful check), `context.rs:223`
+    (`len ≥ 12`, reached from `protect_rtp` with 1-11 bytes). The 128-byte GCM AAD copy
+    also ran on **protect**, which the old path calls with publisher headers.
+  - **ROC estimate bug** in `estimate_index_for_ssrc`: `seq.wrapping_sub(s_l) > 32768`
+    where RFC 3711 Appendix A means signed `SEQ - s_l`. With ROC > 0 and s_l < 2^15,
+    every reordered packet (seq < s_l) was put in the previous ROC and failed
+    authentication. Fixed in the shared `srtp/index.rs`, so the old path gets it too. On
+    the **send** side the same estimate also reused keystream: at ROC 1 with s_l = 2, a
+    packet with seq 1 was encrypted as index (0, 1), already sent in the first cycle.
+  - Once `SrtpCipher` GCM is ring, the bench's GCM `verify()` compares ring with ring. The
+    independent checks are `gcm_ring_matches_rustcrypto_{rtp,rtcp}` (RustCrypto
+    `Aes128Gcm` stays a dependency for AES-256) and `webrtc-srtp` in `direction.rs` tests.
+  - `size_of::<SrtpInbound>() + size_of::<SrtpOutbound>()` = 7,728 B (tested ≤ 8 KB),
+    a third of the 25 KB budget. `ReplayProtection` is 48 B (window size, enable flag and
+    two stats counters beside the 16 B of state) × 64 instances: slimming it saves ≈ 2 KB
+    if 1.7's memory bench needs it.
+  - **Review fixes (2026-09-26), before commit:**
+    - `SrtpOutbound::retire` reopened keystream reuse: protecting the SSRC again started a
+      fresh slot at index 0 and SRTCP index 0 under the same key, guarded only by a doc
+      comment. Now `SrtpOutbound` protects only SSRCs `register`ed by the control path, and
+      `register` applies §9.3's monotonic rule itself (offset from the session's SSRC base
+      strictly increasing, `< 2^31`), so a retired SSRC can never be registered or sent
+      again. The rule sits on registration, not on first use: first packets of two
+      subscriptions can go out in either order. This is the second, independent protection
+      the note promises; the shard's `Subscribe` check stays.
+    - Inbound eviction could kill a stream: a media SSRC idle > 30 s evicted from a full
+      table came back at ROC 0 after a wrap and failed authentication for the rest of the
+      session, and lost its replay window. Now SDP-signaled SSRCs are `pin`ned (≤ 12 of the
+      16 slots) and never evicted; only unsignaled SSRCs (receiver RTCP) are.
+    - Both regression tests were checked to fail with the fix disabled.
+    - **Precondition for 1.2a's rewriter:** the sequence numbers a subscription sends never
+      jump forward by 2^15 or more. The outbound index estimate follows RFC 3711, so a
+      larger jump is read as the previous ROC and the packets are refused (no reuse, but a
+      long run of drops). The rewriter asserts this in debug builds and counts it in
+      release.
 
 **Tests:**
 - RFC 3711 B.2 and RFC 7714 §16 vectors pass through `SrtpInbound`/`SrtpOutbound` (RTP and
@@ -190,6 +227,13 @@ rewrite.rs, pool.rs, shard/mod.rs, shard/io.rs (MemIo only)}`, `tests/shard.rs`;
   out-of-order), `Unsubscribe` (retire the SSRC), `CloseSession` (eager removal of tracks,
   subscriptions to them, its own subscriptions, map entries), `SendDatagram`. Unknown ids →
   `CommandRejected`.
+- SRTP contexts (from 1.1's review): `SrtpOutbound::new(km, ssrc_base)` with the base from
+  `CreateSession`; `register(out_ssrc)` on `Subscribe` and for `rtcp_ssrc` (so `rtcp_ssrc`
+  must come from the same base + offset allocator, before any subscription), `retire` on
+  `Unsubscribe`. `SrtpInbound::pin(ssrc)` on `AddTrack` with an SSRC and when SSRC learning
+  binds one (1.2b), `unpin` on `RemoveTrack`. `Subscribe`/`AddTrack` can precede
+  `InstallSrtp`: at `InstallSrtp`, register the session's existing out SSRCs in offset
+  order and pin its existing track SSRCs. A `register`/`pin` error rejects the command.
 - `ice.rs`: binding-request handler of note §8.2, with one change: **a slim in-place scan
   instead of `StunMessage::parse`**. `StunMessage` is ≈ 19 KB (16 × `Option<StunAttribute>`
   of ≈ 1,208 B, the `Data` variant holds 1,200 bytes), returned by value and moved twice,
@@ -879,7 +923,7 @@ The note's §19 risks stand; these are the ones the audit added.
 
 | Part | State | Commits | Notes |
 |------|-------|---------|-------|
-| 1.1 SRTP per direction | Not started | | |
+| 1.1 SRTP per direction | Done | see git log (1.1) | ring GCM, `direction.rs`, `index.rs`, robustness tests; ROC reorder bug fixed; review fixes: outbound registration (monotonic offsets), pinned inbound SSRCs |
 | 1.2a Shard core: tables, commands, ICE-lite, forwarding | Not started | | |
 | 1.2b Shard core: extensions, RTCP, housekeeping, alloc test | Not started | | |
 | 1.3 Shard thread and I/O | Not started | | |
@@ -914,3 +958,26 @@ Add one line per working session: date, part, what was done, what is left.
   1.1/1.2a and exit criterion 6; SDP BUNDLE and size limits added to 1.4; DTLS role, output
   and input details added to 1.5a; harness, keepalive and CNAME findings added to 1.5b-1.6b;
   SDK extension and dev token added to 1.8 (owner's decision). ≈ 16-17 sessions. Next: 1.1.
+- 2026-09-26: 1.1 implemented (uncommitted, for review). AES-128-GCM on `ring`, checked
+  byte for byte against RustCrypto (headers up to 300 B, ROC up to `u32::MAX`, SRTCP);
+  packet-content asserts in `crypto.rs`/`context.rs` replaced by errors;
+  `srtp/robustness.rs` (malformed list + proptest through `SrtpContext`, `SrtpCipher`,
+  `SrtpInbound`, `SrtpOutbound`); `srtp/index.rs` (`RocState`, shared); `srtp/direction.rs`
+  with RFC vectors, rollover and reordering against `SrtpContext` and `webrtc-srtp`, sent-
+  index window, slot rules. Found and fixed the ROC reorder bug (code notes).
+  `srtp_backends` (`verify()` passes; ns, protect 160/1,200 B, unprotect 160/1,200 B):
+  macOS arm64 `SrtpCipher` GCM 102/282/107/297 (ring reference 99/282/101/297 in Part 5),
+  `SrtpContext` GCM 136/320/167/366 (was 156/809/218/871). Linux container: SRTP tests
+  green; every backend, OpenSSL included, ran ≈ 35% slower than Part 5 (VM not idle), and
+  within that run `SrtpCipher` GCM 129/321/147/369 vs the ring reference 137/330/147/349.
+  Next: 1.2a.
+- 2026-09-26: 1.1 review fixes (uncommitted). `SrtpOutbound` takes the session's SSRC base
+  and protects only `register`ed SSRCs, with the monotonic rule enforced in `register`
+  (a retired SSRC never sends again); `SrtpInbound::pin`/`unpin` keep signaled SSRCs from
+  eviction. Tests for both, each checked to fail without its fix. 1.2a's command handling
+  updated to call `register`/`retire`/`pin`/`unpin`. Next: commit, then 1.2a.
+- 2026-09-26, review of 1.1 (separate session): adversarial review found `retire()`
+  reopening keystream reuse and inbound eviction able to kill a stream; both fixed with
+  regression tests (fail without the fix). Verified: fmt, clippy, all tests on macOS
+  (1,842) and Linux arm64 (1,843, incl. e2e). Committed. Next: 1.2a (register the session's
+  `rtcp_ssrc` at offset 0 from the SSRC base).

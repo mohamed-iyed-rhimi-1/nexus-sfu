@@ -9,9 +9,10 @@ use aes::cipher::{generic_array::GenericArray as AesGenericArray, KeyInit as Aes
 use aes::Aes128;
 use aes_gcm::{
     aead::{generic_array::GenericArray, AeadInPlace},
-    Aes128Gcm, Aes256Gcm,
+    Aes256Gcm,
 };
 use hmac::{Hmac, Mac};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use sha1::Sha1;
 
 use super::error::SrtpError;
@@ -45,45 +46,89 @@ impl From<ProtectionProfile> for CipherSuite {
     }
 }
 
-/// Inner cipher enum supporting both AES-128 and AES-256.
-enum AesGcmCipherInner {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
+/// One AES-GCM key: AES-128 on `ring` (the profile WebRTC negotiates),
+/// AES-256 on RustCrypto (not offered; kept for completeness).
+enum GcmKey {
+    Aes128(LessSafeKey),
+    Aes256(Box<Aes256Gcm>),
 }
 
-impl AesGcmCipherInner {
-    /// Encrypt in place with detached tag.
-    fn encrypt_in_place_detached(
-        &self,
-        nonce: &GenericArray<u8, aes_gcm::aead::consts::U12>,
-        aad: &[u8],
-        buffer: &mut [u8],
-    ) -> Result<aes_gcm::Tag, SrtpError> {
-        match self {
-            Self::Aes128(c) => c
-                .encrypt_in_place_detached(nonce, aad, buffer)
-                .map_err(|_| SrtpError::EncryptionFailed),
-            Self::Aes256(c) => c
-                .encrypt_in_place_detached(nonce, aad, buffer)
-                .map_err(|_| SrtpError::EncryptionFailed),
-        }
+impl GcmKey {
+    fn new_128(key: &[u8]) -> Result<Self, SrtpError> {
+        assert!(key.len() == 16);
+        let unbound =
+            UnboundKey::new(&AES_128_GCM, key).map_err(|_| SrtpError::InvalidKeyMaterial)?;
+        Ok(Self::Aes128(LessSafeKey::new(unbound)))
     }
 
-    /// Decrypt in place with detached tag.
-    fn decrypt_in_place_detached(
+    fn new_256(key: &[u8]) -> Self {
+        assert!(key.len() == 32);
+        Self::Aes256(Box::new(Aes256Gcm::new(GenericArray::from_slice(key))))
+    }
+
+    /// Encrypt `data` in place; returns the detached tag. `aad` is a slice
+    /// of the packet (no copy, no length limit).
+    fn seal(
         &self,
-        nonce: &GenericArray<u8, aes_gcm::aead::consts::U12>,
+        nonce: [u8; 12],
         aad: &[u8],
-        buffer: &mut [u8],
-        tag: &aes_gcm::Tag,
-    ) -> Result<(), SrtpError> {
+        data: &mut [u8],
+    ) -> Result<[u8; SRTP_AUTH_TAG_SIZE], SrtpError> {
+        let mut out = [0u8; SRTP_AUTH_TAG_SIZE];
         match self {
-            Self::Aes128(c) => c
-                .decrypt_in_place_detached(nonce, aad, buffer, tag)
+            Self::Aes128(key) => {
+                let tag = key
+                    .seal_in_place_separate_tag(
+                        Nonce::assume_unique_for_key(nonce),
+                        Aad::from(aad),
+                        data,
+                    )
+                    .map_err(|_| SrtpError::EncryptionFailed)?;
+                out.copy_from_slice(tag.as_ref());
+            }
+            Self::Aes256(c) => {
+                let tag = c
+                    .encrypt_in_place_detached(GenericArray::from_slice(&nonce), aad, data)
+                    .map_err(|_| SrtpError::EncryptionFailed)?;
+                out.copy_from_slice(&tag);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Authenticate and decrypt `ciphertext ‖ tag` in place; returns the
+    /// plaintext length. On failure the buffer contents are unspecified
+    /// (`ring` may have overwritten them): callers drop the packet.
+    fn open(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        data_and_tag: &mut [u8],
+    ) -> Result<usize, SrtpError> {
+        if data_and_tag.len() < SRTP_AUTH_TAG_SIZE {
+            return Err(SrtpError::PacketTooShort);
+        }
+        match self {
+            Self::Aes128(key) => key
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(aad),
+                    data_and_tag,
+                )
+                .map(|plain| plain.len())
                 .map_err(|_| SrtpError::AuthenticationFailed),
-            Self::Aes256(c) => c
-                .decrypt_in_place_detached(nonce, aad, buffer, tag)
-                .map_err(|_| SrtpError::AuthenticationFailed),
+            Self::Aes256(c) => {
+                let (data, tag) =
+                    data_and_tag.split_at_mut(data_and_tag.len() - SRTP_AUTH_TAG_SIZE);
+                c.decrypt_in_place_detached(
+                    GenericArray::from_slice(&nonce),
+                    aad,
+                    data,
+                    GenericArray::from_slice(tag),
+                )
+                .map(|()| data.len())
+                .map_err(|_| SrtpError::AuthenticationFailed)
+            }
         }
     }
 }
@@ -93,12 +138,12 @@ impl AesGcmCipherInner {
 /// Handles encryption/decryption of SRTP/SRTCP packets.
 /// Supports both AES-128-GCM and AES-256-GCM.
 pub struct AesGcmCipher {
-    /// RTP cipher (128 or 256 bit).
-    rtp_cipher: AesGcmCipherInner,
+    /// RTP key (128 or 256 bit).
+    rtp_cipher: GcmKey,
     /// RTP salt.
     rtp_salt: [u8; 12],
-    /// RTCP cipher (128 or 256 bit).
-    rtcp_cipher: AesGcmCipherInner,
+    /// RTCP key (128 or 256 bit).
+    rtcp_cipher: GcmKey,
     /// RTCP salt.
     rtcp_salt: [u8; 12],
 }
@@ -115,20 +160,16 @@ impl AesGcmCipher {
         let (rtp_cipher, rtcp_cipher) = match keys.profile {
             ProtectionProfile::AeadAes128Gcm => {
                 assert!(keys.rtp_key_len == 16);
-                let rtp = Aes128Gcm::new(GenericArray::from_slice(keys.rtp_key()));
-                let rtcp = Aes128Gcm::new(GenericArray::from_slice(keys.rtcp_key()));
                 (
-                    AesGcmCipherInner::Aes128(rtp),
-                    AesGcmCipherInner::Aes128(rtcp),
+                    GcmKey::new_128(keys.rtp_key())?,
+                    GcmKey::new_128(keys.rtcp_key())?,
                 )
             }
             ProtectionProfile::AeadAes256Gcm => {
                 assert!(keys.rtp_key_len == 32);
-                let rtp = Aes256Gcm::new(GenericArray::from_slice(keys.rtp_key()));
-                let rtcp = Aes256Gcm::new(GenericArray::from_slice(keys.rtcp_key()));
                 (
-                    AesGcmCipherInner::Aes256(rtp),
-                    AesGcmCipherInner::Aes256(rtcp),
+                    GcmKey::new_256(keys.rtp_key()),
+                    GcmKey::new_256(keys.rtcp_key()),
                 )
             }
             _ => return Err(SrtpError::UnsupportedCipherSuite),
@@ -219,10 +260,12 @@ impl AesGcmCipher {
         packet_len: usize,
         index: PacketIndex,
     ) -> Result<usize, SrtpError> {
-        assert!(packet_len >= RTP_HEADER_SIZE);
         assert!(packet.len() >= packet_len);
 
-        // Validate input bounds
+        // Validate input bounds (packet contents never panic)
+        if packet_len < RTP_HEADER_SIZE {
+            return Err(SrtpError::PacketTooShort);
+        }
         if packet_len > super::MAX_PACKET_SIZE as usize {
             return Err(SrtpError::PacketTooLarge);
         }
@@ -264,24 +307,16 @@ impl AesGcmCipher {
         assert!(packet.len() >= packet_len + SRTP_AUTH_TAG_SIZE);
 
         let nonce = self.build_rtp_nonce(header.ssrc, index);
-        let nonce_arr = GenericArray::from_slice(&nonce);
 
-        // AAD is the RTP header (immutable copy for AEAD)
-        let mut aad = [0u8; 128];
-        aad[..header.header_len].copy_from_slice(&packet[..header.header_len]);
-
-        // Encrypt payload in-place
-        let _payload_len = packet_len - header.header_len;
-        let payload = &mut packet[header.header_len..packet_len];
-
-        let tag = self.rtp_cipher.encrypt_in_place_detached(
-            nonce_arr,
-            &aad[..header.header_len],
-            payload,
-        )?;
+        // AAD is the RTP header, a slice of the packet itself.
+        let (head, rest) = packet.split_at_mut(header.header_len);
+        let payload_len = packet_len - header.header_len;
+        let tag = self
+            .rtp_cipher
+            .seal(nonce, head, &mut rest[..payload_len])?;
 
         // Append auth tag
-        packet[packet_len..packet_len + SRTP_AUTH_TAG_SIZE].copy_from_slice(&tag);
+        rest[payload_len..payload_len + SRTP_AUTH_TAG_SIZE].copy_from_slice(&tag);
 
         Ok(packet_len + SRTP_AUTH_TAG_SIZE)
     }
@@ -301,7 +336,6 @@ impl AesGcmCipher {
         index: PacketIndex,
     ) -> Result<usize, SrtpError> {
         assert!(packet.len() >= packet_len);
-        assert!(packet_len >= RTP_HEADER_SIZE + SRTP_AUTH_TAG_SIZE);
 
         if packet_len < RTP_HEADER_SIZE + SRTP_AUTH_TAG_SIZE {
             return Err(SrtpError::PacketTooShort);
@@ -348,29 +382,14 @@ impl AesGcmCipher {
         assert!(packet_len >= header.header_len + SRTP_AUTH_TAG_SIZE);
 
         let nonce = self.build_rtp_nonce(header.ssrc, index);
-        let nonce_arr = GenericArray::from_slice(&nonce);
 
-        // AAD is the RTP header (immutable copy for AEAD)
-        let mut aad = [0u8; 128];
-        aad[..header.header_len].copy_from_slice(&packet[..header.header_len]);
+        // AAD is the RTP header; ciphertext ‖ tag follow it contiguously.
+        let (head, rest) = packet.split_at_mut(header.header_len);
+        let plain_len =
+            self.rtp_cipher
+                .open(nonce, head, &mut rest[..packet_len - header.header_len])?;
 
-        // Extract tag from end of packet
-        let ciphertext_end = packet_len - SRTP_AUTH_TAG_SIZE;
-        let mut tag_bytes = [0u8; SRTP_AUTH_TAG_SIZE];
-        tag_bytes.copy_from_slice(&packet[ciphertext_end..packet_len]);
-        let tag = GenericArray::from_slice(&tag_bytes);
-
-        // Decrypt payload in-place
-        let payload = &mut packet[header.header_len..ciphertext_end];
-
-        self.rtp_cipher.decrypt_in_place_detached(
-            nonce_arr,
-            &aad[..header.header_len],
-            payload,
-            tag,
-        )?;
-
-        Ok(header.header_len + payload.len())
+        Ok(header.header_len + plain_len)
     }
 
     /// Encrypt RTCP packet in-place.
@@ -423,7 +442,6 @@ impl AesGcmCipher {
 
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let nonce = self.build_rtcp_nonce(ssrc, srtcp_index);
-        let nonce_arr = GenericArray::from_slice(&nonce);
 
         let index_with_e = srtcp_index | super::SRTCP_E_FLAG;
 
@@ -434,9 +452,7 @@ impl AesGcmCipher {
 
         // Encrypt payload in-place
         let payload = &mut packet[RTCP_HEADER_SIZE..packet_len];
-        let tag = self
-            .rtcp_cipher
-            .encrypt_in_place_detached(nonce_arr, &aad, payload)?;
+        let tag = self.rtcp_cipher.seal(nonce, &aad, payload)?;
 
         // header | ciphertext | tag(16) | E+index(4)
         let index_offset = packet_len + SRTP_AUTH_TAG_SIZE;
@@ -460,7 +476,6 @@ impl AesGcmCipher {
         packet_len: usize,
     ) -> Result<(usize, u32), SrtpError> {
         assert!(packet.len() >= packet_len);
-        assert!(packet_len >= RTCP_HEADER_SIZE + 4 + SRTP_AUTH_TAG_SIZE);
 
         if packet_len < RTCP_HEADER_SIZE + 4 + SRTP_AUTH_TAG_SIZE {
             return Err(SrtpError::PacketTooShort);
@@ -519,24 +534,19 @@ impl AesGcmCipher {
 
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let nonce = self.build_rtcp_nonce(ssrc, srtcp_index);
-        let nonce_arr = GenericArray::from_slice(&nonce);
 
         // AAD = RTCP header || E+SRTCP_index (RFC 7714 §9.1)
         let mut aad = [0u8; RTCP_HEADER_SIZE + 4];
         aad[..RTCP_HEADER_SIZE].copy_from_slice(&packet[..RTCP_HEADER_SIZE]);
         aad[RTCP_HEADER_SIZE..].copy_from_slice(&packet[index_offset..packet_len]);
 
-        // Extract tag
-        let mut tag_bytes = [0u8; SRTP_AUTH_TAG_SIZE];
-        tag_bytes.copy_from_slice(&packet[tag_offset..index_offset]);
-        let tag = GenericArray::from_slice(&tag_bytes);
+        // Ciphertext ‖ tag sit contiguously between the header and E+index.
+        let plain_len =
+            self.rtcp_cipher
+                .open(nonce, &aad, &mut packet[RTCP_HEADER_SIZE..index_offset])?;
+        assert!(RTCP_HEADER_SIZE + plain_len == tag_offset);
 
-        // Decrypt payload in-place (between header and tag)
-        let payload = &mut packet[RTCP_HEADER_SIZE..tag_offset];
-        self.rtcp_cipher
-            .decrypt_in_place_detached(nonce_arr, &aad, payload, tag)?;
-
-        Ok((RTCP_HEADER_SIZE + payload.len(), srtcp_index))
+        Ok((RTCP_HEADER_SIZE + plain_len, srtcp_index))
     }
 }
 
@@ -698,9 +708,11 @@ impl AesCmHmacCipher {
         packet_len: usize,
         index: PacketIndex,
     ) -> Result<usize, SrtpError> {
-        assert!(packet_len >= RTP_HEADER_SIZE);
         assert!(packet.len() >= packet_len);
 
+        if packet_len < RTP_HEADER_SIZE {
+            return Err(SrtpError::PacketTooShort);
+        }
         if packet_len > super::MAX_PACKET_SIZE as usize {
             return Err(SrtpError::PacketTooLarge);
         }
@@ -742,7 +754,6 @@ impl AesCmHmacCipher {
         index: PacketIndex,
     ) -> Result<usize, SrtpError> {
         assert!(packet.len() >= packet_len);
-        assert!(packet_len >= RTP_HEADER_SIZE + self.tag_len);
 
         if packet_len < RTP_HEADER_SIZE + self.tag_len {
             return Err(SrtpError::PacketTooShort);
@@ -855,7 +866,6 @@ impl AesCmHmacCipher {
         packet_len: usize,
     ) -> Result<(usize, u32), SrtpError> {
         assert!(packet.len() >= packet_len);
-        assert!(packet_len > 4);
 
         // Minimum: header(8) + E+index(4) + tag
         if packet_len < RTCP_HEADER_SIZE + 4 + self.tag_len {
@@ -1026,6 +1036,7 @@ impl core::fmt::Debug for SrtpCipher {
 mod tests {
     use super::*;
     use crate::srtp::keys::{KeyDerivation, KeyMaterial};
+    use aes_gcm::aead::KeyInit;
 
     fn test_keys() -> SrtpKeys {
         let key = [
@@ -1202,6 +1213,121 @@ mod tests {
 
         // Payload should be restored
         assert_eq!(&packet[12..20], original_payload.as_slice());
+    }
+
+    // ========================================================================
+    // ring AES-128-GCM against the RustCrypto implementation (oracle)
+    // ========================================================================
+
+    /// RTP packet with `csrcs` CSRCs and an extension of `ext_words` words.
+    fn gcm_oracle_packet(buf: &mut [u8], csrcs: u8, ext_words: u16, payload: usize) -> usize {
+        // Fill CSRCs, extension body and payload first; header fields after.
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29);
+        }
+        buf[0] = 0x80 | csrcs | if ext_words > 0 { 0x10 } else { 0 };
+        buf[1] = 96;
+        buf[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
+        buf[4..8].copy_from_slice(&90_000u32.to_be_bytes());
+        buf[8..12].copy_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        let mut len = 12 + 4 * csrcs as usize;
+        if ext_words > 0 {
+            buf[len..len + 2].copy_from_slice(&[0xBE, 0xDE]);
+            buf[len + 2..len + 4].copy_from_slice(&ext_words.to_be_bytes());
+            len += 4 + 4 * ext_words as usize;
+        }
+        len + payload
+    }
+
+    /// RustCrypto AES-128-GCM with the same nonce and AAD rules.
+    fn rustcrypto_seal(key: &[u8], nonce: [u8; 12], aad: &[u8], data: &mut [u8]) -> [u8; 16] {
+        let c = aes_gcm::Aes128Gcm::new(GenericArray::from_slice(key));
+        let tag = c
+            .encrypt_in_place_detached(GenericArray::from_slice(&nonce), aad, data)
+            .unwrap();
+        tag.into()
+    }
+
+    #[test]
+    fn gcm_ring_matches_rustcrypto_rtp() {
+        let keys = test_keys();
+        let cipher = AesGcmCipher::new(&keys).unwrap();
+        // Header lengths 12, 20 (CSRC), 140 (15 CSRCs + 16-word ext), 300.
+        for (csrcs, ext_words) in [(0u8, 0u16), (2, 0), (15, 16), (0, 71)] {
+            for payload in [0usize, 1, 160, 1200] {
+                for roc in [0u32, 3, u32::MAX] {
+                    let index = PacketIndex::new(roc, 0x1234);
+                    let mut plain = [0u8; 1600];
+                    let len = gcm_oracle_packet(&mut plain, csrcs, ext_words, payload);
+                    let hlen = len - payload;
+
+                    let mut expected = plain;
+                    let nonce = cipher.build_rtp_nonce(0xCAFE_BABE, index);
+                    let (head, rest) = expected.split_at_mut(hlen);
+                    let tag = rustcrypto_seal(keys.rtp_key(), nonce, head, &mut rest[..payload]);
+                    rest[payload..payload + 16].copy_from_slice(&tag);
+
+                    let mut ours = plain;
+                    let out = cipher.protect_rtp(&mut ours, len, index).unwrap();
+                    assert_eq!(out, len + 16);
+                    assert_eq!(
+                        ours[..out],
+                        expected[..out],
+                        "hlen {hlen} payload {payload}"
+                    );
+
+                    let back = cipher.unprotect_rtp(&mut ours, out, index).unwrap();
+                    assert_eq!(ours[..back], plain[..len]);
+
+                    let mut tampered = expected;
+                    tampered[out - 1] ^= 1;
+                    assert!(cipher.unprotect_rtp(&mut tampered, out, index).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gcm_ring_matches_rustcrypto_rtcp() {
+        let keys = test_keys();
+        let cipher = AesGcmCipher::new(&keys).unwrap();
+        for body in [0usize, 20, 200, 1200] {
+            for srtcp_index in [0u32, 1, 0x5d4, super::super::SRTCP_INDEX_MASK] {
+                let mut plain = [0u8; 1600];
+                plain[..8].copy_from_slice(&[0x81, 0xC8, 0, 6, 0x4D, 0x61, 0x72, 0x73]);
+                for (i, b) in plain[8..8 + body].iter_mut().enumerate() {
+                    *b = i as u8;
+                }
+                let len = 8 + body;
+
+                let mut expected = plain;
+                let e_index = (srtcp_index | super::super::SRTCP_E_FLAG).to_be_bytes();
+                let mut aad = [0u8; 12];
+                aad[..8].copy_from_slice(&plain[..8]);
+                aad[8..].copy_from_slice(&e_index);
+                let nonce = cipher.build_rtcp_nonce(0x4D61_7273, srtcp_index);
+                let tag = rustcrypto_seal(keys.rtcp_key(), nonce, &aad, &mut expected[8..len]);
+                expected[len..len + 16].copy_from_slice(&tag);
+                expected[len + 16..len + 20].copy_from_slice(&e_index);
+
+                let mut ours = plain;
+                let out = cipher.protect_rtcp(&mut ours, len, srtcp_index).unwrap();
+                assert_eq!(out, len + 20);
+                assert_eq!(
+                    ours[..out],
+                    expected[..out],
+                    "body {body} index {srtcp_index}"
+                );
+
+                let (back, idx) = cipher.unprotect_rtcp(&mut ours, out).unwrap();
+                assert_eq!((back, idx), (len, srtcp_index));
+                assert_eq!(ours[..back], plain[..len]);
+
+                let mut tampered = expected;
+                tampered[out - 5] ^= 1;
+                assert!(cipher.unprotect_rtcp(&mut tampered, out).is_err());
+            }
+        }
     }
 
     // ========================================================================

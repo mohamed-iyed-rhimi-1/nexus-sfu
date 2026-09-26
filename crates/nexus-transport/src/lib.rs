@@ -97,8 +97,8 @@ pub use dtls::{
 // Re-export SRTP types.
 pub use srtp::{
     AesCmHmacCipher, AesGcmCipher, CipherSuite as SrtpCipherSuite, KeyDerivation,
-    KeyMaterial as SrtpKeyMaterial, ReplayProtection, SrtpCipher, SrtpContext, SrtpError, SrtpKeys,
-    SrtpSession, SrtpSessionPool, SrtpStats,
+    KeyMaterial as SrtpKeyMaterial, ReplayProtection, SrtpCipher, SrtpContext, SrtpError,
+    SrtpInbound, SrtpKeys, SrtpOutbound, SrtpSession, SrtpSessionPool, SrtpStats,
 };
 
 // Re-export socket configuration types.
