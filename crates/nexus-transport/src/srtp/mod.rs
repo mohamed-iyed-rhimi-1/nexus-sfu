@@ -36,6 +36,8 @@ mod crypto;
 mod error;
 mod keys;
 mod replay;
+#[cfg(test)]
+mod rfc_vectors;
 mod types;
 
 pub use context::{PoolStats, SrtpContext, SrtpSession, SrtpSessionPool, SrtpStats};

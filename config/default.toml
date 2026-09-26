@@ -42,6 +42,8 @@ loss_threshold_percent = 5
 decrease_factor = 0.85
 increase_bps = 100000
 
+# Unused: QUIC signaling is not started (WebSocket only). Kept for when it is
+# connected to the orchestrator.
 [quic]
 bind_addr = "127.0.0.1:8443"
 max_connections = 1000
@@ -96,24 +98,6 @@ include_thread_ids = true
 # Unique node ID. Set to 0 for auto-generation from hostname+pid+time.
 # In production, set explicitly or derive from HOSTNAME.
 node_id = 0
-
-[xdp]
-# XDP kernel bypass disabled in development
-enabled = false
-interface = "lo"
-queue_id = 0
-forward_table_path = "/sys/fs/bpf/nexus/forward_table"
-stats_map_path = "/sys/fs/bpf/nexus/stats_map"
-umem_num_frames = 4096
-umem_frame_size = 4096
-fill_ring_size = 2048
-comp_ring_size = 2048
-rx_ring_size = 2048
-tx_ring_size = 2048
-batch_size = 32
-poll_timeout_ms = 100
-attach_mode = "skb"                     # SKB mode for dev (works without driver support)
-fallback_on_failure = true
 
 # ============================================================================
 # ICE Server Configuration

@@ -33,6 +33,9 @@ getrandom = "0.2"
 ring = "0.17"
 rcgen = "0.12"
 openssl = { version = "0.10", features = ["vendored"] }
+# SSL_ctrl for the DTLS retransmission timer, which the openssl crate does not wrap
+openssl-sys = "0.9"
+foreign-types = "0.3"
 
 # Linux io_uring support (optional, Linux only)
 # SHA-1 (HMAC for SRTP_AES128_CM_SHA1_80, the profile browsers negotiate)

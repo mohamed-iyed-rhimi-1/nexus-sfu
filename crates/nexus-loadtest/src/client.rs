@@ -30,6 +30,7 @@ use crate::error::ClientError;
 use crate::media::{AudioGenerator, AudioPattern, VideoGenerator, VideoPattern};
 use crate::metrics::ClientMetrics;
 use crate::signaling::SignalingConnection;
+use crate::track_stats::{TrackRxStats, TrackStatsMap};
 
 /// Client connection state
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +110,8 @@ pub struct HeadlessClient {
     ice_connected: Arc<AtomicBool>,
     /// Remote track IDs announced by the SFU (Joined + TrackPublished), not yet subscribed
     announced_tracks: Vec<TrackId>,
+    /// What was received on each remote track, by SSRC
+    track_stats: TrackStatsMap,
 }
 
 impl HeadlessClient {
@@ -136,6 +139,7 @@ impl HeadlessClient {
             last_per_packet_time: None,
             ice_connected: Arc::new(AtomicBool::new(false)),
             announced_tracks: Vec::new(),
+            track_stats: TrackStatsMap::default(),
         })
     }
 
@@ -193,6 +197,26 @@ impl HeadlessClient {
         let mut setting_engine = webrtc::api::setting_engine::SettingEngine::default();
         // Increase internal buffers to prevent "buffer: full" drops under load
         setting_engine.set_receive_mtu(8192);
+        if let Some(role) = self.config.answering_dtls_role {
+            setting_engine
+                .set_answering_dtls_role(role)
+                .map_err(|e| ClientError::PeerConnectionFailed(e.to_string()))?;
+        }
+        if let Some(rules) = &self.config.loss {
+            let conn = crate::lossy::LossyUdpConn::bind(
+                std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                std::sync::Arc::clone(rules),
+            )
+            .await
+            .map_err(|e| ClientError::PeerConnectionFailed(format!("lossy socket: {e}")))?;
+            let mux = webrtc::ice::udp_mux::UDPMuxDefault::new(
+                webrtc::ice::udp_mux::UDPMuxParams::new(conn),
+            );
+            setting_engine.set_udp_network(webrtc::ice::udp_network::UDPNetwork::Muxed(mux));
+        }
+        if self.config.ipv4_only {
+            setting_engine.set_network_types(vec![webrtc::ice::network_type::NetworkType::Udp4]);
+        }
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
@@ -200,7 +224,9 @@ impl HeadlessClient {
             .build();
 
         // Build ICE server list: use configured servers or fall back to Google public STUN
-        let ice_servers = if self.config.ice_servers.is_empty() {
+        let ice_servers = if self.config.ice_servers.is_empty() && !self.config.default_stun {
+            Vec::new()
+        } else if self.config.ice_servers.is_empty() {
             vec![webrtc::ice_transport::ice_server::RTCIceServer {
                 urls: vec![
                     "stun:stun.l.google.com:19302".to_string(),
@@ -382,11 +408,13 @@ impl HeadlessClient {
         let rx_packets = Arc::clone(&self.rx_packets);
         let rx_bytes = Arc::clone(&self.rx_bytes);
         let first_frame_received = Arc::clone(&self.first_frame_received);
+        let track_stats = self.track_stats.clone();
 
         peer_connection.on_track(Box::new(move |track, _receiver, _transceiver| {
             let rx_packets = Arc::clone(&rx_packets);
             let rx_bytes = Arc::clone(&rx_bytes);
             let first_frame_received = Arc::clone(&first_frame_received);
+            let track_stats = track_stats.clone();
 
             Box::pin(async move {
                 tracing::info!(
@@ -402,6 +430,8 @@ impl HeadlessClient {
 
                 // Spawn a reader task that drains RTP packets and counts them
                 let track_clone = track.clone();
+                let kind = track.kind().to_string();
+                let mime_type = track.codec().capability.mime_type;
                 tokio::spawn(async move {
                     let mut pkt_count: u64 = 0;
                     loop {
@@ -409,6 +439,13 @@ impl HeadlessClient {
                             Ok((rtp_packet, _attributes)) => {
                                 let payload_len = rtp_packet.payload.len();
                                 pkt_count += 1;
+                                track_stats.record(
+                                    rtp_packet.header.ssrc,
+                                    &kind,
+                                    &mime_type,
+                                    rtp_packet.header.sequence_number,
+                                    rtp_packet.header.timestamp,
+                                );
                                 if pkt_count <= 3 {
                                     tracing::info!(
                                         "RTP pkt #{}: ssrc={} pt={} seq={} ts={} marker={} payload_len={}",
@@ -894,6 +931,18 @@ impl HeadlessClient {
     }
 
     /// Get the participant ID (if assigned)
+    /// True once the peer connection (ICE and DTLS) is connected.
+    pub fn is_connected(&self) -> bool {
+        self.peer_connection
+            .as_ref()
+            .is_some_and(|pc| pc.connection_state() == RTCPeerConnectionState::Connected)
+    }
+
+    /// Per-track receive statistics, by SSRC.
+    pub fn track_stats(&self) -> Vec<TrackRxStats> {
+        self.track_stats.snapshot()
+    }
+
     pub fn participant_id(&self) -> Option<ParticipantId> {
         self.participant_id
     }

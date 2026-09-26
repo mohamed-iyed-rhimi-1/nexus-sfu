@@ -28,7 +28,8 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::SignalMessage;
 use crate::websocket::{
-    register_signaling_connection, unregister_signaling_connection, MAX_CONNECTIONS,
+    new_signaling_connections, register_signaling_connection, unregister_signaling_connection,
+    SignalingConnections, MAX_CONNECTIONS,
 };
 use nexus_api::JwtValidator;
 
@@ -70,7 +71,11 @@ pub enum OrchestratorEvent {
 }
 
 pub struct WebSocketServer {
-    bind_addr: SocketAddr,
+    /// Listener bound in `new`, so the address (and a port-0 port) is known
+    /// before `run` and a bind failure stops startup.
+    listener: std::net::TcpListener,
+    local_addr: SocketAddr,
+    connections: SignalingConnections,
     jwt_validator: Arc<JwtValidator>,
     shared_shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicU32>,
@@ -93,9 +98,6 @@ impl WebSocketServer {
         tls_cert_path: &str,
         tls_key_path: &str,
     ) -> Result<Self, String> {
-        // Precondition assertions
-        assert!(bind_addr.port() > 0, "bind port must be > 0");
-
         let tls_acceptor = match (tls_cert_path.is_empty(), tls_key_path.is_empty()) {
             (true, true) => {
                 warn!("TLS not configured: WebSocket signaling is UNENCRYPTED (development only)");
@@ -114,14 +116,36 @@ impl WebSocketServer {
             }
         };
 
+        let listener = std::net::TcpListener::bind(bind_addr)
+            .map_err(|e| format!("WebSocket bind {}: {}", bind_addr, e))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("WebSocket listener nonblocking: {}", e))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| format!("WebSocket local address: {}", e))?;
+        assert!(local_addr.port() != 0, "bound port is known");
+
         Ok(Self {
-            bind_addr,
+            listener,
+            local_addr,
+            connections: new_signaling_connections(),
             jwt_validator,
             shared_shutdown,
             active_connections: Arc::new(AtomicU32::new(0)),
             orchestrator_tx,
             tls_acceptor,
         })
+    }
+
+    /// Address the listener is bound to (the real port when 0 was requested).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// This server's live connections (for shutdown notifications).
+    pub fn connections(&self) -> SignalingConnections {
+        Arc::clone(&self.connections)
     }
 
     /// Build TLS acceptor from PEM certificate and key files.
@@ -166,7 +190,7 @@ impl WebSocketServer {
     }
 
     pub async fn run(&self) -> Result<(), std::io::Error> {
-        let listener = TcpListener::bind(self.bind_addr).await?;
+        let listener = TcpListener::from_std(self.listener.try_clone()?)?;
         let protocol = if self.tls_acceptor.is_some() {
             "wss"
         } else {
@@ -174,7 +198,7 @@ impl WebSocketServer {
         };
         info!(
             "{} signaling server listening on {}",
-            protocol, self.bind_addr
+            protocol, self.local_addr
         );
 
         let shutdown = self.shared_shutdown.clone();
@@ -224,6 +248,7 @@ impl WebSocketServer {
             let connections = self.active_connections.clone();
             let orchestrator_tx = self.orchestrator_tx.clone();
             let tls_acceptor = self.tls_acceptor.clone();
+            let registry = self.connections();
 
             tokio::spawn(async move {
                 connections.fetch_add(1, Ordering::Relaxed);
@@ -235,6 +260,7 @@ impl WebSocketServer {
                     jwt_validator,
                     shutdown,
                     orchestrator_tx,
+                    registry,
                 )
                 .await
                 {
@@ -260,6 +286,7 @@ async fn upgrade_and_handle(
     jwt_validator: Arc<JwtValidator>,
     shutdown: Arc<AtomicBool>,
     orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
+    connections: SignalingConnections,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(acceptor) = tls_acceptor {
         let tls_stream = acceptor.accept(stream).await.map_err(
@@ -274,6 +301,7 @@ async fn upgrade_and_handle(
             jwt_validator,
             shutdown,
             orchestrator_tx,
+            connections,
         )
         .await
     } else {
@@ -284,6 +312,7 @@ async fn upgrade_and_handle(
             jwt_validator,
             shutdown,
             orchestrator_tx,
+            connections,
         )
         .await
     }
@@ -299,6 +328,7 @@ async fn handle_connection<S>(
     jwt_validator: Arc<JwtValidator>,
     shutdown: Arc<AtomicBool>,
     orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
+    connections: SignalingConnections,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -366,10 +396,11 @@ where
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<SignalMessage>(MAX_OUTBOUND_QUEUE);
 
     // Register connection.
-    register_signaling_connection(participant_id, outbound_tx.clone());
+    register_signaling_connection(&connections, participant_id, outbound_tx.clone());
 
     // Drop guard: ensure cleanup runs even on early returns / panics.
     let _cleanup = ConnectionCleanup {
+        connections,
         participant_id,
         orchestrator_tx: orchestrator_tx.clone(),
     };
@@ -550,13 +581,14 @@ async fn wait_for_auth<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Drop guard that ensures signaling connection cleanup on all exit paths.
 struct ConnectionCleanup {
+    connections: SignalingConnections,
     participant_id: u64,
     orchestrator_tx: mpsc::Sender<OrchestratorEvent>,
 }
 
 impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
-        unregister_signaling_connection(self.participant_id);
+        unregister_signaling_connection(&self.connections, self.participant_id);
         // Fire-and-forget disconnect notification.
         let _ = self
             .orchestrator_tx
@@ -573,7 +605,7 @@ mod tests {
     fn build(cert: &str, key: &str) -> Result<WebSocketServer, String> {
         let (tx, _rx) = mpsc::channel(1);
         WebSocketServer::new(
-            "127.0.0.1:8080".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             Arc::new(JwtValidator::new("test-secret-at-least-32-characters-long")),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -594,6 +626,16 @@ mod tests {
             .err()
             .expect("a configured but missing certificate must be an error");
         assert!(err.contains("TLS init failed"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_port_zero_binds_a_real_port() {
+        let a = build("", "").unwrap();
+        let b = build("", "").unwrap();
+        assert_ne!(a.local_addr().port(), 0);
+        assert_ne!(a.local_addr(), b.local_addr());
+        // Each server has its own connection registry.
+        assert!(!Arc::ptr_eq(&a.connections(), &b.connections()));
     }
 
     #[test]

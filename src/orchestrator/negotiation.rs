@@ -15,6 +15,7 @@ use crate::types::{MediaKind, TrackId};
 use crate::worker::{WorkerMessage, WorkerPool};
 use nexus_state::gossip::types::TrackInfo;
 use nexus_state::DistributedState;
+use nexus_transport::dtls::DtlsRole;
 use nexus_transport::ice::{Candidate, IceCredentials, MAX_CANDIDATES};
 use nexus_webrtc::sdp::{MediaType, OfferMline, SdpNegotiator};
 use nexus_webrtc::webrtc::{TransportId, WebRtcTransport};
@@ -147,7 +148,8 @@ pub struct NegotiationManager {
     distributed_state: Arc<DistributedState>,
     pub ice_gather_tx: mpsc::UnboundedSender<IceGatheringEvent>,
     pub ice_gather_rx: mpsc::UnboundedReceiver<IceGatheringEvent>,
-    media_bind_addr: SocketAddr,
+    /// Host candidate addresses (see `candidates.rs`); never unspecified.
+    candidate_addrs: Arc<[SocketAddr]>,
 }
 
 impl NegotiationManager {
@@ -156,8 +158,20 @@ impl NegotiationManager {
         ssrc_router: Arc<SsrcRouter>,
         worker_pool: Arc<RwLock<WorkerPool>>,
         distributed_state: Arc<DistributedState>,
-        media_bind_addr: SocketAddr,
+        candidate_addrs: Vec<SocketAddr>,
     ) -> Self {
+        assert!(
+            !candidate_addrs.is_empty(),
+            "at least one ICE candidate address"
+        );
+        assert!(candidate_addrs.len() <= MAX_CANDIDATES as usize);
+        for addr in &candidate_addrs {
+            assert!(
+                !addr.ip().is_unspecified(),
+                "candidate {addr} is unspecified"
+            );
+            assert!(addr.port() != 0, "candidate {addr} has no port");
+        }
         let (ice_gather_tx, ice_gather_rx) = mpsc::unbounded_channel();
         Self {
             states: HashMap::with_capacity(1024),
@@ -167,7 +181,7 @@ impl NegotiationManager {
             distributed_state,
             ice_gather_tx,
             ice_gather_rx,
-            media_bind_addr,
+            candidate_addrs: candidate_addrs.into(),
         }
     }
 
@@ -463,6 +477,30 @@ impl NegotiationManager {
             });
         }
 
+        // DTLS role from the answer's a=setup (we offered actpass). Fixed by
+        // the first answer; later answers must agree.
+        let role = match Self::dtls_role_from_answer(&answer) {
+            Ok(role) => role,
+            Err(reason) => {
+                warn!("Answer from participant {}: {}", participant_id, reason);
+                return;
+            }
+        };
+        let role_result = self.webrtc_transport.with_session_mut(transport_id, |ws| {
+            if ws.dtls_role() == role {
+                Ok(())
+            } else {
+                ws.set_dtls_role(role)
+            }
+        });
+        if let Some(Err(e)) = role_result {
+            warn!(
+                "Participant {} changed a=setup after DTLS started: {:?}",
+                participant_id, e
+            );
+            return;
+        }
+
         // Pin the peer's DTLS certificate. Until this is set the session
         // will not trust the handshake; on mismatch it fails.
         match Self::extract_fingerprint(&answer) {
@@ -547,6 +585,30 @@ impl NegotiationManager {
         info!("Answer processed from participant {}", participant_id);
     }
 
+    /// Our DTLS role given the answerer's `a=setup` (RFC 8842 §5.2): the
+    /// answerer's `active` makes us the server, `passive` the client. A
+    /// missing attribute keeps the server role, as before.
+    fn dtls_role_from_answer(
+        sdp: &nexus_webrtc::sdp::SessionDescription,
+    ) -> Result<DtlsRole, &'static str> {
+        use nexus_webrtc::sdp::DtlsSetup;
+        let mut setup = sdp.setup;
+        for i in 0..(sdp.media_count as usize).min(8) {
+            if setup.is_some() {
+                break;
+            }
+            if let Some(ref media) = sdp.media[i] {
+                setup = media.setup;
+            }
+        }
+        match setup {
+            None | Some(DtlsSetup::Active) => Ok(DtlsRole::Server),
+            Some(DtlsSetup::Passive) => Ok(DtlsRole::Client),
+            Some(DtlsSetup::Actpass) => Err("a=setup:actpass is not valid in an answer"),
+            Some(DtlsSetup::Holdconn) => Err("a=setup:holdconn is not supported"),
+        }
+    }
+
     /// SHA-256 DTLS fingerprint from the session level, else the first
     /// m-line that has one (bundled m-lines share one transport).
     fn extract_fingerprint(sdp: &nexus_webrtc::sdp::SessionDescription) -> Option<[u8; 32]> {
@@ -598,15 +660,18 @@ impl NegotiationManager {
         let generation = state.gathering_generation;
 
         let tx = self.ice_gather_tx.clone();
-        let media_addr = self.media_bind_addr;
+        let addrs = Arc::clone(&self.candidate_addrs);
         tokio::spawn(async move {
-            let candidate = Candidate::new_host(media_addr, 1, 0);
-            let _ = tx.send(IceGatheringEvent::Candidate {
-                participant_id,
-                transport_id,
-                candidate,
-                generation,
-            });
+            for (idx, addr) in addrs.iter().enumerate() {
+                // Distinct interface index: distinct local preference and priority.
+                let candidate = Candidate::new_host(*addr, 1, idx as u8);
+                let _ = tx.send(IceGatheringEvent::Candidate {
+                    participant_id,
+                    transport_id,
+                    candidate,
+                    generation,
+                });
+            }
             let _ = tx.send(IceGatheringEvent::Complete {
                 participant_id,
                 transport_id,
@@ -1208,4 +1273,31 @@ fn send_error(
             message: message.to_string(),
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(setup_line: &str, media_setup_line: &str) -> nexus_webrtc::sdp::SessionDescription {
+        let fp = ["AB"; 32].join(":");
+        let sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             a=ice-ufrag:testufrag\r\na=ice-pwd:testpwd12345678901234567890\r\n\
+             a=fingerprint:sha-256 {fp}\r\n{setup_line}\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{media_setup_line}"
+        );
+        nexus_webrtc::sdp::SdpParser::parse(&sdp).unwrap()
+    }
+
+    #[test]
+    fn test_dtls_role_from_answer_setup() {
+        let role = |s: &str, m: &str| NegotiationManager::dtls_role_from_answer(&answer(s, m));
+        assert_eq!(role("a=setup:active\r\n", ""), Ok(DtlsRole::Server));
+        assert_eq!(role("a=setup:passive\r\n", ""), Ok(DtlsRole::Client));
+        // Browsers put a=setup on the m-line.
+        assert_eq!(role("", "a=setup:passive\r\n"), Ok(DtlsRole::Client));
+        assert_eq!(role("", ""), Ok(DtlsRole::Server));
+        assert!(role("a=setup:actpass\r\n", "").is_err());
+    }
 }

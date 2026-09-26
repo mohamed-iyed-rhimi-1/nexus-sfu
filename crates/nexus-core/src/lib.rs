@@ -31,5 +31,5 @@ pub use error::{
 // because it depends on crate-specific configs (GossipConfig, etc.).
 pub use config::{
     ActorConfig, BweConfig, ConfigError, LogLevel, LoggingConfig, MemoryConfig, MetricsConfig,
-    RoomConfig, SecurityConfig, TransportConfig, Validate, WorkerConfig,
+    RoomConfig, SecurityConfig, TransportConfig, Validate, WorkerConfig, MAX_ANNOUNCED_IPS,
 };

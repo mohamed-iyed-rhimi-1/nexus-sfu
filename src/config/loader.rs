@@ -68,6 +68,8 @@ impl ConfigLoader {
     /// - `NEXUS_ARENA_SIZE_MB`: Packet arena size in MB (memory.arena_size_mb)
     /// - `NEXUS_LOG_LEVEL`: Log level (logging.level)
     /// - `NEXUS_METRICS_ADDR`: Metrics bind address (metrics.bind_addr)
+    /// - `NEXUS_ANNOUNCED_IPS`: comma-separated IPs advertised as ICE host
+    ///   candidates (transport.announced_ips); empty clears the list
     ///
     /// # Requirements Coverage
     ///
@@ -115,6 +117,29 @@ impl ConfigLoader {
             config.metrics.bind_addr = addr;
         }
 
+        if let Ok(ips) = env::var("NEXUS_ANNOUNCED_IPS") {
+            config.transport.announced_ips =
+                parse_ip_list(&ips).map_err(|e| ConfigError::invalid("NEXUS_ANNOUNCED_IPS", &e))?;
+        }
+
         Ok(config)
     }
+}
+
+/// Parse a comma-separated IP list; blank entries are skipped.
+fn parse_ip_list(value: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    let mut ips = Vec::new();
+    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if ips.len() >= nexus_core::MAX_ANNOUNCED_IPS {
+            return Err(format!(
+                "at most {} addresses",
+                nexus_core::MAX_ANNOUNCED_IPS
+            ));
+        }
+        ips.push(
+            part.parse()
+                .map_err(|_| format!("'{part}' is not an IP address"))?,
+        );
+    }
+    Ok(ips)
 }

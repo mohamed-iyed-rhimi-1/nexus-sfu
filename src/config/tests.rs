@@ -113,7 +113,27 @@ fn test_env_var_overrides() {
     assert_eq!(config.transport.tls_key_path, "/tmp/test-key.pem");
     assert_eq!(config.quic.cert_path, "/tmp/test-cert.pem");
 
+    // Test 4: announced IPs, comma-separated
+    env::set_var("NEXUS_ANNOUNCED_IPS", " 203.0.113.7, 2001:db8::1 ,");
+    let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
+    assert_eq!(
+        config.transport.announced_ips,
+        vec![
+            "203.0.113.7".parse::<std::net::IpAddr>().unwrap(),
+            "2001:db8::1".parse().unwrap()
+        ]
+    );
+    env::set_var("NEXUS_ANNOUNCED_IPS", "203.0.113.7,not-an-ip");
+    assert!(ConfigLoader::merge_from_env(NexusConfig::default()).is_err());
+    env::set_var("NEXUS_ANNOUNCED_IPS", "0.0.0.0");
+    let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
+    assert!(
+        config.validate().is_err(),
+        "unspecified IP must fail validation"
+    );
+
     // Cleanup
+    env::remove_var("NEXUS_ANNOUNCED_IPS");
     env::remove_var("NEXUS_JWT_SECRET");
     env::remove_var("NEXUS_TLS_CERT_PATH");
     env::remove_var("NEXUS_TLS_KEY_PATH");

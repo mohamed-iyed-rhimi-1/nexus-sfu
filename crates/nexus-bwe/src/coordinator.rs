@@ -143,6 +143,13 @@ impl BandwidthCoordinator {
         crate::remb::RembGenerator::new(ssrc).generate(target_bitrate, ssrc)
     }
 
+    /// Generate a REMB for `media_ssrc` sent from `sender_ssrc`. The sender
+    /// SSRC must be the SFU's own, distinct per SRTCP context.
+    pub fn generate_remb_from(&self, sender_ssrc: Ssrc, media_ssrc: Ssrc) -> Vec<u8> {
+        let target_bitrate = self.gcc.target_bitrate_bps();
+        crate::remb::RembGenerator::new(sender_ssrc).generate(target_bitrate, media_ssrc)
+    }
+
     /// Get current GCC target bitrate
     pub fn target_bitrate(&self) -> u64 {
         self.gcc.target_bitrate_bps()

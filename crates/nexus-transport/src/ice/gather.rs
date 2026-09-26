@@ -1124,8 +1124,35 @@ impl CandidateGatherer {
 ///
 /// - Loop bound assertion in while loop
 /// - Postcondition for result array bounds
-#[allow(dead_code)] // Used by gather_host_candidates (task 3.3)
 fn enumerate_interfaces() -> Result<[Option<IpAddr>; MAX_INTERFACES], IceError> {
+    enumerate_interfaces_where(|_| true)
+}
+
+/// Addresses of this host that remote peers are most likely to reach, for
+/// advertising as ICE host candidates when no address is configured.
+///
+/// Skips unspecified, loopback and IPv4 link-local addresses, unless nothing
+/// else exists, in which case loopback addresses are returned (a single-host
+/// setup). Best effort: behind NAT none of these may be reachable, which is
+/// why `transport.announced_ips` exists.
+pub fn host_interface_ips() -> [Option<IpAddr>; MAX_INTERFACES] {
+    let routable = |ip: &IpAddr| {
+        let link_local_v4 = matches!(ip, IpAddr::V4(v4) if v4.is_link_local());
+        !ip.is_unspecified() && !ip.is_loopback() && !link_local_v4
+    };
+    let none = || std::array::from_fn(|_| None);
+    let found = enumerate_interfaces_where(routable).unwrap_or_else(|_| none());
+    if found[0].is_some() {
+        return found;
+    }
+    enumerate_interfaces_where(|ip| ip.is_loopback()).unwrap_or_else(|_| none())
+}
+
+/// Enumerate up to MAX_INTERFACES addresses of interfaces that are up,
+/// keeping only those `keep` accepts.
+fn enumerate_interfaces_where(
+    keep: impl Fn(&IpAddr) -> bool,
+) -> Result<[Option<IpAddr>; MAX_INTERFACES], IceError> {
     let mut result: [Option<IpAddr>; MAX_INTERFACES] = std::array::from_fn(|_| None);
     let mut count = 0;
 
@@ -1150,15 +1177,16 @@ fn enumerate_interfaces() -> Result<[Option<IpAddr>; MAX_INTERFACES], IceError> 
                 );
 
                 let ifa = &*curr;
+                let is_up = (ifa.ifa_flags & libc::IFF_UP as libc::c_uint) != 0;
 
-                if !ifa.ifa_addr.is_null() {
+                if !ifa.ifa_addr.is_null() && is_up {
                     let family = (*ifa.ifa_addr).sa_family as i32;
+                    let mut found = None;
 
                     if family == libc::AF_INET {
                         let sockaddr_in = ifa.ifa_addr as *const libc::sockaddr_in;
                         let ip = Ipv4Addr::from(u32::from_be((*sockaddr_in).sin_addr.s_addr));
-                        result[count] = Some(IpAddr::V4(ip));
-                        count += 1;
+                        found = Some(IpAddr::V4(ip));
                     } else if family == libc::AF_INET6 {
                         let sockaddr_in6 = ifa.ifa_addr as *const libc::sockaddr_in6;
                         let octets = (*sockaddr_in6).sin6_addr.s6_addr;
@@ -1166,9 +1194,13 @@ fn enumerate_interfaces() -> Result<[Option<IpAddr>; MAX_INTERFACES], IceError> 
 
                         // Skip link-local addresses
                         if !ip.is_unspecified() && (ip.segments()[0] & 0xffc0) != 0xfe80 {
-                            result[count] = Some(IpAddr::V6(ip));
-                            count += 1;
+                            found = Some(IpAddr::V6(ip));
                         }
+                    }
+
+                    if let Some(ip) = found.filter(|ip| keep(ip)) {
+                        result[count] = Some(ip);
+                        count += 1;
                     }
                 }
 
@@ -1182,8 +1214,11 @@ fn enumerate_interfaces() -> Result<[Option<IpAddr>; MAX_INTERFACES], IceError> 
     #[cfg(not(unix))]
     {
         // Fallback: just use 0.0.0.0 to bind all interfaces
-        result[0] = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        count = 1;
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        if keep(&any) {
+            result[0] = Some(any);
+            count = 1;
+        }
     }
 
     // Postcondition: count must be bounded (TigerStyle Phase 2.7)
@@ -1204,6 +1239,21 @@ mod tests {
     // ========================================================================
     // Basic Gathering Tests
     // ========================================================================
+
+    #[test]
+    fn test_host_interface_ips_never_unspecified() {
+        let ips = host_interface_ips();
+        let found: Vec<IpAddr> = ips.iter().flatten().copied().collect();
+        assert!(found.iter().all(|ip| !ip.is_unspecified()));
+        // Loopback only appears when nothing else exists.
+        let has_routable = found.iter().any(|ip| !ip.is_loopback());
+        if has_routable {
+            assert!(found.iter().all(|ip| !ip.is_loopback()));
+        }
+        // Filled front to back.
+        let count = found.len();
+        assert!(ips[count..].iter().all(|ip| ip.is_none()));
+    }
 
     #[test]
     fn test_enumerate_interfaces() {

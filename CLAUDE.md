@@ -59,8 +59,12 @@ cargo run -- --config config/development.toml    # Development (needs certs/dev-
 ./target/release/nexus-sfu --config config/production.toml
 
 # Test
-cargo test --workspace                   # All tests (only in-crate tests and top-level tests/*.rs compile)
+cargo test --workspace                   # All tests, including tests/e2e.rs (~10 s)
+cargo test --test e2e                    # End-to-end: in-process SFU + webrtc-rs clients
+cargo test --features sim --test pps_pipeline   # Sim-mode pipeline flood (not in the default run)
 cargo bench --bench real_path            # Real ingress/egress path cost
+cargo bench --bench srtp_backends        # SRTP protect/unprotect per backend (Phase 0.4)
+cargo bench --bench udp_floor            # Raw sendmmsg/recvmmsg cost, Linux only
 cargo bench --bench memory               # Heap per participant; NEXUS_MEM_BUDGET_KB=<n> makes it a check
 
 # Lint
@@ -86,7 +90,9 @@ cd deploy/docker && ./build.sh && ./run.sh     # run.sh: TLS_CERT/TLS_KEY, NEXUS
 
 See `architecture.md` for the full picture. The essentials:
 
-- **Ingress:** one busy loop on the main thread (`Sfu::run_packet_loop`, `src/sfu.rs`)
+- **Startup:** `nexus_sfu::server::start` (`src/server.rs`) wires everything and returns a
+  `ServerHandle` (bound addresses, `shutdown()`); `main.rs` adds config, tracing, signals.
+- **Ingress:** one busy loop on its own thread (`Sfu::run_packet_loop`, `src/sfu.rs`)
   receives, classifies, decrypts (under a per-session mutex) and routes every packet.
 - **Workers:** pinned threads (`src/worker/pool.rs`) own tracks; per subscriber they copy,
   rewrite, SRTP-encrypt and `sendmmsg`.
@@ -100,8 +106,8 @@ The redesign replaces ingress and workers with per-session shards
 ### Workspace Structure
 
 ```
-src/                 Binary crate: main.rs, sfu.rs (packet loop), orchestrator/, worker/,
-                     forward/ (router.rs is live), config/, signal/, transport/
+src/                 Binary crate: main.rs, server.rs (startup), sfu.rs (packet loop),
+                     orchestrator/, worker/, forward/ (SSRC router), config/, signal/, transport/
 crates/
   nexus-core/        Shared types, config primitives
   nexus-transport/   UDP, io_uring, ICE, DTLS (OpenSSL), SRTP, arena, ring buffer
@@ -113,11 +119,13 @@ crates/
   nexus-metrics/     Prometheus metrics
   nexus-state/       CRDTs, SWIM gossip
   nexus-actor/       Actor system; only config limits and migration types are used
-  nexus-recorder/    Unused (removed in Phase 0)
   nexus-dst/         Deterministic simulation; does not exercise the server
-  nexus-loadtest/    Load generator with webrtc-rs clients
+  nexus-loadtest/    Load generator with webrtc-rs clients; also the e2e tests' clients
+                     (per-track receive stats, loss injection in lossy.rs)
 sdk/                 TypeScript client SDK
-benches/             real_path, memory (trusted); forwarding, packet_processing, crdt_sync
+tests/               e2e.rs (+ e2e/harness.rs), pps_pipeline.rs (--features sim)
+benches/             real_path, memory, srtp_backends, udp_floor (trusted);
+                     forwarding, packet_processing, crdt_sync
 deploy/              Docker, Grafana dashboard
 ```
 
@@ -157,10 +165,12 @@ If TLS paths are set but the files do not load, the SFU refuses to start.
 ## Testing
 
 - Unit tests live in each crate (`#[cfg(test)]`).
-- `tests/` subdirectories (`integration/`, `stress/`, `unit/`, `validation/`) are **not
-  compiled** by cargo and are stale; they are deleted in Phase 0. Only top-level
-  `tests/*.rs` files are compiled.
-- End-to-end tests with real WebRTC clients: `tests/e2e.rs` (added in Phase 0).
+- Only top-level `tests/*.rs` files are compiled; helpers live in `tests/e2e/` and are
+  included with `#[path]`.
+- End-to-end tests with real WebRTC clients: `tests/e2e.rs`. The SFU runs in-process on
+  ephemeral ports and announces the host's first non-loopback IPv4 address (webrtc-rs never
+  offers loopback candidates), so the tests need one network interface. Loss is injected on
+  a client's socket (`nexus_loadtest::lossy`). Each later phase adds its exit checks here.
 - Benchmarks: `real_path` and `memory` measure the live path; CI runs them as a smoke test
   and enforces a memory budget.
 
@@ -179,6 +189,6 @@ If TLS paths are set but the files do not load, the SFU refuses to start.
 |-------------------|----------|---------|
 | 10000 / 10000 | UDP | Media (RTP/RTCP, STUN, DTLS) |
 | 8080 / 443 | TCP | WebSocket signaling (WSS when TLS is configured) |
-| 8443 / 443 | UDP | QUIC signaling (stub) |
+| 8443 / 443 | UDP | QUIC signaling (config only; not started) |
 | 8081 / 8081 | TCP | REST API, `/health`, `/ready` |
 | 9090 / 9090 | TCP | Prometheus metrics |

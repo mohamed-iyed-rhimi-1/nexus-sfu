@@ -16,11 +16,6 @@
 //!
 //! The canonical implementation now lives in `crates/nexus-transport/`.
 //! This module provides backward-compatible re-exports.
-//!
-//! # XDP Support
-//!
-//! On Linux with the `xdp` feature enabled, this module also provides
-//! AF_XDP socket support for zero-copy packet I/O.
 
 // Re-export all transport types from nexus-transport crate
 pub use nexus_transport::batch::{BatchSender, BatchSenderStats, BatchSenderStatsSnapshot};
@@ -31,16 +26,6 @@ pub use nexus_transport::io_uring::{
 pub use nexus_transport::media_transport::{MediaRecvPacket, MediaTransport, TransportMode};
 pub use nexus_transport::udp::{
     ReceiveMode, RecvPacket, TransportConfig, TransportStats, TransportStatsSnapshot, UdpTransport,
-};
-
-// XDP support (Linux only, stays in src/ as it's application-specific)
-#[cfg(all(target_os = "linux", feature = "xdp"))]
-pub mod af_xdp;
-
-#[cfg(all(target_os = "linux", feature = "xdp"))]
-pub use af_xdp::{
-    AfXdpConfig, AfXdpPacket, AfXdpSocket, AfXdpStats, AfXdpStatsSnapshot, DEFAULT_FRAME_SIZE,
-    DEFAULT_NUM_FRAMES, MAX_BATCH_PACKETS,
 };
 
 #[cfg(test)]

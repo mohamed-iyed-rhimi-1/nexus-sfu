@@ -75,6 +75,7 @@ mod webinar_scenario {
             connection_timeout: base_config.connection_timeout,
             ice_servers: Vec::new(),
             connection: Default::default(),
+            ..Default::default()
         };
         client_configs.push(broadcaster_config);
 
@@ -87,6 +88,7 @@ mod webinar_scenario {
                 connection_timeout: base_config.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: Default::default(),
+                ..Default::default()
             };
             client_configs.push(viewer_config);
         }
@@ -198,6 +200,7 @@ mod conference_scenario {
                 connection_timeout: base_config.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: Default::default(),
+                ..Default::default()
             };
             client_configs.push(participant_config);
         }

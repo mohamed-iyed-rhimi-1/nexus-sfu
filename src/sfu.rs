@@ -1,7 +1,7 @@
 //! SFU - Main entry point wiring all components together.
 //!
 //! The Sfu struct is the top-level coordinator that initializes and manages
-//! all SFU components: PacketArena, WorkerPool, SsrcRouter, ActorManager,
+//! all SFU components: PacketArena, WorkerPool, SsrcRouter,
 //! and CongestionController (GCC).
 //!
 //! # Architecture
@@ -62,13 +62,9 @@ use tracing::{debug, info, warn};
 use crate::config::NexusConfig;
 use crate::error::{SfuError, SignalingError, TransportError, WorkerError};
 use crate::forward::SsrcRouter;
-#[cfg(all(target_os = "linux", feature = "xdp"))]
-use crate::forward::{XdpPacketProcessor, XdpProcessorConfig};
-use crate::state::ForwardTable;
-use crate::transport::{TransportConfig, UdpTransport};
+use crate::transport::TransportConfig;
 use crate::types::{ParticipantId, TrackId};
 use crate::worker::WorkerPool;
-use nexus_actor::ActorManager;
 use nexus_bwe::CongestionController;
 use nexus_media::rtcp::{RtcpHeader, RtcpType};
 use nexus_media::rtp::RtpHeader;
@@ -257,991 +253,6 @@ impl Default for DrainState {
     }
 }
 
-/// Maximum ICE credentials to store (prevents unbounded growth).
-const MAX_ICE_CREDENTIALS: usize = 2048;
-
-/// Global ICE credentials store.
-/// Maps ice_ufrag to ice_pwd for STUN message integrity verification.
-/// Uses DashMap for lock-free concurrent access.
-static ICE_CREDENTIALS: Lazy<dashmap::DashMap<String, String>> =
-    Lazy::new(|| dashmap::DashMap::with_capacity(256));
-
-// ============================================================================
-// XDP Packet Loop (Requirement 2: XDP Integration)
-// ============================================================================
-
-/// XDP-integrated packet loop.
-///
-/// Receives cold-path packets from AF_XDP and processes them.
-/// Falls back to standard UDP transport when XDP is not available.
-///
-/// # Requirements Coverage
-///
-/// - Requirement 2.1: Receive cold-path packets via AF_XDP socket
-/// - Requirement 2.3: Fall back to standard io_uring/recvmmsg path on XDP failure
-/// - Requirement 2.4: Use standard receive path when XDP is disabled
-///
-/// # TigerStyle Compliance
-///
-/// - ≤70 lines per function
-/// - ≥2 assertions per function
-/// - Bounded loops with compile-time constants
-/// - Zero allocation after initialization
-pub struct XdpPacketLoop {
-    /// XDP processor (Linux only with xdp feature)
-    /// Owns the ForwardTable when XDP is active
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    xdp_processor: Option<XdpPacketProcessor>,
-    /// Fallback UDP transport
-    fallback_transport: UdpTransport,
-    /// SSRC router
-    ssrc_router: Arc<SsrcRouter>,
-    /// BWE controller for RTCP cold-path handling
-    /// WHY: Cold-path RTCP packets need to be routed to the BWE controller
-    /// for bandwidth estimation updates.
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    bwe_controller: Option<Arc<CongestionController>>,
-    /// WebRTC transport for DTLS/STUN cold-path handling
-    /// WHY: Cold-path DTLS and STUN packets need to be routed to the
-    /// WebRTC transport for session management.
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    webrtc_transport: Option<Arc<WebRtcTransport>>,
-    /// Running flag
-    running: AtomicBool,
-    /// Statistics (using XdpProcessorStats for compatibility)
-    stats: crate::forward::XdpProcessorStats,
-}
-
-// ============================================================================
-// Cold-Path Packet Handler (Requirement 25: XDP Cold-Path Packet Consumption)
-// ============================================================================
-
-/// Handler for cold-path packets from AF_XDP.
-///
-/// Routes RTCP, DTLS, and STUN packets to their respective handlers:
-/// - RTCP → BWE controller for bandwidth estimation
-/// - DTLS → WebRTC transport for handshake processing
-/// - STUN → WebRTC transport for ICE connectivity checks
-///
-/// # Source Address Preservation
-///
-/// This handler preserves source addresses for proper response routing.
-/// STUN binding responses and DTLS handshake responses are sent back
-/// to the originating peer address.
-///
-/// # Requirements Coverage
-///
-/// - Requirement 7.5: Route cold-path packets with source address preservation
-/// - Requirement 25.4: Route RTCP to BWE handler
-/// - Requirement 25.5: Route DTLS to DTLS handshake handler
-/// - Requirement 25.6: Route STUN to ICE agent handler
-///
-/// # TigerStyle Compliance
-///
-/// - Uses Arc for shared ownership
-/// - No dynamic allocation in hot path
-#[cfg(all(target_os = "linux", feature = "xdp"))]
-struct ColdPathHandler {
-    /// BWE controller for RTCP processing
-    bwe: Arc<CongestionController>,
-    /// WebRTC transport for DTLS/STUN processing
-    webrtc: Arc<WebRtcTransport>,
-}
-
-#[cfg(all(target_os = "linux", feature = "xdp"))]
-impl crate::forward::PacketHandler for ColdPathHandler {
-    /// Handle RTP packet (new SSRC registration).
-    ///
-    /// WHY: RTP packets on the cold path indicate a new SSRC that needs
-    /// to be registered in the forward table for kernel-space forwarding.
-    fn handle_rtp(&self, _ssrc: u32, _data: &[u8]) {
-        // RTP packets on cold path are for new SSRC registration
-        // This is handled by the main packet loop, not here
-        // WHY: New SSRC registration requires access to the SsrcRouter
-        // which is not available in this handler context.
-    }
-
-    /// Handle RTCP packet for BWE updates.
-    ///
-    /// Routes RTCP packets to the congestion controller for bandwidth
-    /// estimation. Supports Receiver Reports, Transport Feedback, and
-    /// other RTCP packet types.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 25.4: Route RTCP to BWE handler
-    fn handle_rtcp(&self, data: &[u8]) {
-        // Precondition: RTCP packets must be at least 8 bytes
-        if data.len() < 8 {
-            return;
-        }
-
-        // Parse RTCP header to determine packet type
-        let packet_type = data[1];
-
-        match packet_type {
-            // Receiver Report (RR) - PT 201
-            201 => {
-                // Extract loss fraction and cumulative lost from RR
-                // RR format: header (8) + report blocks (24 each)
-                if data.len() >= 32 {
-                    let loss_fraction = data[12];
-                    let cumulative_lost = u32::from_be_bytes([0, data[13], data[14], data[15]]);
-
-                    // Update BWE with loss information
-                    // WHY: Loss-based BWE uses fraction lost to adjust bandwidth estimate
-                    self.bwe.on_receiver_report(
-                        loss_fraction as u32,
-                        None, // RTT calculated separately
-                        cumulative_lost as u64,
-                    );
-                }
-            }
-            // Transport Feedback (RTPFB) - PT 205
-            205 => {
-                // Transport-wide CC feedback
-                // WHY: Delay-based BWE uses transport feedback for congestion detection
-                // Full parsing would require TransportFeedback struct
-            }
-            _ => {
-                // Other RTCP types (SR, SDES, BYE, etc.) - no BWE action needed
-            }
-        }
-    }
-
-    /// Handle RTCP packet with source address for BWE updates.
-    ///
-    /// Routes RTCP packets to the congestion controller for bandwidth
-    /// estimation with source address preservation.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.5: Route cold-path packets with source address preservation
-    /// - Requirement 25.4: Route RTCP to BWE handler
-    fn handle_rtcp_with_addr(&self, data: &[u8], source_addr: std::net::SocketAddr) {
-        // Log source address for debugging
-        tracing::trace!("RTCP packet from {} ({} bytes)", source_addr, data.len());
-
-        // Delegate to standard handler - RTCP doesn't need source address for BWE
-        self.handle_rtcp(data);
-    }
-
-    /// Handle DTLS packet for handshake processing.
-    ///
-    /// Routes DTLS packets to the WebRTC transport for session
-    /// establishment and key exchange.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 25.5: Route DTLS to DTLS handshake handler
-    fn handle_dtls(&self, data: &[u8]) {
-        // Precondition: DTLS records must be at least 13 bytes
-        if data.len() < 13 {
-            return;
-        }
-
-        // DTLS packets need source address for session lookup
-        // This method is called when source address is not available
-        tracing::debug!(
-            "DTLS packet received on XDP cold path ({} bytes) - no source address",
-            data.len()
-        );
-    }
-
-    /// Handle DTLS packet with source address for handshake processing.
-    ///
-    /// Routes DTLS packets to the WebRTC transport for session
-    /// establishment and key exchange with source address preservation.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.5: Route cold-path packets with source address preservation
-    /// - Requirement 25.5: Route DTLS to DTLS handshake handler
-    fn handle_dtls_with_addr(&self, data: &[u8], source_addr: std::net::SocketAddr) {
-        // Precondition: DTLS records must be at least 13 bytes
-        if data.len() < 13 {
-            return;
-        }
-
-        tracing::debug!("DTLS packet from {} ({} bytes)", source_addr, data.len());
-
-        // Route to WebRTC transport for DTLS handshake processing
-        // The transport will look up the session by source address
-        let result = self.webrtc.process_packet(data, source_addr);
-
-        // Handle result - DTLS responses are sent back to the source
-        match result {
-            Ok(Some((_session_id, incoming_data))) => {
-                // DTLS response needs to be sent back
-                // Note: We don't have direct access to the UDP transport here
-                // The response will be queued and sent by the main loop
-                tracing::debug!("DTLS response generated for {}", source_addr,);
-            }
-            Ok(None) => {
-                // Packet processed, no response needed
-            }
-            Err(e) => {
-                tracing::debug!("DTLS processing error from {}: {:?}", source_addr, e);
-            }
-        }
-    }
-
-    /// Handle STUN packet for ICE connectivity checks.
-    ///
-    /// Routes STUN packets to the WebRTC transport for ICE agent
-    /// processing and connectivity verification.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 25.6: Route STUN to ICE agent handler
-    fn handle_stun(&self, data: &[u8]) {
-        // Precondition: STUN messages must be at least 20 bytes
-        if data.len() < 20 {
-            return;
-        }
-
-        // STUN packets need source address for response routing
-        // This method is called when source address is not available
-        tracing::debug!(
-            "STUN packet received on XDP cold path ({} bytes) - no source address",
-            data.len()
-        );
-    }
-
-    /// Handle STUN packet with source address for ICE connectivity checks.
-    ///
-    /// Routes STUN packets to the WebRTC transport for ICE agent
-    /// processing and connectivity verification with source address preservation.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.5: Route cold-path packets with source address preservation
-    /// - Requirement 25.6: Route STUN to ICE agent handler
-    fn handle_stun_with_addr(&self, data: &[u8], source_addr: std::net::SocketAddr) {
-        // Precondition: STUN messages must be at least 20 bytes
-        if data.len() < 20 {
-            return;
-        }
-
-        tracing::debug!("STUN packet from {} ({} bytes)", source_addr, data.len());
-
-        // Route to WebRTC transport for ICE agent processing
-        // The transport will look up the session by source address
-        let result = self.webrtc.process_packet(data, source_addr);
-
-        // Handle result - STUN responses are sent back to the source
-        match result {
-            Ok(Some((_session_id, incoming_data))) => {
-                // STUN response needs to be sent back
-                // Note: We don't have direct access to the UDP transport here
-                // The response will be queued and sent by the main loop
-                tracing::debug!("STUN response generated for {}", source_addr,);
-            }
-            Ok(None) => {
-                // Packet processed, no response needed (e.g., STUN indication)
-            }
-            Err(e) => {
-                tracing::debug!("STUN processing error from {}: {:?}", source_addr, e);
-            }
-        }
-    }
-}
-
-impl XdpPacketLoop {
-    /// Maximum packets per batch (TigerStyle: compile-time constant).
-    pub const MAX_BATCH_SIZE: usize = 64;
-    /// Poll timeout in milliseconds.
-    pub const POLL_TIMEOUT_MS: u32 = 1;
-
-    /// Initialize with XDP if available, fallback otherwise.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - XDP configuration
-    /// * `transport` - Fallback UDP transport
-    /// * `ssrc_router` - SSRC router for packet routing
-    /// * `bwe_controller` - BWE controller for RTCP cold-path handling (optional)
-    /// * `webrtc_transport` - WebRTC transport for DTLS/STUN cold-path handling (optional)
-    ///
-    /// # Returns
-    ///
-    /// `Ok(XdpPacketLoop)` on success, `Err(SfuError)` on failure.
-    ///
-    /// # Requirements
-    ///
-    /// * 2.3 - Fall back to standard transport on XDP failure
-    /// * 2.4 - Use standard receive path when XDP is disabled
-    /// * 25.4 - Route RTCP to BWE handler
-    /// * 25.5 - Route DTLS to DTLS handshake handler
-    /// * 25.6 - Route STUN to ICE agent handler
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    pub fn new(
-        _config: &crate::config::XdpConfig,
-        transport: UdpTransport,
-        ssrc_router: Arc<SsrcRouter>,
-        #[cfg(all(target_os = "linux", feature = "xdp"))] bwe_controller: Option<
-            Arc<CongestionController>,
-        >,
-        #[cfg(all(target_os = "linux", feature = "xdp"))] webrtc_transport: Option<
-            Arc<WebRtcTransport>,
-        >,
-    ) -> Result<Self, SfuError> {
-        // Compile-time checks (TigerStyle)
-        const _: () = assert!(
-            XdpPacketLoop::MAX_BATCH_SIZE > 0,
-            "MAX_BATCH_SIZE must be positive"
-        );
-        const _: () = assert!(
-            XdpPacketLoop::MAX_BATCH_SIZE <= 64,
-            "MAX_BATCH_SIZE must not exceed 64"
-        );
-
-        // Try to initialize XDP processor (includes opening forward table)
-        #[cfg(all(target_os = "linux", feature = "xdp"))]
-        let xdp_processor = if _config.enabled {
-            // WHY: We need both BWE and WebRTC transport to create a real handler
-            match (&bwe_controller, &webrtc_transport) {
-                (Some(bwe), Some(webrtc)) => {
-                    Self::try_init_xdp(_config, bwe.clone(), webrtc.clone())
-                }
-                _ => {
-                    info!("XDP enabled but BWE/WebRTC not available, using NoOp handler");
-                    Self::try_init_xdp_noop(_config)
-                }
-            }
-        } else {
-            info!("XDP disabled in configuration, using fallback transport");
-            None
-        };
-
-        // Postcondition assertion (TigerStyle)
-        #[cfg(all(target_os = "linux", feature = "xdp"))]
-        {
-            if xdp_processor.is_some() {
-                info!("XDP packet loop initialized with AF_XDP socket");
-            } else {
-                info!("XDP packet loop initialized with fallback transport");
-            }
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-        info!("XDP not available on this platform, using fallback transport");
-
-        Ok(Self {
-            #[cfg(all(target_os = "linux", feature = "xdp"))]
-            xdp_processor,
-            fallback_transport: transport,
-            ssrc_router,
-            #[cfg(all(target_os = "linux", feature = "xdp"))]
-            bwe_controller,
-            #[cfg(all(target_os = "linux", feature = "xdp"))]
-            webrtc_transport,
-            running: AtomicBool::new(false),
-            stats: crate::forward::XdpProcessorStats::new(),
-        })
-    }
-
-    /// Try to initialize XDP processor with ColdPathHandler.
-    ///
-    /// Creates a real packet handler that routes cold-path packets to
-    /// their respective handlers (BWE, DTLS, ICE).
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - XDP configuration
-    /// * `bwe` - BWE controller for RTCP handling
-    /// * `webrtc` - WebRTC transport for DTLS/STUN handling
-    ///
-    /// # Returns
-    ///
-    /// Some(XdpPacketProcessor) on success, None on failure (graceful fallback).
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 25.4: Route RTCP to BWE handler
-    /// - Requirement 25.5: Route DTLS to DTLS handshake handler
-    /// - Requirement 25.6: Route STUN to ICE agent handler
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    fn try_init_xdp(
-        config: &crate::config::XdpConfig,
-        bwe: Arc<CongestionController>,
-        webrtc: Arc<WebRtcTransport>,
-    ) -> Option<XdpPacketProcessor> {
-        // First, try to open the forward table
-        let forward_table = match ForwardTable::open(&config.forward_table_path) {
-            Ok(ft) => {
-                info!("Opened XDP forward table at {}", config.forward_table_path);
-                ft
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to open XDP forward table: {}, cannot initialize XDP",
-                    e
-                );
-                return None;
-            }
-        };
-
-        // Create the ColdPathHandler with real routing
-        // WHY: This handler routes cold-path packets to their respective
-        // handlers instead of dropping them like NoOpHandler did.
-        let handler = Arc::new(ColdPathHandler { bwe, webrtc });
-
-        let processor_config = XdpProcessorConfig {
-            ifname: config.interface.clone(),
-            queue_id: config.queue_id,
-            forward_table_path: config.forward_table_path.clone(),
-            batch_size: Self::MAX_BATCH_SIZE,
-            poll_timeout_ms: Self::POLL_TIMEOUT_MS,
-        };
-
-        match XdpPacketProcessor::with_config(processor_config, forward_table, handler) {
-            Ok(processor) => {
-                info!(
-                    "XDP processor initialized with ColdPathHandler on interface {} queue {}",
-                    config.interface, config.queue_id
-                );
-                Some(processor)
-            }
-            Err(e) => {
-                warn!("Failed to initialize XDP processor: {}, falling back", e);
-                None
-            }
-        }
-    }
-
-    /// Try to initialize XDP processor with NoOpHandler (fallback).
-    ///
-    /// Used when BWE/WebRTC transport are not available.
-    ///
-    /// Returns None if initialization fails (graceful fallback).
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    fn try_init_xdp_noop(config: &crate::config::XdpConfig) -> Option<XdpPacketProcessor> {
-        // First, try to open the forward table
-        let forward_table = match ForwardTable::open(&config.forward_table_path) {
-            Ok(ft) => {
-                info!("Opened XDP forward table at {}", config.forward_table_path);
-                ft
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to open XDP forward table: {}, cannot initialize XDP",
-                    e
-                );
-                return None;
-            }
-        };
-
-        // Create a no-op packet handler for cold-path packets
-        // WHY: This is a fallback when BWE/WebRTC are not available
-        struct NoOpHandler;
-        impl crate::forward::PacketHandler for NoOpHandler {
-            fn handle_rtp(&self, _ssrc: u32, _data: &[u8]) {}
-            fn handle_rtcp(&self, _data: &[u8]) {}
-            fn handle_dtls(&self, _data: &[u8]) {}
-            fn handle_stun(&self, _data: &[u8]) {}
-        }
-
-        let handler = Arc::new(NoOpHandler);
-        let processor_config = XdpProcessorConfig {
-            ifname: config.interface.clone(),
-            queue_id: config.queue_id,
-            forward_table_path: config.forward_table_path.clone(),
-            batch_size: Self::MAX_BATCH_SIZE,
-            poll_timeout_ms: Self::POLL_TIMEOUT_MS,
-        };
-
-        match XdpPacketProcessor::with_config(processor_config, forward_table, handler) {
-            Ok(processor) => {
-                info!(
-                    "XDP processor initialized with NoOpHandler on interface {} queue {}",
-                    config.interface, config.queue_id
-                );
-                Some(processor)
-            }
-            Err(e) => {
-                warn!("Failed to initialize XDP processor: {}, falling back", e);
-                None
-            }
-        }
-    }
-
-    /// Check if XDP is active.
-    ///
-    /// Returns true if XDP processor is initialized and running.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - Inline for zero-cost abstraction
-    #[inline]
-    pub fn is_xdp_active(&self) -> bool {
-        #[cfg(all(target_os = "linux", feature = "xdp"))]
-        {
-            self.xdp_processor.is_some()
-        }
-        #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-        {
-            false
-        }
-    }
-
-    /// Get the forward table (if XDP is active).
-    ///
-    /// Returns a reference to the forward table owned by the XDP processor.
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    #[inline]
-    pub fn forward_table(&self) -> Option<&ForwardTable> {
-        self.xdp_processor.as_ref().map(|p| p.forward_table())
-    }
-
-    /// Get the forward table (stub for non-Linux).
-    #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-    #[inline]
-    pub fn forward_table(&self) -> Option<&ForwardTable> {
-        None
-    }
-
-    /// Get the SSRC router.
-    #[inline]
-    pub fn ssrc_router(&self) -> &Arc<SsrcRouter> {
-        &self.ssrc_router
-    }
-
-    /// Poll DTLS retransmissions for all handshaking sessions.
-    ///
-    /// Called every 200ms from the packet loop. Iterates all sessions
-    /// in DtlsHandshaking state and sends retransmit data if timers
-    /// have expired.
-    ///
-    /// # TigerStyle
-    /// - Bounded iteration (max_webrtc_sessions)
-    /// - Explicit error handling per session
-    /// - No panics on individual session failures
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    #[allow(dead_code)]
-    fn poll_dtls_retransmissions(&self) {
-        let webrtc_transport = match &self.webrtc_transport {
-            Some(t) => t,
-            None => return,
-        };
-
-        let session_ids: Vec<nexus_webrtc::webrtc::TransportId> =
-            { self.webrtc_transport.session_ids() };
-
-        for session_id in session_ids {
-            let retransmit_result = self
-                .webrtc_transport
-                .with_session_mut(session_id, |session| {
-                    // Only check sessions in DtlsHandshaking state
-                    if session.state() != nexus_webrtc::webrtc::SessionState::DtlsHandshaking {
-                        return None;
-                    }
-
-                    // Check for pending retransmission
-                    session.poll_dtls_retransmit()
-                });
-
-            if let Some(Some((dest_addr, data))) = retransmit_result {
-                // Send via fallback transport
-                if let Err(e) = self.fallback_transport.send(&data, dest_addr) {
-                    warn!("Failed to send DTLS retransmit: {:?}", e);
-                }
-                debug!(
-                    "DTLS retransmit sent to {} for session {}",
-                    dest_addr,
-                    session_id.value()
-                );
-            }
-        }
-    }
-
-    /// Stub for non-XDP builds.
-    #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-    #[allow(dead_code)]
-    fn poll_dtls_retransmissions(&self) {
-        // No-op: DTLS retransmissions handled elsewhere without XDP
-    }
-
-    /// Check consent freshness for all established sessions.
-    ///
-    /// Per RFC 7675, if a peer hasn't responded to STUN consent checks
-    /// within the consent timeout, the session is considered dead.
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    #[allow(dead_code)]
-    fn poll_consent_freshness(&self) {
-        let webrtc_transport = match &self.webrtc_transport {
-            Some(t) => t,
-            None => return,
-        };
-
-        let stale_sessions: Vec<nexus_webrtc::webrtc::TransportId> =
-            { self.webrtc_transport.check_consent_freshness() };
-
-        for session_id in stale_sessions {
-            info!(
-                "Session {} failed consent freshness check, closing",
-                session_id.value()
-            );
-            // Close the session
-            self.webrtc_transport
-                .with_session_mut(session_id, |session| {
-                    session.close();
-                });
-        }
-    }
-
-    /// Stub for non-XDP builds.
-    #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-    #[allow(dead_code)]
-    fn poll_consent_freshness(&self) {
-        // No-op: Consent freshness handled elsewhere without XDP
-    }
-
-    /// Get statistics.
-    #[inline]
-    pub fn stats(&self) -> &crate::forward::XdpProcessorStats {
-        &self.stats
-    }
-
-    /// Check if the loop is running.
-    #[inline]
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
-    /// Stop the packet loop.
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-
-    /// Get the fallback transport.
-    #[inline]
-    pub fn fallback_transport(&self) -> &UdpTransport {
-        &self.fallback_transport
-    }
-
-    /// Get mutable reference to fallback transport.
-    #[inline]
-    pub fn fallback_transport_mut(&mut self) -> &mut UdpTransport {
-        &mut self.fallback_transport
-    }
-
-    /// Run the main packet loop.
-    ///
-    /// Polls AF_XDP socket (if available) or fallback transport for packets.
-    /// Dispatches packets to appropriate handlers based on classification.
-    /// Unknown SSRCs are dispatched to worker registration.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown_rx` - Receiver for shutdown signal
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on graceful shutdown, `Err(SfuError)` on failure.
-    ///
-    /// # Requirements
-    ///
-    /// * 2.1 - Receive cold-path packets via AF_XDP socket
-    /// * 2.8 - Integrate shutdown signal handling
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines (split into helpers)
-    /// - ≥2 assertions
-    /// - Bounded loops with compile-time constants
-    ///
-    /// Run the main packet loop (synchronous version for dedicated thread).
-    ///
-    /// Polls AF_XDP socket (if available) or fallback transport for packets.
-    /// Dispatches packets to appropriate handlers based on classification.
-    /// Unknown SSRCs are dispatched to worker registration.
-    ///
-    /// WHY sync instead of async: This loop runs on a dedicated thread, not in
-    /// the tokio runtime. Using sync primitives (thread::yield_now, thread::sleep)
-    /// avoids async overhead and allows tighter control over CPU usage.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown_rx` - Receiver for shutdown signal (std::sync channel)
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on graceful shutdown, `Err(SfuError)` on failure.
-    ///
-    /// # Requirements
-    ///
-    /// * 2.1 - Receive cold-path packets via AF_XDP socket
-    /// * 2.8 - Integrate shutdown signal handling
-    /// * 28.6 - Use SpinLoop for packet processing
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines (split into helpers)
-    /// - ≥2 assertions
-    /// - Bounded loops with compile-time constants
-    pub fn run(&mut self, shutdown_rx: &std::sync::mpsc::Receiver<()>) -> Result<(), SfuError> {
-        use crate::spin::SpinLoop;
-
-        // Compile-time checks
-        const _: () = assert!(
-            XdpPacketLoop::MAX_BATCH_SIZE <= 64,
-            "MAX_BATCH_SIZE must not exceed 64"
-        );
-        const _: () = assert!(
-            XdpPacketLoop::POLL_TIMEOUT_MS > 0,
-            "POLL_TIMEOUT_MS must be positive"
-        );
-
-        self.running.store(true, Ordering::SeqCst);
-        info!(
-            "XDP packet loop started (XDP active: {})",
-            self.is_xdp_active()
-        );
-
-        let mut packets_processed: u64 = 0;
-        let mut spin_loop = SpinLoop::new();
-
-        loop {
-            // Check for shutdown signal (non-blocking)
-            if shutdown_rx.try_recv().is_ok() {
-                info!("XDP packet loop received shutdown signal");
-                break;
-            }
-
-            // Check running flag
-            if !self.running.load(Ordering::SeqCst) {
-                break;
-            }
-
-            // Process packets based on XDP availability
-            let batch_count = self.process_packet_batch();
-            packets_processed += batch_count as u64;
-
-            // Log statistics periodically
-            if packets_processed > 0 && packets_processed % 100000 == 0 {
-                let stats = self.stats.snapshot();
-                debug!(
-                    "XDP loop processed {} packets (RTP: {}, RTCP: {}, DTLS: {}, STUN: {})",
-                    stats.packets_received,
-                    stats.rtp_packets,
-                    stats.rtcp_packets,
-                    stats.dtls_packets,
-                    stats.stun_packets
-                );
-            }
-
-            // Adaptive spin: update state and wait appropriately
-            spin_loop.on_poll_result(batch_count);
-        }
-
-        self.running.store(false, Ordering::SeqCst);
-        info!(
-            "XDP packet loop stopped, processed {} packets total",
-            packets_processed
-        );
-
-        Ok(())
-    }
-
-    /// Process a batch of packets from either XDP or fallback transport.
-    ///
-    /// # Returns
-    ///
-    /// Number of packets processed in this batch.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    fn process_packet_batch(&mut self) -> u32 {
-        #[cfg(all(target_os = "linux", feature = "xdp"))]
-        {
-            if let Some(ref mut processor) = self.xdp_processor {
-                return self.process_xdp_packets(processor);
-            }
-        }
-
-        // Fallback to standard transport
-        self.process_fallback_packets()
-    }
-
-    /// Process packets from XDP processor.
-    ///
-    /// Polls the AF_XDP RX ring for cold-path packets and dispatches them
-    /// to the appropriate handlers via `process_xdp_batch`.
-    ///
-    /// # Arguments
-    ///
-    /// * `processor` - Mutable reference to the XDP packet processor
-    ///
-    /// # Returns
-    ///
-    /// Number of packets processed.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 25.1: Poll AF_XDP_RX_Ring for cold-path packets
-    /// - Requirement 25.2: Consume up to MAX_BATCH_SIZE (64) packets per poll
-    /// - Requirement 25.3: Pass packets to process_xdp_batch for classification
-    /// - Requirement 25.7: Proceed to fallback on zero packets
-    /// - Requirement 25.8: Refill fill ring after consuming
-    /// - Requirement 25.9: Increment per-type packet counters
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    /// - Bounded loop (max 64 packets)
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    fn process_xdp_packets(&mut self, processor: &mut XdpPacketProcessor) -> u32 {
-        // Precondition assertions (TigerStyle)
-        assert!(
-            Self::MAX_BATCH_SIZE <= 64,
-            "MAX_BATCH_SIZE must not exceed 64"
-        );
-        assert!(
-            processor.is_running() || true,
-            "processor must be accessible"
-        );
-
-        // Get mutable access to the AF_XDP socket
-        // WHY: We need direct socket access to poll for cold-path packets
-        let af_xdp_socket = match processor.af_xdp_socket_mut() {
-            Some(sock) => sock,
-            None => return 0,
-        };
-
-        // Poll AF_XDP socket for cold-path packets
-        // WHY: Cold-path packets (RTCP, DTLS, STUN) are redirected to user space
-        // by the XDP BPF program and need to be consumed from the RX ring.
-        let packets = match af_xdp_socket.recv_batch(Self::MAX_BATCH_SIZE) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("AF_XDP recv error: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return 0;
-            }
-        };
-
-        // Early return if no packets available
-        // WHY: Requirement 25.7 - proceed to fallback on zero packets
-        if packets.is_empty() {
-            return 0;
-        }
-
-        let packet_count: u32 = packets.len() as u32;
-
-        // Feed packets to process_xdp_batch for classification and dispatch
-        // WHY: Requirement 25.3 - classification via PacketType::classify
-        // The processor's handler (ColdPathHandler) routes packets to BWE/DTLS/ICE
-        let processed = processor.process_xdp_batch(&packets);
-
-        // Refill the fill ring after consuming
-        // WHY: Requirement 25.8 - maintain zero-copy buffer availability
-        if let Err(e) = af_xdp_socket.refill_fill_ring(packet_count as usize) {
-            tracing::warn!("Failed to refill AF_XDP fill ring: {}", e);
-        }
-
-        // Postcondition assertion (TigerStyle)
-        assert!(
-            processed <= packet_count,
-            "processed count must not exceed input count"
-        );
-
-        processed
-    }
-
-    /// Process packets from fallback UDP transport.
-    ///
-    /// # Returns
-    ///
-    /// Number of packets processed.
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    fn process_fallback_packets(&mut self) -> u32 {
-        use crate::forward::process_fallback_batch;
-
-        // Receive batch from fallback transport
-        let packets = match self.fallback_transport.recv_batch(Self::MAX_BATCH_SIZE) {
-            Ok(p) => p,
-            Err(crate::error::TransportError::RecvFailed { source }) => {
-                if source.kind() != std::io::ErrorKind::WouldBlock {
-                    warn!("Fallback transport receive error: {}", source);
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-                return 0;
-            }
-            Err(e) => {
-                warn!("Fallback transport error: {}", e);
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return 0;
-            }
-        };
-
-        if packets.is_empty() {
-            return 0;
-        }
-
-        // Process the batch (zero-allocation: stack-allocated results buffer)
-        let mut results = [(crate::forward::PacketType::Unknown, None, 0usize);
-            crate::forward::processor::MAX_FALLBACK_BATCH];
-        let count = process_fallback_batch(&packets, &self.stats, &mut results);
-
-        // Dispatch packets based on classification
-        for (ptype, ssrc, _idx) in &results[..count] {
-            match ptype {
-                crate::forward::PacketType::Rtp => {
-                    if let Some(ssrc_val) = ssrc {
-                        // Check if SSRC is known
-                        if self.ssrc_router.lookup(*ssrc_val).is_none() {
-                            // Unknown SSRC - would dispatch to worker registration
-                            debug!("Unknown SSRC {} detected, needs registration", ssrc_val);
-                        }
-                    }
-                }
-                _ => {
-                    // Other packet types are handled by the main SFU loop
-                }
-            }
-        }
-
-        results.len() as u32
-    }
-}
-
-/// Register ICE credentials for a participant.
-/// Call this when generating SDP answer.
-pub fn register_ice_credentials(ice_ufrag: &str, ice_pwd: &str) {
-    if ICE_CREDENTIALS.len() >= MAX_ICE_CREDENTIALS {
-        warn!(
-            "ICE credentials store at capacity ({}), dropping oldest",
-            MAX_ICE_CREDENTIALS
-        );
-        return;
-    }
-    ICE_CREDENTIALS.insert(ice_ufrag.to_string(), ice_pwd.to_string());
-    debug!("Registered ICE credentials for ufrag {}", ice_ufrag);
-}
-
-/// Look up ICE password by ufrag.
-#[allow(dead_code)] // Reserved for STUN message integrity verification
-fn lookup_ice_password(ice_ufrag: &str) -> Option<String> {
-    ICE_CREDENTIALS.get(ice_ufrag).map(|v| v.value().clone())
-}
-
-/// Remove ICE credentials when participant leaves.
-pub fn unregister_ice_credentials(ice_ufrag: &str) {
-    ICE_CREDENTIALS.remove(ice_ufrag);
-}
-
 /// Shutdown timeout in milliseconds.
 #[allow(dead_code)] // Reserved for graceful shutdown implementation
 const SHUTDOWN_TIMEOUT_MS: u64 = 5000;
@@ -1298,6 +309,29 @@ impl DropTracker {
     }
 }
 
+/// Per-track cache of the publisher SRTCP key last sent to the worker:
+/// track_id -> (session_id, key fingerprint). Lets the ingress loop send
+/// `SetPublisherSrtcp` once per key instead of on every packet. Entries are
+/// removed when the track is removed (`forget_publisher_srtcp`).
+static SRTCP_SENT_CACHE: Lazy<dashmap::DashMap<u64, (u64, [u8; 32])>> =
+    Lazy::new(|| dashmap::DashMap::with_capacity(256));
+
+/// Drop a removed track's entry from the SRTCP sent-cache.
+pub(crate) fn forget_publisher_srtcp(track_id: crate::types::TrackId) {
+    SRTCP_SENT_CACHE.remove(&track_id);
+    assert!(!SRTCP_SENT_CACHE.contains_key(&track_id));
+}
+
+#[cfg(test)]
+pub(crate) fn publisher_srtcp_cached(track_id: crate::types::TrackId) -> bool {
+    SRTCP_SENT_CACHE.contains_key(&track_id)
+}
+
+#[cfg(test)]
+pub(crate) fn remember_publisher_srtcp_for_test(track_id: crate::types::TrackId) {
+    SRTCP_SENT_CACHE.insert(track_id, (0, [0; 32]));
+}
+
 pub struct Sfu {
     /// Configuration.
     config: NexusConfig,
@@ -1311,9 +345,6 @@ pub struct Sfu {
     /// SSRC to track routing table.
     ssrc_router: Arc<SsrcRouter>,
 
-    /// Actor manager for room/participant/track management.
-    actor_manager: Arc<ActorManager>,
-
     /// Distributed state for CRDT synchronization.
     distributed_state: Arc<DistributedState>,
 
@@ -1322,6 +353,9 @@ pub struct Sfu {
 
     /// UDP transport for media packets (standard or io_uring).
     transport: Option<crate::transport::MediaTransport>,
+
+    /// Address the media socket actually bound (resolves port 0).
+    media_local_addr: SocketAddr,
 
     /// WebRTC transport for session management (ICE/DTLS/SRTP).
     /// Uses interior mutability - all methods take &self instead of &mut self.
@@ -1333,7 +367,6 @@ pub struct Sfu {
     /// Shared shutdown signal for all subsystems.
     ///
     /// This AtomicBool is shared by:
-    /// - XdpPacketLoop
     /// - WorkerPool (all MediaWorkers)
     /// - Gossip thread
     /// - Signaling server
@@ -1347,6 +380,14 @@ pub struct Sfu {
 
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
+
+    /// Set from outside (`stop_handle`) to end the packet loop; the caller
+    /// then runs `shutdown()`, which notifies clients before the shared
+    /// shutdown flag stops signaling.
+    stop_requested: Arc<AtomicBool>,
+
+    /// The signaling server's connections, for shutdown notifications.
+    signaling_connections: Option<crate::signal::SignalingConnections>,
 
     /// Gossip thread handle.
     /// The gossip thread runs the SWIM protocol for cluster membership
@@ -1387,25 +428,7 @@ pub struct Sfu {
     /// Ingest drops because the packet arena had no free slot.
     arena_drops: DropTracker,
 
-    /// XDP Forward Table for kernel-space RTP forwarding.
-    ///
-    /// When XDP is enabled, this table maps SSRC values to subscriber
-    /// destination addresses, allowing the XDP BPF program to forward
-    /// RTP packets directly in kernel space without user-space involvement.
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.2: ForwardTable manages BPF map entries
-    /// - Requirement 7.3: Update ForwardTable when track is published
-    /// - Requirement 7.4: Update ForwardTable when subscription changes
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    forward_table: Option<ForwardTable>,
-
     packets_processed: u64,
-    /// Relay manager for inter-node cascade (None if single-node).
-    relay_manager: Option<Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>>,
-    /// Relay event receiver for orchestrator (taken once at startup).
-    relay_event_rx: Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>>,
     /// Cold-path channel: STUN/DTLS packets → ConnectionMonitor in orchestrator.
     connection_tx: Option<mpsc::Sender<crate::orchestrator::events::ColdPathPacket>>,
 }
@@ -1417,9 +440,8 @@ impl Sfu {
     /// - PacketArena for zero-allocation packet handling
     /// - WorkerPool with CPU-pinned threads
     /// - SsrcRouter for packet routing
-    /// - ActorManager for room/participant management
     /// - CongestionController (GCC) for bandwidth estimation
-    /// - UdpTransport for media I/O
+    /// - MediaTransport for media I/O
     ///
     /// # Arguments
     ///
@@ -1523,23 +545,6 @@ impl Sfu {
         let distributed_state = Arc::new(DistributedState::new(state_config));
         info!("Distributed state initialized with actor_id={}", actor_id);
 
-        // Initialize actor manager
-        info!("Initializing actor manager...");
-        let actor_manager = Arc::new(ActorManager::new(
-            config.actor.max_room_actors as usize,
-            config.actor.max_participant_actors as usize,
-            (config.actor.max_participant_actors * 10) as usize,
-            distributed_state.clone(),
-        ));
-
-        // Verify ActorManager uses same DistributedState instance
-        assert!(
-            Arc::ptr_eq(&actor_manager.distributed_state(), &distributed_state),
-            "ActorManager must use same DistributedState instance"
-        );
-
-        info!("Actor manager initialized");
-
         // Initialize GCC congestion controller
         let gcc = Arc::new(CongestionController::new(
             config.bwe.min_bandwidth_bps as u64,
@@ -1570,12 +575,14 @@ impl Sfu {
         )
         .map_err(SfuError::Transport)?;
         let socket_fd = transport.socket_fd();
-        info!(
-            "Media transport bound to {}",
-            transport
-                .local_addr()
-                .unwrap_or(config.transport.media_bind_addr)
-        );
+        let media_local_addr = transport.local_addr().map_err(|source| {
+            SfuError::Transport(TransportError::BindFailed {
+                addr: config.transport.media_bind_addr,
+                source,
+            })
+        })?;
+        assert!(media_local_addr.port() != 0, "bound media port is known");
+        info!("Media transport bound to {}", media_local_addr);
 
         // Initialize WebRTC transport for session management
         info!("Creating WebRTC transport...");
@@ -1662,10 +669,6 @@ impl Sfu {
         // Create channel for state updates from DistributedState to gossip thread
         let (state_update_tx, state_update_rx) =
             std::sync::mpsc::channel::<nexus_state::StateUpdate>();
-
-        // Create channel for relay events from gossip thread to orchestrator
-        let (relay_event_tx, relay_event_rx) =
-            mpsc::unbounded_channel::<nexus_state::gossip::RelayEvent>();
 
         // Set the broadcast sender on distributed state
         distributed_state.set_broadcast_sender(state_update_tx);
@@ -1764,11 +767,6 @@ impl Sfu {
                         warn!("Gossip recv error: {:?}", e);
                     }
 
-                    // Drain relay events from gossip → orchestrator
-                    for event in swim_protocol.drain_relay_events() {
-                        let _ = relay_event_tx.send(event);
-                    }
-
                     // Sleep for probe interval
                     std::thread::sleep(std::time::Duration::from_millis(probe_interval_ms));
                 }
@@ -1780,31 +778,6 @@ impl Sfu {
             }))?;
 
         info!("Gossip thread spawned");
-
-        // Initialize XDP ForwardTable if XDP is enabled
-        #[cfg(all(target_os = "linux", feature = "xdp"))]
-        let forward_table = if config.xdp.enabled {
-            match ForwardTable::open(&config.xdp.forward_table_path) {
-                Ok(ft) => {
-                    info!(
-                        "XDP ForwardTable opened at {}",
-                        config.xdp.forward_table_path
-                    );
-                    Some(ft)
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to open XDP ForwardTable: {}, XDP forwarding disabled",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            info!("XDP disabled in configuration");
-            None
-        };
-
         info!("Nexus SFU MVP initialization complete");
 
         // Create drain state before moving config
@@ -1815,25 +788,23 @@ impl Sfu {
             arena,
             worker_pool: Some(Arc::new(RwLock::new(worker_pool))),
             ssrc_router,
-            actor_manager,
             distributed_state,
             gcc,
             transport: Some(transport),
+            media_local_addr,
             webrtc_transport,
             is_shutdown: AtomicBool::new(false),
             shared_shutdown,
             shutdown_tx: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            signaling_connections: None,
             gossip_thread: Some(gossip_thread),
             gossip_shutdown_tx: Some(gossip_shutdown_tx),
             drain_state: Arc::new(DrainState::new(drain_timeout_ms)),
             metrics,
             worker_queue_drops: DropTracker::default(),
             arena_drops: DropTracker::default(),
-            #[cfg(all(target_os = "linux", feature = "xdp"))]
-            forward_table,
             packets_processed: 0,
-            relay_manager: None,
-            relay_event_rx: Some(relay_event_rx),
             connection_tx: None,
         })
     }
@@ -1846,6 +817,12 @@ impl Sfu {
         tx: mpsc::Sender<crate::orchestrator::events::ColdPathPacket>,
     ) {
         self.connection_tx = Some(tx);
+    }
+
+    /// Address the media socket is bound to, with the real port when the
+    /// configured port was 0.
+    pub fn media_local_addr(&self) -> SocketAddr {
+        self.media_local_addr
     }
 
     /// Get the media transport's local address for creating a PacketSender.
@@ -1883,12 +860,6 @@ impl Sfu {
         &self.ssrc_router
     }
 
-    /// Get the actor manager.
-    #[inline]
-    pub fn actor_manager(&self) -> &Arc<ActorManager> {
-        &self.actor_manager
-    }
-
     /// Get worker pool.
     ///
     /// Returns Arc<RwLock<WorkerPool>> for thread-safe access.
@@ -1905,21 +876,6 @@ impl Sfu {
     #[inline]
     pub fn distributed_state(&self) -> &Arc<DistributedState> {
         &self.distributed_state
-    }
-
-    /// Set the relay manager for inter-node cascade.
-    pub fn set_relay_manager(
-        &mut self,
-        mgr: Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>,
-    ) {
-        self.relay_manager = Some(mgr);
-    }
-
-    /// Take the relay event receiver (for passing to the orchestrator). Can only be called once.
-    pub fn take_relay_event_rx(
-        &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>> {
-        self.relay_event_rx.take()
     }
 
     /// Get the WebRTC transport.
@@ -1944,6 +900,16 @@ impl Sfu {
     #[inline]
     pub fn bwe(&self) -> &Arc<CongestionController> {
         &self.gcc
+    }
+
+    /// Flag that ends the packet loop when set (see `stop_requested`).
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_requested)
+    }
+
+    /// Connections to notify on shutdown (the signaling server's registry).
+    pub fn set_signaling_connections(&mut self, connections: crate::signal::SignalingConnections) {
+        self.signaling_connections = Some(connections);
     }
 
     /// Get the shared shutdown signal.
@@ -1998,7 +964,7 @@ impl Sfu {
     /// Subscribe a participant to a track with destination address.
     ///
     /// This is a convenience method that:
-    /// 1. Calls actor_manager.subscribe_to_track to get the worker_id
+    /// 1. Looks up the worker that owns the track in the SSRC router
     /// 2. Sends ActorSubscribe message to the appropriate worker
     /// 3. Returns the generated subscriber_id for tracking
     ///
@@ -2024,11 +990,12 @@ impl Sfu {
             return Err("destination port must be valid (> 0)".to_string());
         }
 
-        // Call actor manager to get worker_id
+        // The router records (ssrc, track, worker) when the track is assigned.
         let worker_id = self
-            .actor_manager
-            .subscribe_to_track(subscriber_id, track_id, dest_addr)
-            .map_err(|e| format!("Actor manager subscribe failed: {}", e))?;
+            .ssrc_router
+            .lookup_by_track(track_id)
+            .map(|(_ssrc, worker_id)| worker_id)
+            .ok_or(format!("Track {} is not assigned to a worker", track_id))?;
 
         // Get worker pool
         let worker_pool_arc = self.worker_pool_arc().ok_or("Worker pool not available")?;
@@ -2053,15 +1020,6 @@ impl Sfu {
                 srtp_context: None,
             })
             .map_err(|e| format!("Failed to send subscribe message to worker: {:?}", e))?;
-
-        // Update XDP ForwardTable with new subscriber mapping
-        // Requirement 7.4: Update ForwardTable when subscription changes
-        #[cfg(all(target_os = "linux", feature = "xdp"))]
-        {
-            if let Some(ssrc) = self.ssrc_router.lookup_ssrc_by_track(track_id) {
-                self.update_forward_table_for_subscription(ssrc, dest_addr);
-            }
-        }
 
         Ok(subscriber_id_unique)
     }
@@ -2172,206 +1130,6 @@ impl Sfu {
     pub fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::Acquire)
     }
-
-    // ========================================================================
-    // XDP ForwardTable Management (Requirement 7: AF_XDP Integration Wiring)
-    // ========================================================================
-
-    /// Update the XDP ForwardTable when a track is published.
-    ///
-    /// This method is called when a new track is registered to update the
-    /// BPF map with the SSRC-to-destination mapping for kernel-space forwarding.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssrc` - RTP SSRC of the published track
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.2: ForwardTable manages BPF map entries
-    /// - Requirement 7.3: Update ForwardTable when track is published
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    /// - Guarded with cfg for XDP feature
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    pub fn on_track_published(&self, ssrc: u32) {
-        // Precondition check
-        if ssrc == 0 {
-            warn!("on_track_published called with zero SSRC, ignoring");
-            return;
-        }
-
-        // Get ForwardTable if available
-        let forward_table = match &self.forward_table {
-            Some(ft) => ft,
-            None => {
-                debug!("XDP ForwardTable not available, skipping track publish update");
-                return;
-            }
-        };
-
-        // For a newly published track, we don't have subscribers yet.
-        // The ForwardTable will be updated when subscriptions are added.
-        // This method serves as a hook point for future enhancements
-        // (e.g., pre-registering the SSRC with a placeholder entry).
-        debug!(
-            "Track published with SSRC {}, ForwardTable has {} entries",
-            ssrc,
-            forward_table.entry_count()
-        );
-    }
-
-    /// Update the XDP ForwardTable when a subscription is added.
-    ///
-    /// This method updates the BPF map with the SSRC-to-subscriber mapping
-    /// so the XDP program can forward RTP packets directly in kernel space.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssrc` - RTP SSRC of the track
-    /// * `dest_addr` - Destination socket address of the subscriber
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.3: Update ForwardTable when track is published
-    /// - Requirement 7.4: Update ForwardTable when subscription changes
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    /// - Guarded with cfg for XDP feature
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    fn update_forward_table_for_subscription(&self, ssrc: u32, dest_addr: SocketAddr) {
-        use crate::state::ForwardEntry;
-
-        // Precondition checks
-        if ssrc == 0 {
-            warn!("update_forward_table_for_subscription called with zero SSRC, ignoring");
-            return;
-        }
-        if dest_addr.port() == 0 {
-            warn!("update_forward_table_for_subscription called with invalid destination port, ignoring");
-            return;
-        }
-
-        // Get ForwardTable if available
-        let forward_table = match &self.forward_table {
-            Some(ft) => ft,
-            None => {
-                debug!("XDP ForwardTable not available, skipping subscription update");
-                return;
-            }
-        };
-
-        // Create ForwardEntry for the subscriber
-        // Note: In a real deployment, we would need to resolve the MAC address
-        // via ARP or use a default gateway MAC. For now, we use a placeholder.
-        let dst_mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // Placeholder MAC
-        let ifindex = self.config.xdp.ifindex.unwrap_or(1); // Default interface index
-
-        let ip_octets = match dest_addr.ip() {
-            std::net::IpAddr::V4(ipv4) => ipv4.octets(),
-            std::net::IpAddr::V6(_) => {
-                warn!("IPv6 not supported for XDP forwarding, skipping");
-                return;
-            }
-        };
-
-        let entry = ForwardEntry::from_ipv4(dst_mac, ip_octets, dest_addr.port(), ifindex);
-
-        // Insert into ForwardTable
-        match forward_table.insert(ssrc, entry) {
-            Ok(()) => {
-                info!(
-                    "Updated XDP ForwardTable: SSRC {} -> {}:{} (ifindex {})",
-                    ssrc,
-                    dest_addr.ip(),
-                    dest_addr.port(),
-                    ifindex
-                );
-            }
-            Err(e) => {
-                warn!("Failed to update XDP ForwardTable for SSRC {}: {}", ssrc, e);
-            }
-        }
-    }
-
-    /// Remove an SSRC from the XDP ForwardTable.
-    ///
-    /// This method is called when a track is unpublished or all subscribers
-    /// have unsubscribed, removing the SSRC-to-destination mapping from the
-    /// BPF map.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssrc` - RTP SSRC to remove
-    ///
-    /// # Requirements Coverage
-    ///
-    /// - Requirement 7.2: ForwardTable manages BPF map entries
-    ///
-    /// # TigerStyle Compliance
-    ///
-    /// - ≤70 lines
-    /// - ≥2 assertions
-    /// - Guarded with cfg for XDP feature
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    pub fn remove_from_forward_table(&self, ssrc: u32) {
-        // Precondition check
-        if ssrc == 0 {
-            warn!("remove_from_forward_table called with zero SSRC, ignoring");
-            return;
-        }
-
-        // Get ForwardTable if available
-        let forward_table = match &self.forward_table {
-            Some(ft) => ft,
-            None => {
-                debug!("XDP ForwardTable not available, skipping removal");
-                return;
-            }
-        };
-
-        // Remove from ForwardTable
-        match forward_table.remove(ssrc) {
-            Ok(()) => {
-                info!("Removed SSRC {} from XDP ForwardTable", ssrc);
-            }
-            Err(crate::state::XdpError::NotFound { .. }) => {
-                debug!("SSRC {} not found in XDP ForwardTable", ssrc);
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to remove SSRC {} from XDP ForwardTable: {}",
-                    ssrc, e
-                );
-            }
-        }
-    }
-
-    /// Get the XDP ForwardTable (if available).
-    ///
-    /// Returns a reference to the ForwardTable for external access.
-    ///
-    /// # Returns
-    ///
-    /// `Some(&ForwardTable)` if XDP is enabled and initialized, `None` otherwise.
-    #[cfg(all(target_os = "linux", feature = "xdp"))]
-    #[inline]
-    pub fn forward_table(&self) -> Option<&ForwardTable> {
-        self.forward_table.as_ref()
-    }
-
-    /// Get the XDP ForwardTable (stub for non-Linux platforms).
-    #[cfg(not(all(target_os = "linux", feature = "xdp")))]
-    #[inline]
-    pub fn forward_table(&self) -> Option<&ForwardTable> {
-        None
-    }
 }
 
 impl Sfu {
@@ -2451,6 +1209,11 @@ impl Sfu {
                 break;
             }
 
+            if self.stop_requested.load(Ordering::Acquire) {
+                info!("Stop requested");
+                break;
+            }
+
             // Check shared shutdown signal (Requirement 15.6)
             if self.shared_shutdown.load(Ordering::Acquire) {
                 info!("Shared shutdown signal detected");
@@ -2507,36 +1270,6 @@ impl Sfu {
             }
             count
         };
-
-        // Drain relay output from workers → RelayManager (cascade forwarding).
-        if let Some(ref relay_mgr) = self.relay_manager {
-            if let Some(ref pool_arc) = self.worker_pool {
-                let pool = pool_arc.read();
-                let relay_rx = pool.relay_output_rx();
-                let mgr = relay_mgr.read();
-                for _ in 0..256 {
-                    match relay_rx.try_recv() {
-                        Ok(out) => {
-                            mgr.relay_packet(
-                                out.peer_node,
-                                out.track_id,
-                                &out.data[..out.len as usize],
-                            );
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let inbound_rx = mgr.packet_rx();
-                for _ in 0..256 {
-                    match inbound_rx.try_recv() {
-                        Ok(pkt) => {
-                            let _ = pool.inject_relay_packet(pkt.track_id, pkt.data, pkt.len);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
 
         Ok(batch_count)
     }
@@ -2702,6 +1435,7 @@ impl Sfu {
     /// - Inline for hot path performance
     /// - Explicit error handling
     #[inline]
+    #[cfg_attr(feature = "sim", allow(dead_code))] // callers are compiled out in sim
     fn send_packet(&self, data: &[u8], dest_addr: SocketAddr) {
         // Precondition checks (TigerStyle)
         if data.is_empty() {
@@ -3140,14 +1874,6 @@ impl Sfu {
         track_id: crate::types::TrackId,
         source_addr: SocketAddr,
     ) {
-        use once_cell::sync::Lazy;
-
-        // Per-track cache of last sent key material fingerprint.
-        // Maps track_id -> (session_id, key_fingerprint).
-        // Uses DashMap for lock-free concurrent access (no Mutex contention).
-        static SRTCP_SENT_CACHE: Lazy<dashmap::DashMap<u64, (u64, [u8; 32])>> =
-            Lazy::new(|| dashmap::DashMap::with_capacity(256));
-
         // Precondition check
         if track_id == 0 {
             debug!("Cannot send publisher SRTCP: track ID is zero");
@@ -3211,9 +1937,15 @@ impl Sfu {
             }
         }
 
-        // Enforce capacity bound before inserting
+        // Enforce capacity bound before inserting. Entries are removed with
+        // their track (`forget_publisher_srtcp`), so this only triggers with
+        // more than MAX_SRTCP_CACHE_SIZE live published tracks. An evicted
+        // track is sent again; the worker keeps its context for the same key.
         if SRTCP_SENT_CACHE.len() >= Self::MAX_SRTCP_CACHE_SIZE {
-            // Evict oldest entries (clear half the cache)
+            warn!(
+                "SRTCP sent-cache full ({} tracks); evicting half",
+                SRTCP_SENT_CACHE.len()
+            );
             let to_remove: Vec<u64> = SRTCP_SENT_CACHE
                 .iter()
                 .take(Self::MAX_SRTCP_CACHE_SIZE / 2)
@@ -3498,7 +2230,9 @@ impl Sfu {
     ///
     /// - Requirement 10.3: Notify participants of shutdown
     async fn notify_participants_of_shutdown(&self) {
-        let connections = crate::signal::signaling_connections();
+        let Some(connections) = self.signaling_connections.clone() else {
+            return;
+        };
         let drain_seconds = self.config.drain_timeout_ms / 1000;
 
         let shutdown_msg = crate::signal::SignalMessage::ServerShutdown {
@@ -3631,19 +2365,13 @@ impl Sfu {
         // Postcondition assertion (TigerStyle)
         assert!(self.webrtc_transport.state() == WebRtcTransportState::Stopped);
 
-        // Shutdown worker pool
+        // Shutdown worker pool. The orchestrator holds another reference, so
+        // stop the workers through the lock rather than waiting for the last
+        // Arc; shutdown is idempotent.
         if let Some(pool_arc) = self.worker_pool.take() {
             info!("Shutting down worker pool...");
-            match std::sync::Arc::try_unwrap(pool_arc) {
-                Ok(pool_rwlock) => {
-                    let mut pool = pool_rwlock.into_inner();
-                    pool.shutdown().map_err(SfuError::Worker)?;
-                    info!("Worker pool shutdown complete");
-                }
-                Err(_) => {
-                    warn!("Could not unwrap worker pool Arc - other references exist");
-                }
-            }
+            pool_arc.write().shutdown().map_err(SfuError::Worker)?;
+            info!("Worker pool shutdown complete");
         }
 
         // Drop transport
@@ -3670,7 +2398,7 @@ impl Sfu {
             arena_free_slots: self.arena.free_count(),
             arena_capacity: self.arena.capacity(),
             ssrc_count: self.ssrc_router.len() as u32,
-            room_count: self.actor_manager.room_count() as u32,
+            room_count: self.distributed_state.room_count() as u32,
             bwe_estimate_bps: self.bwe().estimated_bandwidth_bps(),
             bwe_target_bps: self.bwe().target_bitrate_bps(),
             webrtc_session_count: webrtc_stats.0,
@@ -3699,15 +2427,7 @@ impl Drop for Sfu {
 
             // Shutdown worker pool synchronously
             if let Some(pool_arc) = self.worker_pool.take() {
-                match std::sync::Arc::try_unwrap(pool_arc) {
-                    Ok(pool_rwlock) => {
-                        let mut pool = pool_rwlock.into_inner();
-                        let _ = pool.shutdown();
-                    }
-                    Err(_) => {
-                        warn!("Could not unwrap worker pool Arc - other references exist");
-                    }
-                }
+                let _ = pool_arc.write().shutdown();
             }
         }
     }

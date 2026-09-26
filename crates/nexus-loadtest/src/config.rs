@@ -56,6 +56,18 @@ pub struct ClientConfig {
     pub ice_servers: Vec<String>,
     /// Signaling auth and TLS options
     pub connection: ConnectionOptions,
+    /// Fall back to Google's public STUN servers when `ice_servers` is empty.
+    /// Tests turn this off: they run offline and need host candidates only.
+    pub default_stun: bool,
+    /// Gather IPv4 UDP candidates only.
+    pub ipv4_only: bool,
+    /// DTLS role to take when answering (the SFU offers `actpass`). `None`
+    /// keeps webrtc-rs's default (client). `Some(Server)` answers
+    /// `a=setup:passive`, making the SFU the DTLS client.
+    pub answering_dtls_role: Option<webrtc::dtls_transport::dtls_role::DTLSRole>,
+    /// Run ICE over one socket that drops datagrams by these rules
+    /// (see `lossy.rs`). `None`: webrtc-rs's own sockets, no loss.
+    pub loss: Option<std::sync::Arc<crate::lossy::LossRules>>,
 }
 
 impl Default for ClientConfig {
@@ -67,6 +79,10 @@ impl Default for ClientConfig {
             connection_timeout: Duration::from_secs(60),
             ice_servers: Vec::new(),
             connection: ConnectionOptions::default(),
+            default_stun: true,
+            ipv4_only: false,
+            answering_dtls_role: None,
+            loss: None,
         }
     }
 }

@@ -1,11 +1,5 @@
-pub mod handler;
 pub mod server;
 
-pub use handler::{
-    error_codes as handler_error_codes, ClientStats, JoinResponse, MessageType, SessionTicket,
-    SignalingHandler, SignalingHandlerError, TrackEntry, MAX_PARTICIPANT_NAME_LEN,
-    MAX_SESSION_TICKETS, MAX_STATS_PAYLOAD_SIZE, MAX_TRACKS_IN_RESPONSE, TICKET_LIFETIME_SECS,
-};
 pub use server::{OrchestratorEvent, WebSocketServer};
 
 // ============================================================================
@@ -27,19 +21,27 @@ pub struct SignalingConnectionHandle {
     pub sender: mpsc::Sender<SignalMessage>,
 }
 
-/// Get the global signaling connections registry.
-pub fn signaling_connections() -> &'static Arc<DashMap<u64, SignalingConnectionHandle>> {
-    use std::sync::OnceLock;
-    static CONNECTIONS: OnceLock<Arc<DashMap<u64, SignalingConnectionHandle>>> = OnceLock::new();
-    CONNECTIONS.get_or_init(|| Arc::new(DashMap::new()))
+/// One signaling server's live connections, by participant ID. Owned by the
+/// server (not process-global), so two servers in one process, as in the
+/// end-to-end tests, never reach each other's clients.
+pub type SignalingConnections = Arc<DashMap<u64, SignalingConnectionHandle>>;
+
+/// Create an empty connections registry.
+pub fn new_signaling_connections() -> SignalingConnections {
+    Arc::new(DashMap::new())
 }
 
 /// Register a signaling connection for a participant.
-pub fn register_signaling_connection(participant_id: u64, sender: mpsc::Sender<SignalMessage>) {
-    signaling_connections().insert(participant_id, SignalingConnectionHandle { sender });
+pub fn register_signaling_connection(
+    connections: &SignalingConnections,
+    participant_id: u64,
+    sender: mpsc::Sender<SignalMessage>,
+) {
+    assert!(participant_id != 0, "participant 0 is reserved");
+    connections.insert(participant_id, SignalingConnectionHandle { sender });
 }
 
 /// Unregister a signaling connection for a participant.
-pub fn unregister_signaling_connection(participant_id: u64) {
-    signaling_connections().remove(&participant_id);
+pub fn unregister_signaling_connection(connections: &SignalingConnections, participant_id: u64) {
+    connections.remove(&participant_id);
 }

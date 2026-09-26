@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest", "crates/nexus-recorder"]
+members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest"]
 resolver = "2"
 
 [package]
@@ -43,7 +43,6 @@ futures-util = "0.3"
 
 # Concurrency primitives
 dashmap = "5.5"
-arc-swap = "1.6"
 crossbeam = "0.8"
 parking_lot = "0.12"
 
@@ -81,10 +80,6 @@ notify = "6.1"        # File watching for hot-reload
 # System metrics (CPU, memory)
 sysinfo = "0.30"
 
-# Cryptography for TURN authentication (HMAC-SHA1, MD5)
-hmac = "0.12"
-sha1 = "0.10"
-md-5 = "0.10"
 rand = "0.8"
 getrandom = "0.2"
 
@@ -113,9 +108,6 @@ libc = "0.2"
 default = ["io_uring"]
 io_uring = ["io-uring"]
 capnp = ["nexus-signal/capnp"]
-# XDP/BPF kernel bypass for high-performance packet forwarding (Linux only)
-# Requires: libbpf-dev, clang, CAP_NET_ADMIN capability
-xdp = []
 # Production build guards - enables compile-time checks for production-critical features
 # Ensures sendmmsg is available on Linux, fails compilation on non-Linux platforms
 production = []
@@ -129,6 +121,11 @@ tokio-test = "0.4"
 webrtc = "0.10"
 # Session hooks used by benches/real_path.rs and benches/memory.rs
 nexus-webrtc = { path = "crates/nexus-webrtc", features = ["test-hooks"] }
+# webrtc-rs clients for tests/e2e.rs
+nexus-loadtest = { path = "crates/nexus-loadtest" }
+# Alternative SRTP backends compared in benches/srtp_backends.rs
+openssl = "0.10"
+ring = "0.17"
 
 [[example]]
 name = "basic_sfu"
@@ -139,6 +136,14 @@ harness = false
 
 [[bench]]
 name = "memory"
+harness = false
+
+[[bench]]
+name = "srtp_backends"
+harness = false
+
+[[bench]]
+name = "udp_floor"
 harness = false
 
 [[bench]]

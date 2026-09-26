@@ -80,49 +80,20 @@ run_test "SRTP Module Unit Tests" "cargo test --lib srtp:: -- --test-threads=1"
 run_test "SDP Module Unit Tests" "cargo test --lib sdp:: -- --test-threads=1"
 
 # =============================================================================
-# Phase 2: Integration Tests
+# Phase 2: End-to-end tests (real WebRTC clients against the in-process SFU)
 # =============================================================================
 
-echo -e "${BLUE}--- Phase 2: Integration Tests ---${NC}"
+echo -e "${BLUE}--- Phase 2: End-to-End Tests ---${NC}"
 echo ""
 
-run_test "ICE/DTLS/SRTP Flow" "cargo test --test ice_dtls_srtp_flow -- --test-threads=1"
-run_test "Offer/Answer Exchange" "cargo test --test offer_answer_exchange -- --test-threads=1"
-run_test "Session Cleanup" "cargo test --test session_cleanup -- --test-threads=1"
+run_test "E2E (webrtc-rs clients)" "cargo test --test e2e"
 
 # =============================================================================
-# Phase 3: Stress Tests (Skip in quick mode)
+# Phase 3: Property Tests (Skip in quick mode)
 # =============================================================================
 
 if [ "$QUICK_MODE" = false ]; then
-    echo -e "${BLUE}--- Phase 3: Stress Tests ---${NC}"
-    echo ""
-    
-    run_test "Resource Limits" "cargo test --test resource_limits -- --test-threads=1"
-    run_test "Replay Window Exhaustion" "cargo test --test replay_window_exhaustion -- --test-threads=1"
-    run_test "Concurrent Sessions" "cargo test --test concurrent_sessions -- --test-threads=1"
-else
-    echo -e "${YELLOW}--- Phase 3: Stress Tests (SKIPPED - quick mode) ---${NC}"
-    ((SKIPPED+=3))
-    echo ""
-fi
-
-# =============================================================================
-# Phase 4: Validation Tests
-# =============================================================================
-
-echo -e "${BLUE}--- Phase 4: Validation Tests ---${NC}"
-echo ""
-
-run_test "RFC Compliance" "cargo test --test rfc_compliance -- --test-threads=1"
-run_test "TigerStyle Assertions" "cargo test --test tigerstyle_assertions -- --test-threads=1"
-
-# =============================================================================
-# Phase 5: Property Tests (Skip in quick mode)
-# =============================================================================
-
-if [ "$QUICK_MODE" = false ]; then
-    echo -e "${BLUE}--- Phase 5: Property Tests ---${NC}"
+    echo -e "${BLUE}--- Phase 3: Property Tests ---${NC}"
     echo ""
     
     run_test "SDP Property Tests" "cargo test --lib sdp::parser::tests::property_tests -- --test-threads=1"
@@ -130,16 +101,16 @@ if [ "$QUICK_MODE" = false ]; then
     run_test "ICE Property Tests" "cargo test --lib ice::agent::tests::property_tests -- --test-threads=1"
     run_test "DTLS Property Tests" "cargo test --lib dtls::session::tests::property_tests -- --test-threads=1"
 else
-    echo -e "${YELLOW}--- Phase 5: Property Tests (SKIPPED - quick mode) ---${NC}"
+    echo -e "${YELLOW}--- Phase 3: Property Tests (SKIPPED - quick mode) ---${NC}"
     ((SKIPPED+=4))
     echo ""
 fi
 
 # =============================================================================
-# Phase 6: Documentation Tests
+# Phase 4: Documentation Tests
 # =============================================================================
 
-echo -e "${BLUE}--- Phase 6: Documentation Tests ---${NC}"
+echo -e "${BLUE}--- Phase 4: Documentation Tests ---${NC}"
 echo ""
 
 run_test "Doc Tests" "cargo test --doc"

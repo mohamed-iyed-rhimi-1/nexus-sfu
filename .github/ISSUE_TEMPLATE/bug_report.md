@@ -18,7 +18,7 @@ What you expected to happen.
 - OS: [e.g. Ubuntu 24.04]
 - Rust version: [e.g. 1.83.0]
 - Nexus version: [e.g. v0.1.0]
-- Features enabled: [e.g. xdp]
+- Features enabled: [e.g. io_uring]
 
 **Logs**
 Relevant log output (set `RUST_LOG=debug`).

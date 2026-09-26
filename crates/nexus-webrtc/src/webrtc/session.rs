@@ -1567,15 +1567,57 @@ impl WebRtcSession {
         }
     }
 
+    /// Our DTLS role.
+    pub fn dtls_role(&self) -> DtlsRole {
+        self.config.dtls_role
+    }
+
+    /// Set the DTLS role from the peer's `a=setup` (RFC 8842): `passive` in
+    /// the answer makes us the client. Only allowed before the handshake
+    /// starts; the local certificate and fingerprint do not change.
+    pub fn set_dtls_role(&mut self, role: DtlsRole) -> Result<(), WebRtcError> {
+        if self.dtls_session.is_some()
+            || matches!(
+                self.state,
+                SessionState::DtlsHandshaking | SessionState::Established
+            )
+        {
+            return Err(WebRtcError::InvalidState);
+        }
+        self.config.dtls_role = role;
+        if let Some(engine) = self.openssl_dtls.as_mut() {
+            engine.set_role(role);
+        }
+        assert_eq!(self.config.dtls_role, role);
+        Ok(())
+    }
+
     /// Check if DTLS needs retransmission and return the data to send.
     ///
     /// Returns (destination_address, retransmit_data) if a retransmit is needed.
+    ///
+    /// Drives OpenSSL's retransmission timer when OpenSSL runs the handshake
+    /// (the usual case); otherwise the pure-Rust session's.
     pub fn poll_dtls_retransmit(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         if self.state != SessionState::DtlsHandshaking {
             return None;
         }
 
         let dest = self.remote_addr?;
+        if let Some(engine) = self.openssl_dtls.as_mut() {
+            return match engine.handle_timeout() {
+                Ok(data) if !data.is_empty() => {
+                    tracing::debug!(%dest, len = data.len(), "DTLS flight retransmitted");
+                    Some((dest, data))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    // Keeps failing until the handshake timeout closes the session.
+                    tracing::warn!(%dest, "DTLS retransmission: {}", e);
+                    None
+                }
+            };
+        }
         let dtls = self.dtls_session.as_mut()?;
 
         dtls.time_until_timeout()?;
@@ -2893,6 +2935,15 @@ impl WebRtcSession {
         if self.state == SessionState::IceConnecting {
             let _ = self.start_dtls_handshake();
         }
+    }
+
+    /// Complete ICE with `remote` as the selected peer and start DTLS, as
+    /// `check_ice_completion` does; returns the first DTLS flight (a
+    /// ClientHello when we are the DTLS client).
+    pub fn complete_ice_for_testing(&mut self, remote: SocketAddr) -> Option<Vec<u8>> {
+        assert_eq!(self.state, SessionState::IceConnecting);
+        self.remote_addr = Some(remote);
+        self.start_dtls_handshake().ok().flatten()
     }
 
     /// Inject DTLS completion for testing.

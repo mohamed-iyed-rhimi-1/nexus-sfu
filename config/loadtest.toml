@@ -37,6 +37,8 @@ loss_threshold_percent = 10
 decrease_factor = 0.9
 increase_bps = 100000
 
+# Unused: QUIC signaling is not started (WebSocket only). Kept for when it is
+# connected to the orchestrator.
 [quic]
 bind_addr = "0.0.0.0:8443"
 max_connections = 200
@@ -88,23 +90,6 @@ level = "info"                          # Info level to reduce noise during load
 structured = true
 include_timestamps = true
 include_thread_ids = true
-
-[xdp]
-enabled = false
-interface = ""
-queue_id = 0
-forward_table_path = "/sys/fs/bpf/nexus/forward_table"
-stats_map_path = "/sys/fs/bpf/nexus/stats_map"
-umem_num_frames = 4096
-umem_frame_size = 4096
-fill_ring_size = 2048
-comp_ring_size = 2048
-rx_ring_size = 2048
-tx_ring_size = 2048
-batch_size = 64
-poll_timeout_ms = 100
-attach_mode = "skb"
-fallback_on_failure = true
 
 [ice_servers]
 stun_servers = []

@@ -4,6 +4,7 @@
 //! and timer ticks to the appropriate manager. Owns the shared
 //! `ParticipantHandle` table.
 
+pub mod candidates;
 pub mod connection;
 pub mod events;
 pub mod negotiation;
@@ -44,20 +45,15 @@ pub struct SessionOrchestrator {
     negotiation: NegotiationManager,
     subscription: SubscriptionManager,
     connection: ConnectionMonitor,
-    /// Relay manager for inter-node cascade.
-    relay_manager: Option<Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>>,
-    local_node_id: u64,
-    relay_event_rx: Option<mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>>,
 }
 
 impl SessionOrchestrator {
     pub fn new(
         webrtc_transport: Arc<WebRtcTransport>,
         ssrc_router: Arc<SsrcRouter>,
-        _actor_manager: Arc<crate::nexus_actor::ActorManager>,
         distributed_state: Arc<DistributedState>,
         worker_pool: Arc<RwLock<WorkerPool>>,
-        media_bind_addr: SocketAddr,
+        candidate_addrs: Vec<SocketAddr>,
         packet_sender: PacketSender,
     ) -> Self {
         Self {
@@ -68,32 +64,11 @@ impl SessionOrchestrator {
                 ssrc_router,
                 worker_pool.clone(),
                 distributed_state.clone(),
-                media_bind_addr,
+                candidate_addrs,
             ),
             subscription: SubscriptionManager::new(worker_pool, distributed_state),
             connection: ConnectionMonitor::new(webrtc_transport, packet_sender),
-            relay_manager: None,
-            local_node_id: 0,
-            relay_event_rx: None,
         }
-    }
-
-    pub fn set_relay_manager(
-        &mut self,
-        relay_manager: Arc<parking_lot::RwLock<crate::relay::manager::RelayManager>>,
-        local_node_id: u64,
-        relay_event_rx: mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>,
-    ) {
-        self.relay_manager = Some(relay_manager);
-        self.local_node_id = local_node_id;
-        self.relay_event_rx = Some(relay_event_rx);
-    }
-
-    pub fn set_relay_event_rx(
-        &mut self,
-        rx: mpsc::UnboundedReceiver<nexus_state::gossip::RelayEvent>,
-    ) {
-        self.relay_event_rx = Some(rx);
     }
 
     /// Main event loop.
@@ -101,9 +76,19 @@ impl SessionOrchestrator {
         &mut self,
         mut event_rx: mpsc::Receiver<OrchestratorEvent>,
         mut connection_rx: mpsc::Receiver<ColdPathPacket>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
     ) {
+        // The event senders outlive the loop (the negotiation manager holds
+        // one), so channel closure never ends it: the shutdown flag does.
+        let mut shutdown_check = tokio::time::interval(std::time::Duration::from_millis(50));
         loop {
             tokio::select! {
+                _ = shutdown_check.tick() => {
+                    if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                        info!("Session orchestrator shutting down");
+                        break;
+                    }
+                }
                 Some(event) = event_rx.recv() => {
                     self.dispatch_event(event);
                 }
@@ -113,14 +98,6 @@ impl SessionOrchestrator {
                 Some(packet) = connection_rx.recv() => {
                     let events = self.connection.process_incoming(packet);
                     for ev in events { self.handle_session_event(ev); }
-                }
-                Some(relay_event) = async {
-                    match self.relay_event_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    self.process_relay_events(vec![relay_event]);
                 }
                 _ = self.connection.ice_interval.tick() => {
                     let events = self.connection.poll_ice();
@@ -399,27 +376,5 @@ impl SessionOrchestrator {
         self.negotiation.cleanup_participant(participant_id);
         self.sessions.remove(&participant_id);
         info!("Participant {} fully cleaned up", participant_id);
-    }
-
-    fn process_relay_events(&mut self, events: Vec<nexus_state::gossip::RelayEvent>) {
-        let pool = self.subscription.worker_pool();
-        let pool = pool.read();
-        for event in events {
-            match event {
-                nexus_state::gossip::RelayEvent::Subscribe {
-                    track_id,
-                    requester_node,
-                } => {
-                    let _ = pool.add_relay_subscriber(track_id, requester_node);
-                }
-                nexus_state::gossip::RelayEvent::Unsubscribe {
-                    track_id,
-                    requester_node,
-                } => {
-                    let sub_id = (requester_node & 0x7FFFFFFF) as u32 | 0x80000000;
-                    let _ = pool.remove_subscriber(track_id, sub_id);
-                }
-            }
-        }
     }
 }

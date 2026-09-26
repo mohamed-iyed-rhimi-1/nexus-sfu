@@ -17,8 +17,9 @@ Status legend:
 | ⬜ Planned | Described in the vision, no implementation |
 | ❌ Needs redesign | The design as written is incompatible with WebRTC or with other requirements |
 
-Findings are as of commit `062e668` (v0.1.0). Line references will drift; prefer the file
-paths.
+Findings are as of commit `062e668` (v0.1.0), updated for Phase 0 (live bug fixes, dead
+code removed, end-to-end harness, measurements). Line references will drift; prefer the
+file paths.
 
 ---
 
@@ -26,24 +27,26 @@ paths.
 
 ### 1.1 Process layout
 
-One binary, one node. `main.rs` (`#[tokio::main]`) starts:
+One binary, one node. `main.rs` (`#[tokio::main]`) loads config, initialises tracing and
+calls `nexus_sfu::server::start` (`src/server.rs`), which the end-to-end tests call too:
 
 ```
-main thread (root future of the tokio runtime)
-└── Ingress packet loop      Sfu::run_packet_loop — busy loop, all media ingress for the process
-
-tokio runtime (multi-thread)
-├── Signaling server         WebSocket + JSON (used by SDK and loadtest); QUIC listener (stub, see 2.1)
-├── SessionOrchestrator      tokio::select! loop: Room / Negotiation / Subscription / ConnectionMonitor
-│                            also runs every DTLS handshake and ICE/consent timer
-├── REST API                 Axum + JWT, /health, /ready, /metrics
-└── Metrics                  Prometheus
-
 std threads
+├── nexus-ingress            Sfu::run_packet_loop on its own current-thread runtime —
+│                            busy loop, all media ingress for the process
 ├── Worker pool              N workers (num_cpus by default), CPU-pinned if worker.cpu_affinity,
 │                            SCHED_FIFO if worker.realtime_priority
 └── Gossip                   SWIM probe cycle + CRDT sync (nexus-state), bound to a random port
+
+tokio runtime (multi-thread)
+├── Signaling server         WebSocket + JSON (used by SDK and loadtest); QUIC is not started
+├── SessionOrchestrator      tokio::select! loop: Room / Negotiation / Subscription / ConnectionMonitor
+│                            also runs every DTLS handshake and ICE/consent timer
+└── REST API                 Axum + JWT, /health, /ready, /metrics (Prometheus)
 ```
+
+`main.rs` waits for SIGTERM/SIGINT and calls `ServerHandle::shutdown`: stop the ingress
+loop, notify clients, drain, stop the worker pool, gossip and control-plane tasks.
 
 ### 1.2 Media data path
 
@@ -93,12 +96,12 @@ Key facts:
 |-----------|--------|----------|
 | Session orchestrator (room, negotiation, subscription, connection monitor) | ✅ | `src/orchestrator/` |
 | SDP offer/answer (SFU always offers) | ✅ | `crates/nexus-webrtc/src/sdp`, `src/orchestrator/negotiation.rs` |
-| ICE: one host candidate, consent checks, full ICE (controlling) | 🟡 | Candidate is the bind address, see 2.1 |
-| DTLS via OpenSSL, peer certificate checked against SDP `a=fingerprint` (RFC 8122) | 🟡 | Handshake works; no retransmission timer, see 2.1 |
+| ICE: host candidates from `transport.announced_ips` (or the bind IP / interfaces) with the bound port, consent checks, full ICE (controlling) | ✅ | `src/orchestrator/candidates.rs`, `negotiation.rs` |
+| DTLS via OpenSSL, peer certificate checked against SDP `a=fingerprint` (RFC 8122); role from the answer's `a=setup`; retransmission via OpenSSL's timer | ✅ | `openssl_backend.rs` `handle_timeout`, `session.rs` `poll_dtls_retransmit` |
 | SRTP / SRTCP (AES-CM-HMAC-SHA1-80, AES-GCM) | ✅ | `crates/nexus-transport/src/srtp` |
 | WebSocket signaling with JSON (SDK, loadtest) | ✅ | `crates/nexus-signal/src/websocket` |
 | TLS for signaling, refuses to start if configured TLS fails | ✅ | `WebSocketServer::new` |
-| QUIC signaling with Cap'n Proto | 🟡 | Echo stub, see 2.1 |
+| QUIC signaling with Cap'n Proto | 🟡 | Echo stub in `nexus-signal`, not started (see 2.1) |
 | REST API with JWT, `/health`, `/ready` | ✅ | `crates/nexus-api` |
 | Prometheus metrics + Grafana dashboard | ✅ | `crates/nexus-metrics`, `deploy/grafana` |
 | GCC bandwidth estimation, REMB | 🟡 | Runs, never receives input, see 2.1 |
@@ -114,7 +117,7 @@ Key facts:
 | SWIM membership + gossip | 🟡 | Thread runs, but binds `0.0.0.0:0` (a random port), so other nodes cannot use it as a seed |
 | No Redis / no database | ✅ | |
 | Subscription graph in CRDT | 🟡 | ORSWOT capacity is 10,000 entries; `add_subscription` errors are discarded, so large rooms silently lose entries |
-| Cross-node relay (cascade) | 🟡 | `set_relay_manager` is never called and nothing creates a relay request, so no packets are relayed |
+| Cross-node relay (cascade) | ⬜ | Removed in Phase 0 (it never relayed a packet); non-goal of the redesign |
 
 ### 1.5 Memory model
 
@@ -138,39 +141,43 @@ Key facts:
 
 | Feature | Why | Where |
 |---------|-----|-------|
-| **Connecting from another machine** | The only ICE candidate is the bind address (`0.0.0.0:10000` in every shipped config). No announced/public IP setting. Works only with client and SFU on one host. | `negotiation.rs` `start_ice_gathering` |
 | **NACK retransmission** | Subscriber matched by `s.id == sender_ssrc` (participant id vs RTCP SSRC); ring looked up by its push counter, not RTP seq; `seq_map` never read; retransmits skip the rewrite; upstream NACK uses the subscriber's seq space; `nack` is never offered to publishers. | `pool.rs` `retransmit_from_ring_buffer`, `handle_rtcp_nack`; `negotiator.rs` |
 | **Simulcast** | Each simulcast SSRC becomes its own track; layer messages are never sent; no `a=rid`/`a=simulcast` offered. | `pool.rs`, `negotiation.rs` |
 | **Bandwidth estimation** | Worker GCC inputs are never sent; TWCC ext id stays 0; REMB always advertises the 1 Mbps constant. | `pool.rs` `BandwidthCoordinator`; `negotiation.rs` |
 | **Keyframe on join** | No PLI when a subscriber is added; FIR ignored. PLI forwarding from subscribers works. | `pool.rs` `add_subscriber`; `sfu.rs` RTCP dispatch |
 | **MID per subscriber** | One MID value per track (last subscriber wins); injection skips packets already carrying MID id 1. | `pool.rs` `SetTrackMid`, `inject_mid_extension` |
 | **Address changes** | Subscriber destination fixed at subscribe time; NAT rebinding and ICE restart never reach workers. | `subscription.rs`; `pool.rs` `add_subscriber` |
-| **DTLS retransmission** | The 200 ms timer polls the unused custom DTLS engine; OpenSSL's timer is never driven. The SFU offers `actpass`, so browsers usually take the DTLS client role and their own retransmissions cover most losses; when the SFU is the client, a lost flight stalls the handshake. | `session.rs` `poll_dtls_retransmit`; `openssl_backend.rs` |
-| **QUIC signaling** | Accepts connections and echoes the offer back as the answer; never talks to the orchestrator. | `crates/nexus-signal/src/quic/streams.rs` |
+| **QUIC signaling** | Not started. The module accepts connections and echoes the offer back as the answer; it never talks to the orchestrator. | `crates/nexus-signal/src/quic/streams.rs` |
+
+Fixed in Phase 0: connecting from another machine (`transport.announced_ips` /
+`NEXUS_ANNOUNCED_IPS`, candidates carry the bound port) and DTLS retransmission (OpenSSL's
+timer is driven; the answer's `a=setup:passive` makes the SFU the DTLS client). Both are
+covered by `tests/e2e.rs`.
 
 ### 2.2 Security risks
 
-- **SRTCP nonce reuse toward publishers.** Each published track gets its own SRTCP context
-  (`SetPublisherSrtcp`), all derived from the same key and each starting its SRTCP index at
-  0. REMB is sent from each video track's context with sender SSRC 1, and forwarded PLI/NACK
-  keep the subscriber's sender SSRC, so two tracks of one publisher can emit the same
-  (key, SSRC, index) and AES-CM reuses keystream.
+- **SRTCP toward publishers: one context per track, one key per publisher.** Each published
+  track still has its own SRTCP context built from the publisher's key (`SetPublisherSrtcp`),
+  each starting its SRTCP index at 0. Until Phase 0 this reused keystream: REMB and TWCC used
+  sender SSRC 1 and forwarded PLI/NACK kept the subscriber's SSRC, so two tracks could emit
+  the same (key, SSRC, index). Phase 0 closes it on the legacy path: every RTCP packet to a
+  publisher carries its track's own random `rtcp_sender_ssrc` and is protected with that
+  track's context, a repeated key keeps the existing context, and the ingress key cache
+  forgets removed tracks. The structural fix (one context per session) is Phase 1.
 
 ### 2.3 Code not reachable from `main.rs`
 
-About 17,000 lines, plus 5,600 lines of tests that are never compiled:
+Phase 0 removed about 17,000 lines of unreachable code and 5,600 lines of tests that were
+never compiled: the XDP packet loop, `src/forward/{multicast,selective,processor}.rs`,
+AF_XDP, `bpf/`, the relay, `nexus-recorder`, TURN, `SignalingHandler`,
+`src/track_registry.rs`, QUIC and `ActorManager` from startup, and
+`tests/{integration,stress,unit,validation,common}`. What remains unreachable:
 
-| Code | Lines | Note |
-|------|------:|------|
-| `XdpPacketLoop` (`src/sfu.rs`) | ~1,000 | Never constructed |
-| `src/forward/{multicast,selective,processor}.rs` | ~3,100 | Used by the XDP loop, re-exports and one bench |
-| `src/relay/`, relay plumbing in workers | ~450 + | See 1.4 |
-| `nexus-actor` runtime | ~5,900 | `ActorManager` built, only `room_count()` used; migration drivers never called |
-| `nexus-recorder` | ~1,300 | Routes never mounted, no media fed |
-| TURN (`crates/nexus-transport/src/turn`) | ~3,900 | Only re-exported |
-| `nexus-signal` `SignalingHandler` | ~1,200 | Never constructed |
-| `src/track_registry.rs` | 113 | Created and dropped in `main.rs` |
-| `tests/{integration,stress,unit,validation,common}` | ~5,600 | No `[[test]]` entries; imports that no longer exist |
+| Code | Note |
+|------|------|
+| `nexus-actor` runtime | Not started. Config validation uses its limits and the worker its migration types; goes with the worker pool in Phase 6 |
+| `nexus-signal` QUIC module | Not started; `[quic]` config kept, marked unused |
+| `src/worker/spsc.rs`, migration drivers | Created but no production sender / caller (Part 3) |
 
 `nexus-dst` builds and runs, but models the actor system and does not exercise the server.
 
@@ -186,7 +193,7 @@ About 17,000 lines, plus 5,600 lines of tests that are never compiled:
 | SPSC ingress → worker channels | 🟡 | `src/worker/spsc.rs`, no production sender |
 | Actor-per-track runtime (`nexus-actor` supervision) | 🟡 | See 2.3 |
 | Track migration, consistent hashing, work stealing | 🟡 | `migrate_track` has no caller; assignment is FNV-1a modulo |
-| Cross-node forwarding | 🟡 | See 1.4 |
+| Cross-node forwarding | ⬜ | Relay code removed in Phase 0 (1.4) |
 | QUIC 0-RTT signaling | 🟡 | See 2.1 |
 | gRPC API | ⬜ | REST only |
 | Edge layer (anycast, PoPs), Kubernetes manifests, autoscaler, Terraform | ⬜ | `deploy/` has `docker/` and `grafana/` |
@@ -209,9 +216,9 @@ and its own encryption; the redesign budgets for that cost instead of avoiding i
 
 ### 4.2 XDP / eBPF forwarding of RTP
 
-`bpf/xdp_sfu.c` rewrites IP/port and redirects the publisher's packet. That forwards the
-publisher's SRTP ciphertext, which subscribers cannot decrypt, and the map holds one
-destination per SSRC, so it cannot fan out. AF_XDP remains possible as a faster userspace
+`bpf/xdp_sfu.c` (removed in Phase 0) rewrote IP/port and redirected the publisher's
+packet. That forwards the publisher's SRTP ciphertext, which subscribers cannot decrypt, and
+the map held one destination per SSRC, so it could not fan out. AF_XDP remains possible as a faster userspace
 socket, with SRTP still in userspace.
 
 ### 4.3 "Zero locks, zero allocation" hot path
@@ -274,6 +281,30 @@ sockets; no NIC.
 | Retransmit ring, full | 3,000 KB of arena | — |
 | **A+V publisher, no subscriptions** | **1,526 KB** + 6,000 KB arena | — |
 | **+ subscribed to 10 A+V publishers** | **1,615 KB** + 6,000 KB arena | — |
+
+**SRTP backends** (Phase 0.4, `cargo bench --bench srtp_backends`; **macOS arm64, Apple M2
+Pro, not yet Linux**). Median ns per packet, 20-byte RTP header + payload; every backend's
+output is checked byte-for-byte against `SrtpContext` before timing.
+
+| Profile | Backend | protect 160 B | protect 1,200 B | unprotect 160 B | unprotect 1,200 B |
+|---------|---------|--------------:|----------------:|----------------:|------------------:|
+| AES-CM-HMAC-SHA1-80 | RustCrypto `SrtpContext` (current) | 273 | 1,000 | 281 | 1,013 |
+| AES-CM-HMAC-SHA1-80 | OpenSSL CTR + OpenSSL HMAC¹ | 483 | 1,139 | 488 | 1,149 |
+| AES-CM-HMAC-SHA1-80 | OpenSSL CTR + ring HMAC² | 1,117 | 4,297 | 1,126 | 4,314 |
+| AES-128-GCM | RustCrypto `SrtpContext` (current) | 156 | 809 | 218 | 871 |
+| AES-128-GCM | OpenSSL EVP | 167 | 301 | 164 | 306 |
+| AES-128-GCM | ring `LessSafeKey` | 99 | 282 | 101 | 297 |
+
+¹ Copies two digest contexts per packet (the `openssl` crate has no reusable keyed HMAC); an
+upper bound. ² ring's SHA-1 has no hardware acceleration.
+
+The RFC 7714 vectors added with this bench found two AES-GCM interop bugs, fixed in Phase 0:
+the AEAD KDF put the label in salt byte 6 instead of 7 (wrong RTP salt and RTCP keys), and
+SRTCP put E+index before the tag instead of after it. AES-GCM therefore never worked with
+browsers; it went unnoticed because AES-CM is offered first.
+
+Not measured yet: the Linux arm64 / x86_64 runs of both benches and the kernel `sendmmsg`
+floor (`cargo bench --bench udp_floor`, Linux only). See `docs/plans/phase-0.md`.
 
 Known gaps: no benchmark covers kernel receive, a real NIC, or latency (P50/P99) under
 load. "Packets/sec" always needs to say ingress (published) or egress (forwarded).

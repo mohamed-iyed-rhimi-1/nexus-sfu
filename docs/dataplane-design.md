@@ -412,3 +412,4 @@ section updated at the end of every working session.
 | Date | Change |
 |------|--------|
 | 2026-09-25 | First version. Findings and baseline moved to `architecture.md`. |
+| 2026-09-26 | Phase 0.4, partial (macOS arm64 only; Linux runs and the `sendmmsg` floor still to do, so §2's 500K/core target is **not yet confirmed or revised**). Provisional backend per profile (§3.4, D7): AES-128-GCM → ring (≈ 0.28 µs per 1,200-byte packet vs 0.81 µs RustCrypto; OpenSSL EVP 0.30 µs), AES-CM-HMAC-SHA1-80 → keep RustCrypto (no alternative was faster). Profile order in `use_srtp` unchanged (AES-CM first) until AES-GCM, now RFC 7714-correct after two interop fixes, is checked against a browser. With GCM at ≈ 0.3 µs, the 2 µs budget holds if kernel send stays ≤ ≈ 1.2 µs per datagram (the §2 rule). |

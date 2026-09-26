@@ -9,10 +9,7 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
 use nexus_media::rtp::RtpHeader;
-use nexus_sfu::{
-    forward::{SsrcRouter, Subscriber, SubscriberList},
-    transport::BatchSender,
-};
+use nexus_sfu::{forward::SsrcRouter, transport::BatchSender};
 use nexus_transport::{arena::PacketArena, ring_buffer::RingBuffer};
 
 // =============================================================================
@@ -224,42 +221,6 @@ fn bench_batch_sender_queue(c: &mut Criterion) {
             }
         });
     });
-}
-
-/// Benchmark subscriber list iteration (hot path)
-fn bench_subscriber_iteration(c: &mut Criterion) {
-    let mut group = c.benchmark_group("subscriber_iteration");
-
-    for subscriber_count in [100, 500, 1000].iter() {
-        let mut list = SubscriberList::new(5_000_000_000);
-
-        // Add subscribers
-        for i in 1..=*subscriber_count {
-            let addr: SocketAddr = format!("192.168.{}.{}:5000", i / 256, i % 256)
-                .parse()
-                .unwrap();
-            let subscriber = Subscriber::new(i as u32, i as u64, addr);
-            list.add(subscriber);
-        }
-
-        group.throughput(Throughput::Elements(*subscriber_count as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(subscriber_count),
-            subscriber_count,
-            |b, _| {
-                b.iter(|| {
-                    let mut count = 0;
-                    for subscriber in list.iter_hot() {
-                        black_box(subscriber.dest_addr());
-                        count += 1;
-                    }
-                    black_box(count);
-                });
-            },
-        );
-    }
-
-    group.finish();
 }
 
 /// Benchmark packet forwarding to multiple subscribers
@@ -693,7 +654,6 @@ criterion_group!(
     bench_ring_buffer_push,
     bench_ssrc_lookup,
     bench_batch_sender_queue,
-    bench_subscriber_iteration,
     bench_packet_forwarding,
     bench_batch_sender_throughput,
     bench_shallow_clone,

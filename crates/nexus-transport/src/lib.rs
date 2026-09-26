@@ -54,7 +54,6 @@ pub mod media_transport;
 pub mod ring_buffer;
 pub mod socket_config;
 pub mod srtp;
-pub mod turn;
 pub mod udp;
 
 #[cfg(test)]
@@ -119,13 +118,3 @@ pub use gso::{GsoBatchSender, GsoStats, GsoStatsSnapshot, MAX_GSO_BUFFER_SIZE, M
 
 // Re-export media transport types.
 pub use media_transport::{MediaRecvPacket, MediaTransport, TransportMode};
-
-// Re-export TURN types.
-pub use turn::{
-    Allocation, AllocationState, ChannelBinding, Permission, RelayedAddress, TransportProtocol,
-    TurnClient, TurnClientConfig, TurnCredentials, TurnError, TurnServerInfo,
-    CHANNEL_BINDING_LIFETIME, CHANNEL_DATA_HEADER_SIZE, CHANNEL_NUMBER_MAX, CHANNEL_NUMBER_MIN,
-    DEFAULT_ALLOCATION_LIFETIME, MAX_ALLOCATION_LIFETIME, MAX_CHANNEL_BINDINGS, MAX_PERMISSIONS,
-    MAX_TURN_DATA_SIZE, MIN_ALLOCATION_LIFETIME, PERMISSION_LIFETIME, REFRESH_MARGIN_SECONDS,
-    TRANSPORT_TCP, TRANSPORT_UDP,
-};

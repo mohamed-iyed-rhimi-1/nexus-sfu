@@ -19,9 +19,6 @@ nexus-metrics = { path = "../nexus-metrics" }
 # Distributed state for room synchronization
 nexus-state = { path = "../nexus-state" }
 
-# Recording manager
-nexus-recorder = { path = "../nexus-recorder" }
-
 # HTTP server framework
 axum = { version = "0.7", features = ["json", "macros"] }
 

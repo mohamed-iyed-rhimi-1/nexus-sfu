@@ -7,13 +7,9 @@
 //! The SFU follows a specific initialization order per the architecture document:
 //! 1. Configuration loading and validation
 //! 2. Tracing/logging initialization
-//! 3. Distributed state initialization (handled by Sfu::new)
-//! 4. Gossip protocol initialization (handled by Sfu::new)
-//! 5. Worker pool initialization (handled by Sfu::new)
-//! 6. Signaling server initialization
-//! 7. Metrics server initialization
-//! 8. API server initialization
-//! 9. Shutdown signal handler registration
+//! 3. `nexus_sfu::server::start`: SFU (distributed state, gossip, worker
+//!    pool, media socket), signaling, orchestrator, API, packet loop
+//! 4. Wait for SIGTERM / SIGINT, then graceful shutdown
 //!
 //! # Usage
 //!
@@ -37,8 +33,6 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use nexus_sfu::config::{ConfigLoader, ConfigWatcher, NexusConfig};
-use nexus_sfu::sfu::Sfu;
-use nexus_sfu::signal::{SignalingConfig, SignalingServer};
 use nexus_sfu::tracing::{init_tracing, ExtendedLoggingConfig};
 use nexus_sfu::VERSION;
 
@@ -341,201 +335,25 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(config.clone())));
 
     // ========================================================================
-    // Phase 5-7: Initialize SFU (distributed state, gossip, worker pool)
-    // Distributed state → gossip → worker pool
-    // PacketArena is created before WorkerPool (in Sfu::new)
+    // Phase 5: Start the server (SFU, signaling, orchestrator, API) and run
+    // until SIGTERM / SIGINT
     // ========================================================================
-    // Note: Sfu::new() handles the following in order:
-    // - PacketArena initialization
-    // - SSRC router initialization
-    // - Distributed state initialization
-    // - Actor manager initialization
-    // - GCC congestion controller initialization
-    // - UDP transport initialization
-    // - WebRTC transport initialization
-    // - Worker pool initialization
-    // - Gossip protocol initialization
-
-    // Use signaling server (QUIC-first with WebSocket fallback)
-    run(config).await
-}
-
-/// Run SFU with signaling (QUIC-first with WebSocket fallback).
-///
-/// This is the default and recommended mode. The signaling server:
-/// 1. Attempts to start QUIC signaling as the primary transport
-/// 2. If QUIC succeeds, also starts WebSocket for fallback clients
-/// 3. If QUIC fails (no TLS certs, port blocked, etc.), falls back to WebSocket only
-async fn run(config: NexusConfig) -> ExitCode {
-    // ========================================================================
-    // Create SFU (handles distributed state, gossip, worker pool)
-    // ========================================================================
-    let mut sfu = match Sfu::new(config.clone()).await {
-        Ok(s) => s,
+    let server = match nexus_sfu::server::start(config).await {
+        Ok(server) => server,
         Err(e) => {
-            error!("Failed to initialize SFU: {}", e);
+            error!("Startup failed: {}", e);
             return ExitCode::FAILURE;
         }
     };
-
-    info!("SFU initialized");
-
-    // Create orchestrator channel
-    let (orchestrator_tx, orchestrator_rx) =
-        tokio::sync::mpsc::channel::<nexus_sfu::signal::OrchestratorEvent>(4096);
-
-    // ========================================================================
-    // Configure signaling server (QUIC-first with WebSocket fallback)
-    // ========================================================================
-    let quic_addr: SocketAddr = config.quic.bind_addr.parse().unwrap_or_else(|_| {
-        warn!("Invalid QUIC bind address, using default 0.0.0.0:4433");
-        "0.0.0.0:4433".parse().unwrap()
-    });
-
-    let signaling_config = SignalingConfig {
-        quic_addr,
-        ws_addr: config.transport.signaling_bind_addr,
-        tls_cert_path: config.transport.tls_cert_path.clone(),
-        tls_key_path: config.transport.tls_key_path.clone(),
-        jwt_secret: config.security.jwt_secret.clone(),
-        max_connections: config.transport.max_webrtc_sessions,
-        quic_config: config.quic.clone(),
-    };
-
     info!(
-        quic_addr = %signaling_config.quic_addr,
-        ws_addr = %signaling_config.ws_addr,
-        "Signaling server configured (QUIC-first with WebSocket fallback)"
+        media = %server.media_addr(),
+        signaling = %server.signaling_addr(),
+        candidates = ?server.candidate_addrs(),
+        "Nexus SFU running"
     );
 
-    // Create signaling server
-    // Fails on a configured-but-broken TLS setup: never downgrade to plain WS.
-    let signaling_server = match SignalingServer::new(
-        signaling_config,
-        sfu.shared_shutdown().clone(),
-        orchestrator_tx.clone(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to set up signaling: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Start signaling server in background
-    let signaling_handle = tokio::spawn(async move {
-        if let Err(e) = signaling_server.run().await {
-            error!("Signaling server error: {}", e);
-        }
-    });
-
-    info!("Signaling server started (QUIC-first with WebSocket fallback)");
-
-    // Shared SSRC resolver: orchestrator registers tracks by MID, packet loop resolves SSRCs
-    let _ssrc_resolver = std::sync::Arc::new(nexus_sfu::track_registry::SsrcResolver::new());
-
-    // Create cold-path channel (packet loop → orchestrator for STUN/DTLS)
-    let (connection_tx, connection_rx) =
-        tokio::sync::mpsc::channel::<nexus_sfu::orchestrator::events::ColdPathPacket>(4096);
-
-    // Create PacketSender for ConnectionMonitor
-    let media_socket = sfu
-        .media_socket_for_sender()
-        .expect("Media socket must be available for PacketSender");
-    let packet_sender = nexus_sfu::orchestrator::connection::PacketSender::new(media_socket);
-
-    // Start session orchestrator
-    let worker_pool_arc = sfu
-        .worker_pool_arc()
-        .expect("Worker pool must be initialized");
-    let relay_event_rx = sfu.take_relay_event_rx();
-    let mut orchestrator = nexus_sfu::orchestrator::SessionOrchestrator::new(
-        sfu.webrtc_transport().clone(),
-        sfu.ssrc_router().clone(),
-        sfu.actor_manager().clone(),
-        sfu.distributed_state().clone(),
-        worker_pool_arc,
-        config.transport.media_bind_addr,
-        packet_sender,
-    );
-    if let Some(rx) = relay_event_rx {
-        orchestrator.set_relay_event_rx(rx);
-    }
-
-    // ssrc_resolver is used internally by the SFU packet loop
-
-    let orchestrator_handle = tokio::spawn(async move {
-        orchestrator.run(orchestrator_rx, connection_rx).await;
-    });
-
-    info!("Session orchestrator started");
-
-    // Start API server
-    let api_handle = if config.api.enabled {
-        let api_addr: SocketAddr = match config.api.bind_addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                error!("Invalid API bind address: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        // Use with_distributed_state to enable room synchronization between API and orchestrator
-        let api_server = nexus_sfu::nexus_api::ApiServer::with_distributed_state(
-            api_addr,
-            &config.security.jwt_secret,
-            sfu.metrics().cloned(),
-            sfu.distributed_state().clone(),
-        );
-        // The API starts last: worker pool, signaling and orchestrator are
-        // already running, so the SFU can take traffic.
-        api_server.set_ready();
-        let api_shutdown = sfu.shared_shutdown().clone();
-        Some(tokio::spawn(async move {
-            tokio::select! {
-                result = api_server.run() => {
-                    if let Err(e) = result {
-                        error!("API server error: {}", e);
-                    }
-                }
-                _ = async {
-                    loop {
-                        if api_shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                            info!("API server shutting down");
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                } => {}
-            }
-        }))
-    } else {
-        info!("API server disabled");
-        None
-    };
-
-    // Wire cold-path channel into SFU packet loop
-    sfu.set_connection_tx(connection_tx);
-
-    // Run SFU packet processing loop
-    let result = sfu.run_with_signals().await;
-
-    // Graceful shutdown: wait briefly for tasks to finish, then abort if needed.
-    let shutdown_timeout = tokio::time::Duration::from_secs(5);
-    let mut api_handle = api_handle;
-    let _ = tokio::time::timeout(shutdown_timeout, async {
-        let _ = signaling_handle.await;
-        let _ = orchestrator_handle.await;
-        if let Some(handle) = api_handle.take() {
-            let _ = handle.await;
-        }
-    })
-    .await;
-    // Abort any still-running tasks after timeout.
-    if let Some(handle) = api_handle {
-        handle.abort();
-    }
-
-    match result {
+    wait_for_shutdown_signal(&server).await;
+    match server.shutdown().await {
         Ok(()) => {
             info!("Nexus SFU shutdown complete");
             ExitCode::SUCCESS
@@ -543,6 +361,26 @@ async fn run(config: NexusConfig) -> ExitCode {
         Err(e) => {
             error!("SFU error: {}", e);
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Wait for SIGTERM or SIGINT, or for the packet loop to stop on its own.
+async fn wait_for_shutdown_signal(server: &nexus_sfu::server::ServerHandle) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("register SIGINT handler");
+    let mut check = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => { info!("Received SIGTERM"); return; }
+            _ = sigint.recv() => { info!("Received SIGINT"); return; }
+            _ = check.tick() => {
+                if server.is_finished() {
+                    warn!("Packet loop stopped; shutting down");
+                    return;
+                }
+            }
         }
     }
 }

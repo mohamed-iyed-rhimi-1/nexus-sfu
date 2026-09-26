@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 // -----------------------------------------------------------------------
 // Validation trait
@@ -115,7 +115,15 @@ pub struct TransportConfig {
     /// STUN server addresses for server-reflexive candidate gathering.
     #[serde(default)]
     pub stun_servers: Vec<String>,
+    /// Addresses advertised as ICE host candidates, with the bound media port.
+    /// Empty: the bind IP if it is specific, otherwise the host's interfaces.
+    /// A server behind NAT or in a container needs its public address here.
+    #[serde(default)]
+    pub announced_ips: Vec<IpAddr>,
 }
+
+/// Upper bound on `transport.announced_ips` (one host candidate each).
+pub const MAX_ANNOUNCED_IPS: usize = 8;
 
 impl Default for TransportConfig {
     fn default() -> Self {
@@ -134,6 +142,7 @@ impl Default for TransportConfig {
             tls_cert_path: String::new(),
             tls_key_path: String::new(),
             stun_servers: Vec::new(),
+            announced_ips: Vec::new(),
         }
     }
 }
@@ -190,6 +199,20 @@ impl Validate for TransportConfig {
                  must both be set or both be empty"
                     .to_string(),
             );
+        }
+
+        // Announced IPs become ICE candidates: they must be reachable unicast
+        if self.announced_ips.len() > MAX_ANNOUNCED_IPS {
+            errors.push(format!(
+                "transport.announced_ips must have <= {MAX_ANNOUNCED_IPS} entries"
+            ));
+        }
+        for ip in &self.announced_ips {
+            if ip.is_unspecified() || ip.is_multicast() {
+                errors.push(format!(
+                    "transport.announced_ips: {ip} is not a unicast address"
+                ));
+            }
         }
 
         if errors.is_empty() {
@@ -764,6 +787,33 @@ mod tests {
     fn test_valid_transport_config() {
         let cfg = TransportConfig::default();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_announced_ips_must_be_unicast() {
+        let ok = TransportConfig {
+            announced_ips: vec![
+                "203.0.113.7".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+
+        for bad in ["0.0.0.0", "::", "224.0.0.1", "ff02::1"] {
+            let cfg = TransportConfig {
+                announced_ips: vec![bad.parse().unwrap()],
+                ..Default::default()
+            };
+            let errs = cfg.validate().unwrap_err();
+            assert!(errs.iter().any(|e| e.contains("announced_ips")), "{bad}");
+        }
+
+        let too_many = TransportConfig {
+            announced_ips: vec!["203.0.113.7".parse().unwrap(); MAX_ANNOUNCED_IPS + 1],
+            ..Default::default()
+        };
+        assert!(too_many.validate().is_err());
     }
 
     #[test]

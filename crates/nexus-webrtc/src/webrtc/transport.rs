@@ -1335,6 +1335,113 @@ mod tests {
         assert_eq!(state(&transport, id), SessionState::Established);
     }
 
+    // ── DTLS retransmission (OpenSSL timer) ────────────────────────────
+    //
+    // OpenSSL's DTLS timer runs on the real clock (1 s initially, doubling),
+    // so these tests sleep past it; there is no clock to advance.
+
+    const PAST_FIRST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_100);
+
+    /// A session past ICE where the SFU is the DTLS client (answer said
+    /// `a=setup:passive`), a browser-side OpenSSL server engine whose
+    /// fingerprint is pinned, and the SFU's first flight (ClientHello).
+    fn sfu_as_dtls_client() -> (WebRtcTransport, TransportId, OpenSslDtlsEngine, Vec<u8>) {
+        let transport = WebRtcTransport::new(TransportConfig::default()).unwrap();
+        transport.start().unwrap();
+        let id = transport
+            .create_session(DtlsParameters::new(DtlsRole::Server))
+            .unwrap();
+        transport.associate_address(PEER.parse().unwrap(), id);
+        let mut peer = OpenSslDtlsEngine::new(EngineRole::Server).unwrap();
+        assert!(peer.start_handshake().unwrap().is_empty());
+        let fp = *peer.fingerprint();
+        let hello = transport
+            .with_session_mut(id, |s| {
+                s.set_remote_fingerprint(fp).unwrap();
+                s.set_dtls_role(EngineRole::Client).unwrap();
+                s.force_state_for_testing(SessionState::IceConnecting);
+                s.complete_ice_for_testing(PEER.parse().unwrap())
+            })
+            .unwrap()
+            .expect("the DTLS client sends a ClientHello");
+        (transport, id, peer, hello)
+    }
+
+    fn poll_retransmit(transport: &WebRtcTransport, id: TransportId) -> Option<Vec<u8>> {
+        transport
+            .with_session_mut(id, |s| s.poll_dtls_retransmit())
+            .unwrap()
+            .map(|(dest, data)| {
+                assert_eq!(dest, PEER.parse().unwrap());
+                data
+            })
+    }
+
+    /// Deliver `flight` to the SFU; returns its reply flight.
+    fn to_sfu(transport: &WebRtcTransport, flight: &[u8]) -> Vec<u8> {
+        let mut out = [0u8; 2048];
+        match transport.process_packet(flight, PEER.parse().unwrap(), &mut out) {
+            Ok(Some((_, IncomingData::Dtls(reply)))) => reply,
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_dtls_role_follows_answer_setup() {
+        let (transport, id, _peer, hello) = sfu_as_dtls_client();
+        assert!(!hello.is_empty());
+        let role = transport.with_session(id, |s| s.dtls_role()).unwrap();
+        assert_eq!(role, EngineRole::Client);
+        // Fixed once the handshake has started.
+        let again = transport.with_session_mut(id, |s| s.set_dtls_role(EngineRole::Server));
+        assert_eq!(again, Some(Err(WebRtcError::InvalidState)));
+    }
+
+    #[test]
+    fn test_dtls_no_retransmit_before_timeout() {
+        let (transport, id, _peer, _hello) = sfu_as_dtls_client();
+        assert_eq!(poll_retransmit(&transport, id), None);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(poll_retransmit(&transport, id), None);
+    }
+
+    #[test]
+    fn test_dtls_survives_lost_first_flights() {
+        let (transport, id, mut peer, _lost_hello) = sfu_as_dtls_client();
+
+        // The SFU's ClientHello was lost; its timer resends it.
+        std::thread::sleep(PAST_FIRST_TIMEOUT);
+        let hello = poll_retransmit(&transport, id).expect("ClientHello retransmitted");
+        assert!(
+            poll_retransmit(&transport, id).is_none(),
+            "one flight per expiry"
+        );
+
+        // The peer's first flight is lost too; the peer's timer resends it.
+        let lost = peer.process(&hello).unwrap();
+        assert!(!lost.is_empty());
+        std::thread::sleep(PAST_FIRST_TIMEOUT);
+        let server_flight = peer.handle_timeout().unwrap();
+        assert!(!server_flight.is_empty(), "peer retransmits its flight");
+
+        // From here nothing is lost.
+        let mut flight = to_sfu(&transport, &server_flight);
+        for _ in 0..8 {
+            if flight.is_empty() {
+                break;
+            }
+            let reply = peer.process(&flight).unwrap();
+            flight = if reply.is_empty() {
+                Vec::new()
+            } else {
+                to_sfu(&transport, &reply)
+            };
+        }
+        assert!(peer.is_established());
+        assert_eq!(state(&transport, id), SessionState::Established);
+        assert!(poll_retransmit(&transport, id).is_none());
+    }
+
     #[test]
     fn test_dtls_fingerprint_mismatch_after_handshake() {
         let (transport, id) = session_awaiting_dtls();

@@ -7,13 +7,12 @@
 # - worker: CPU-pinned media worker threads
 # - room: Room limits and timeouts
 # - bwe: Bandwidth estimation (GCC algorithm)
-# - quic: QUIC signaling server (TLS, 0-RTT)
+# - quic: QUIC signaling (unused: not started, WebSocket only)
 # - gossip: SWIM gossip protocol for cluster state sync
 # - actor: Actor system limits and supervision
 # - metrics: Prometheus metrics endpoint
 # - security: JWT authentication
 # - logging: Structured logging configuration
-# - xdp: AF_XDP kernel bypass (Linux only)
 # - api: REST API server
 #
 # Configuration Precedence: CLI > env > file > defaults
@@ -59,6 +58,8 @@ loss_threshold_percent = 5
 decrease_factor = 0.85
 increase_bps = 100000
 
+# Unused: QUIC signaling is not started (WebSocket only). Kept for when it is
+# connected to the orchestrator.
 [quic]
 bind_addr = "0.0.0.0:443"
 max_connections = 10000
@@ -119,26 +120,6 @@ level = "info"                          # Less verbose in production
 structured = true
 include_timestamps = true
 include_thread_ids = false              # Reduce log size
-
-[xdp]
-# XDP kernel bypass for high-performance packet forwarding (Linux only)
-# Requires: libbpf-dev, clang, CAP_NET_ADMIN capability
-# Set interface to your primary NIC (e.g., "eth0", "ens192")
-enabled = true
-interface = "eth0"                      # MUST override with actual interface
-queue_id = 0
-forward_table_path = "/sys/fs/bpf/nexus/forward_table"
-stats_map_path = "/sys/fs/bpf/nexus/stats_map"
-umem_num_frames = 8192                  # More frames for production
-umem_frame_size = 4096
-fill_ring_size = 4096                   # Larger rings for production
-comp_ring_size = 4096
-rx_ring_size = 4096
-tx_ring_size = 4096
-batch_size = 64
-poll_timeout_ms = 100
-attach_mode = "native"                  # Use native mode for best performance
-fallback_on_failure = true              # Fall back to io_uring if XDP fails
 
 [api]
 bind_addr = "0.0.0.0:8081"

@@ -1446,6 +1446,7 @@ mod webinar_client_counts {
             connection_timeout: config.base.connection_timeout,
             ice_servers: Vec::new(),
             connection: config.base.connection.clone(),
+            ..Default::default()
         };
         client_configs.push(broadcaster_config);
 
@@ -1458,6 +1459,7 @@ mod webinar_client_counts {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(viewer_config);
         }
@@ -1610,6 +1612,7 @@ mod conference_client_counts {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(participant_config);
         }
@@ -1796,6 +1799,7 @@ mod stress_scenario_distribution {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(participant_config);
             }

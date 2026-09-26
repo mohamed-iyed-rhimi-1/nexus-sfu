@@ -14,9 +14,6 @@ use std::time::{Duration, Instant};
 
 use nexus_sfu::config::NexusConfig;
 use nexus_sfu::sfu::Sfu;
-// Use the actor crate's MediaKind for actor_manager calls
-use nexus_sfu::nexus_actor::MediaKind as ActorMediaKind;
-// Use core MediaKind for register_and_assign_track
 use nexus_sfu::types::MediaKind;
 
 fn rtp_packet(seq: u16, ssrc: u32) -> Vec<u8> {
@@ -49,16 +46,13 @@ async fn test_full_pipeline_500k_pps() {
     config.transport.signaling_bind_addr = "127.0.0.1:0".parse().unwrap();
 
     let mut sfu = Sfu::new(config).await.expect("SFU init");
-    let actor_mgr = sfu.actor_manager().clone();
 
-    // ── 2. Room → publishers → tracks → subscribers ─────────────────────
+    // ── 2. Publishers → tracks → subscribers ─────────────────────────────
+    // IDs are chosen here; the SSRC router records which worker owns each
+    // track, and subscribe_to_track looks it up there.
     const NUM_PUB: u32 = 1;
     const SUBS_PER: u32 = 999;
     let ssrc_base: u32 = 1000;
-
-    let room_id = actor_mgr
-        .create_room("loadtest".into(), 1000)
-        .expect("create_room");
 
     let mut track_ids: Vec<u64> = Vec::new();
     let mut pub_ids: Vec<u64> = Vec::new();
@@ -66,18 +60,11 @@ async fn test_full_pipeline_500k_pps() {
     for t in 0..NUM_PUB {
         let ssrc = ssrc_base + t;
 
-        // add_participant returns the generated participant_id
-        let pid = actor_mgr
-            .add_participant(room_id, format!("pub-{t}"))
-            .expect("add_participant");
+        let pid = 1 + t as u64;
         pub_ids.push(pid);
-
-        let tid = actor_mgr
-            .publish_track(pid, ActorMediaKind::Video, ssrc)
-            .expect("publish_track");
+        let tid = 1 + t as u64;
         track_ids.push(tid);
 
-        // Also register in SSRC router for the recv path
         sfu.register_and_assign_track(tid, pid, ssrc, MediaKind::Video)
             .expect("register_ssrc");
     }
@@ -88,9 +75,7 @@ async fn test_full_pipeline_500k_pps() {
                 .parse()
                 .unwrap();
 
-            let sub_pid = actor_mgr
-                .add_participant(room_id, format!("sub-{t}-{s}"))
-                .expect("add_sub");
+            let sub_pid = 10_000 + (t * SUBS_PER + s) as u64;
 
             sfu.subscribe_to_track(sub_pid, track_ids[t as usize], dest)
                 .expect("subscribe");

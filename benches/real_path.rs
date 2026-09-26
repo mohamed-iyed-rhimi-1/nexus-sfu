@@ -26,8 +26,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use criterion::Throughput;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
@@ -42,6 +40,9 @@ use nexus_transport::arena::PacketArena;
 use nexus_transport::srtp::{KeyMaterial, ProtectionProfile, SrtpContext, SrtpPolicy};
 use nexus_webrtc::webrtc::WebRtcTransport;
 use nexus_webrtc::webrtc::{DtlsParameters, DtlsRole, IncomingData, TransportConfig};
+
+mod common;
+use common::{raise_fd_limit, Sinks};
 
 const PUBLISHER_SSRC: u32 = 0x1234_5678;
 const TRACK_ID: u64 = 1;
@@ -115,85 +116,6 @@ fn write_rtp(buf: &mut [u8], seq: u16, ts: u32, payload: usize) -> usize {
         *b = i as u8;
     }
     20 + payload
-}
-
-/// Raise the open-file limit so hundreds of sink sockets can be bound.
-fn raise_fd_limit() {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit/setrlimit only read/write the struct we pass.
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max.min(8192);
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
-}
-
-const DRAIN_THREADS: usize = 4;
-
-/// Loopback sockets standing in for subscribers, drained by background
-/// threads. Undrained sockets fill up and make sends fail (ENOBUFS on
-/// macOS), and failed sends are much cheaper than real ones.
-struct Sinks {
-    addrs: Vec<SocketAddr>,
-    stop: Arc<AtomicBool>,
-    threads: Vec<std::thread::JoinHandle<()>>,
-}
-
-impl Sinks {
-    fn new(count: usize) -> Self {
-        assert!(count > 0, "need at least one sink");
-        let sockets: Vec<UdpSocket> = (0..count)
-            .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind sink socket"))
-            .collect();
-        let addrs = sockets.iter().map(|s| s.local_addr().unwrap()).collect();
-        let stop = Arc::new(AtomicBool::new(false));
-        let per_thread = count.div_ceil(DRAIN_THREADS);
-        let mut threads = Vec::with_capacity(DRAIN_THREADS);
-        let mut sockets = sockets.into_iter();
-        for _ in 0..DRAIN_THREADS {
-            let chunk: Vec<UdpSocket> = sockets.by_ref().take(per_thread).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            let stop = Arc::clone(&stop);
-            threads.push(std::thread::spawn(move || drain(chunk, stop)));
-        }
-        Self {
-            addrs,
-            stop,
-            threads,
-        }
-    }
-}
-
-fn drain(sockets: Vec<UdpSocket>, stop: Arc<AtomicBool>) {
-    let mut buf = [0u8; 1500];
-    for socket in &sockets {
-        socket.set_nonblocking(true).expect("nonblocking sink");
-    }
-    while !stop.load(Ordering::Relaxed) {
-        for socket in &sockets {
-            // Bounded: at most 64 datagrams per socket per pass.
-            for _ in 0..64 {
-                if socket.recv(&mut buf).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Sinks {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
 }
 
 // =============================================================================

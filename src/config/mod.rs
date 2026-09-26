@@ -6,7 +6,6 @@ mod ice;
 mod loader;
 mod validation;
 mod watcher;
-mod xdp;
 
 pub use api::ApiConfig;
 pub use ice::{
@@ -15,7 +14,6 @@ pub use ice::{
 pub use loader::ConfigLoader;
 pub use validation::ConfigError;
 pub use watcher::ConfigWatcher;
-pub use xdp::XdpConfig;
 
 // Import config structs from nexus-core (single source of truth)
 pub use nexus_core::config::{
@@ -63,7 +61,6 @@ pub struct NexusConfig {
     pub api: ApiConfig,
     pub security: SecurityConfig,
     pub logging: LoggingConfig,
-    pub xdp: XdpConfig,
     /// ICE server configuration for STUN/TURN.
     #[serde(default)]
     pub ice_servers: IceServerConfig,
@@ -119,7 +116,6 @@ impl NexusConfig {
         self.api.validate()?;
         validate_core_config("security", self.security.validate())?;
         validate_core_config("logging", self.logging.validate())?;
-        self.xdp.validate()?;
         self.ice_servers.validate()?;
         self.cluster.validate()?;
 
@@ -158,10 +154,10 @@ impl NexusConfig {
             ));
         }
 
-        // Actor limits must fit the actor system's compiled capacity;
-        // ActorManager::new asserts these, so an oversized value would
-        // otherwise abort at startup instead of failing config validation.
-        // Track capacity is derived as participants * 10 (see Sfu::new).
+        // Actor limits must fit the actor system's compiled capacity
+        // (nexus-actor asserts these). The actor runtime is no longer started,
+        // but the limits stay validated until the worker pool is replaced.
+        // Track capacity is derived as participants * 10.
         let actor_limits = [
             (
                 "actor.max_room_actors",
@@ -231,7 +227,6 @@ impl Default for NexusConfig {
             api: ApiConfig::default(),
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
-            xdp: XdpConfig::default(),
             ice_servers: IceServerConfig::default(),
             cluster: ClusterConfig::default(),
             drain_timeout_ms: default_drain_timeout_ms(),

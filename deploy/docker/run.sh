@@ -30,6 +30,20 @@ readonly METRICS_PORT="${METRICS_PORT:-9090}"    # Prometheus
 
 readonly READY_TIMEOUT_SECONDS=30
 
+# ICE host candidates. Inside a container the SFU only sees the container's
+# own addresses, so remote clients need the host's reachable IP here
+# (comma-separated). Empty: the SFU advertises its interface addresses, which
+# only works for clients on this host.
+readonly NEXUS_ANNOUNCED_IPS="${NEXUS_ANNOUNCED_IPS:-}"
+
+# The candidate carries the container's media port, so the host must publish
+# the same port.
+if [[ "${MEDIA_PORT}" != "10000" && -n "${NEXUS_ANNOUNCED_IPS}" ]]; then
+    echo "Error: MEDIA_PORT must be 10000 when NEXUS_ANNOUNCED_IPS is set" >&2
+    echo "(ICE candidates advertise the container's port 10000)." >&2
+    exit 1
+fi
+
 for f in "${TLS_CERT}" "${TLS_KEY}"; do
     if [[ ! -r "${f}" ]]; then
         echo "Error: TLS file not found or unreadable: ${f}" >&2
@@ -54,6 +68,7 @@ fi
 
 echo "Starting ${IMAGE_NAME}:${IMAGE_TAG} as ${CONTAINER_NAME}"
 echo "  TLS: ${TLS_CERT}, ${TLS_KEY}"
+echo "  Announced IPs: ${NEXUS_ANNOUNCED_IPS:-<none: container interfaces, local clients only>}"
 echo "  Limits: memory=${MEMORY_LIMIT} cpus=${CPU_LIMIT} pids=${PIDS_LIMIT} nofile=${NOFILE_LIMIT}"
 
 # No Docker health check: the image is distroless (no shell, no wget).
@@ -67,6 +82,7 @@ docker run \
     --pids-limit="${PIDS_LIMIT}" \
     --ulimit nofile="${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     --env NEXUS_JWT_SECRET="${NEXUS_JWT_SECRET}" \
+    --env NEXUS_ANNOUNCED_IPS="${NEXUS_ANNOUNCED_IPS}" \
     --volume "${TLS_CERT}:/etc/nexus/tls/cert.pem:ro" \
     --volume "${TLS_KEY}:/etc/nexus/tls/key.pem:ro" \
     --publish "${MEDIA_PORT}:10000/udp" \

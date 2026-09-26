@@ -51,6 +51,8 @@ loss_threshold_percent = 10             # 10% (more tolerant for local testing)
 decrease_factor = 0.9                   # 0.9 (gentler decrease for dev)
 increase_bps = 50000                    # 50 Kbps (smaller steps for dev)
 
+# Unused: QUIC signaling is not started (WebSocket only). Kept for when it is
+# connected to the orchestrator.
 [quic]
 bind_addr = "0.0.0.0:8443"
 max_connections = 100
@@ -106,25 +108,6 @@ level = "debug"                         # Debug logging enabled (per task spec)
 structured = true
 include_timestamps = true
 include_thread_ids = true
-
-[xdp]
-# XDP kernel bypass disabled for development (per task spec)
-# XDP requires Linux with CAP_NET_ADMIN and libbpf
-enabled = false
-interface = ""
-queue_id = 0
-forward_table_path = "/sys/fs/bpf/nexus/forward_table"
-stats_map_path = "/sys/fs/bpf/nexus/stats_map"
-umem_num_frames = 4096
-umem_frame_size = 4096
-fill_ring_size = 2048
-comp_ring_size = 2048
-rx_ring_size = 2048
-tx_ring_size = 2048
-batch_size = 64
-poll_timeout_ms = 100
-attach_mode = "native"
-fallback_on_failure = true
 
 # ============================================================================
 # ICE Server Configuration (Development)

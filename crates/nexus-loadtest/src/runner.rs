@@ -429,6 +429,7 @@ impl TestRunner {
             connection_timeout: config.base.connection_timeout,
             ice_servers: Vec::new(),
             connection: config.base.connection.clone(),
+            ..Default::default()
         };
         client_configs.push(broadcaster_config);
 
@@ -441,6 +442,7 @@ impl TestRunner {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(viewer_config);
         }
@@ -603,6 +605,7 @@ impl TestRunner {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(participant_config);
         }
@@ -800,6 +803,7 @@ impl TestRunner {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(participant_config);
             }
@@ -1173,6 +1177,7 @@ mod tests {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(broadcaster_config);
 
@@ -1185,6 +1190,7 @@ mod tests {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(viewer_config);
             }
@@ -1245,6 +1251,7 @@ mod tests {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(broadcaster_config);
 
@@ -1256,6 +1263,7 @@ mod tests {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(viewer_config);
             }
@@ -1289,6 +1297,7 @@ mod tests {
                 connection_timeout: config.base.connection_timeout,
                 ice_servers: Vec::new(),
                 connection: config.base.connection.clone(),
+                ..Default::default()
             };
             client_configs.push(broadcaster_config);
 
@@ -1300,6 +1309,7 @@ mod tests {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(viewer_config);
             }
@@ -1348,6 +1358,7 @@ mod tests {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(participant_config);
             }
@@ -1412,6 +1423,7 @@ mod tests {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(participant_config);
             }
@@ -1445,6 +1457,7 @@ mod tests {
                     connection_timeout: config.base.connection_timeout,
                     ice_servers: Vec::new(),
                     connection: config.base.connection.clone(),
+                    ..Default::default()
                 };
                 client_configs.push(participant_config);
             }
@@ -1530,6 +1543,7 @@ mod tests {
                         connection_timeout: config.base.connection_timeout,
                         ice_servers: Vec::new(),
                         connection: config.base.connection.clone(),
+                        ..Default::default()
                     };
                     client_configs.push(participant_config);
                 }
@@ -1599,6 +1613,7 @@ mod tests {
                         connection_timeout: config.base.connection_timeout,
                         ice_servers: Vec::new(),
                         connection: config.base.connection.clone(),
+                        ..Default::default()
                     };
                     client_configs.push(participant_config);
                 }
@@ -1639,6 +1654,7 @@ mod tests {
                         connection_timeout: config.base.connection_timeout,
                         ice_servers: Vec::new(),
                         connection: config.base.connection.clone(),
+                        ..Default::default()
                     };
                     client_configs.push(participant_config);
                 }
@@ -1682,6 +1698,7 @@ mod tests {
                         connection_timeout: config.base.connection_timeout,
                         ice_servers: Vec::new(),
                         connection: config.base.connection.clone(),
+                        ..Default::default()
                     };
                     client_configs.push(participant_config);
                 }
@@ -1725,6 +1742,7 @@ mod tests {
                         connection_timeout: config.base.connection_timeout,
                         ice_servers: Vec::new(),
                         connection: config.base.connection.clone(),
+                        ..Default::default()
                     };
                     client_configs.push(participant_config);
                 }

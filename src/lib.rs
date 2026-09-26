@@ -34,9 +34,9 @@
 // =============================================================================
 // Re-export modules (thin wrappers over library crates)
 // =============================================================================
-// The transport module re-exports from nexus_transport and includes local af_xdp.
+// The transport module re-exports from nexus_transport.
 
-pub mod transport; // → nexus_transport + local af_xdp
+pub mod transport; // → nexus_transport
 
 // =============================================================================
 // Application modules (unique to binary crate)
@@ -50,13 +50,11 @@ pub mod error;
 pub mod forward;
 pub mod orchestrator;
 pub mod proto;
-pub mod relay;
+pub mod server;
 pub mod sfu;
 pub mod signal;
 pub mod spin;
-pub mod state;
 pub mod tracing;
-pub mod track_registry;
 pub mod types;
 pub mod worker;
 
@@ -139,12 +137,6 @@ pub use nexus_transport::ice::{
     ChecklistState, IceAgent, IceConfig, IceConnectionState, IceCredentials, IceError,
     IceGatheringState, IceRole, StunAttribute, StunClass, StunMessage, StunMethod,
 };
-pub use nexus_transport::turn::{
-    Allocation, AllocationState, ChannelBinding, Permission, RelayedAddress, TransportProtocol,
-    TurnClient, TurnClientConfig, TurnCredentials, TurnError, TurnServerInfo,
-    CHANNEL_BINDING_LIFETIME, CHANNEL_NUMBER_MAX, CHANNEL_NUMBER_MIN, DEFAULT_ALLOCATION_LIFETIME,
-    PERMISSION_LIFETIME,
-};
 
 // -----------------------------------------------------------------------------
 // nexus-media: RTP/RTCP types
@@ -168,20 +160,14 @@ pub use config::{
     SecurityConfig,
     TransportConfig, // Application-level transport config (distinct from UdpTransportConfig)
     WorkerConfig,
-    XdpConfig,
 };
 pub use error::{
     signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
     SfuError, SignalingError, TransportError, WorkerError,
 };
-pub use forward::{
-    PacketHandler, PacketType, SsrcError, SsrcRouter, Subscriber, SubscriberList,
-    SubscriberListStats, SubscriberListStatsSnapshot, ViewportFilter, DEFAULT_COLD_TIMEOUT_NS,
-    MAX_SUBSCRIBERS_PER_TRACK,
-};
+pub use forward::{SsrcError, SsrcRouter};
 pub use sfu::{DrainState, Sfu, SfuStats};
 pub use spin::SpinLoop;
-pub use state::{ForwardEntry, ForwardTable, XdpError};
 pub use tracing::{
     init_tracing, init_tracing_extended, ExtendedLoggingConfig, HotPathMetrics,
     HotPathMetricsSnapshot, LatencyGuard, LatencyKind, TracingError, HOT_PATH_METRICS,
@@ -211,19 +197,12 @@ pub mod tier {
     /// MVP: io_uring/kqueue with batch forwarding
     pub const CURRENT: &str = "MVP - Batch Forwarding with Worker Sharding";
 
-    /// Tier 2: XDP kernel bypass (optional, Linux only)
-    pub const TIER2: &str = "XDP Kernel Bypass - 15M+ packets/sec/core";
-
     /// Expected performance metrics
     pub mod metrics {
         /// Packets per second per core (target)
         pub const PACKETS_PER_SEC_PER_CORE: u64 = 500_000;
-        /// Packets per second per core with XDP (target)
-        pub const PACKETS_PER_SEC_PER_CORE_XDP: u64 = 15_000_000;
         /// Latency in milliseconds (P50 target)
         pub const LATENCY_P50_MS: u64 = 20;
-        /// Latency in microseconds with XDP (P50 target)
-        pub const LATENCY_P50_US_XDP: u64 = 100;
         /// Latency in milliseconds (P99 target)
         pub const LATENCY_P99_MS: u64 = 50;
         /// Maximum participants per room

@@ -30,6 +30,20 @@ pub struct KeyMaterial {
     pub profile: ProtectionProfile,
 }
 
+/// Equal when the profile and the used key and salt bytes are equal (the
+/// unused tail of the fixed arrays is ignored). Not constant-time: for
+/// deciding whether a context can be kept, not for authentication.
+impl PartialEq for KeyMaterial {
+    fn eq(&self, other: &Self) -> bool {
+        self.profile == other.profile
+            && self.master_key[..self.master_key_len] == other.master_key[..other.master_key_len]
+            && self.master_salt[..self.master_salt_len]
+                == other.master_salt[..other.master_salt_len]
+    }
+}
+
+impl Eq for KeyMaterial {}
+
 impl KeyMaterial {
     /// Create from raw bytes (AES-128-GCM).
     pub fn from_aes128_gcm(key: &[u8], salt: &[u8]) -> Result<Self, SrtpError> {
@@ -339,13 +353,14 @@ impl KeyDerivation {
         assert!(master_key.len() >= 16);
         assert!(output.len() <= 32);
 
-        // Build IV: salt XOR (label << 48)
-        // For 12-byte salt, label goes at byte index 6 (bit 48)
+        // RFC 3711 §4.3.1 / RFC 7714 §11: x = key_id XOR master_salt, with
+        // key_id = label || r (r = 0, 48 bits) right-aligned in 112 bits. The
+        // 96-bit AEAD salt is padded with two zero bytes to 112 bits (as in
+        // libsrtp), so the label lands in byte 7.
+        assert!(master_salt.len() <= 14, "salt fits the 112-bit KDF input");
         let mut iv = [0u8; 16];
         iv[..master_salt.len()].copy_from_slice(master_salt);
-        if master_salt.len() > 6 {
-            iv[6] ^= label;
-        }
+        iv[7] ^= label;
 
         // Use AES-CM (counter mode) to generate key stream
         Self::aes_cm_generate(master_key, &iv, output)

@@ -37,24 +37,13 @@ pub use quic::{QuicConnection, QuicSignaling, SessionStore, SessionTicket};
 
 // WebSocket server types (moved from src/signal/)
 pub use websocket::{
-    handler_error_codes,
+    new_signaling_connections,
     register_signaling_connection,
-    signaling_connections,
     unregister_signaling_connection,
-    ClientStats,
-    JoinResponse,
-    MessageType,
     OrchestratorEvent,
     // Connection registry
     SignalingConnectionHandle,
-    SignalingHandler,
-    SignalingHandlerError,
-    TrackEntry,
+    SignalingConnections,
     WebSocketServer,
     MAX_CONNECTIONS,
-    MAX_PARTICIPANT_NAME_LEN,
-    MAX_SESSION_TICKETS,
-    MAX_STATS_PAYLOAD_SIZE,
-    MAX_TRACKS_IN_RESPONSE,
-    TICKET_LIFETIME_SECS,
 };

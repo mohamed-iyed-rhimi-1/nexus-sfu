@@ -61,14 +61,6 @@ check_deprecated "to_json|from_json" "JSON methods" ""
 echo ""
 echo "5. Verifying new architecture components..."
 
-echo -n "  ActorManager in Sfu... "
-if rg "ActorManager" src/sfu.rs > /dev/null 2>&1; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FAIL${NC}"
-    ERRORS=$((ERRORS + 1))
-fi
-
 echo -n "  DistributedState in Sfu... "
 if rg "DistributedState" src/sfu.rs > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"

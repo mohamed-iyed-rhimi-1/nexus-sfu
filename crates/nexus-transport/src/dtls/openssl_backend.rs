@@ -21,6 +21,7 @@
 //! - No dynamic allocation on hot path after handshake
 //! - Explicit error handling, no unwrap on fallible paths
 
+use foreign_types::ForeignTypeRef;
 use openssl::ec::{EcGroup, EcKey};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
@@ -39,6 +40,10 @@ use super::types::DtlsRole;
 
 /// Maximum bytes read from BIO per call.
 const MAX_BIO_READ: usize = 16384;
+
+/// `SSL_ctrl` command behind `DTLSv1_handle_timeout` (a macro in `ssl.h`, so
+/// not exported by openssl-sys).
+const DTLS_CTRL_HANDLE_TIMEOUT: libc::c_int = 74;
 
 /// SRTP protection profile names for set_tlsext_use_srtp.
 const SRTP_AES128_CM_SHA1_80: &str = "SRTP_AES128_CM_SHA1_80";
@@ -364,6 +369,23 @@ impl OpenSslDtlsEngine {
         self.srtp_keys.as_ref()
     }
 
+    /// Our DTLS role.
+    pub fn role(&self) -> DtlsRole {
+        self.role
+    }
+
+    /// Change the DTLS role before the handshake starts (the role is only
+    /// known once the SDP answer's `a=setup` arrives; the certificate, and so
+    /// the fingerprint already sent in the offer, stays the same).
+    pub fn set_role(&mut self, role: DtlsRole) {
+        assert!(
+            !self.started,
+            "DTLS role is fixed once the handshake starts"
+        );
+        self.role = role;
+        assert_eq!(self.role, role);
+    }
+
     /// Start the DTLS handshake.
     ///
     /// For client role: initiates ClientHello.
@@ -617,5 +639,37 @@ impl OpenSslDtlsEngine {
     /// Take any pending output data.
     pub fn take_pending_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_output)
+    }
+
+    /// Drive OpenSSL's DTLS retransmission timer.
+    ///
+    /// While the handshake is in progress and OpenSSL's timer has expired
+    /// (1 s initially, doubling up to 60 s), OpenSSL rebuilds its last flight;
+    /// the records are returned for sending. Before the deadline, or outside a
+    /// handshake, returns an empty buffer. Safe to call as often as wanted.
+    pub fn handle_timeout(&mut self) -> Result<Vec<u8>, DtlsError> {
+        let Some(mid) = self.mid_handshake.as_mut() else {
+            return Ok(Vec::new());
+        };
+        assert!(self.started, "mid-handshake implies started");
+        assert!(!self.established, "mid-handshake implies not established");
+
+        let ssl = mid.ssl().as_ptr();
+        assert!(!ssl.is_null());
+        // SAFETY: `ssl` is the live `SSL*` owned by `mid`, which stays borrowed
+        // (and so alive and unmoved) for this call. DTLSv1_handle_timeout only
+        // touches that SSL object and writes to its BIO, which is our MemBio;
+        // larg and parg are unused by this command.
+        let ret = unsafe {
+            openssl_sys::SSL_ctrl(ssl, DTLS_CTRL_HANDLE_TIMEOUT, 0, std::ptr::null_mut())
+        };
+        // 1: retransmitted, 0: timer not expired or not running, <0: error
+        // (for example, too many retransmissions).
+        if ret < 0 {
+            return Err(DtlsError::handshake_failed(
+                "DTLS retransmission failed (peer unreachable)",
+            ));
+        }
+        Ok(mid.get_mut().take_outgoing())
     }
 }

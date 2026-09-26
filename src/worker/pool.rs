@@ -402,12 +402,6 @@ pub struct MediaWorker {
     num_workers: u32,
     /// Last REMB sent timestamp (microseconds).
     last_remb_sent_us: u64,
-    /// REMB generator (sender SSRC = 1 for SFU).
-    remb_generator: nexus_bwe::RembGenerator,
-    /// Channel for relay output packets (worker → main loop → RelayManager).
-    /// When a subscriber has `is_relay == true`, raw RTP is queued here
-    /// instead of going through SRTP + batch_sender.
-    relay_out_tx: Option<crossbeam::channel::Sender<RelayOutput>>,
     /// Ring retention for new track actors (packets), shared with the pool.
     ring_retention: Arc<AtomicU32>,
     /// Reverse SSRC→TrackId map for routing SPSC cross-worker packets.
@@ -415,18 +409,6 @@ pub struct MediaWorker {
     ssrc_to_track: HashMap<Ssrc, TrackId>,
     /// RTCP transmission scheduler (RFC 3550 §6.2-6.4).
     rtcp_scheduler: nexus_media::rtcp::RtcpScheduler,
-}
-
-/// A packet destined for a relay peer node.
-pub struct RelayOutput {
-    /// Peer node to relay to.
-    pub peer_node: u64,
-    /// Track ID.
-    pub track_id: TrackId,
-    /// Raw RTP data (no SRTP).
-    pub data: [u8; 1500],
-    /// Length of valid data.
-    pub len: u16,
 }
 
 /// State for a TrackActor hosted by a worker.
@@ -477,6 +459,14 @@ struct TrackActorState {
     publisher_addr: Option<SocketAddr>,
     /// Publisher SRTCP context for protecting feedback (PLI/NACK).
     publisher_srtcp_context: Option<nexus_transport::srtp::SrtpContext>,
+    /// Key material `publisher_srtcp_context` was built from; an update with
+    /// the same key keeps the context (and its SRTCP index).
+    publisher_srtcp_key: Option<nexus_transport::srtp::KeyMaterial>,
+    /// Sender SSRC of every RTCP packet sent to this track's publisher
+    /// (REMB, TWCC, PLI, NACK). Random, non-zero, distinct from the track's
+    /// media SSRCs; unique per track, so the publisher's key never sees the
+    /// same (sender SSRC, SRTCP index) from two contexts.
+    rtcp_sender_ssrc: u32,
     /// Last RTP timestamp from publisher packets (for SR generation).
     last_rtp_timestamp: Option<u32>,
     /// Simulcast SSRC mapping: layer_index -> SSRC.
@@ -556,10 +546,6 @@ struct ActorSubscriber {
     viewport_visible: Vec<u32>,
     /// Viewport: sorted source participant IDs pinned by subscriber.
     viewport_pinned: Vec<u32>,
-    /// If true, this subscriber is a relay to another SFU node.
-    is_relay: bool,
-    /// Peer node ID for relay subscribers (0 if not relay).
-    relay_node: u64,
     /// If non-zero, rewrite the RTP payload type byte to this value.
     /// Used when the subscriber's SDP assigns a different PT than the
     /// publisher's to satisfy BUNDLE PT uniqueness (RFC 8843 §9.2).
@@ -568,6 +554,18 @@ struct ActorSubscriber {
     /// Rewrites the publisher's SSRC so simulcast layer switches
     /// don't cause SSRC discontinuities at the subscriber.
     outbound_ssrc: u32,
+}
+
+/// A random RTCP sender SSRC: non-zero and not in `avoid`.
+fn random_rtcp_sender_ssrc(avoid: &[u32]) -> u32 {
+    // Bounded retries; with 2^32 values, a second draw is already rare.
+    for _ in 0..16 {
+        let ssrc: u32 = rand::random();
+        if ssrc != 0 && !avoid.contains(&ssrc) {
+            return ssrc;
+        }
+    }
+    unreachable!("16 random u32 draws all collided");
 }
 
 impl TrackActorState {
@@ -621,6 +619,8 @@ impl TrackActorState {
             last_sr_sent_us: 0,
             publisher_addr: None,
             publisher_srtcp_context: None,
+            publisher_srtcp_key: None,
+            rtcp_sender_ssrc: random_rtcp_sender_ssrc(&[ssrc]),
             last_rtp_timestamp: None,
             simulcast_ssrcs: [None; 3],
             mid_ext_id: 0,
@@ -633,6 +633,45 @@ impl TrackActorState {
             twcc_arrivals: Vec::with_capacity(128),
             twcc_fb_count: 0,
             last_twcc_sent_us: 0,
+        }
+    }
+
+    /// Media SSRCs this track uses (primary and simulcast layers).
+    fn media_ssrcs(&self) -> [u32; 4] {
+        let [a, b, c] = self.simulcast_ssrcs;
+        [self.ssrc, a.unwrap_or(0), b.unwrap_or(0), c.unwrap_or(0)]
+    }
+
+    /// Re-draw `rtcp_sender_ssrc` if a media SSRC learned later collides.
+    fn ensure_rtcp_sender_ssrc_distinct(&mut self) {
+        let media = self.media_ssrcs();
+        if media.contains(&self.rtcp_sender_ssrc) {
+            self.rtcp_sender_ssrc = random_rtcp_sender_ssrc(&media);
+        }
+        assert!(!media.contains(&self.rtcp_sender_ssrc));
+    }
+
+    /// SRTCP-protect an RTCP packet for this track's publisher. Returns the
+    /// destination and protected packet, or `None` without an address or
+    /// context yet. The packet's sender SSRC must be `rtcp_sender_ssrc`.
+    fn protect_for_publisher(&mut self, mut packet: Vec<u8>) -> Option<(SocketAddr, Vec<u8>)> {
+        assert!(packet.len() >= 8, "RTCP packet has a sender SSRC");
+        let sender = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        assert_eq!(sender, self.rtcp_sender_ssrc, "one sender SSRC per context");
+        let addr = self.publisher_addr?;
+        let ctx = self.publisher_srtcp_context.as_mut()?;
+        let len = packet.len();
+        // Room for the 4-byte SRTCP index and the auth tag.
+        packet.resize(len + 4 + ctx.cipher_tag_len(), 0);
+        match ctx.protect_rtcp(&mut packet, len) {
+            Ok(protected_len) => {
+                packet.truncate(protected_len);
+                Some((addr, packet))
+            }
+            Err(e) => {
+                tracing::warn!(track_id = self.track_id, error = ?e, "SRTCP protect failed");
+                None
+            }
         }
     }
 
@@ -660,8 +699,6 @@ impl TrackActorState {
             max_requested_layer: 2,
             viewport_visible: Vec::new(),
             viewport_pinned: Vec::new(),
-            is_relay: false,
-            relay_node: 0,
             pt_override: 0,
             outbound_ssrc: ssrc,
         });
@@ -781,8 +818,6 @@ impl MediaWorker {
             ssrc_hasher: None, // Will be set by WorkerPool
             num_workers: 0,    // Will be set by WorkerPool
             last_remb_sent_us: 0,
-            remb_generator: nexus_bwe::RembGenerator::new(1), // SFU sender SSRC
-            relay_out_tx: None,
             ring_retention: Arc::new(AtomicU32::new(ACTOR_RING_CAPACITY as u32)),
             ssrc_to_track: HashMap::new(),
             rtcp_scheduler: nexus_media::rtcp::RtcpScheduler::new(1_000_000), // initial 1 Mbps
@@ -1343,6 +1378,7 @@ impl MediaWorker {
                 assert!(layer < 3, "Simulcast layer must be 0, 1, or 2");
                 if let Some(actor) = self.actors.get_mut(&track_id) {
                     actor.simulcast_ssrcs[layer as usize] = Some(ssrc);
+                    actor.ensure_rtcp_sender_ssrc_distinct();
                     self.ssrc_to_track.insert(ssrc, track_id);
                     tracing::info!(track_id, layer, ssrc, "Simulcast SSRC mapped");
                 }
@@ -1352,6 +1388,7 @@ impl MediaWorker {
                 if let Some(actor) = self.actors.get_mut(&track_id) {
                     actor.ssrc = ssrc;
                     actor.sr_generator = nexus_media::rtcp::SenderReportGenerator::new(ssrc);
+                    actor.ensure_rtcp_sender_ssrc_distinct();
                     self.ssrc_to_track.insert(ssrc, track_id);
                     tracing::info!(track_id, ssrc, "SSRC bound to track");
                 }
@@ -1451,76 +1488,6 @@ impl MediaWorker {
                 }
                 true
             }
-            WorkerMessage::AddRelaySubscriber {
-                track_id,
-                peer_node,
-                subscriber_id,
-            } => {
-                if let Some(actor) = self.actors.get_mut(&track_id) {
-                    const MAX_SUBSCRIBERS_PER_TRACK: usize = 2000;
-                    if actor.subscribers.len() < MAX_SUBSCRIBERS_PER_TRACK {
-                        actor.subscribers.push(ActorSubscriber {
-                            id: subscriber_id,
-                            participant_id: 0,
-                            dest_addr: "0.0.0.0:0".parse().unwrap(),
-                            target_layer: 2,
-                            srtp_context: None,
-                            seq_counter: 0,
-                            ts_offset: 0,
-                            ts_offset_initialized: false,
-                            seq_map: [0u16; 1024],
-                            max_requested_layer: 2,
-                            viewport_visible: Vec::new(),
-                            viewport_pinned: Vec::new(),
-                            is_relay: true,
-                            relay_node: peer_node,
-                            pt_override: 0,
-                            outbound_ssrc: 0,
-                        });
-                        tracing::info!(
-                            worker_id = self.worker_id,
-                            track_id,
-                            peer_node,
-                            "Added relay subscriber"
-                        );
-                    }
-                }
-                true
-            }
-            WorkerMessage::RelayPacket {
-                track_id,
-                data,
-                len,
-            } => {
-                // Inject relay packet as if it was received locally.
-                // Find the track actor and process through the forwarding pipeline.
-                if let Some(actor) = self.actors.get_mut(&track_id) {
-                    if let Some(mut slot) = self.arena.alloc() {
-                        let slot_data = slot.data_mut();
-                        slot_data[..len as usize].copy_from_slice(&data[..len as usize]);
-                        slot.set_len(len);
-
-                        // Forward to subscribers before storing in ring buffer
-                        let packet_layer = actor.current_layer;
-                        Self::forward_to_subscribers_static(
-                            actor,
-                            &slot,
-                            packet_layer,
-                            &mut self.arena,
-                            &mut self.batch_sender,
-                            &mut self.packets_dropped,
-                            &mut self.dropped_unprotected,
-                            &mut self.bytes_copied_fanout,
-                            &mut self.arena_alloc_failures_fanout,
-                            &self.relay_out_tx,
-                        );
-
-                        actor.ring_buffer.push_bounded(slot, actor.ring_retention);
-                        actor.packets_received += 1;
-                    }
-                }
-                true
-            }
         }
     }
 
@@ -1566,8 +1533,6 @@ impl MediaWorker {
                 max_requested_layer: 2,
                 viewport_visible: Vec::new(),
                 viewport_pinned: Vec::new(),
-                is_relay: false,
-                relay_node: 0,
                 pt_override: 0,
                 outbound_ssrc: 0,
             });
@@ -1681,7 +1646,6 @@ impl MediaWorker {
                     &mut self.dropped_unprotected,
                     &mut self.bytes_copied_fanout,
                     &mut self.arena_alloc_failures_fanout,
-                    &self.relay_out_tx,
                 );
             }
         }
@@ -1991,7 +1955,6 @@ impl MediaWorker {
         dropped_unprotected: &mut u64,
         bytes_copied_fanout: &mut u64,
         arena_alloc_failures_fanout: &mut u64,
-        relay_out_tx: &Option<crossbeam::channel::Sender<RelayOutput>>,
     ) {
         // Precondition assertions (TigerStyle: ≥2 assertions)
         assert!(!packet.is_empty(), "packet length must be positive");
@@ -2033,22 +1996,6 @@ impl MediaWorker {
                 if !in_pinned && !in_visible {
                     continue;
                 }
-            }
-
-            // Relay forwarding: skip SRTP, send raw RTP to peer node.
-            if subscriber.is_relay {
-                if let Some(tx) = relay_out_tx {
-                    let mut out = RelayOutput {
-                        peer_node: subscriber.relay_node,
-                        track_id: actor.track_id,
-                        data: [0u8; 1500],
-                        len: packet_len as u16,
-                    };
-                    out.data[..packet_len].copy_from_slice(packet.data());
-                    let _ = tx.try_send(out); // Drop if full — backpressure
-                }
-                forwarded_count += 1;
-                continue;
             }
 
             // Under sim feature, skip SRTP entirely — forward plain RTP
@@ -2412,13 +2359,13 @@ impl MediaWorker {
 
         // Collect REMB packets to send to publishers (not subscribers)
         // REMB must be sent to the media sender for bitrate control
-        let remb_packets: Vec<(SocketAddr, Vec<u8>)> = self
+        let remb_packets: Vec<(TrackId, Vec<u8>)> = self
             .actors
             .iter()
-            .filter_map(|(_track_id, actor)| {
-                let remb_packet = coordinator.generate_remb(actor.ssrc);
-                // Use publisher address instead of subscriber address
-                actor.publisher_addr.map(|addr| (addr, remb_packet))
+            .filter(|(_, actor)| actor.publisher_addr.is_some())
+            .map(|(track_id, actor)| {
+                let remb = coordinator.generate_remb_from(actor.rtcp_sender_ssrc, actor.ssrc);
+                (*track_id, remb)
             })
             .collect();
 
@@ -2458,44 +2405,16 @@ impl MediaWorker {
         }
 
         // Send REMB packets with SRTCP protection to publishers
-        for (publisher_addr, remb_packet) in remb_packets {
-            // Find the actor with matching publisher address to get SRTCP context
-            if let Some(actor) = self
+        // Each REMB is protected with the context of the track it describes,
+        // the same actor whose sender SSRC it carries.
+        for (track_id, remb_packet) in remb_packets {
+            let protected = self
                 .actors
-                .values_mut()
-                .find(|a| a.publisher_addr == Some(publisher_addr))
-            {
-                if let Some(ref mut srtcp_ctx) = actor.publisher_srtcp_context {
-                    // Apply SRTCP protection — add room for 4-byte index + auth tag
-                    let srtcp_overhead = 4 + srtcp_ctx.cipher_tag_len();
-                    let mut protected_remb = Vec::with_capacity(remb_packet.len() + srtcp_overhead);
-                    protected_remb.extend_from_slice(&remb_packet);
-                    protected_remb.resize(remb_packet.len() + srtcp_overhead, 0);
-                    let remb_len = remb_packet.len();
-
-                    match srtcp_ctx.protect_rtcp(&mut protected_remb, remb_len) {
-                        Ok(protected_len) => {
-                            protected_remb.truncate(protected_len);
-                            self.send_rtcp_packet(publisher_addr, &protected_remb);
-                            tracing::trace!(
-                                publisher_addr = ?publisher_addr,
-                                "REMB sent to publisher with SRTCP protection"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = ?e,
-                                "Failed to protect REMB with SRTCP, dropping"
-                            );
-                        }
-                    }
-                } else {
-                    // No SRTCP context - skip sending
-                    tracing::trace!(
-                        publisher_addr = ?publisher_addr,
-                        "No SRTCP context for publisher, skipping REMB"
-                    );
-                }
+                .get_mut(&track_id)
+                .and_then(|actor| actor.protect_for_publisher(remb_packet));
+            if let Some((addr, packet)) = protected {
+                self.send_rtcp_packet(addr, &packet);
+                tracing::trace!(publisher_addr = ?addr, "REMB sent to publisher");
             }
         }
 
@@ -2695,35 +2614,11 @@ impl MediaWorker {
                 continue;
             }
 
-            // Need both publisher address and SRTCP context
-            let (publisher_addr, srtcp_ctx) =
-                match (actor.publisher_addr, actor.publisher_srtcp_context.as_mut()) {
-                    (Some(addr), Some(ctx)) => (addr, ctx),
-                    _ => continue,
-                };
-
-            // Generate REMB packet
-            let mut remb_packet = self.remb_generator.generate(estimated_bps, actor.ssrc);
-            let remb_len = remb_packet.len();
-
-            // Ensure buffer has room for SRTCP overhead (4-byte index + auth tag)
-            let srtcp_overhead = 4 + srtcp_ctx.cipher_tag_len();
-            remb_packet.resize(remb_len + srtcp_overhead, 0);
-
-            // Apply SRTCP protection
-            match srtcp_ctx.protect_rtcp(&mut remb_packet, remb_len) {
-                Ok(protected_len) => {
-                    remb_packet.truncate(protected_len);
-                    self.send_rtcp_packet(publisher_addr, &remb_packet);
-                    remb_sent_count += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        track_id,
-                        error = ?e,
-                        "Failed to protect REMB with SRTCP"
-                    );
-                }
+            let remb_packet = nexus_bwe::RembGenerator::new(actor.rtcp_sender_ssrc)
+                .generate(estimated_bps, actor.ssrc);
+            if let Some((addr, protected)) = actor.protect_for_publisher(remb_packet) {
+                self.send_rtcp_packet(addr, &protected);
+                remb_sent_count += 1;
             }
         }
 
@@ -2786,37 +2681,21 @@ impl MediaWorker {
 
             // Build feedback packet
             let fb_packet = nexus_media::rtcp::TwccFeedbackBuilder::build(
-                1, // SFU sender SSRC
+                actor.rtcp_sender_ssrc,
                 actor.ssrc,
                 fb_count,
                 &actor.twcc_arrivals,
             );
             actor.twcc_arrivals.clear();
 
-            let mut fb_data = match fb_packet {
+            let fb_data = match fb_packet {
                 Some(d) => d,
                 None => continue,
             };
 
-            // SRTCP-protect
-            if let Some(ref mut srtcp_ctx) = actor.publisher_srtcp_context {
-                let fb_len = fb_data.len();
-                let srtcp_overhead = 4 + srtcp_ctx.cipher_tag_len();
-                fb_data.resize(fb_len + srtcp_overhead, 0);
-
-                match srtcp_ctx.protect_rtcp(&mut fb_data, fb_len) {
-                    Ok(protected_len) => {
-                        fb_data.truncate(protected_len);
-                        self.send_rtcp_packet(publisher_addr, &fb_data);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            track_id,
-                            error = ?e,
-                            "Failed to protect TWCC feedback with SRTCP"
-                        );
-                    }
-                }
+            if let Some((addr, protected)) = actor.protect_for_publisher(fb_data) {
+                debug_assert_eq!(addr, publisher_addr);
+                self.send_rtcp_packet(addr, &protected);
             }
         }
     }
@@ -2939,44 +2818,29 @@ impl MediaWorker {
                 actor.publisher_addr
             });
 
-        // Find actor and get both publisher address and SRTCP context
-        let (publisher_addr, publisher_srtcp) = self
-            .actors
-            .values_mut()
-            .find(|a| a.ssrc == media_ssrc)
-            .map(|actor| (actor.publisher_addr, actor.publisher_srtcp_context.as_mut()))
-            .unwrap_or((None, None));
+        // Forward with this track's own RTCP sender SSRC and context, not the
+        // subscriber's SSRC (which shares no key with the publisher).
+        let actor = self.actors.values_mut().find(|a| a.ssrc == media_ssrc);
+        let (publisher_addr, has_srtcp, protected) = match actor {
+            Some(actor) => {
+                let pli = Self::build_pli_packet_static(media_ssrc, actor.rtcp_sender_ssrc);
+                (
+                    actor.publisher_addr,
+                    actor.publisher_srtcp_context.is_some(),
+                    actor.protect_for_publisher(pli),
+                )
+            }
+            None => (None, false, None),
+        };
 
-        match (publisher_addr, publisher_srtcp) {
-            (Some(addr), Some(srtcp_ctx)) => {
-                // Build PLI packet with original sender_ssrc
-                let mut pli_packet = Self::build_pli_packet_static(media_ssrc, sender_ssrc);
-                let pli_len = pli_packet.len();
-
-                // Add room for SRTCP overhead (4-byte index + auth tag)
-                let srtcp_overhead = 4 + srtcp_ctx.cipher_tag_len();
-                pli_packet.resize(pli_len + srtcp_overhead, 0);
-
-                // Apply SRTCP protection (Comment 2 fix)
-                match srtcp_ctx.protect_rtcp(&mut pli_packet, pli_len) {
-                    Ok(protected_len) => {
-                        pli_packet.truncate(protected_len);
-                        self.send_rtcp_packet(addr, &pli_packet);
-
-                        tracing::info!(
-                            publisher_addr = ?addr,
-                            "PLI forwarded to publisher with SRTCP protection"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?e,
-                            "Failed to protect PLI with SRTCP, dropping"
-                        );
-                    }
+        match (publisher_addr, has_srtcp) {
+            (Some(_), true) => {
+                if let Some((addr, packet)) = protected {
+                    self.send_rtcp_packet(addr, &packet);
+                    tracing::info!(publisher_addr = ?addr, "PLI forwarded to publisher");
                 }
             }
-            (Some(_), None) => {
+            (Some(_), false) => {
                 tracing::warn!(
                     worker_id = self.worker_id,
                     media_ssrc,
@@ -3149,41 +3013,34 @@ impl MediaWorker {
             return;
         }
 
-        // Build and send NACK to publisher for packets not in ring buffer
-        let (publisher_addr, publisher_srtcp) = self
-            .actors
-            .values_mut()
-            .find(|a| a.ssrc == media_ssrc)
-            .map(|actor| (actor.publisher_addr, actor.publisher_srtcp_context.as_mut()))
-            .unwrap_or((None, None));
+        // Forward upstream with this track's RTCP sender SSRC and context; the
+        // subscriber's SSRC was only needed to find the subscriber above.
+        let actor = self.actors.values_mut().find(|a| a.ssrc == media_ssrc);
+        let (publisher_addr, has_srtcp, protected) = match actor {
+            Some(actor) => {
+                let nack =
+                    Self::build_nack_packet_static(media_ssrc, &remaining, actor.rtcp_sender_ssrc);
+                (
+                    actor.publisher_addr,
+                    actor.publisher_srtcp_context.is_some(),
+                    actor.protect_for_publisher(nack),
+                )
+            }
+            None => (None, false, None),
+        };
 
-        match (publisher_addr, publisher_srtcp) {
-            (Some(addr), Some(srtcp_ctx)) => {
-                let mut nack_packet =
-                    Self::build_nack_packet_static(media_ssrc, &remaining, sender_ssrc);
-                let nack_len = nack_packet.len();
-
-                // Add room for SRTCP overhead (4-byte index + auth tag)
-                let srtcp_overhead = 4 + srtcp_ctx.cipher_tag_len();
-                nack_packet.resize(nack_len + srtcp_overhead, 0);
-
-                match srtcp_ctx.protect_rtcp(&mut nack_packet, nack_len) {
-                    Ok(protected_len) => {
-                        nack_packet.truncate(protected_len);
-                        self.send_rtcp_packet(addr, &nack_packet);
-
-                        tracing::info!(
-                            publisher_addr = ?addr,
-                            remaining_count = remaining.len(),
-                            "NACK forwarded to publisher for packets not in ring buffer"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "Failed to protect NACK with SRTCP");
-                    }
+        match (publisher_addr, has_srtcp) {
+            (Some(_), true) => {
+                if let Some((addr, packet)) = protected {
+                    self.send_rtcp_packet(addr, &packet);
+                    tracing::info!(
+                        publisher_addr = ?addr,
+                        remaining_count = remaining.len(),
+                        "NACK forwarded to publisher for packets not in ring buffer"
+                    );
                 }
             }
-            (Some(_), None) => {
+            (Some(_), false) => {
                 tracing::warn!(
                     worker_id = self.worker_id,
                     media_ssrc,
@@ -3339,11 +3196,18 @@ impl MediaWorker {
         assert!(track_id > 0, "Track ID must be non-zero");
 
         if let Some(actor) = self.actors.get_mut(&track_id) {
-            // Create SRTCP context from key material
+            // Same key: keep the context. A new context would restart the
+            // SRTCP index at 0 and reuse keystream.
+            let same_key = actor.publisher_srtcp_key.as_ref() == Some(&key_material);
+            if same_key && actor.publisher_srtcp_context.is_some() {
+                self.actor_messages_processed += 1;
+                return;
+            }
             match nexus_transport::srtp::SrtpContext::new(&key_material, srtp_policy) {
                 Ok(srtcp_context) => {
                     let is_update = actor.publisher_srtcp_context.is_some();
                     actor.publisher_srtcp_context = Some(srtcp_context);
+                    actor.publisher_srtcp_key = Some(key_material);
                     tracing::info!(
                         worker_id = self.worker_id,
                         track_id,
@@ -3498,8 +3362,6 @@ impl MediaWorker {
                     max_requested_layer: target_layer,
                     viewport_visible: Vec::new(),
                     viewport_pinned: Vec::new(),
-                    is_relay: false,
-                    relay_node: 0,
                     pt_override: 0,
                     outbound_ssrc: 0,
                 });
@@ -3672,9 +3534,6 @@ pub struct WorkerPool {
     migration_metrics: Arc<MigrationMetrics>,
     /// Last rebalance timestamp (nanos since epoch).
     last_rebalance_time: Arc<AtomicU64>,
-    /// Receiver for relay output packets from workers.
-    /// Drained by the SFU main loop and forwarded to RelayManager.
-    relay_out_rx: crossbeam::channel::Receiver<RelayOutput>,
 }
 
 impl WorkerPool {
@@ -3759,9 +3618,6 @@ impl WorkerPool {
             Vec::new()
         };
 
-        // Relay output channel — all workers share the sender.
-        // SFU main loop drains relay_out_rx → RelayManager.
-        let (relay_out_tx, relay_out_rx) = crossbeam::channel::bounded::<RelayOutput>(8192);
         let ring_retention = Arc::new(AtomicU32::new(ACTOR_RING_CAPACITY as u32));
 
         // =========================================================================
@@ -3892,7 +3748,6 @@ impl WorkerPool {
             let spsc_receivers: Vec<Option<super::spsc::SpscReceiver<4096>>> =
                 std::mem::take(&mut worker_receivers[worker_id as usize]);
 
-            let relay_tx_clone = relay_out_tx.clone();
             let ring_retention_clone = Arc::clone(&ring_retention);
 
             // Spawn worker thread
@@ -3957,7 +3812,6 @@ impl WorkerPool {
                         Ok(mut worker) => {
                             // Set SPSC channel handles (Requirement 1.3)
                             worker.set_spsc_channels(spsc_receivers, spsc_senders);
-                            worker.relay_out_tx = Some(relay_tx_clone);
                             worker.ring_retention = ring_retention_clone;
                             worker.run()
                         }
@@ -4072,7 +3926,6 @@ impl WorkerPool {
             migration_event_tx,
             migration_metrics: Arc::new(MigrationMetrics::new()),
             last_rebalance_time: Arc::new(AtomicU64::new(0)),
-            relay_out_rx,
             ring_retention,
         })
     }
@@ -4180,6 +4033,9 @@ impl WorkerPool {
     ///
     /// * `track_id` - ID of the track to remove
     pub fn remove_track(&mut self, track_id: TrackId) -> Result<(), WorkerError> {
+        // The ingress loop's record of the key sent for this track goes too,
+        // so the cache does not grow over the process lifetime.
+        crate::sfu::forget_publisher_srtcp(track_id);
         if let Some(worker_id) = self.track_to_worker.remove(&track_id) {
             let worker = &self.workers[worker_id as usize];
             worker.send(WorkerMessage::RemoveTrack { track_id })?;
@@ -4494,80 +4350,6 @@ impl WorkerPool {
         worker.send(WorkerMessage::SetContentType {
             track_id,
             content_type,
-        })
-    }
-
-    /// Get the relay output receiver. The SFU main loop drains this
-    /// and forwards packets to `RelayManager::relay_packet()`.
-    pub fn relay_output_rx(&self) -> &crossbeam::channel::Receiver<RelayOutput> {
-        &self.relay_out_rx
-    }
-
-    /// Add a relay subscriber to a track (for cascade to a peer node).
-    ///
-    /// # TigerStyle: ≥2 assertions
-    pub fn add_relay_subscriber(
-        &self,
-        track_id: TrackId,
-        peer_node: u64,
-    ) -> Result<(), WorkerError> {
-        assert!(track_id != 0, "track_id must be non-zero");
-        assert!(peer_node != 0, "peer_node must be non-zero");
-
-        let worker_id = match self.track_to_worker.get(&track_id) {
-            Some(&id) => id,
-            None => {
-                return Err(WorkerError::InvalidConfig {
-                    message: format!("track {} not assigned to worker", track_id),
-                })
-            }
-        };
-
-        let worker = match self.get_worker(worker_id) {
-            Some(w) => w,
-            None => {
-                return Err(WorkerError::InvalidConfig {
-                    message: format!("worker {} not found", worker_id),
-                })
-            }
-        };
-
-        // Derive subscriber_id from peer_node to ensure uniqueness.
-        let subscriber_id = (peer_node & 0x7FFFFFFF) as u32 | 0x80000000; // High bit set = relay
-
-        worker.send(WorkerMessage::AddRelaySubscriber {
-            track_id,
-            peer_node,
-            subscriber_id,
-        })
-    }
-
-    /// Inject a relay packet from a peer node into the local worker pipeline.
-    ///
-    /// # TigerStyle: ≥2 assertions
-    pub fn inject_relay_packet(
-        &self,
-        track_id: TrackId,
-        data: [u8; 1500],
-        len: u16,
-    ) -> Result<(), WorkerError> {
-        assert!(track_id != 0, "track_id must be non-zero");
-        assert!(len > 0, "len must be positive");
-
-        let worker_id = match self.track_to_worker.get(&track_id) {
-            Some(&id) => id,
-            None => return Ok(()), // Track not on this node — ignore.
-        };
-
-        let worker = match self.get_worker(worker_id) {
-            Some(w) => w,
-            None => return Ok(()),
-        };
-
-        worker.send(WorkerMessage::RelayPacket {
-            track_id,
-            data: Box::new(data),
-            len,
         })
     }
 
@@ -5075,5 +4857,189 @@ mod tests {
 
         assert_eq!(pool.running_worker_count(), 3);
         assert!(pool.all_workers_healthy());
+    }
+
+    // ── SRTCP toward publishers: no (sender SSRC, index) reuse ───────────
+
+    mod publisher_srtcp {
+        use super::*;
+        use nexus_transport::srtp::{KeyMaterial, ProtectionProfile, SrtpContext, SrtpPolicy};
+        use std::collections::HashSet;
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+        use std::time::Duration;
+
+        const VIDEO_A: u32 = 0x1111_1111;
+        const VIDEO_B: u32 = 0x2222_2222;
+        const SUBSCRIBER_SSRC: u32 = 0x5555_5555;
+
+        fn publisher_key() -> KeyMaterial {
+            let profile = ProtectionProfile::Aes128CmHmacSha1_80;
+            let len = profile.key_len() + profile.salt_len();
+            let material: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(7) | 1).collect();
+            KeyMaterial::from_dtls_export(&material, profile).unwrap()
+        }
+
+        fn policy() -> SrtpPolicy {
+            SrtpPolicy {
+                profile: ProtectionProfile::Aes128CmHmacSha1_80,
+                ..SrtpPolicy::default()
+            }
+        }
+
+        /// A standalone worker with two video tracks of one publisher, both
+        /// holding SRTCP contexts built from the publisher's single key.
+        struct Rig {
+            worker: MediaWorker,
+            tx: Sender<WorkerMessage>,
+            publisher: UdpSocket,
+            _send_socket: UdpSocket,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                let send_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let publisher = UdpSocket::bind("127.0.0.1:0").unwrap();
+                publisher
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let (mut worker, tx) =
+                    MediaWorker::new_standalone(16, send_socket.as_raw_fd()).unwrap();
+                for (track_id, ssrc) in [(1, VIDEO_A), (2, VIDEO_B)] {
+                    tx.send(WorkerMessage::SpawnActor {
+                        track_id,
+                        participant_id: 7,
+                        ssrc,
+                        kind: MediaKind::Video,
+                        content_type: 0,
+                    })
+                    .unwrap();
+                }
+                worker.process_one_iteration();
+                let addr = publisher.local_addr().unwrap();
+                for actor in worker.actors.values_mut() {
+                    actor.publisher_addr = Some(addr);
+                }
+                let mut rig = Self {
+                    worker,
+                    tx,
+                    publisher,
+                    _send_socket: send_socket,
+                };
+                rig.set_key(1);
+                rig.set_key(2);
+                rig
+            }
+
+            fn set_key(&mut self, track_id: TrackId) {
+                self.tx
+                    .send(WorkerMessage::SetPublisherSrtcp {
+                        track_id,
+                        key_material: publisher_key(),
+                        srtp_policy: policy(),
+                    })
+                    .unwrap();
+                self.worker.process_one_iteration();
+            }
+
+            /// Every RTCP datagram the publisher received so far.
+            fn received(&mut self) -> Vec<Vec<u8>> {
+                self.worker.flush_batches();
+                let mut out = Vec::new();
+                let mut buf = [0u8; 1500];
+                while let Ok(n) = self.publisher.recv(&mut buf) {
+                    out.push(buf[..n].to_vec());
+                }
+                out
+            }
+        }
+
+        /// (sender SSRC, SRTCP index) of a protected packet, from the wire.
+        fn sender_and_index(packet: &[u8]) -> (u32, u32) {
+            let tag = 10; // AES_CM_128_HMAC_SHA1_80
+            let e_index = &packet[packet.len() - tag - 4..packet.len() - tag];
+            let index = u32::from_be_bytes(e_index.try_into().unwrap()) & 0x7FFF_FFFF;
+            let sender = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+            (sender, index)
+        }
+
+        #[test]
+        fn test_publisher_rtcp_never_reuses_sender_and_index() {
+            let mut rig = Rig::new();
+            let senders: Vec<u32> = rig
+                .worker
+                .actors
+                .values()
+                .map(|a| a.rtcp_sender_ssrc)
+                .collect();
+            assert_ne!(senders[0], senders[1], "one sender SSRC per track");
+
+            // process_one_iteration already ran REMB on the real clock.
+            let base = rig.worker.last_remb_sent_us;
+            for round in 1..=3u64 {
+                rig.worker.generate_and_send_remb(base + round * 2_000_000);
+                rig.worker.handle_rtcp_pli(VIDEO_A, SUBSCRIBER_SSRC);
+                rig.worker.handle_rtcp_pli(VIDEO_B, SUBSCRIBER_SSRC);
+            }
+            let packets = rig.received();
+            assert_eq!(packets.len(), 12, "2 tracks x 3 rounds x (REMB + PLI)");
+
+            let mut seen = HashSet::new();
+            let mut inbound = SrtpContext::new(&publisher_key(), policy()).unwrap();
+            for packet in &packets {
+                let (sender, index) = sender_and_index(packet);
+                assert!(senders.contains(&sender), "sender SSRC {sender:#x}");
+                assert!(
+                    seen.insert((sender, index)),
+                    "reused ({sender:#x}, {index})"
+                );
+                // The publisher's inbound context accepts every packet.
+                let mut buf = packet.clone();
+                inbound.unprotect_rtcp(&mut buf, packet.len()).unwrap();
+            }
+        }
+
+        #[test]
+        fn test_same_key_keeps_srtcp_index() {
+            let mut rig = Rig::new();
+            rig.worker.handle_rtcp_pli(VIDEO_A, SUBSCRIBER_SSRC);
+            rig.set_key(1); // same key again (e.g. the ingress cache was evicted)
+            rig.worker.handle_rtcp_pli(VIDEO_A, SUBSCRIBER_SSRC);
+            let indices: Vec<u32> = rig
+                .received()
+                .iter()
+                .map(|p| sender_and_index(p).1)
+                .collect();
+            assert_eq!(indices, vec![0, 1]);
+        }
+
+        #[test]
+        fn test_new_media_ssrc_never_equals_rtcp_sender_ssrc() {
+            let mut rig = Rig::new();
+            let sender = rig.worker.actors[&1].rtcp_sender_ssrc;
+            rig.tx
+                .send(WorkerMessage::SetSsrc {
+                    track_id: 1,
+                    ssrc: sender,
+                })
+                .unwrap();
+            rig.worker.process_one_iteration();
+            let actor = &rig.worker.actors[&1];
+            assert_eq!(actor.ssrc, sender);
+            assert_ne!(actor.rtcp_sender_ssrc, sender);
+            assert_ne!(actor.rtcp_sender_ssrc, 0);
+        }
+
+        #[test]
+        fn test_remove_track_forgets_srtcp_cache_entry() {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut pool = WorkerPool::new(1, 16, socket.as_raw_fd(), false, false, 0).unwrap();
+            let (track_id, _) = pool.assign_track(VIDEO_A, MediaKind::Video).unwrap();
+            crate::sfu::remember_publisher_srtcp_for_test(track_id);
+            assert!(crate::sfu::publisher_srtcp_cached(track_id));
+            pool.remove_track(track_id).unwrap();
+            assert!(!crate::sfu::publisher_srtcp_cached(track_id));
+            pool.shutdown().unwrap();
+        }
     }
 }

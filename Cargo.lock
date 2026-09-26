@@ -1891,7 +1891,6 @@ dependencies = [
  "jsonwebtoken",
  "nexus-core",
  "nexus-metrics",
- "nexus-recorder",
  "nexus-state",
  "parking_lot",
  "serde",
@@ -1947,6 +1946,7 @@ dependencies = [
 name = "nexus-loadtest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "clap",
  "futures-util",
@@ -1990,22 +1990,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-recorder"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "nexus-core",
- "parking_lot",
- "serde",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "nexus-sfu"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "axum",
  "capnp",
  "capnpc",
@@ -2015,17 +2002,16 @@ dependencies = [
  "dashmap",
  "futures-util",
  "getrandom 0.2.17",
- "hmac",
  "http 1.4.0",
  "hyper",
  "io-uring",
  "libc",
- "md-5",
  "memmap2",
  "nexus-actor",
  "nexus-api",
  "nexus-bwe",
  "nexus-core",
+ "nexus-loadtest",
  "nexus-media",
  "nexus-metrics",
  "nexus-signal",
@@ -2035,16 +2021,17 @@ dependencies = [
  "notify",
  "num_cpus",
  "once_cell",
+ "openssl",
  "parking_lot",
  "proptest",
  "prost",
  "prost-build",
  "rand 0.8.5",
+ "ring 0.17.14",
  "rustls 0.22.4",
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha1",
  "sysinfo",
  "thiserror 1.0.69",
  "tokio",
@@ -2113,6 +2100,7 @@ dependencies = [
  "crc32fast",
  "crossbeam",
  "ctr",
+ "foreign-types",
  "getrandom 0.2.17",
  "hmac",
  "io-uring",
@@ -2122,6 +2110,7 @@ dependencies = [
  "nexus-core",
  "nexus-media",
  "openssl",
+ "openssl-sys",
  "proptest",
  "rcgen 0.12.1",
  "ring 0.17.14",

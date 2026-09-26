@@ -266,23 +266,6 @@ pub enum WorkerMessage {
     /// Set content type on a track actor (0=camera, 1=screen, 2=audio).
     /// Screen share tracks bypass viewport filtering.
     SetContentType { track_id: TrackId, content_type: u8 },
-
-    /// Add a relay subscriber — forwards packets to a peer SFU node.
-    /// No SRTP needed (inter-node traffic on private network).
-    AddRelaySubscriber {
-        track_id: TrackId,
-        peer_node: u64,
-        /// Subscriber ID (derived from peer_node for uniqueness).
-        subscriber_id: u32,
-    },
-
-    /// Inject a relay packet received from a peer node into the local pipeline.
-    /// Data is boxed to avoid bloating the enum size (1500 bytes → pointer).
-    RelayPacket {
-        track_id: TrackId,
-        data: Box<[u8; 1500]>,
-        len: u16,
-    },
 }
 
 /// Worker statistics for monitoring.
