@@ -145,6 +145,29 @@ keeps the index; a test that the cache entry is gone after `RemoveTrack`.
 
 ---
 
+#### d) SRTP keystream reuse on re-subscribe
+
+**Problem** (found in the Phase 0 review): a subscription's `SrtpContext` is built fresh in
+`handle_session_established` (`src/orchestrator/subscription.rs`) from the subscriber
+session's key. The SSRC is not rewritten (`outbound_ssrc: 0`) and `seq_counter` starts at
+0 (`src/worker/pool.rs`, `add_subscriber`). A client that sends `Unsubscribe` then
+`Subscribe` for the same track gets a new context with the same key, SSRC and packet
+indices as the first one: AES-CM keystream reuse on media, and for AES-GCM nonce reuse,
+which also exposes the authentication key.
+
+**Change** (the proper fix, one outbound context per session, is Phase 1; this closes it on
+the legacy path): when a subscriber is removed, the worker keeps that subscription's
+`SrtpContext` and last `seq_counter`, keyed by (subscriber, publisher SSRC); a later
+`AddSubscriber` for the same pair with equal `KeyMaterial` reuses them and continues the
+sequence, so ROC/sequence never restart under the same key. Entries are dropped when the
+subscriber session closes (bounded map, oldest evicted, and an evicted pair must not be
+reused: on eviction, refuse the re-subscribe for that pair with an error rather than start
+at 0).
+
+**Tests:** worker test: subscribe, forward N packets, unsubscribe, subscribe again, forward
+more; decrypt everything with one receiving context and assert no (SSRC, index) repeats.
+E2E: the same through signaling.
+
 ### 0.2 Delete dead code
 
 One commit per item, so each can be reverted alone. After each: `cargo build`, `clippy
@@ -269,7 +292,8 @@ running in CI on every push. Every later phase adds its exit checks here.
 | 0.1c SRTCP nonce reuse | Done | Phase 0 commit | Per-track `rtcp_sender_ssrc` on REMB/TWCC/PLI/NACK; same key keeps the context; cache entry removed with the track |
 | 0.2 Dead code | Done | Phase 0 commit | 21,700 lines removed, 3,900 added across all of Phase 0; `tests/pps_pipeline.rs` rewritten without `ActorManager` |
 | 0.3 E2E harness | Done | Phase 0 commit | `src/server.rs` (`start` → `ServerHandle`), `tests/e2e.rs`: 3 tests, ~10 s on macOS |
-| 0.4 Measurements | Partial | Phase 0 commit | Benches, RFC 3711/7714 packet vectors and macOS numbers done; two AES-GCM interop bugs found and fixed. **Left:** run `srtp_backends` and `udp_floor` on Linux arm64 (Docker) and x86_64, then confirm or revise §2 and pick the backends (revision log) |
+| 0.1d SRTP reuse on re-subscribe | Not started | | Found in review; see 0.1d |
+| 0.4 Measurements | Done (x86_64 left for CI) | Phase 0 commit + results commit | Linux arm64: GCM → ring (0.24 µs), CM → RustCrypto (0.77 µs), `sendmmsg` floor 1.06 µs; 500K/core confirmed for AES-GCM (design revision log). x86_64 runs when the CI billing lock is cleared |
 
 ### Session log
 
@@ -294,3 +318,16 @@ Add one line per working session: date, part, what was done, what is left.
   host disk filled, so nothing ran on Linux: the Linux build, clippy and `cargo test
   --workspace` (incl. e2e) are unverified locally and are left to CI. Next: Linux runs of
   both benches, then close exit criterion 4.
+- 2026-09-26, review and verification (separate session): reviewed the Phase 0 commit.
+  AES-GCM fixes checked against RFC 7714 vectors and webrtc-srtp. Fixed from the review:
+  interface fallback filtered by family during enumeration (IPv6 could fill all 8 slots;
+  `::` bind now dual-stack); `two_party_audio_video` asserts each side receives exactly the
+  peer's SSRCs; the DTLS e2e test asserts the dropped datagram is the SFU's ClientHello and
+  uses the plan's 3 s deadline; `set_dtls_role` returns an error instead of panicking on a
+  closed session; `Create` wait has a timeout; `run.sh` no longer mentions QUIC. Verified:
+  fmt, clippy, all tests (1,814 macOS / 1,815 Linux arm64, incl. e2e and `--features sim`),
+  release build, bench smoke, memory budget. Linux 0.4 benches run on an idle machine.
+  Deferred low findings: an answer with `setup:passive` after DTLS started is dropped with a
+  warning instead of failing the session (`negotiation.rs`); `SRTCP_SENT_CACHE` can keep a
+  stale entry if a packet races `forget_publisher_srtcp` (bounded). New: 0.1d.
+  Left in Phase 0: 0.1d, x86_64 numbers.

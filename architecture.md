@@ -164,6 +164,16 @@ covered by `tests/e2e.rs`.
   publisher carries its track's own random `rtcp_sender_ssrc` and is protected with that
   track's context, a repeated key keeps the existing context, and the ingress key cache
   forgets removed tracks. The structural fix (one context per session) is Phase 1.
+- **SRTP keystream reuse on re-subscribe (open).** Each subscription gets a fresh
+  `SrtpContext` from the subscriber session's key, with the publisher's SSRC (not
+  rewritten) and a sequence counter starting at 0. `Unsubscribe` then `Subscribe` for the
+  same track on the same session repeats the (key, SSRC, packet index) sequence: keystream
+  reuse on media with AES-CM, nonce reuse with AES-GCM. Any client can trigger it. Plan:
+  `docs/plans/phase-0.md` 0.1d; removed by construction in Phase 1 (one outbound context
+  per session).
+- **Subscriber SR contexts** share the same weakness: the per-subscription context also
+  protects the SRs sent to that subscriber, so they restart at SRTCP index 0 on
+  re-subscribe. Covered by the same fix.
 
 ### 2.3 Code not reachable from `main.rs`
 
@@ -282,9 +292,22 @@ sockets; no NIC.
 | **A+V publisher, no subscriptions** | **1,526 KB** + 6,000 KB arena | — |
 | **+ subscribed to 10 A+V publishers** | **1,615 KB** + 6,000 KB arena | — |
 
-**SRTP backends** (Phase 0.4, `cargo bench --bench srtp_backends`; **macOS arm64, Apple M2
-Pro, not yet Linux**). Median ns per packet, 20-byte RTP header + payload; every backend's
-output is checked byte-for-byte against `SrtpContext` before timing.
+**SRTP backends** (Phase 0.4, `cargo bench --bench srtp_backends`). Median ns per packet,
+20-byte RTP header + payload; every backend's output is checked byte-for-byte against
+`SrtpContext` before timing.
+
+Linux arm64 (Docker VM, 6 vCPUs, Apple M2 Pro host, idle machine):
+
+| Profile | Backend | protect 160 B | protect 1,200 B | unprotect 160 B | unprotect 1,200 B |
+|---------|---------|--------------:|----------------:|----------------:|------------------:|
+| AES-CM-HMAC-SHA1-80 | RustCrypto `SrtpContext` (current) | 238 | 763 | 247 | 773 |
+| AES-CM-HMAC-SHA1-80 | OpenSSL CTR + OpenSSL HMAC¹ | 391 | 839 | 346 | 810 |
+| AES-CM-HMAC-SHA1-80 | OpenSSL CTR + ring HMAC² | 924 | 3,596 | 936 | 3,277 |
+| AES-128-GCM | RustCrypto `SrtpContext` (current) | 440 | 2,279 | 495 | 2,226 |
+| AES-128-GCM | OpenSSL EVP | 131 | 290 | 126 | 266 |
+| AES-128-GCM | ring `LessSafeKey` | 103 | 238 | 107 | 258 |
+
+macOS arm64 (Apple M2 Pro, native):
 
 | Profile | Backend | protect 160 B | protect 1,200 B | unprotect 160 B | unprotect 1,200 B |
 |---------|---------|--------------:|----------------:|----------------:|------------------:|
@@ -303,8 +326,19 @@ the AEAD KDF put the label in salt byte 6 instead of 7 (wrong RTP salt and RTCP 
 SRTCP put E+index before the tag instead of after it. AES-GCM therefore never worked with
 browsers; it went unnoticed because AES-CM is offered first.
 
-Not measured yet: the Linux arm64 / x86_64 runs of both benches and the kernel `sendmmsg`
-floor (`cargo bench --bench udp_floor`, Linux only). See `docs/plans/phase-0.md`.
+**Kernel UDP floor** (`cargo bench --bench udp_floor`, Linux arm64, same VM): raw
+`sendmmsg`/`recvmmsg` of 1,200-byte datagrams in batches of 64 over loopback, no SFU code.
+
+| Operation | ns per datagram |
+|-----------|----------------:|
+| `sendmmsg`, 1 destination | 665 |
+| `sendmmsg`, 10 destinations | 895 |
+| `sendmmsg`, 100 destinations | 1,058 |
+| `recvmmsg` | 418 |
+
+Loopback delivers each datagram to the receiving socket inside the sender's system call, so
+these include receive-side work a NIC transmit would not; treat them as an upper bound for
+the send floor on this machine. Not measured: x86_64 (needs the CI runner) and a real NIC.
 
 Known gaps: no benchmark covers kernel receive, a real NIC, or latency (P50/P99) under
 load. "Packets/sec" always needs to say ingress (published) or egress (forwarded).
