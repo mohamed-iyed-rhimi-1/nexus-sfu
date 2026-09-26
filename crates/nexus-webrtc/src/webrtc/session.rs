@@ -1576,10 +1576,14 @@ impl WebRtcSession {
     /// the answer makes us the client. Only allowed before the handshake
     /// starts; the local certificate and fingerprint do not change.
     pub fn set_dtls_role(&mut self, role: DtlsRole) -> Result<(), WebRtcError> {
-        if self.dtls_session.is_some()
+        // The engine's own flag, not only the session state: `close()` resets
+        // the state but a started engine cannot change role (it asserts).
+        let engine_started = self.openssl_dtls.as_ref().is_some_and(|e| e.is_started());
+        if engine_started
+            || self.dtls_session.is_some()
             || matches!(
                 self.state,
-                SessionState::DtlsHandshaking | SessionState::Established
+                SessionState::DtlsHandshaking | SessionState::Established | SessionState::Closed
             )
         {
             return Err(WebRtcError::InvalidState);

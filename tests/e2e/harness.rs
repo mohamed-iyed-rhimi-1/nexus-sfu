@@ -34,7 +34,7 @@ pub fn init_logging() {
 /// candidates, so a client can only pair with a candidate on a real
 /// interface; the SFU and clients share this host.
 pub fn announced_ip() -> IpAddr {
-    let ips = nexus_sfu::nexus_transport::ice::gather::host_interface_ips();
+    let ips = nexus_sfu::nexus_transport::ice::gather::host_interface_ips(IpAddr::is_ipv4);
     ips.iter()
         .flatten()
         .copied()

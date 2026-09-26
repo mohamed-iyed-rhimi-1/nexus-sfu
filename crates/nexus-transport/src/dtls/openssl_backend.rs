@@ -332,6 +332,11 @@ impl OpenSslDtlsEngine {
         &self.certificate_der
     }
 
+    /// Whether the handshake has been started (the role is fixed from then on).
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+
     /// Whether the handshake is complete.
     pub fn is_established(&self) -> bool {
         self.established

@@ -24,7 +24,7 @@ readonly NOFILE_LIMIT="65536"
 
 # Host ports. Container ports are fixed by config/production.toml.
 readonly MEDIA_PORT="${MEDIA_PORT:-10000}"       # RTP/RTCP, udp
-readonly SIGNAL_PORT="${SIGNAL_PORT:-443}"       # WSS on tcp, QUIC on udp
+readonly SIGNAL_PORT="${SIGNAL_PORT:-443}"       # WSS (tcp)
 readonly API_PORT="${API_PORT:-8081}"            # REST API, /health, /ready
 readonly METRICS_PORT="${METRICS_PORT:-9090}"    # Prometheus
 
@@ -86,7 +86,6 @@ docker run \
     --volume "${TLS_CERT}:/etc/nexus/tls/cert.pem:ro" \
     --volume "${TLS_KEY}:/etc/nexus/tls/key.pem:ro" \
     --publish "${MEDIA_PORT}:10000/udp" \
-    --publish "${SIGNAL_PORT}:443/udp" \
     --publish "${SIGNAL_PORT}:443/tcp" \
     --publish "${API_PORT}:8081/tcp" \
     --publish "${METRICS_PORT}:9090/tcp" \
@@ -115,7 +114,7 @@ if ((elapsed >= READY_TIMEOUT_SECONDS)); then
 fi
 
 echo ""
-echo "  Signaling: wss://localhost:${SIGNAL_PORT} (QUIC on udp/${SIGNAL_PORT})"
+echo "  Signaling: wss://localhost:${SIGNAL_PORT}"
 echo "  Health:    http://localhost:${API_PORT}/health"
 echo "  Metrics:   http://localhost:${METRICS_PORT}/metrics"
 echo "  Logs:      docker logs -f ${CONTAINER_NAME}"

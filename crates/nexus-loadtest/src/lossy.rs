@@ -79,7 +79,12 @@ struct RuleState {
     rule: LossRule,
     seen: u64,
     dropped: u64,
+    /// Leading bytes of the first datagram this rule dropped.
+    first_dropped: Option<Vec<u8>>,
 }
+
+/// Bytes of a dropped datagram kept by [`LossRules::first_dropped`].
+const DROPPED_SAMPLE_BYTES: usize = 32;
 
 /// Rules shared between a test and the client's socket. Rules can be added
 /// while the client runs.
@@ -110,6 +115,7 @@ impl LossRules {
             rule,
             seen: 0,
             dropped: 0,
+            first_dropped: None,
         });
     }
 
@@ -117,6 +123,13 @@ impl LossRules {
     pub fn dropped_by_rule(&self) -> Vec<u64> {
         let rules = self.rules.lock().expect("loss rules lock");
         rules.iter().map(|r| r.dropped).collect()
+    }
+
+    /// Leading bytes (up to 32) of the first datagram rule `index` dropped,
+    /// so a test can check it dropped what it meant to.
+    pub fn first_dropped(&self, index: usize) -> Option<Vec<u8>> {
+        let rules = self.rules.lock().expect("loss rules lock");
+        rules.get(index).and_then(|r| r.first_dropped.clone())
     }
 
     /// Datagrams dropped and passed so far.
@@ -142,6 +155,10 @@ impl LossRules {
             if in_window && self.roll(state.rule.rate_permille) {
                 state.dropped += 1;
                 drop = true;
+                if state.first_dropped.is_none() {
+                    let len = datagram.len().min(DROPPED_SAMPLE_BYTES);
+                    state.first_dropped = Some(datagram[..len].to_vec());
+                }
             }
         }
         let counter = if drop {

@@ -57,8 +57,7 @@ pub fn select_candidate_ips(
             .flatten()
             .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
             .copied()
-            // A socket bound to 0.0.0.0 cannot receive on IPv6 addresses.
-            .filter(|ip| ip.is_ipv4() == bind_ip.is_ipv4())
+            .filter(|ip| family_reachable(bind_ip, ip))
             .collect();
         (usable, CandidateSource::Interfaces)
     };
@@ -72,6 +71,32 @@ pub fn select_candidate_ips(
     (ips, source)
 }
 
+/// Whether a socket bound to the wildcard `bind_ip` receives on `ip`.
+///
+/// `0.0.0.0` receives IPv4 only. `::` is dual-stack: nothing sets
+/// `IPV6_V6ONLY`, and Linux and macOS default it to off.
+fn family_reachable(bind_ip: IpAddr, ip: &IpAddr) -> bool {
+    bind_ip.is_ipv6() || ip.is_ipv4()
+}
+
+/// Interface addresses for a wildcard bind: IPv4 first, then (for a
+/// dual-stack `::` bind) IPv6 in the remaining slots.
+fn interface_ips(bind_ip: IpAddr) -> [Option<IpAddr>; MAX_INTERFACES] {
+    use nexus_transport::ice::gather::host_interface_ips;
+    let mut out = host_interface_ips(IpAddr::is_ipv4);
+    if bind_ip.is_ipv6() {
+        let v6 = host_interface_ips(IpAddr::is_ipv6);
+        let free = out
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(MAX_INTERFACES);
+        for (slot, ip) in out[free..].iter_mut().zip(v6.iter().flatten()) {
+            *slot = Some(*ip);
+        }
+    }
+    out
+}
+
 /// Candidate socket addresses for the media socket bound at `bound`.
 pub fn candidate_addrs(
     announced: &[IpAddr],
@@ -79,7 +104,7 @@ pub fn candidate_addrs(
 ) -> (Vec<SocketAddr>, CandidateSource) {
     assert!(bound.port() != 0, "candidate port must be the bound port");
     let interfaces = if announced.is_empty() && bound.ip().is_unspecified() {
-        nexus_transport::ice::gather::host_interface_ips()
+        interface_ips(bound.ip())
     } else {
         [None; MAX_INTERFACES]
     };
@@ -149,6 +174,13 @@ mod tests {
         let (ips, source) = select_candidate_ips(&[], ip("0.0.0.0"), &interfaces);
         assert_eq!(ips, vec![ip("192.168.1.2"), ip("10.1.2.3")]);
         assert_eq!(source, CandidateSource::Interfaces);
+    }
+
+    #[test]
+    fn dual_stack_wildcard_keeps_both_families() {
+        let interfaces = [Some(ip("192.168.1.2")), Some(ip("2001:db8::1")), None];
+        let (ips, _) = select_candidate_ips(&[], ip("::"), &interfaces);
+        assert_eq!(ips, vec![ip("192.168.1.2"), ip("2001:db8::1")]);
     }
 
     #[test]

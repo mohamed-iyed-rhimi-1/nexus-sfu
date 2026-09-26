@@ -1397,6 +1397,18 @@ mod tests {
         assert_eq!(again, Some(Err(WebRtcError::InvalidState)));
     }
 
+    /// A late answer for a closed session whose handshake had started is an
+    /// error, not a panic (the engine asserts its role cannot change).
+    #[test]
+    fn test_dtls_role_after_close_is_error() {
+        let (transport, id, _peer, _hello) = sfu_as_dtls_client();
+        let result = transport.with_session_mut(id, |s| {
+            s.close();
+            s.set_dtls_role(EngineRole::Server)
+        });
+        assert_eq!(result, Some(Err(WebRtcError::InvalidState)));
+    }
+
     #[test]
     fn test_dtls_no_retransmit_before_timeout() {
         let (transport, id, _peer, _hello) = sfu_as_dtls_client();

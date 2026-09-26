@@ -1131,21 +1131,25 @@ fn enumerate_interfaces() -> Result<[Option<IpAddr>; MAX_INTERFACES], IceError> 
 /// Addresses of this host that remote peers are most likely to reach, for
 /// advertising as ICE host candidates when no address is configured.
 ///
+/// Only addresses `accept` allows are considered, and the filter runs during
+/// enumeration, so addresses of an unwanted family cannot use up the
+/// `MAX_INTERFACES` slots (hosts often have many IPv6 addresses).
+///
 /// Skips unspecified, loopback and IPv4 link-local addresses, unless nothing
 /// else exists, in which case loopback addresses are returned (a single-host
 /// setup). Best effort: behind NAT none of these may be reachable, which is
 /// why `transport.announced_ips` exists.
-pub fn host_interface_ips() -> [Option<IpAddr>; MAX_INTERFACES] {
+pub fn host_interface_ips(accept: impl Fn(&IpAddr) -> bool) -> [Option<IpAddr>; MAX_INTERFACES] {
     let routable = |ip: &IpAddr| {
         let link_local_v4 = matches!(ip, IpAddr::V4(v4) if v4.is_link_local());
-        !ip.is_unspecified() && !ip.is_loopback() && !link_local_v4
+        !ip.is_unspecified() && !ip.is_loopback() && !link_local_v4 && accept(ip)
     };
     let none = || std::array::from_fn(|_| None);
     let found = enumerate_interfaces_where(routable).unwrap_or_else(|_| none());
     if found[0].is_some() {
         return found;
     }
-    enumerate_interfaces_where(|ip| ip.is_loopback()).unwrap_or_else(|_| none())
+    enumerate_interfaces_where(|ip| ip.is_loopback() && accept(ip)).unwrap_or_else(|_| none())
 }
 
 /// Enumerate up to MAX_INTERFACES addresses of interfaces that are up,
@@ -1242,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_host_interface_ips_never_unspecified() {
-        let ips = host_interface_ips();
+        let ips = host_interface_ips(|_| true);
         let found: Vec<IpAddr> = ips.iter().flatten().copied().collect();
         assert!(found.iter().all(|ip| !ip.is_unspecified()));
         // Loopback only appears when nothing else exists.
@@ -1253,6 +1257,14 @@ mod tests {
         // Filled front to back.
         let count = found.len();
         assert!(ips[count..].iter().all(|ip| ip.is_none()));
+    }
+
+    #[test]
+    fn test_host_interface_ips_filters_family() {
+        let v4 = host_interface_ips(IpAddr::is_ipv4);
+        assert!(v4.iter().flatten().all(IpAddr::is_ipv4));
+        let v6 = host_interface_ips(IpAddr::is_ipv6);
+        assert!(v6.iter().flatten().all(IpAddr::is_ipv6));
     }
 
     #[test]

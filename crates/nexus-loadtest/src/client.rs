@@ -938,6 +938,21 @@ impl HeadlessClient {
             .is_some_and(|pc| pc.connection_state() == RTCPeerConnectionState::Connected)
     }
 
+    /// SSRCs this client sends on (one per published track).
+    pub async fn published_ssrcs(&self) -> Vec<u32> {
+        let Some(pc) = self.peer_connection.as_ref() else {
+            return Vec::new();
+        };
+        let mut ssrcs = Vec::new();
+        for sender in pc.get_senders().await {
+            if sender.track().await.is_some() {
+                let params = sender.get_parameters().await;
+                ssrcs.extend(params.encodings.iter().map(|e| e.ssrc));
+            }
+        }
+        ssrcs
+    }
+
     /// Per-track receive statistics, by SSRC.
     pub fn track_stats(&self) -> Vec<TrackRxStats> {
         self.track_stats.snapshot()

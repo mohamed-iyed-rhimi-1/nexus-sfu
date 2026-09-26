@@ -57,8 +57,14 @@ async fn two_party_audio_video() {
     tokio::time::sleep(MEDIA_WINDOW).await;
     let (a_after, b_after) = (a.track_stats(), b.track_stats());
 
-    check_received("A", &a_before, &a_after);
-    check_received("B", &b_before, &b_after);
+    // Each side receives exactly the other's streams: not its own echoed
+    // back, not a mix. The SFU does not rewrite SSRCs yet (design §3.5); once
+    // it does, compare against the SSRCs it announces instead.
+    let (a_sent, b_sent) = (a.published_ssrcs().await, b.published_ssrcs().await);
+    assert_eq!(a_sent.len(), 2, "A publishes audio and video: {a_sent:?}");
+    assert_eq!(b_sent.len(), 2, "B publishes audio and video: {b_sent:?}");
+    check_received("A", &a_before, &a_after, &b_sent);
+    check_received("B", &b_before, &b_after, &a_sent);
 
     let _ = a.disconnect().await;
     let _ = b.disconnect().await;
@@ -87,7 +93,14 @@ fn check_received(
     who: &str,
     before: &[nexus_loadtest::TrackRxStats],
     after: &[nexus_loadtest::TrackRxStats],
+    peer_ssrcs: &[u32],
 ) {
+    let received: BTreeSet<u32> = after.iter().map(|t| t.ssrc).collect();
+    let expected: BTreeSet<u32> = peer_ssrcs.iter().copied().collect();
+    assert_eq!(
+        received, expected,
+        "{who}: must receive exactly the peer's SSRCs"
+    );
     let kinds: BTreeSet<&str> = after.iter().map(|t| t.kind.as_str()).collect();
     assert_eq!(
         after.len(),
@@ -147,11 +160,15 @@ async fn candidate_is_announced_address() {
     })
     .await
     .unwrap();
-    let room_id = loop {
-        if let SignalMessage::Created { room_id, .. } = sig.recv().await.unwrap() {
-            break room_id;
+    let room_id = tokio::time::timeout(STEP_TIMEOUT, async {
+        loop {
+            if let SignalMessage::Created { room_id, .. } = sig.recv().await.unwrap() {
+                break room_id;
+            }
         }
-    };
+    })
+    .await
+    .expect("SFU answers Create");
     sig.join_room(room_id, "cand").await.expect("joins");
     sig.send(SignalMessage::Publish {
         kinds: vec!["audio".to_string()],
@@ -202,8 +219,9 @@ async fn dtls_survives_lost_first_flight() {
     let start = Instant::now();
     client.start_publishing().await.expect("ICE connects");
 
-    // ICE is up; DTLS completes once the SFU resends its ClientHello.
-    let deadline = start + Duration::from_secs(3) + STEP_TIMEOUT;
+    // ICE is up; DTLS completes once the SFU resends its ClientHello
+    // (OpenSSL's first timeout is 1 s, polled every 200 ms).
+    let deadline = start + Duration::from_secs(3);
     while !client.is_connected() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -216,6 +234,17 @@ async fn dtls_survives_lost_first_flight() {
         rules.dropped_by_rule(),
         vec![1],
         "the first flight was dropped"
+    );
+    // Prove the SFU was the DTLS client: what was dropped is its ClientHello
+    // (record type 22 = handshake; handshake type at byte 13, 1 = ClientHello).
+    let dropped = rules.first_dropped(0).expect("a datagram was dropped");
+    assert_eq!(
+        dropped[0], 22,
+        "dropped a DTLS handshake record: {dropped:02x?}"
+    );
+    assert_eq!(
+        dropped[13], 1,
+        "dropped the SFU's ClientHello: {dropped:02x?}"
     );
 
     let _ = client.disconnect().await;
