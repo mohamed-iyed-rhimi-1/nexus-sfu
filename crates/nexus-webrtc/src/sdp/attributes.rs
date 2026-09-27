@@ -256,6 +256,14 @@ impl DtlsFingerprint {
     /// - Explicit error handling
     /// - Validates even-length hex string to prevent panic
     fn parse_hex_bytes(hex_str: &str) -> Result<Vec<u8>, SdpError> {
+        // Slicing by byte pairs below is only safe on ASCII: a multi-byte character
+        // would put a pair boundary inside it and panic.
+        if !hex_str.is_ascii() {
+            return Err(SdpError::InvalidFingerprint {
+                reason: "non-ASCII hex string",
+            });
+        }
+
         // Check for odd-length hex string which would cause panic during parsing
         if hex_str.len() % 2 != 0 {
             return Err(SdpError::InvalidFingerprint {
@@ -359,6 +367,17 @@ impl RtpCodec {
     ///
     /// Format: payload_type name/clock_rate[/channels]
     pub fn parse(payload_type: u8, value: &str) -> Result<Self, SdpError> {
+        // RTP payload types are 7 bits (RFC 3550 §5.1).
+        if payload_type > 127 {
+            return Err(SdpError::InvalidAttribute {
+                name: "rtpmap".to_string(),
+                value: format!(
+                    "{} {}",
+                    payload_type,
+                    value.chars().take(32).collect::<String>()
+                ),
+            });
+        }
         let parts: Vec<&str> = value.split('/').collect();
         if parts.len() < 2 {
             return Err(SdpError::InvalidAttribute {
@@ -536,15 +555,21 @@ impl SsrcInfo {
             (rest, "")
         };
 
+        // Over capacity is an error, never a cut: the cname and msid values are
+        // compared later (lip sync, track identity).
+        if attr.len() > 32 || val.len() > 256 {
+            return Err(SdpError::InvalidAttribute {
+                name: "ssrc".to_string(),
+                value: value.chars().take(64).collect(),
+            });
+        }
         let mut attribute = [0u8; 32];
-        let attr_bytes = attr.as_bytes();
-        let attr_len = attr_bytes.len().min(32);
-        attribute[..attr_len].copy_from_slice(&attr_bytes[..attr_len]);
+        let attr_len = attr.len();
+        attribute[..attr_len].copy_from_slice(attr.as_bytes());
 
         let mut value_buf = [0u8; 256];
-        let val_bytes = val.as_bytes();
-        let value_len = val_bytes.len().min(256);
-        value_buf[..value_len].copy_from_slice(&val_bytes[..value_len]);
+        let value_len = val.len();
+        value_buf[..value_len].copy_from_slice(val.as_bytes());
 
         Ok(Self {
             ssrc,

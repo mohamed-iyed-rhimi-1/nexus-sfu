@@ -6,8 +6,8 @@ use super::attributes::{
 };
 use super::error::SdpError;
 use super::{
-    MAX_CANDIDATES_PER_MEDIA, MAX_CODECS_PER_MEDIA, MAX_EXTMAPS_PER_MEDIA, MAX_RIDS_PER_MEDIA,
-    MAX_RTCP_FB_PER_MEDIA, MAX_SSRCS_PER_MEDIA, MAX_SSRC_GROUPS_PER_MEDIA,
+    MAX_CANDIDATES_PER_MEDIA, MAX_CODECS_PER_MEDIA, MAX_EXTMAPS_PER_MEDIA, MAX_MID_LEN,
+    MAX_RIDS_PER_MEDIA, MAX_RTCP_FB_PER_MEDIA, MAX_SSRCS_PER_MEDIA, MAX_SSRC_GROUPS_PER_MEDIA,
 };
 
 /// Media type.
@@ -196,7 +196,34 @@ pub struct IceUfrag {
     pub len: u16,
 }
 
+/// RFC 8445 §5.3 ice-char: ALPHA / DIGIT / "+" / "/".
+fn is_ice_chars(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+/// Parse an ice-ufrag or ice-pwd value from a peer: 1-256 ice-chars, else an error
+/// (never a truncated credential).
+fn parse_ice_value(name: &str, s: &str) -> Result<([u8; 256], u16), SdpError> {
+    if s.is_empty() || s.len() > 256 || !is_ice_chars(s) {
+        return Err(SdpError::InvalidAttribute {
+            name: name.to_string(),
+            value: s.chars().take(32).collect(),
+        });
+    }
+    let mut value = [0u8; 256];
+    value[..s.len()].copy_from_slice(s.as_bytes());
+    Ok((value, s.len() as u16))
+}
+
 impl IceUfrag {
+    /// A ufrag from untrusted text: 1-256 ice-chars (RFC 8445 §5.3), else an error.
+    pub fn parse(s: &str) -> Result<Self, SdpError> {
+        let (value, len) = parse_ice_value("ice-ufrag", s)?;
+        Ok(Self { value, len })
+    }
+
+    /// A ufrag from our own credentials (validated by the caller).
     pub fn new(s: &str) -> Self {
         let mut value = [0u8; 256];
         let bytes = s.as_bytes();
@@ -221,6 +248,13 @@ pub struct IcePwd {
 }
 
 impl IcePwd {
+    /// A password from untrusted text: 1-256 ice-chars (RFC 8445 §5.3), else an error.
+    pub fn parse(s: &str) -> Result<Self, SdpError> {
+        let (value, len) = parse_ice_value("ice-pwd", s)?;
+        Ok(Self { value, len })
+    }
+
+    /// A password from our own credentials (validated by the caller).
     pub fn new(s: &str) -> Self {
         let mut value = [0u8; 256];
         let bytes = s.as_bytes();
@@ -247,15 +281,18 @@ pub struct IceOptions {
 /// Media ID.
 #[derive(Debug, Clone)]
 pub struct Mid {
-    pub value: [u8; 16],
+    pub value: [u8; MAX_MID_LEN],
     pub len: u8,
 }
 
 impl Mid {
+    /// A mid from a known-short string (literals, the negotiator's own mids). A mid
+    /// longer than `MAX_MID_LEN` is truncated; input from a peer goes through `parse`.
     pub fn new(s: &str) -> Self {
-        let mut value = [0u8; 16];
+        debug_assert!(s.len() <= MAX_MID_LEN, "mid longer than MAX_MID_LEN");
+        let mut value = [0u8; MAX_MID_LEN];
         let bytes = s.as_bytes();
-        let len = bytes.len().min(16);
+        let len = bytes.len().min(MAX_MID_LEN);
         value[..len].copy_from_slice(&bytes[..len]);
         Self {
             value,
@@ -263,9 +300,30 @@ impl Mid {
         }
     }
 
+    /// A mid from untrusted text: a token (RFC 5888 §4, RFC 8866 token-char) of
+    /// 1-`MAX_MID_LEN` bytes, else an error, never a truncation (a cut mid would no
+    /// longer match its BUNDLE entry).
+    pub fn parse(s: &str) -> Result<Self, SdpError> {
+        if s.is_empty() || s.len() > MAX_MID_LEN || !s.bytes().all(is_token_char) {
+            return Err(SdpError::InvalidAttribute {
+                name: "mid".to_string(),
+                value: s.chars().take(32).collect(),
+            });
+        }
+        let mid = Self::new(s);
+        debug_assert_eq!(mid.as_str(), s);
+        Ok(mid)
+    }
+
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.value[..self.len as usize]).unwrap_or("")
     }
+}
+
+/// RFC 8866 §9 token-char: `%x21 / %x23-27 / %x2A-2B / %x2D-2E / %x30-39 / %x41-5A /
+/// %x5E-7E`.
+fn is_token_char(b: u8) -> bool {
+    matches!(b, 0x21 | 0x23..=0x27 | 0x2A..=0x2B | 0x2D..=0x2E | 0x30..=0x39 | 0x41..=0x5A | 0x5E..=0x7E)
 }
 
 /// SSRC group (RFC 5576, e.g., FID for RTX, SIM for simulcast).
@@ -306,6 +364,46 @@ pub struct Msid {
     /// Track ID (optional).
     pub track_id: [u8; 128],
     pub track_id_len: u8,
+}
+
+impl Msid {
+    /// Longest stream or track id stored.
+    pub const MAX_ID_LEN: usize = 128;
+
+    /// An msid from our own ids. An id longer than `MAX_ID_LEN` is an error, never a
+    /// truncation: the offer also prints the same ids in `a=ssrc:<ssrc> msid:`, and a
+    /// truncated copy would announce two different msids for one m-line.
+    pub fn new(stream_id: &str, track_id: &str) -> Result<Self, SdpError> {
+        for id in [stream_id, track_id] {
+            if id.len() > Self::MAX_ID_LEN {
+                return Err(SdpError::TooLarge {
+                    size: id.len(),
+                    max: Self::MAX_ID_LEN,
+                });
+            }
+        }
+        let mut msid = Self {
+            stream_id: [0u8; 128],
+            stream_id_len: stream_id.len() as u8,
+            track_id: [0u8; 128],
+            track_id_len: track_id.len() as u8,
+        };
+        msid.stream_id[..stream_id.len()].copy_from_slice(stream_id.as_bytes());
+        msid.track_id[..track_id.len()].copy_from_slice(track_id.as_bytes());
+        debug_assert_eq!(msid.stream_id(), stream_id);
+        debug_assert_eq!(msid.track_id(), track_id);
+        Ok(msid)
+    }
+
+    /// The stream id (MediaStream id).
+    pub fn stream_id(&self) -> &str {
+        std::str::from_utf8(&self.stream_id[..self.stream_id_len as usize]).unwrap_or("")
+    }
+
+    /// The track id (empty when absent).
+    pub fn track_id(&self) -> &str {
+        std::str::from_utf8(&self.track_id[..self.track_id_len as usize]).unwrap_or("")
+    }
 }
 
 /// Connection info.

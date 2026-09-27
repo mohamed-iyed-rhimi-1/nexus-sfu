@@ -25,14 +25,15 @@ use foreign_types::ForeignTypeRef;
 use openssl::ec::{EcGroup, EcKey};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
-use openssl::pkey::PKey;
+use openssl::pkey::{PKey, Private};
 use openssl::srtp::SrtpProfileId;
 use openssl::ssl::{
     HandshakeError, MidHandshakeSslStream, Ssl, SslContext, SslContextBuilder, SslMethod,
-    SslOptions, SslStream, SslVerifyMode, SslVersion,
+    SslOptions, SslSessionCacheMode, SslStream, SslVerifyMode, SslVersion,
 };
 use openssl::x509::X509;
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use super::crypto::SrtpKeyMaterial;
 use super::error::DtlsError;
@@ -121,6 +122,182 @@ impl Write for MemBio {
     }
 }
 
+/// The process's DTLS identity: an ECDSA P-256 key, a self-signed X.509 certificate,
+/// its SHA-256 fingerprint and the `SslContext` that serves them (design note §6.3).
+///
+/// Created once; every session's engine builds only its own `Ssl` from the shared
+/// context (`OpenSslDtlsEngine::with_certificate`), so the fingerprint in every offer is
+/// the same. Cloning is cheap: the context is reference-counted and the DER shared.
+#[derive(Clone)]
+pub struct DtlsCertificate {
+    /// SSL context holding the key and certificate.
+    ctx: SslContext,
+    /// SHA-256 fingerprint of the certificate.
+    fingerprint: [u8; 32],
+    /// DER-encoded certificate.
+    der: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for DtlsCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DtlsCertificate")
+            .field("fingerprint", &self.fingerprint)
+            .field("der_len", &self.der.len())
+            .finish()
+    }
+}
+
+impl DtlsCertificate {
+    /// Generate a key and self-signed certificate and configure the DTLS 1.2 context
+    /// (DTLS-SRTP profiles, peer certificate required, no tickets).
+    pub fn generate() -> Result<Self, DtlsError> {
+        let pkey = generate_key()?;
+        let x509 = build_certificate(&pkey)?;
+        let der = x509
+            .to_der()
+            .map_err(|e| DtlsError::handshake_failed(format!("to_der: {}", e)))?;
+        let fingerprint = fingerprint_of(&x509)?;
+        let ctx = build_context(&pkey, &x509)?;
+
+        // Postconditions: a usable identity.
+        assert!(!der.is_empty(), "certificate DER must not be empty");
+        assert!(
+            fingerprint.iter().any(|&b| b != 0),
+            "fingerprint must be set"
+        );
+        Ok(Self {
+            ctx,
+            fingerprint,
+            der: der.into(),
+        })
+    }
+
+    /// SHA-256 fingerprint of the certificate (the SDP `a=fingerprint`).
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+
+    /// DER-encoded certificate.
+    pub fn der(&self) -> &[u8] {
+        &self.der
+    }
+}
+
+/// An ECDSA P-256 key pair.
+fn generate_key() -> Result<PKey<Private>, DtlsError> {
+    let ec_group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
+        .map_err(|e| DtlsError::handshake_failed(format!("EC group: {}", e)))?;
+    let ec_key = EcKey::generate(&ec_group)
+        .map_err(|e| DtlsError::handshake_failed(format!("EC keygen: {}", e)))?;
+    PKey::from_ec_key(ec_key).map_err(|e| DtlsError::handshake_failed(format!("PKey: {}", e)))
+}
+
+/// A self-signed X.509 v3 certificate for `pkey`, CN "Nexus SFU", with a random 64-bit
+/// serial, valid from one day ago (tolerates peers whose clock is behind) for 365 days.
+fn build_certificate(pkey: &PKey<Private>) -> Result<X509, DtlsError> {
+    let err = |what: &str, e: openssl::error::ErrorStack| {
+        DtlsError::handshake_failed(format!("{}: {}", what, e))
+    };
+    let mut builder = X509::builder().map_err(|e| err("X509 builder", e))?;
+    builder.set_version(2).map_err(|e| err("set version", e))?;
+
+    let mut serial = openssl::bn::BigNum::new().map_err(|e| err("serial", e))?;
+    serial
+        .rand(64, openssl::bn::MsbOption::ONE, false)
+        .map_err(|e| err("serial", e))?;
+    let serial = openssl::asn1::Asn1Integer::from_bn(&serial).map_err(|e| err("serial asn1", e))?;
+    builder
+        .set_serial_number(&serial)
+        .map_err(|e| err("set serial", e))?;
+
+    let mut name = openssl::x509::X509NameBuilder::new().map_err(|e| err("name builder", e))?;
+    name.append_entry_by_text("CN", "Nexus SFU")
+        .map_err(|e| err("CN", e))?;
+    let name = name.build();
+    builder
+        .set_subject_name(&name)
+        .map_err(|e| err("set subject", e))?;
+    builder
+        .set_issuer_name(&name)
+        .map_err(|e| err("set issuer", e))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| DtlsError::handshake_failed("clock before 1970".to_string()))?
+        .as_secs() as i64;
+    let not_before =
+        openssl::asn1::Asn1Time::from_unix(now - 86_400).map_err(|e| err("not_before", e))?;
+    let not_after = openssl::asn1::Asn1Time::days_from_now(365).map_err(|e| err("not_after", e))?;
+    builder
+        .set_not_before(&not_before)
+        .map_err(|e| err("set not_before", e))?;
+    builder
+        .set_not_after(&not_after)
+        .map_err(|e| err("set not_after", e))?;
+
+    builder.set_pubkey(pkey).map_err(|e| err("set pubkey", e))?;
+    builder
+        .sign(pkey, MessageDigest::sha256())
+        .map_err(|e| err("sign", e))?;
+    Ok(builder.build())
+}
+
+/// SHA-256 of a certificate.
+fn fingerprint_of(x509: &X509) -> Result<[u8; 32], DtlsError> {
+    let digest = x509
+        .digest(MessageDigest::sha256())
+        .map_err(|e| DtlsError::handshake_failed(format!("digest: {}", e)))?;
+    assert_eq!(digest.len(), 32, "SHA-256 digest must be 32 bytes");
+    let mut fingerprint = [0u8; 32];
+    fingerprint.copy_from_slice(&digest);
+    Ok(fingerprint)
+}
+
+/// The DTLS 1.2 context serving `pkey` and `x509`.
+fn build_context(pkey: &PKey<Private>, x509: &X509) -> Result<SslContext, DtlsError> {
+    let err = |what: &str, e: openssl::error::ErrorStack| {
+        DtlsError::handshake_failed(format!("{}: {}", what, e))
+    };
+    let mut ctx = SslContextBuilder::new(SslMethod::dtls()).map_err(|e| err("SSL ctx", e))?;
+    ctx.set_min_proto_version(Some(SslVersion::DTLS1_2))
+        .map_err(|e| err("min version", e))?;
+    ctx.set_certificate(x509).map_err(|e| err("set cert", e))?;
+    ctx.set_private_key(pkey).map_err(|e| err("set key", e))?;
+    ctx.check_private_key().map_err(|e| err("check key", e))?;
+
+    // Cipher suites for DTLS-SRTP
+    ctx.set_cipher_list("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
+        .map_err(|e| err("ciphers", e))?;
+
+    // SRTP profiles — prefer AES128_CM_SHA1_80 for interoperability.
+    // While RFC 8827 §6.5 recommends GCM, webrtc-rs (used in loadtest)
+    // and some browser versions have incomplete GCM-SRTP support.
+    // AES128_CM_SHA1_80 is universally supported. GCM is offered as
+    // fallback for clients that prefer it.
+    ctx.set_tlsext_use_srtp(&format!(
+        "{}:{}",
+        SRTP_AES128_CM_SHA1_80, SRTP_AEAD_AES_128_GCM
+    ))
+    .map_err(|e| err("srtp ext", e))?;
+
+    // Require the peer's certificate (RFC 8827 §6.5: both sides present
+    // one). It is self-signed, so skip CA-chain validation here; the
+    // session checks its SHA-256 against the SDP a=fingerprint instead
+    // (see `peer_fingerprint`). Without PEER a server never requests the
+    // client certificate and there is nothing to verify.
+    ctx.set_verify_callback(
+        SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+        |_preverify_ok, _store| true,
+    );
+
+    // Disable session tickets and the session cache (not needed for DTLS-SRTP): the
+    // context is shared by every session of the process, so a server-side cache would
+    // keep one entry per handshake, process-wide.
+    ctx.set_options(SslOptions::NO_TICKET);
+    ctx.set_session_cache_mode(SslSessionCacheMode::OFF);
+    Ok(ctx.build())
+}
+
 /// OpenSSL DTLS handshake engine.
 ///
 /// Manages the DTLS handshake using OpenSSL's DTLS 1.2 implementation.
@@ -128,7 +305,8 @@ impl Write for MemBio {
 ///
 /// # Lifecycle
 ///
-/// 1. `new()` — Generate certificate, configure SSL context
+/// 1. `with_certificate()` — take the shared certificate and context
+///    (`new()` generates a certificate of its own, as the old path does)
 /// 2. `start_handshake()` — Begin DTLS handshake (client sends ClientHello)
 /// 3. `process()` — Feed incoming DTLS records, get outgoing records
 /// 4. After `is_established()` — Call `export_srtp_keys()` for SRTP material
@@ -137,18 +315,14 @@ impl Write for MemBio {
 ///
 /// Not thread-safe. Must be used from a single thread (the session owner).
 pub struct OpenSslDtlsEngine {
-    /// SSL context (shared config).
-    ctx: SslContext,
+    /// Certificate, fingerprint and SSL context (shared between engines).
+    certificate: DtlsCertificate,
     /// Mid-handshake state (during async handshake).
     mid_handshake: Option<MidHandshakeSslStream<MemBio>>,
     /// Completed SSL stream (after handshake).
     stream: Option<SslStream<MemBio>>,
     /// Our role.
     role: DtlsRole,
-    /// DER-encoded certificate.
-    certificate_der: Vec<u8>,
-    /// SHA-256 fingerprint of our certificate.
-    fingerprint: [u8; 32],
     /// Whether handshake is complete.
     established: bool,
     /// SRTP key material (populated after handshake).
@@ -164,172 +338,53 @@ pub struct OpenSslDtlsEngine {
 }
 
 impl OpenSslDtlsEngine {
-    /// Create new DTLS engine.
+    /// Create a DTLS engine with a certificate of its own.
     ///
     /// Generates a self-signed ECDSA P-256 certificate and configures
-    /// the OpenSSL context for DTLS 1.2 with SRTP extension.
+    /// the OpenSSL context for DTLS 1.2 with SRTP extension. The old path's
+    /// per-session engine; the new control plane uses `with_certificate`.
     ///
     /// # Arguments
     /// * `role` — Client or Server
-    ///
-    /// # Panics
-    /// Panics if OpenSSL initialization fails (fatal, cannot recover).
     pub fn new(role: DtlsRole) -> Result<Self, DtlsError> {
-        // Generate ECDSA P-256 key pair
-        let ec_group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-            .map_err(|e| DtlsError::handshake_failed(format!("EC group: {}", e)))?;
-        let ec_key = EcKey::generate(&ec_group)
-            .map_err(|e| DtlsError::handshake_failed(format!("EC keygen: {}", e)))?;
-        let pkey = PKey::from_ec_key(ec_key.clone())
-            .map_err(|e| DtlsError::handshake_failed(format!("PKey: {}", e)))?;
+        Ok(Self::with_certificate(role, &DtlsCertificate::generate()?))
+    }
 
-        // Build self-signed X.509 certificate
-        let mut x509_builder = X509::builder()
-            .map_err(|e| DtlsError::handshake_failed(format!("X509 builder: {}", e)))?;
-        x509_builder
-            .set_version(2)
-            .map_err(|e| DtlsError::handshake_failed(format!("set version: {}", e)))?;
-
-        // Serial number
-        let serial = openssl::bn::BigNum::from_u32(1)
-            .map_err(|e| DtlsError::handshake_failed(format!("serial: {}", e)))?;
-        let serial_asn1 = openssl::asn1::Asn1Integer::from_bn(&serial)
-            .map_err(|e| DtlsError::handshake_failed(format!("serial asn1: {}", e)))?;
-        x509_builder
-            .set_serial_number(&serial_asn1)
-            .map_err(|e| DtlsError::handshake_failed(format!("set serial: {}", e)))?;
-
-        // Subject name
-        let mut name_builder = openssl::x509::X509NameBuilder::new()
-            .map_err(|e| DtlsError::handshake_failed(format!("name builder: {}", e)))?;
-        name_builder
-            .append_entry_by_text("CN", "Nexus SFU")
-            .map_err(|e| DtlsError::handshake_failed(format!("CN: {}", e)))?;
-        let name = name_builder.build();
-        x509_builder
-            .set_subject_name(&name)
-            .map_err(|e| DtlsError::handshake_failed(format!("set subject: {}", e)))?;
-        x509_builder
-            .set_issuer_name(&name)
-            .map_err(|e| DtlsError::handshake_failed(format!("set issuer: {}", e)))?;
-
-        // Validity: now to +365 days
-        let not_before = openssl::asn1::Asn1Time::days_from_now(0)
-            .map_err(|e| DtlsError::handshake_failed(format!("not_before: {}", e)))?;
-        let not_after = openssl::asn1::Asn1Time::days_from_now(365)
-            .map_err(|e| DtlsError::handshake_failed(format!("not_after: {}", e)))?;
-        x509_builder
-            .set_not_before(&not_before)
-            .map_err(|e| DtlsError::handshake_failed(format!("set not_before: {}", e)))?;
-        x509_builder
-            .set_not_after(&not_after)
-            .map_err(|e| DtlsError::handshake_failed(format!("set not_after: {}", e)))?;
-
-        x509_builder
-            .set_pubkey(&pkey)
-            .map_err(|e| DtlsError::handshake_failed(format!("set pubkey: {}", e)))?;
-        x509_builder
-            .sign(&pkey, MessageDigest::sha256())
-            .map_err(|e| DtlsError::handshake_failed(format!("sign: {}", e)))?;
-
-        let x509 = x509_builder.build();
-        let certificate_der = x509
-            .to_der()
-            .map_err(|e| DtlsError::handshake_failed(format!("to_der: {}", e)))?;
-
-        // Compute SHA-256 fingerprint
-        let digest = x509
-            .digest(MessageDigest::sha256())
-            .map_err(|e| DtlsError::handshake_failed(format!("digest: {}", e)))?;
-        let mut fingerprint = [0u8; 32];
-        assert_eq!(digest.len(), 32, "SHA-256 digest must be 32 bytes");
-        fingerprint.copy_from_slice(&digest);
-
-        // Build SSL context
-        let method = SslMethod::dtls();
-        let mut ctx_builder = SslContextBuilder::new(method)
-            .map_err(|e| DtlsError::handshake_failed(format!("SSL ctx: {}", e)))?;
-
-        // Set DTLS 1.2 minimum
-        ctx_builder
-            .set_min_proto_version(Some(SslVersion::DTLS1_2))
-            .map_err(|e| DtlsError::handshake_failed(format!("min version: {}", e)))?;
-
-        // Set certificate and private key
-        ctx_builder
-            .set_certificate(&x509)
-            .map_err(|e| DtlsError::handshake_failed(format!("set cert: {}", e)))?;
-        ctx_builder
-            .set_private_key(&pkey)
-            .map_err(|e| DtlsError::handshake_failed(format!("set key: {}", e)))?;
-        ctx_builder
-            .check_private_key()
-            .map_err(|e| DtlsError::handshake_failed(format!("check key: {}", e)))?;
-
-        // Cipher suites for DTLS-SRTP
-        ctx_builder
-            .set_cipher_list("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
-            .map_err(|e| DtlsError::handshake_failed(format!("ciphers: {}", e)))?;
-
-        // SRTP profiles — prefer AES128_CM_SHA1_80 for interoperability.
-        // While RFC 8827 §6.5 recommends GCM, webrtc-rs (used in loadtest)
-        // and some browser versions have incomplete GCM-SRTP support.
-        // AES128_CM_SHA1_80 is universally supported. GCM is offered as
-        // fallback for clients that prefer it.
-        ctx_builder
-            .set_tlsext_use_srtp(&format!(
-                "{}:{}",
-                SRTP_AES128_CM_SHA1_80, SRTP_AEAD_AES_128_GCM
-            ))
-            .map_err(|e| DtlsError::handshake_failed(format!("srtp ext: {}", e)))?;
-
-        // Require the peer's certificate (RFC 8827 §6.5: both sides present
-        // one). It is self-signed, so skip CA-chain validation here; the
-        // session checks its SHA-256 against the SDP a=fingerprint instead
-        // (see `peer_fingerprint`). Without PEER a server never requests the
-        // client certificate and there is nothing to verify.
-        ctx_builder.set_verify_callback(
-            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-            |_preverify_ok, _store| true,
-        );
-
-        // Disable session tickets (not needed for DTLS-SRTP)
-        ctx_builder.set_options(SslOptions::NO_TICKET);
-
-        let ctx = ctx_builder.build();
-
-        Ok(Self {
-            ctx,
+    /// Create a DTLS engine on a shared certificate: only the per-session `Ssl` is
+    /// built (at `start_handshake`), from the certificate's context.
+    pub fn with_certificate(role: DtlsRole, certificate: &DtlsCertificate) -> Self {
+        let engine = Self {
+            certificate: certificate.clone(),
             mid_handshake: None,
             stream: None,
             role,
-            certificate_der,
-            fingerprint,
             established: false,
             srtp_keys: None,
             srtp_profile: None,
             pending_output: Vec::with_capacity(MAX_BIO_READ),
             started: false,
             peer_fingerprint: None,
-        })
+        };
+        debug_assert_eq!(engine.fingerprint(), certificate.fingerprint());
+        engine
     }
 
     /// Get SHA-256 fingerprint of our certificate.
     pub fn fingerprint(&self) -> &[u8; 32] {
         assert!(
-            self.fingerprint.iter().any(|&b| b != 0),
+            self.certificate.fingerprint.iter().any(|&b| b != 0),
             "fingerprint not initialized"
         );
-        &self.fingerprint
+        &self.certificate.fingerprint
     }
 
     /// Get DER-encoded certificate.
     pub fn certificate_der(&self) -> &[u8] {
         assert!(
-            !self.certificate_der.is_empty(),
+            !self.certificate.der.is_empty(),
             "certificate not initialized"
         );
-        &self.certificate_der
+        &self.certificate.der
     }
 
     /// Whether the handshake has been started (the role is fixed from then on).
@@ -401,7 +456,7 @@ impl OpenSslDtlsEngine {
         assert!(!self.started, "handshake already started");
         self.started = true;
 
-        let mut ssl = Ssl::new(&self.ctx)
+        let mut ssl = Ssl::new(&self.certificate.ctx)
             .map_err(|e| DtlsError::handshake_failed(format!("SSL new: {}", e)))?;
 
         if self.role == DtlsRole::Server {
@@ -676,5 +731,115 @@ impl OpenSslDtlsEngine {
             ));
         }
         Ok(mid.get_mut().take_outgoing())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run a handshake between `client` and `server` in memory. Bounded: a DTLS 1.2
+    /// handshake takes two round trips; 16 exchanges is ample.
+    fn handshake(client: &mut OpenSslDtlsEngine, server: &mut OpenSslDtlsEngine) {
+        assert!(server.start_handshake().unwrap().is_empty(), "server waits");
+        let mut to_server = client.start_handshake().unwrap();
+        let mut to_client = Vec::new();
+        for _ in 0..16 {
+            if client.is_established() && server.is_established() {
+                return;
+            }
+            if !to_server.is_empty() {
+                to_client = server.process(&std::mem::take(&mut to_server)).unwrap();
+            }
+            if !to_client.is_empty() {
+                to_server = client.process(&std::mem::take(&mut to_client)).unwrap();
+            }
+        }
+        assert!(client.is_established() && server.is_established());
+    }
+
+    #[test]
+    fn engines_on_one_certificate_handshake_with_each_other() {
+        let certificate = DtlsCertificate::generate().unwrap();
+        let mut client = OpenSslDtlsEngine::with_certificate(DtlsRole::Client, &certificate);
+        let mut server = OpenSslDtlsEngine::with_certificate(DtlsRole::Server, &certificate);
+        assert_eq!(client.fingerprint(), certificate.fingerprint());
+        assert_eq!(server.fingerprint(), certificate.fingerprint());
+        assert_eq!(client.certificate_der(), certificate.der());
+
+        handshake(&mut client, &mut server);
+
+        // Each side saw the shared certificate as the peer's.
+        assert_eq!(client.peer_fingerprint(), Some(certificate.fingerprint()));
+        assert_eq!(server.peer_fingerprint(), Some(certificate.fingerprint()));
+        // Both exported the same keying material (client write = server read).
+        let (c, s) = (client.srtp_keys().unwrap(), server.srtp_keys().unwrap());
+        assert_eq!(c.client_master_key, s.client_master_key);
+        assert_eq!(c.server_master_key, s.server_master_key);
+        assert_eq!(c.client_master_salt, s.client_master_salt);
+        assert_eq!(c.server_master_salt, s.server_master_salt);
+        assert_ne!(c.client_master_key, c.server_master_key);
+    }
+
+    #[test]
+    fn many_sessions_share_one_context() {
+        let certificate = DtlsCertificate::generate().unwrap();
+        let other = DtlsCertificate::generate().unwrap();
+        assert_ne!(certificate.fingerprint(), other.fingerprint());
+        // Two independent handshakes on the same certificate, one after the other.
+        for _ in 0..2 {
+            let mut client = OpenSslDtlsEngine::with_certificate(DtlsRole::Client, &other);
+            let mut server = OpenSslDtlsEngine::with_certificate(DtlsRole::Server, &certificate);
+            handshake(&mut client, &mut server);
+            assert_eq!(client.peer_fingerprint(), Some(certificate.fingerprint()));
+            assert_eq!(server.peer_fingerprint(), Some(other.fingerprint()));
+        }
+    }
+
+    /// A read-only `SSL_CTX_ctrl` query (the `SSL_CTX_sess_*` macros of OpenSSL's ssl.h).
+    fn ctx_query(ctx: &SslContext, cmd: std::os::raw::c_int) -> i64 {
+        use foreign_types::ForeignType;
+        // SAFETY: `ctx` is a live context for the duration of the call, and `cmd` is one
+        // of the getters below, which only read the context.
+        unsafe { openssl_sys::SSL_CTX_ctrl(ctx.as_ptr(), cmd, 0, std::ptr::null_mut()) as i64 }
+    }
+
+    /// `SSL_CTRL_SESS_NUMBER`: sessions held in the cache.
+    const SSL_CTRL_SESS_NUMBER: std::os::raw::c_int = 20;
+    /// `SSL_CTRL_GET_SESS_CACHE_MODE`: the cache mode (0 = `SSL_SESS_CACHE_OFF`).
+    const SSL_CTRL_GET_SESS_CACHE_MODE: std::os::raw::c_int = 45;
+
+    /// The shared context has its session cache off. (With `SSL_VERIFY_PEER` and no
+    /// session id context OpenSSL already stores nothing on the server, so the count
+    /// stays 0 either way; the mode is what guards against a later change.)
+    #[test]
+    fn shared_context_keeps_no_session_cache() {
+        let certificate = DtlsCertificate::generate().unwrap();
+        assert_eq!(ctx_query(&certificate.ctx, SSL_CTRL_GET_SESS_CACHE_MODE), 0);
+        for _ in 0..3 {
+            let mut client = OpenSslDtlsEngine::with_certificate(DtlsRole::Client, &certificate);
+            let mut server = OpenSslDtlsEngine::with_certificate(DtlsRole::Server, &certificate);
+            handshake(&mut client, &mut server);
+        }
+        assert_eq!(ctx_query(&certificate.ctx, SSL_CTRL_SESS_NUMBER), 0);
+    }
+
+    #[test]
+    fn certificate_serial_is_random_and_validity_backdated() {
+        let a = X509::from_der(DtlsCertificate::generate().unwrap().der()).unwrap();
+        let b = X509::from_der(DtlsCertificate::generate().unwrap().der()).unwrap();
+        let serial = |x: &X509| x.serial_number().to_bn().unwrap();
+        assert_ne!(serial(&a), serial(&b));
+        assert!(serial(&a).num_bits() > 32, "64-bit serial");
+        let yesterday = openssl::asn1::Asn1Time::days_from_now(0).unwrap();
+        let diff = a.not_before().diff(&yesterday).unwrap();
+        assert_eq!(diff.days, 1, "not_before one day in the past: {:?}", diff);
+    }
+
+    #[test]
+    fn new_generates_a_certificate_per_engine() {
+        let a = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        let b = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        assert_ne!(a.fingerprint(), b.fingerprint());
     }
 }

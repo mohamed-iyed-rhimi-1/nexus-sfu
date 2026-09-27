@@ -23,8 +23,12 @@ use nexus_webrtc::webrtc::{TransportId, WebRtcTransport};
 use super::ParticipantHandle;
 
 const MAX_TRACKS_PER_PARTICIPANT: u32 = 10;
-/// Most m-lines one session can carry (publish + subscribe + inactive).
-const MAX_MLINES: usize = nexus_webrtc::sdp::MAX_MEDIA_SECTIONS;
+/// Most m-lines one session can carry (publish + subscribe + inactive) on the old
+/// path. Its own constant, so raising the SDP bound (`MAX_MEDIA_SECTIONS`, 32) does not
+/// change what the old path accepts (`webrtc/session.rs` handles at most 10); Phase 1.5b
+/// replaces it with `MAX_MEDIA_SECTIONS`.
+const OLD_PATH_MAX_MLINES: usize = 8;
+const _: () = assert!(OLD_PATH_MAX_MLINES <= nexus_webrtc::sdp::MAX_MEDIA_SECTIONS);
 const MAX_PARTICIPANTS_PER_ROOM: u32 = 1_000;
 
 /// ICE gathering lifecycle state.
@@ -291,20 +295,24 @@ impl NegotiationManager {
             state.pending_publish = Some(published_kinds);
             return;
         }
+
+        // The old path offers at most OLD_PATH_MAX_MLINES m-lines, first offer included:
+        // a larger offer would get an answer handle_answer refuses, leaving offer_pending
+        // set for good.
+        if state.mlines.len() + published_kinds.len() > OLD_PATH_MAX_MLINES {
+            send_error(
+                sessions,
+                participant_id,
+                "TOO_MANY_TRACKS",
+                "Too many m-lines",
+            );
+            return;
+        }
         state.published_kinds = published_kinds.clone();
 
         // Existing transport (from an earlier publish or a subscription): append
         // publish m-lines after the negotiated ones and re-offer the session.
         if let Some(transport_id) = state.transport_id {
-            if state.mlines.len() + published_kinds.len() > MAX_MLINES {
-                send_error(
-                    sessions,
-                    participant_id,
-                    "TOO_MANY_TRACKS",
-                    "Too many m-lines",
-                );
-                return;
-            }
             let mut new_mids = Vec::with_capacity(published_kinds.len());
             for (kind, _content) in &published_kinds {
                 let mid = state.next_mid_index.to_string();
@@ -379,7 +387,13 @@ impl NegotiationManager {
 
         state.next_mid_index = state.mlines.len() as u32;
 
-        let offer_sdp = nexus_webrtc::sdp::SdpPrinter::print(&sdp);
+        let offer_sdp = match nexus_webrtc::sdp::SdpPrinter::print(&sdp) {
+            Ok(sdp) => sdp,
+            Err(e) => {
+                warn!("Offer for participant {} failed: {:?}", participant_id, e);
+                return;
+            }
+        };
         send_to(
             sessions,
             participant_id,
@@ -465,6 +479,17 @@ impl NegotiationManager {
                 return;
             }
         };
+        // The parser accepts up to MAX_MEDIA_SECTIONS (32); the old path never offers
+        // more than OLD_PATH_MAX_MLINES, so an answer with more is not an answer to it.
+        if answer.media.len() > OLD_PATH_MAX_MLINES {
+            warn!(
+                "Answer from {} has {} m-lines, more than the {} offered at most",
+                participant_id,
+                answer.media.len(),
+                OLD_PATH_MAX_MLINES
+            );
+            return;
+        }
 
         // Extract remote ICE credentials
         let (remote_ufrag, remote_pwd) = Self::extract_ice_creds(&answer);
@@ -593,13 +618,11 @@ impl NegotiationManager {
     ) -> Result<DtlsRole, &'static str> {
         use nexus_webrtc::sdp::DtlsSetup;
         let mut setup = sdp.setup;
-        for i in 0..(sdp.media_count as usize).min(8) {
+        for media in &sdp.media {
             if setup.is_some() {
                 break;
             }
-            if let Some(ref media) = sdp.media[i] {
-                setup = media.setup;
-            }
+            setup = media.setup;
         }
         match setup {
             None | Some(DtlsSetup::Active) => Ok(DtlsRole::Server),
@@ -613,9 +636,7 @@ impl NegotiationManager {
     /// m-line that has one (bundled m-lines share one transport).
     fn extract_fingerprint(sdp: &nexus_webrtc::sdp::SessionDescription) -> Option<[u8; 32]> {
         let session_fp = sdp.fingerprint.as_ref();
-        let media_fp = (0..(sdp.media_count as usize).min(8))
-            .filter_map(|i| sdp.media[i].as_ref())
-            .find_map(|m| m.fingerprint.as_ref());
+        let media_fp = sdp.media.iter().find_map(|m| m.fingerprint.as_ref());
         let fp = session_fp.or(media_fp)?;
         if fp.algorithm != nexus_webrtc::sdp::FingerprintAlgorithm::Sha256 || fp.value_len != 32 {
             return None;
@@ -634,14 +655,12 @@ impl NegotiationManager {
                 sdp.ice_pwd.as_ref().map(|p| p.as_str().to_string()),
             );
         }
-        for i in 0..(sdp.media_count as usize).min(8) {
-            if let Some(ref media) = sdp.media[i] {
-                if media.ice_ufrag.is_some() && media.ice_pwd.is_some() {
-                    return (
-                        media.ice_ufrag.as_ref().map(|u| u.as_str().to_string()),
-                        media.ice_pwd.as_ref().map(|p| p.as_str().to_string()),
-                    );
-                }
+        for media in &sdp.media {
+            if media.ice_ufrag.is_some() && media.ice_pwd.is_some() {
+                return (
+                    media.ice_ufrag.as_ref().map(|u| u.as_str().to_string()),
+                    media.ice_pwd.as_ref().map(|p| p.as_str().to_string()),
+                );
             }
         }
         (None, None)
@@ -850,13 +869,8 @@ impl NegotiationManager {
         let room_id = sessions.get(&participant_id).and_then(|h| h.room_id);
 
         let mut notifications: Vec<(u64, SignalMessage)> = Vec::with_capacity(64);
-        let media_count = (sdp.media_count as usize).min(16);
-
-        for i in 0..media_count {
-            let media = match &sdp.media[i] {
-                Some(m) => m,
-                None => continue,
-            };
+        // Bounded: handle_answer refuses answers with more than OLD_PATH_MAX_MLINES.
+        for media in &sdp.media {
             let is_publish_mline = media
                 .mid
                 .as_ref()
@@ -991,7 +1005,7 @@ impl NegotiationManager {
         // Resolve kinds before borrowing state mutably
         let kinds: Vec<(TrackId, u8)> = track_ids
             .iter()
-            .take(MAX_MLINES)
+            .take(OLD_PATH_MAX_MLINES)
             .map(|&tid| {
                 let kind = self
                     .distributed_state
@@ -1038,7 +1052,7 @@ impl NegotiationManager {
                 .find(|s| s.role == MlineRole::Inactive && s.kind == kind)
             {
                 slot.role = MlineRole::Subscribe(tid);
-            } else if state.mlines.len() < MAX_MLINES {
+            } else if state.mlines.len() < OLD_PATH_MAX_MLINES {
                 let mid = state.next_mid_index.to_string();
                 state.next_mid_index += 1;
                 state.mlines.push(MlineSlot {
@@ -1049,7 +1063,7 @@ impl NegotiationManager {
             } else {
                 warn!(
                     "Participant {} at {} m-lines, not offering track {}",
-                    participant_id, MAX_MLINES, tid
+                    participant_id, OLD_PATH_MAX_MLINES, tid
                 );
             }
         }
@@ -1076,7 +1090,7 @@ impl NegotiationManager {
             return;
         }
         assert!(
-            state.mlines.len() <= MAX_MLINES,
+            state.mlines.len() <= OLD_PATH_MAX_MLINES,
             "m-line count must be bounded"
         );
 
@@ -1121,10 +1135,29 @@ impl NegotiationManager {
         let video_codec: Vec<nexus_webrtc::sdp::RtpCodec> =
             publish_codec(false).into_iter().collect();
         let mut mid_map: Vec<(TrackId, String)> = Vec::new();
+        // Per slot: the forwarded SSRC and its announced (stream id, cname). Today's
+        // values: every track is its own stream (1.5b switches to one per publisher).
+        let track_ids: Vec<Option<(u32, String, String)>> = state
+            .mlines
+            .iter()
+            .map(|slot| match slot.role {
+                MlineRole::Subscribe(tid) => {
+                    self.ssrc_router.lookup_ssrc_by_track(tid).map(|ssrc| {
+                        (
+                            ssrc,
+                            format!("nexus-stream-{ssrc}"),
+                            format!("nexus-{ssrc}"),
+                        )
+                    })
+                }
+                _ => None,
+            })
+            .collect();
         let mlines: Vec<OfferMline> = state
             .mlines
             .iter()
-            .map(|slot| {
+            .zip(&track_ids)
+            .map(|(slot, track)| {
                 let codecs: &[nexus_webrtc::sdp::RtpCodec] = if slot.kind == 0 {
                     &audio_codec
                 } else {
@@ -1138,18 +1171,21 @@ impl NegotiationManager {
                         fmtps: &[],
                         offer_pts: &[],
                         extmaps: &[],
+                        rtcp_fbs: &[],
                         direction,
                     })
                 };
                 match slot.role {
                     MlineRole::Publish => recycled(nexus_webrtc::sdp::Direction::RecvOnly),
-                    MlineRole::Subscribe(tid) => match self.ssrc_router.lookup_ssrc_by_track(tid) {
-                        Some(ssrc) => {
+                    MlineRole::Subscribe(tid) => match track {
+                        Some((ssrc, stream_id, cname)) => {
                             mid_map.push((tid, slot.mid.clone()));
                             OfferMline::Track {
-                                ssrc,
+                                ssrc: *ssrc,
                                 media_kind: slot.kind,
                                 mid: slot.mid.as_str(),
+                                stream_id: stream_id.as_str(),
+                                cname: cname.as_str(),
                             }
                         }
                         // Track gone (publisher left): keep the position, send nothing
@@ -1288,6 +1324,76 @@ mod tests {
              m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{media_setup_line}"
         );
         nexus_webrtc::sdp::SdpParser::parse(&sdp).unwrap()
+    }
+
+    /// A manager on the old path's real components, with one worker.
+    fn manager() -> (NegotiationManager, std::net::UdpSocket) {
+        use std::os::fd::AsRawFd;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = nexus_webrtc::webrtc::TransportConfig::default()
+            .with_bind_addr("127.0.0.1:0".parse().unwrap());
+        let transport = WebRtcTransport::new(config).unwrap();
+        transport.start().unwrap();
+        let transport = Arc::new(transport);
+        let pool = WorkerPool::new(1, 16, socket.as_raw_fd(), false, false, 0).unwrap();
+        let state = Arc::new(DistributedState::new(
+            nexus_state::DistributedStateConfig::new(1),
+        ));
+        let manager = NegotiationManager::new(
+            transport,
+            Arc::new(SsrcRouter::new()),
+            Arc::new(RwLock::new(pool)),
+            state,
+            vec![socket.local_addr().unwrap()],
+        );
+        (manager, socket)
+    }
+
+    fn handle(
+        participant_id: u64,
+    ) -> (
+        HashMap<u64, ParticipantHandle>,
+        mpsc::Receiver<SignalMessage>,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let handle = ParticipantHandle {
+            outbound_tx: tx,
+            room_id: None,
+            published_tracks: Vec::new(),
+        };
+        (HashMap::from([(participant_id, handle)]), rx)
+    }
+
+    #[tokio::test]
+    async fn test_first_publish_over_the_old_path_cap_is_refused() {
+        let (mut manager, _socket) = manager();
+        let (sessions, mut rx) = handle(7);
+        manager.add_participant(7);
+        let kinds: Vec<String> = (0..=OLD_PATH_MAX_MLINES)
+            .map(|i| if i % 2 == 0 { "audio" } else { "video" }.to_string())
+            .collect();
+        let contents = vec!["camera".to_string(); kinds.len()];
+
+        manager.handle_publish(7, &kinds, &contents, &sessions);
+
+        match rx.try_recv() {
+            Ok(SignalMessage::Error { code, .. }) => assert_eq!(code, "TOO_MANY_TRACKS"),
+            other => panic!("expected TOO_MANY_TRACKS, got {:?}", other),
+        }
+        let state = &manager.states[&7];
+        assert!(
+            state.transport_id.is_none(),
+            "no transport for a refused publish"
+        );
+        assert!(!state.offer_pending);
+        assert!(state.mlines.is_empty());
+
+        // At the cap: offered.
+        let kinds = &kinds[..OLD_PATH_MAX_MLINES];
+        manager.handle_publish(7, kinds, &contents[..kinds.len()], &sessions);
+        let sent = rx.try_recv();
+        assert!(matches!(sent, Ok(SignalMessage::Offer { .. })), "{sent:?}");
+        assert_eq!(manager.states[&7].mlines.len(), OLD_PATH_MAX_MLINES);
     }
 
     #[test]

@@ -19,7 +19,7 @@ impl SdpParser {
     ///
     /// # TigerStyle Compliance
     ///
-    /// - Bounded parsing (max 8 media sections)
+    /// - Bounded parsing (max `MAX_MEDIA_SECTIONS` media sections)
     /// - Explicit error handling
     /// - Precondition/postcondition assertions
     pub fn parse(sdp: &str) -> Result<SessionDescription, SdpError> {
@@ -86,7 +86,7 @@ impl SdpParser {
 
         // Postcondition: media count must be bounded
         assert!(
-            session.media_count <= MAX_MEDIA_SECTIONS as u8,
+            session.media.len() <= MAX_MEDIA_SECTIONS,
             "Media count must be <= MAX_MEDIA_SECTIONS"
         );
 
@@ -113,7 +113,11 @@ impl SdpParser {
             return Ok(());
         }
 
-        if line.len() < 2 || line.chars().nth(1) != Some('=') {
+        // The type is one ASCII byte followed by '='. Checking bytes (not chars) keeps
+        // the slice below on a char boundary: a multi-byte first character such as
+        // "€=x" must be an error, not a panic.
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 || !bytes[0].is_ascii() || bytes[1] != b'=' {
             // Malformed line - return error instead of silently skipping
             return Err(SdpError::ParseError {
                 line: line_num,
@@ -121,7 +125,7 @@ impl SdpParser {
             });
         }
 
-        let type_char = line.chars().next().unwrap();
+        let type_char = bytes[0] as char;
         let value = &line[2..];
 
         match type_char {
@@ -199,9 +203,9 @@ impl SdpParser {
         }
 
         // Enforce maximum media sections
-        if session.media_count >= MAX_MEDIA_SECTIONS as u8 {
+        if session.media.len() >= MAX_MEDIA_SECTIONS {
             return Err(SdpError::TooManyMedia {
-                count: session.media_count as usize + 1,
+                count: session.media.len() + 1,
                 max: MAX_MEDIA_SECTIONS,
             });
         }
@@ -223,13 +227,11 @@ impl SdpParser {
 
         if !has_session_ice {
             // Check if all media sections have ICE credentials
-            for i in 0..session.media_count as usize {
-                if let Some(ref media) = session.media[i] {
-                    if media.ice_ufrag.is_none() || media.ice_pwd.is_none() {
-                        return Err(SdpError::MissingIceCredentials {
-                            field: "ice-ufrag or ice-pwd",
-                        });
-                    }
+            for media in &session.media {
+                if media.ice_ufrag.is_none() || media.ice_pwd.is_none() {
+                    return Err(SdpError::MissingIceCredentials {
+                        field: "ice-ufrag or ice-pwd",
+                    });
                 }
             }
         }
@@ -244,14 +246,12 @@ impl SdpParser {
 
         // Validate ICE credential lengths (media-level) per RFC 8445
         // ice-ufrag must be at least 4 characters, ice-pwd at least 22 characters
-        for i in 0..session.media_count as usize {
-            if let Some(ref media) = session.media[i] {
-                if let Some(ref ufrag) = media.ice_ufrag {
-                    Self::validate_ice_ufrag(ufrag)?;
-                }
-                if let Some(ref pwd) = media.ice_pwd {
-                    Self::validate_ice_pwd(pwd)?;
-                }
+        for media in &session.media {
+            if let Some(ref ufrag) = media.ice_ufrag {
+                Self::validate_ice_ufrag(ufrag)?;
+            }
+            if let Some(ref pwd) = media.ice_pwd {
+                Self::validate_ice_pwd(pwd)?;
             }
         }
 
@@ -260,12 +260,8 @@ impl SdpParser {
 
         if !has_session_fp {
             // Check if all media sections have fingerprint
-            for i in 0..session.media_count as usize {
-                if let Some(ref media) = session.media[i] {
-                    if media.fingerprint.is_none() {
-                        return Err(SdpError::MissingFingerprint);
-                    }
-                }
+            if session.media.iter().any(|m| m.fingerprint.is_none()) {
+                return Err(SdpError::MissingFingerprint);
             }
         }
 
@@ -274,10 +270,24 @@ impl SdpParser {
             fp.validate()?;
         }
 
-        for i in 0..session.media_count as usize {
-            if let Some(ref media) = session.media[i] {
-                if let Some(ref fp) = media.fingerprint {
-                    fp.validate()?;
+        for media in &session.media {
+            if let Some(ref fp) = media.fingerprint {
+                fp.validate()?;
+            }
+        }
+
+        // Mids identify m-lines (RFC 5888 §4: unique within the session). Bounded:
+        // at most MAX_MEDIA_SECTIONS² comparisons.
+        for (i, media) in session.media.iter().enumerate() {
+            if let Some(mid) = media.mid.as_ref() {
+                let dup = session.media[..i]
+                    .iter()
+                    .any(|m| m.mid.as_ref().is_some_and(|m| m.as_str() == mid.as_str()));
+                if dup {
+                    return Err(SdpError::InvalidAttribute {
+                        name: "mid".to_string(),
+                        value: mid.as_str().to_string(),
+                    });
                 }
             }
         }
@@ -295,29 +305,10 @@ impl SdpParser {
     /// - Validates all BUNDLE MIDs reference existing media sections
     /// - Returns InvalidBundleGroup error for missing MIDs
     fn validate_bundle_group(session: &SessionDescription) -> Result<(), SdpError> {
-        if session.bundle_group_len == 0 {
-            return Ok(());
-        }
-
-        let bundle_str =
-            std::str::from_utf8(&session.bundle_group[..session.bundle_group_len as usize])
-                .unwrap_or("");
-
-        // Parse BUNDLE MIDs and validate each exists
-        for mid in bundle_str.split_whitespace() {
-            let mut found = false;
-            for i in 0..session.media_count as usize {
-                if let Some(ref media) = session.media[i] {
-                    if let Some(ref media_mid) = media.mid {
-                        if media_mid.as_str() == mid {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !found {
+        // Parse BUNDLE MIDs and validate each exists. Bounded: the value is at most
+        // MAX_BUNDLE_LEN bytes, and each check scans at most MAX_MEDIA_SECTIONS.
+        for mid in session.bundle().split_whitespace() {
+            if !session.has_media_with_mid(mid) {
                 return Err(SdpError::InvalidBundleGroup {
                     mid: mid.to_string(),
                 });
@@ -435,18 +426,54 @@ impl SdpParser {
 
         let mut media = MediaDescription::new(media_type, port, protocol);
 
-        // Parse format list
-        for (i, fmt) in parts[3..].iter().enumerate() {
-            if i >= 32 {
+        // Parse format list: RTP payload types (0-127) only. Other formats (e.g.
+        // `webrtc-datachannel`) are skipped rather than stored as PT 0. Bounded by the
+        // 32-entry array.
+        for fmt in &parts[3..] {
+            if media.format_count as usize >= media.formats.len() {
                 break;
             }
-            if let Ok(pt) = fmt.parse::<u8>() {
-                media.formats[i] = pt;
-                media.format_count = (i + 1) as u8;
+            if let Some(pt) = fmt.parse::<u8>().ok().filter(|&pt| pt <= 127) {
+                media.formats[media.format_count as usize] = pt;
+                media.format_count += 1;
             }
         }
 
         Ok(media)
+    }
+
+    /// One `a=extmap` entry: id 1-255 (0 is invalid, RFC 8285 §5) and a URI of at most
+    /// 128 bytes. Anything else is an error, never a truncated URI (the URI decides what
+    /// the extension is).
+    fn parse_extmap(
+        id_str: &str,
+        uri_str: &str,
+        direction: Option<Direction>,
+    ) -> Result<ExtMap, SdpError> {
+        let invalid = || SdpError::InvalidAttribute {
+            name: "extmap".to_string(),
+            value: format!(
+                "{} {}",
+                id_str,
+                uri_str.chars().take(64).collect::<String>()
+            ),
+        };
+        let id = id_str
+            .parse::<u8>()
+            .ok()
+            .filter(|&id| id != 0)
+            .ok_or_else(invalid)?;
+        if uri_str.is_empty() || uri_str.len() > 128 {
+            return Err(invalid());
+        }
+        let mut uri = [0u8; 128];
+        uri[..uri_str.len()].copy_from_slice(uri_str.as_bytes());
+        Ok(ExtMap {
+            id,
+            direction,
+            uri,
+            uri_len: uri_str.len() as u8,
+        })
     }
 
     /// Parse attribute line.
@@ -467,20 +494,22 @@ impl SdpParser {
             // ICE attributes
             "ice-ufrag" => {
                 if let Some(v) = attr_value {
+                    let ufrag = IceUfrag::parse(v)?;
                     if let Some(ref mut media) = current_media {
-                        media.ice_ufrag = Some(IceUfrag::new(v));
+                        media.ice_ufrag = Some(ufrag);
                     } else {
-                        session.ice_ufrag = Some(IceUfrag::new(v));
+                        session.ice_ufrag = Some(ufrag);
                     }
                 }
             }
 
             "ice-pwd" => {
                 if let Some(v) = attr_value {
+                    let pwd = IcePwd::parse(v)?;
                     if let Some(ref mut media) = current_media {
-                        media.ice_pwd = Some(IcePwd::new(v));
+                        media.ice_pwd = Some(pwd);
                     } else {
-                        session.ice_pwd = Some(IcePwd::new(v));
+                        session.ice_pwd = Some(pwd);
                     }
                 }
             }
@@ -568,7 +597,7 @@ impl SdpParser {
             "mid" => {
                 if let Some(v) = attr_value {
                     if let Some(ref mut media) = current_media {
-                        media.mid = Some(Mid::new(v));
+                        media.mid = Some(Mid::parse(v)?);
                     }
                 }
             }
@@ -577,10 +606,8 @@ impl SdpParser {
             "group" => {
                 if let Some(v) = attr_value {
                     if let Some(bundle) = v.strip_prefix("BUNDLE ") {
-                        let bytes = bundle.as_bytes();
-                        let len = bytes.len().min(64);
-                        session.bundle_group[..len].copy_from_slice(&bytes[..len]);
-                        session.bundle_group_len = len as u8;
+                        // An over-long group is an error, never truncated.
+                        session.set_bundle_value(bundle)?;
                     }
                 }
             }
@@ -618,9 +645,9 @@ impl SdpParser {
             "ssrc" => {
                 if let Some(v) = attr_value {
                     if let Some(ref mut media) = current_media {
-                        if let Ok(ssrc) = SsrcInfo::parse(v) {
-                            let _ = media.add_ssrc(ssrc);
-                        }
+                        // A malformed or over-long line is an error; entries beyond
+                        // MAX_SSRCS_PER_MEDIA are still dropped (simulcast, after v1).
+                        let _ = media.add_ssrc(SsrcInfo::parse(v)?);
                     }
                 }
             }
@@ -643,20 +670,8 @@ impl SdpParser {
                                 (id_part, None)
                             };
 
-                            if let Ok(id) = id_str.parse::<u8>() {
-                                let uri_bytes = uri_str.as_bytes();
-                                let uri_len = uri_bytes.len().min(128);
-                                let mut uri = [0u8; 128];
-                                uri[..uri_len].copy_from_slice(&uri_bytes[..uri_len]);
-
-                                let extmap = ExtMap {
-                                    id,
-                                    direction,
-                                    uri,
-                                    uri_len: uri_len as u8,
-                                };
-                                let _ = media.add_extmap(extmap);
-                            }
+                            let _ =
+                                media.add_extmap(Self::parse_extmap(id_str, uri_str, direction)?);
                         }
                     }
                 }
@@ -765,28 +780,9 @@ impl SdpParser {
             "msid" => {
                 if let Some(v) = attr_value {
                     if let Some(ref mut media) = current_media {
-                        let parts: Vec<&str> = v.splitn(2, ' ').collect();
-                        let mut stream_id = [0u8; 128];
-                        let s_bytes = parts[0].as_bytes();
-                        let s_len = s_bytes.len().min(128);
-                        stream_id[..s_len].copy_from_slice(&s_bytes[..s_len]);
-
-                        let mut track_id = [0u8; 128];
-                        let t_len = if parts.len() > 1 {
-                            let t_bytes = parts[1].as_bytes();
-                            let len = t_bytes.len().min(128);
-                            track_id[..len].copy_from_slice(&t_bytes[..len]);
-                            len as u8
-                        } else {
-                            0
-                        };
-
-                        media.msid = Some(super::media::Msid {
-                            stream_id,
-                            stream_id_len: s_len as u8,
-                            track_id,
-                            track_id_len: t_len,
-                        });
+                        // Over-long ids are an error (Msid::new), never cut.
+                        let (stream_id, track_id) = v.split_once(' ').unwrap_or((v, ""));
+                        media.msid = Some(super::media::Msid::new(stream_id, track_id)?);
                     }
                 }
             }
@@ -823,8 +819,9 @@ impl SdpParser {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::media::Mid;
+    use super::super::{MAX_BUNDLE_LEN, MAX_MID_LEN};
     use super::*;
 
     // ========================================================================
@@ -851,9 +848,9 @@ a=rtcp-mux
         assert_eq!(parsed.version, 0);
         assert_eq!(parsed.origin.session_id, 12345);
         assert!(parsed.ice_ufrag.is_some());
-        assert_eq!(parsed.media_count, 1);
+        assert_eq!(parsed.media.len(), 1);
 
-        let media = parsed.media[0].as_ref().unwrap();
+        let media = &parsed.media[0];
         assert_eq!(media.media_type, MediaType::Audio);
         assert!(media.rtcp_mux);
     }
@@ -873,7 +870,7 @@ a=candidate:1 1 udp 2130706431 192.168.1.1 54321 typ host
 
         let parsed = SdpParser::parse(sdp).unwrap();
 
-        let media = parsed.media[0].as_ref().unwrap();
+        let media = &parsed.media[0];
         assert_eq!(media.candidate_count, 1);
     }
 
@@ -915,7 +912,7 @@ a=mid:1
         let parsed = SdpParser::parse(sdp).unwrap();
 
         assert!(parsed.bundle_group_len > 0);
-        assert_eq!(parsed.media_count, 2);
+        assert_eq!(parsed.media.len(), 2);
     }
 
     // ========================================================================
@@ -928,8 +925,8 @@ a=mid:1
         sdp.push_str("a=ice-ufrag:testufrag\na=ice-pwd:testpwd1234567890123456\n");
         sdp.push_str("a=fingerprint:sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90\n");
 
-        // Add 9 media sections (exceeds limit of 8)
-        for i in 0..9 {
+        // Add MAX_MEDIA_SECTIONS + 1 media sections
+        for i in 0..MAX_MEDIA_SECTIONS + 1 {
             sdp.push_str(&format!("m=audio 9 UDP/TLS/RTP/SAVPF 111\na=mid:{}\n", i));
         }
 
@@ -943,14 +940,179 @@ a=mid:1
         sdp.push_str("a=ice-ufrag:testufrag\na=ice-pwd:testpwd1234567890123456\n");
         sdp.push_str("a=fingerprint:sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90\n");
 
-        // Add exactly MAX_MEDIA_SECTIONS (8)
+        // Add exactly MAX_MEDIA_SECTIONS (32)
         for i in 0..MAX_MEDIA_SECTIONS {
             sdp.push_str(&format!("m=audio 9 UDP/TLS/RTP/SAVPF 111\na=mid:{}\n", i));
         }
 
         let result = SdpParser::parse(&sdp);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().media_count, MAX_MEDIA_SECTIONS as u8);
+        assert_eq!(result.unwrap().media.len(), MAX_MEDIA_SECTIONS);
+    }
+
+    /// A valid session header followed by `count` audio m-lines with mids from `mid`,
+    /// and a BUNDLE line naming all of them.
+    fn sdp_with_mlines(count: usize, mid: impl Fn(usize) -> String) -> String {
+        let mut sdp = String::from("v=0\no=- 1 1 IN IP4 0.0.0.0\ns=-\nt=0 0\n");
+        sdp.push_str("a=ice-ufrag:testufrag\na=ice-pwd:testpwd1234567890123456\n");
+        sdp.push_str("a=fingerprint:sha-256 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90\n");
+        let mids: Vec<String> = (0..count).map(&mid).collect();
+        sdp.push_str(&format!("a=group:BUNDLE {}\n", mids.join(" ")));
+        for m in &mids {
+            sdp.push_str(&format!("m=audio 9 UDP/TLS/RTP/SAVPF 111\na=mid:{}\n", m));
+        }
+        sdp
+    }
+
+    #[test]
+    fn test_bundle_keeps_all_32_mids() {
+        // Numeric mids and 16-character mids: the longest group that must fit.
+        let long = |i: usize| format!("{:0>16}", i);
+        for mid in [
+            &(|i: usize| i.to_string()) as &dyn Fn(usize) -> String,
+            &long,
+        ] {
+            let parsed = SdpParser::parse(&sdp_with_mlines(MAX_MEDIA_SECTIONS, mid)).unwrap();
+            let bundle: Vec<&str> = parsed.bundle().split(' ').collect();
+            assert_eq!(bundle.len(), MAX_MEDIA_SECTIONS);
+            for (i, m) in bundle.iter().enumerate() {
+                assert_eq!(*m, mid(i));
+                assert_eq!(parsed.media[i].mid.as_ref().unwrap().as_str(), mid(i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_overlong_bundle_is_an_error_not_a_truncation() {
+        let mut sdp = sdp_with_mlines(1, |i| i.to_string());
+        let group = format!("a=group:BUNDLE 0{}\n", " 0".repeat(MAX_BUNDLE_LEN));
+        sdp = sdp.replace("a=group:BUNDLE 0\n", &group);
+        assert!(matches!(
+            SdpParser::parse(&sdp),
+            Err(SdpError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_overlong_mid_is_an_error_not_a_truncation() {
+        let ok = sdp_with_mlines(1, |_| "a".repeat(MAX_MID_LEN));
+        assert!(SdpParser::parse(&ok).is_ok());
+        let too_long = sdp_with_mlines(1, |_| "a".repeat(MAX_MID_LEN + 1));
+        assert!(matches!(
+            SdpParser::parse(&too_long),
+            Err(SdpError::InvalidAttribute { .. })
+        ));
+    }
+
+    /// `sdp_with_mlines(1, ..)` with `extra` lines appended to its one m-line.
+    fn one_mline_with(extra: &str) -> String {
+        format!("{}{}", sdp_with_mlines(1, |i| i.to_string()), extra)
+    }
+
+    #[test]
+    fn test_fields_over_capacity_are_errors_not_cuts() {
+        let ok = one_mline_with("");
+        assert!(SdpParser::parse(&ok).is_ok());
+        let cases = [
+            // ICE credentials: > 256 bytes, or not ice-char (RFC 8445 §5.3)
+            ok.replace(
+                "a=ice-ufrag:testufrag",
+                &format!("a=ice-ufrag:{}", "u".repeat(257)),
+            ),
+            ok.replace("a=ice-pwd:", &format!("a=ice-pwd:{}", "p".repeat(257))),
+            ok.replace("a=ice-ufrag:testufrag", "a=ice-ufrag:test-ufrag"),
+            ok.replace("a=ice-pwd:testpwd", "a=ice-pwd:testpwé"),
+            // msid ids > 128 bytes
+            one_mline_with(&format!("a=msid:{} t\n", "s".repeat(129))),
+            one_mline_with(&format!("a=msid:s {}\n", "t".repeat(129))),
+            // ssrc attribute value > 256 bytes (cname), attribute name > 32
+            one_mline_with(&format!("a=ssrc:1 cname:{}\n", "c".repeat(257))),
+            one_mline_with(&format!("a=ssrc:1 {}:x\n", "a".repeat(33))),
+            // extmap URI > 128 bytes, id 0
+            one_mline_with(&format!("a=extmap:1 urn:{}\n", "x".repeat(125))),
+            one_mline_with("a=extmap:0 urn:ietf:params:rtp-hdrext:sdes:mid\n"),
+        ];
+        for sdp in &cases {
+            assert!(SdpParser::parse(sdp).is_err(), "accepted: {sdp:?}");
+        }
+        // At capacity: accepted and stored whole.
+        let at = one_mline_with(&format!(
+            "a=msid:{} {}\na=ssrc:1 cname:{}\na=extmap:14 urn:{}\n",
+            "s".repeat(128),
+            "t".repeat(128),
+            "c".repeat(256),
+            "x".repeat(124)
+        ));
+        let parsed = SdpParser::parse(&at).unwrap();
+        let media = &parsed.media[0];
+        let msid = media.msid.as_ref().unwrap();
+        assert_eq!((msid.stream_id().len(), msid.track_id().len()), (128, 128));
+        assert_eq!(media.ssrcs[0].as_ref().unwrap().value_len, 256);
+        assert_eq!(media.extmaps[0].as_ref().unwrap().uri_len, 128);
+    }
+
+    #[test]
+    fn test_mid_must_be_a_unique_token() {
+        let base = sdp_with_mlines(2, |i| i.to_string());
+        assert!(SdpParser::parse(&base).is_ok());
+        let bad = [
+            base.replace("a=mid:1", "a=mid:0")
+                .replace("BUNDLE 0 1", "BUNDLE 0"),
+            base.replace("a=mid:1", "a=mid:a\"b")
+                .replace("BUNDLE 0 1", "BUNDLE 0"),
+            base.replace("a=mid:1", "a=mid:é")
+                .replace("BUNDLE 0 1", "BUNDLE 0"),
+            base.replace("a=mid:1", "a=mid:a(b")
+                .replace("BUNDLE 0 1", "BUNDLE 0"),
+        ];
+        for sdp in &bad {
+            assert!(SdpParser::parse(sdp).is_err(), "accepted: {sdp:?}");
+        }
+        // Token characters other than alphanumerics are fine.
+        let ok = base
+            .replace("a=mid:1", "a=mid:v-1.x_~")
+            .replace("BUNDLE 0 1", "BUNDLE 0 v-1.x_~");
+        assert!(SdpParser::parse(&ok).is_ok());
+    }
+
+    #[test]
+    fn test_format_list_skips_non_payload_types() {
+        let base = sdp_with_mlines(1, |i| i.to_string());
+        let parse = |line: &str| {
+            let sdp = base.replace("m=audio 9 UDP/TLS/RTP/SAVPF 111", line);
+            let parsed = SdpParser::parse(&sdp).unwrap();
+            let m = &parsed.media[0];
+            m.formats[..m.format_count as usize].to_vec()
+        };
+        assert_eq!(
+            parse("m=audio 9 UDP/TLS/RTP/SAVPF 111 abc 96 200"),
+            [111, 96]
+        );
+        assert!(parse("m=application 9 UDP/DTLS/SCTP webrtc-datachannel").is_empty());
+        // A payload type above 127 in rtpmap is not a codec.
+        let sdp = one_mline_with("a=rtpmap:200 opus/48000/2\na=rtpmap:111 opus/48000/2\n");
+        let parsed = SdpParser::parse(&sdp).unwrap();
+        assert_eq!(parsed.media[0].codec_count, 1);
+        assert_eq!(
+            parsed.media[0].codecs[0].as_ref().unwrap().payload_type,
+            111
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_input_is_an_error_not_a_panic() {
+        let base = sdp_with_mlines(1, |i| i.to_string());
+        let cases = [
+            // Multi-byte type character: byte 2 is inside it.
+            format!("{}€=x\n", base),
+            format!("{}é\n", base),
+            // Non-ASCII fingerprint of even byte length.
+            base.replace("a=fingerprint:sha-256 AB", "a=fingerprint:sha-256 Aé:A"),
+            base.replace("a=fingerprint:sha-256 AB:CD", "a=fingerprint:sha-256 éé:CD"),
+        ];
+        for sdp in &cases {
+            assert!(SdpParser::parse(sdp).is_err(), "accepted: {sdp:?}");
+        }
     }
 
     // ========================================================================
@@ -1098,13 +1260,13 @@ m=audio 9 UDP/TLS/RTP/SAVPF 111
         sdp.add_media(media).unwrap();
 
         // Serialize
-        let serialized = sdp.to_sdp();
+        let serialized = sdp.to_sdp().unwrap();
 
         // Parse back
         let reparsed = SdpParser::parse(&serialized).unwrap();
 
         // Verify
-        assert_eq!(reparsed.media_count, 1);
+        assert_eq!(reparsed.media.len(), 1);
         assert!(reparsed.ice_ufrag.is_some());
         assert!(reparsed.fingerprint.is_some());
     }
@@ -1138,10 +1300,10 @@ m=audio 9 UDP/TLS/RTP/SAVPF 111
             media.add_codec(codec).unwrap();
             sdp.add_media(media).unwrap();
 
-            let serialized = sdp.to_sdp();
+            let serialized = sdp.to_sdp().unwrap();
             let reparsed = SdpParser::parse(&serialized).unwrap();
 
-            assert_eq!(reparsed.media[0].as_ref().unwrap().media_type, media_type);
+            assert_eq!(reparsed.media[0].media_type, media_type);
         }
     }
 
@@ -1171,10 +1333,10 @@ m=audio 9 UDP/TLS/RTP/SAVPF 111
             media.add_codec(codec).unwrap();
             sdp.add_media(media).unwrap();
 
-            let serialized = sdp.to_sdp();
+            let serialized = sdp.to_sdp().unwrap();
             let reparsed = SdpParser::parse(&serialized).unwrap();
 
-            assert_eq!(reparsed.media[0].as_ref().unwrap().direction, direction);
+            assert_eq!(reparsed.media[0].direction, direction);
         }
     }
 
@@ -1231,10 +1393,7 @@ a=mid:0
 "#;
 
         let parsed = SdpParser::parse(sdp).unwrap();
-        assert_eq!(
-            parsed.media[0].as_ref().unwrap().media_type,
-            MediaType::Audio
-        );
+        assert_eq!(parsed.media[0].media_type, MediaType::Audio);
     }
 
     #[test]
@@ -1251,10 +1410,7 @@ a=mid:0
 "#;
 
         let parsed = SdpParser::parse(sdp).unwrap();
-        assert_eq!(
-            parsed.media[0].as_ref().unwrap().media_type,
-            MediaType::Video
-        );
+        assert_eq!(parsed.media[0].media_type, MediaType::Video);
     }
 
     // ========================================================================
@@ -1276,7 +1432,7 @@ a=rtpmap:111 opus/48000/2
 "#;
 
         let parsed = SdpParser::parse(sdp).unwrap();
-        let media = parsed.media[0].as_ref().unwrap();
+        let media = &parsed.media[0];
         assert!(media.codec_count >= 1);
     }
 
@@ -1337,7 +1493,7 @@ a=ssrc:12345 cname:test
 "#;
 
         let parsed = SdpParser::parse(sdp).unwrap();
-        let media = parsed.media[0].as_ref().unwrap();
+        let media = &parsed.media[0];
         assert!(media.ssrc_count >= 1);
     }
 
@@ -1425,7 +1581,7 @@ a=ice-pwd:testpwd12345678901234567890
         );
 
         let parsed = result.unwrap();
-        let media = parsed.media[0].as_ref().unwrap();
+        let media = &parsed.media[0];
         assert_eq!(media.ice_ufrag.as_ref().unwrap().as_str(), "testufrag");
         assert_eq!(
             media.ice_pwd.as_ref().unwrap().as_str(),
@@ -1458,13 +1614,81 @@ a=ice-pwd:testpwd12345678901234567890
     // ========================================================================
 
     #[cfg(test)]
-    mod property_tests {
+    pub(crate) mod property_tests {
         use super::*;
         use proptest::prelude::*;
+
+        // `PROPTEST_CASES` overrides the per-run default (e.g. 20000 for a deep run).
+        pub(crate) fn env_cases(default: u32) -> u32 {
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
 
         // Strategy for valid session IDs
         fn valid_session_id() -> impl Strategy<Value = u64> {
             1..u64::MAX
+        }
+
+        /// A valid session header and one m-line, then `lines`.
+        fn with_header(lines: &[String]) -> String {
+            let mut sdp = String::from("v=0\no=- 1 1 IN IP4 0.0.0.0\ns=-\nt=0 0\n");
+            sdp.push_str("m=audio 9 UDP/TLS/RTP/SAVPF 111\n");
+            for line in lines {
+                sdp.push_str(line);
+                sdp.push('\n');
+            }
+            sdp
+        }
+
+        // Strategy for attribute values: any text, printable ASCII, or the
+        // "<number> <token>[:<rest>]" shape of ssrc/extmap/rtpmap/fmtp/rtcp-fb values,
+        // with lengths past every field's capacity (the longest is 256 bytes).
+        pub(crate) fn attr_value() -> impl Strategy<Value = String> {
+            prop_oneof![
+                ".{0,300}",
+                "[ -~]{0,300}",
+                "[0-9]{1,11}(/[a-z]{1,8})? [a-z0-9:/.-]{1,300}( [ -~]{0,40})?",
+                "[0-9]{1,11} [a-z-]{1,40}:[ -~]{0,300}",
+            ]
+        }
+
+        // Strategy for attribute names: every name the parser handles, or a random one
+        pub(crate) fn attr_name() -> impl Strategy<Value = String> {
+            const NAMES: [&str; 27] = [
+                "ice-ufrag",
+                "ice-pwd",
+                "ice-options",
+                "ice-lite",
+                "fingerprint",
+                "setup",
+                "sendrecv",
+                "sendonly",
+                "recvonly",
+                "inactive",
+                "rtcp-mux",
+                "rtcp-rsize",
+                "mid",
+                "group",
+                "rtpmap",
+                "fmtp",
+                "ssrc",
+                "extmap",
+                "candidate",
+                "rtcp-fb",
+                "ssrc-group",
+                "rid",
+                "simulcast",
+                "msid",
+                "rtcp-mux-only",
+                "extmap-allow-mixed",
+                "end-of-candidates",
+            ];
+            prop_oneof![
+                3 => prop::sample::select(&NAMES[..]).prop_map(str::to_string),
+                1 => "[a-z-]{1,14}",
+            ]
         }
 
         // Strategy for valid ICE ufrag
@@ -1486,7 +1710,10 @@ a=ice-pwd:testpwd12345678901234567890
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(50))]
+            #![proptest_config(ProptestConfig {
+                cases: env_cases(50),
+                ..ProptestConfig::default()
+            })]
 
             #[test]
             fn prop_roundtrip_session_id(session_id in valid_session_id()) {
@@ -1510,7 +1737,7 @@ a=ice-pwd:testpwd12345678901234567890
                 media.add_codec(codec).unwrap();
                 sdp.add_media(media).unwrap();
 
-                let serialized = sdp.to_sdp();
+                let serialized = sdp.to_sdp().unwrap();
                 let reparsed = SdpParser::parse(&serialized).unwrap();
 
                 prop_assert_eq!(reparsed.origin.session_id, session_id);
@@ -1538,11 +1765,46 @@ a=ice-pwd:testpwd12345678901234567890
                 media.add_codec(codec).unwrap();
                 sdp.add_media(media).unwrap();
 
-                let serialized = sdp.to_sdp();
+                let serialized = sdp.to_sdp().unwrap();
                 let reparsed = SdpParser::parse(&serialized).unwrap();
 
                 let parsed_ufrag = reparsed.ice_ufrag.as_ref().unwrap();
                 prop_assert_eq!(parsed_ufrag.as_str(), ufrag.as_str());
+            }
+
+            /// Arbitrary lines (any Unicode) after a valid header never panic the parser
+            /// (network input, exit criterion 6). The parser stops at the first error, so
+            /// each shape of line gets its own property.
+            #[test]
+            fn prop_arbitrary_lines_never_panic(lines in prop::collection::vec(".{0,300}", 1..4)) {
+                let _ = SdpParser::parse(&with_header(&lines));
+            }
+
+            /// "<any char>=<value>" lines reach the type dispatch with multi-byte types.
+            #[test]
+            fn prop_typed_lines_never_panic(
+                typed in prop::collection::vec((any::<char>(), ".{0,300}"), 1..4),
+            ) {
+                let lines: Vec<String> =
+                    typed.iter().map(|(c, v)| format!("{}={}", c, v)).collect();
+                let _ = SdpParser::parse(&with_header(&lines));
+            }
+
+            /// Every attribute the parser handles, with arbitrary values.
+            #[test]
+            fn prop_attributes_never_panic(
+                attrs in prop::collection::vec((attr_name(), attr_value()), 1..4),
+            ) {
+                let lines: Vec<String> =
+                    attrs.iter().map(|(n, v)| format!("a={}:{}", n, v)).collect();
+                let _ = SdpParser::parse(&with_header(&lines));
+            }
+
+            /// Fingerprint values after a valid algorithm name (the hex decoder).
+            #[test]
+            fn prop_fingerprint_values_never_panic(value in ".{0,300}") {
+                let lines = [format!("a=fingerprint:sha-256 {}", value)];
+                let _ = SdpParser::parse(&with_header(&lines));
             }
 
             #[test]
@@ -1569,11 +1831,11 @@ a=ice-pwd:testpwd12345678901234567890
                     sdp.add_media(media).unwrap();
                 }
 
-                let serialized = sdp.to_sdp();
+                let serialized = sdp.to_sdp().unwrap();
                 let reparsed = SdpParser::parse(&serialized).unwrap();
 
-                prop_assert_eq!(reparsed.media_count as usize, count);
-                prop_assert!(reparsed.media_count <= MAX_MEDIA_SECTIONS as u8);
+                prop_assert_eq!(reparsed.media.len(), count);
+                prop_assert!(reparsed.media.len() <= MAX_MEDIA_SECTIONS);
             }
 
             #[test]

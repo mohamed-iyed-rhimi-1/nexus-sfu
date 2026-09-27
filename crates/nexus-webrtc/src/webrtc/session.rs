@@ -109,6 +109,9 @@ pub const CONSENT_TIMEOUT_SECS: u64 = 30;
 /// Maximum sessions per transport.
 pub const MAX_SESSIONS: usize = 1000;
 
+/// Most media sections a renegotiation offer or answer may carry on the old path.
+const MAX_RENEGOTIATION_MEDIA: usize = 10;
+
 /// Compile-time assertion that MAX_SESSIONS is exactly 1000.
 const _: () = assert!(
     MAX_SESSIONS == 1000,
@@ -1834,7 +1837,7 @@ impl WebRtcSession {
     /// # Assertions
     ///
     /// * `state == SessionState::Established` - Session must be established
-    /// * `offer.media_count <= 10` - Bounded media sections
+    /// * `offer.media.len() <= 10` - Bounded media sections (more is `InvalidConfig`)
     ///
     /// # Postcondition
     ///
@@ -1855,11 +1858,10 @@ impl WebRtcSession {
             "Renegotiation only allowed in Established state"
         );
 
-        // Precondition: bounded media sections
-        assert!(
-            offer.media_count <= 10,
-            "Media sections must be bounded to 10"
-        );
+        // Bounded media sections: the SDP parser now accepts up to 32, the old path 10.
+        if offer.media.len() > MAX_RENEGOTIATION_MEDIA {
+            return Err(WebRtcError::InvalidConfig);
+        }
 
         tracing::info!(session_id = self.config.id.0, "Handling SDP renegotiation");
 
@@ -1869,11 +1871,9 @@ impl WebRtcSession {
 
         // Collect new mids from offer
         let mut new_mids = Vec::new();
-        for i in 0..offer.media_count as usize {
-            if let Some(media) = &offer.media[i] {
-                if let Some(mid) = &media.mid {
-                    new_mids.push(mid.as_str().to_string());
-                }
+        for media in &offer.media {
+            if let Some(mid) = &media.mid {
+                new_mids.push(mid.as_str().to_string());
             }
         }
 
@@ -1943,7 +1943,7 @@ impl WebRtcSession {
     /// # Preconditions
     ///
     /// * `state == SessionState::Established`
-    /// * `answer.media_count <= 10`
+    /// * `answer.media.len() <= 10` (more is `InvalidConfig`)
     pub fn handle_renegotiation_answer(
         &mut self,
         answer: &crate::sdp::SessionDescription,
@@ -1953,10 +1953,9 @@ impl WebRtcSession {
             SessionState::Established,
             "Renegotiation answer only allowed in Established state"
         );
-        assert!(
-            answer.media_count <= 10,
-            "Media sections must be bounded to 10"
-        );
+        if answer.media.len() > MAX_RENEGOTIATION_MEDIA {
+            return Err(WebRtcError::InvalidConfig);
+        }
 
         tracing::info!(
             session_id = self.config.id.0,
@@ -1967,11 +1966,9 @@ impl WebRtcSession {
         let mut removed_mids = Vec::new();
 
         let mut new_mids = Vec::new();
-        for i in 0..answer.media_count as usize {
-            if let Some(media) = &answer.media[i] {
-                if let Some(mid) = &media.mid {
-                    new_mids.push(mid.as_str().to_string());
-                }
+        for media in &answer.media {
+            if let Some(mid) = &media.mid {
+                new_mids.push(mid.as_str().to_string());
             }
         }
 

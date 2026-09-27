@@ -2073,6 +2073,7 @@ dependencies = [
  "capnpc",
  "dashmap",
  "futures-util",
+ "jsonwebtoken",
  "nexus-api",
  "nexus-core",
  "nexus-state",

@@ -6,8 +6,8 @@ use super::media::{IcePwd, IceUfrag, MediaDescription};
 #[cfg(debug_assertions)]
 use super::parser::SdpParser;
 use super::{
-    MAX_ICE_PWD_LEN, MAX_ICE_UFRAG_LEN, MAX_MEDIA_SECTIONS, MAX_SDP_SIZE, MIN_ICE_PWD_LEN,
-    MIN_ICE_UFRAG_LEN,
+    MAX_BUNDLE_LEN, MAX_ICE_PWD_LEN, MAX_ICE_UFRAG_LEN, MAX_MEDIA_SECTIONS, MAX_SDP_SIZE,
+    MIN_ICE_PWD_LEN, MIN_ICE_UFRAG_LEN,
 };
 
 /// Origin (o=) line.
@@ -126,15 +126,14 @@ pub struct SessionDescription {
     pub setup: Option<DtlsSetup>,
 
     // Groups
-    /// BUNDLE group (MIDs).
-    pub bundle_group: [u8; 64],
-    pub bundle_group_len: u8,
+    /// BUNDLE group (MIDs separated by spaces).
+    pub bundle_group: [u8; MAX_BUNDLE_LEN],
+    pub bundle_group_len: u16,
 
     // Media sections
-    /// Media descriptions.
-    pub media: [Option<MediaDescription>; MAX_MEDIA_SECTIONS],
-    /// Number of media sections.
-    pub media_count: u8,
+    /// Media descriptions, at most `MAX_MEDIA_SECTIONS` (enforced by `add_media` and the
+    /// parser). Each is large (≈ 18 KB of inline arrays), so they live on the heap.
+    pub media: Vec<MediaDescription>,
 }
 
 impl Default for SessionDescription {
@@ -153,10 +152,9 @@ impl Default for SessionDescription {
             ice_lite: false,
             fingerprint: None,
             setup: None,
-            bundle_group: [0u8; 64],
+            bundle_group: [0u8; MAX_BUNDLE_LEN],
             bundle_group_len: 0,
-            media: Default::default(),
-            media_count: 0,
+            media: Vec::new(),
         }
     }
 }
@@ -201,15 +199,15 @@ impl SessionDescription {
 
     /// Add a media section.
     pub fn add_media(&mut self, media: MediaDescription) -> Result<(), SdpError> {
-        if self.media_count as usize >= MAX_MEDIA_SECTIONS {
+        if self.media.len() >= MAX_MEDIA_SECTIONS {
             return Err(SdpError::TooManyMedia {
-                count: self.media_count as usize + 1,
+                count: self.media.len() + 1,
                 max: MAX_MEDIA_SECTIONS,
             });
         }
 
-        self.media[self.media_count as usize] = Some(media);
-        self.media_count += 1;
+        self.media.push(media);
+        debug_assert!(self.media.len() <= MAX_MEDIA_SECTIONS);
         Ok(())
     }
 
@@ -236,12 +234,28 @@ impl SessionDescription {
         }
 
         let bundle = mids.join(" ");
-        let bytes = bundle.as_bytes();
-        let len = bytes.len().min(64);
-        self.bundle_group[..len].copy_from_slice(&bytes[..len]);
-        self.bundle_group_len = len as u8;
+        self.set_bundle_value(&bundle)
+    }
 
+    /// Store a BUNDLE group value (mids separated by spaces). An over-long value is an
+    /// error, never truncated: a cut group would drop or corrupt the last mids.
+    pub fn set_bundle_value(&mut self, bundle: &str) -> Result<(), SdpError> {
+        let bytes = bundle.as_bytes();
+        if bytes.len() > MAX_BUNDLE_LEN {
+            return Err(SdpError::TooLarge {
+                size: bytes.len(),
+                max: MAX_BUNDLE_LEN,
+            });
+        }
+        self.bundle_group[..bytes.len()].copy_from_slice(bytes);
+        self.bundle_group_len = bytes.len() as u16;
+        debug_assert_eq!(self.bundle(), bundle);
         Ok(())
+    }
+
+    /// The BUNDLE group value (empty when there is none).
+    pub fn bundle(&self) -> &str {
+        std::str::from_utf8(&self.bundle_group[..self.bundle_group_len as usize]).unwrap_or("")
     }
 
     /// Check if session has media with given MID.
@@ -250,17 +264,13 @@ impl SessionDescription {
     ///
     /// - Extracted helper for clarity
     /// - Bounded iteration
-    fn has_media_with_mid(&self, target_mid: &str) -> bool {
-        for i in 0..self.media_count as usize {
-            if let Some(ref media) = self.media[i] {
-                if let Some(ref mid) = media.mid {
-                    if mid.as_str() == target_mid {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+    pub(crate) fn has_media_with_mid(&self, target_mid: &str) -> bool {
+        self.media.iter().any(|media| {
+            media
+                .mid
+                .as_ref()
+                .is_some_and(|mid| mid.as_str() == target_mid)
+        })
     }
 
     /// Serialize to complete SDP string.
@@ -268,13 +278,15 @@ impl SessionDescription {
     /// # TigerStyle Compliance
     ///
     /// - Paired assertion: validates result can be re-parsed
-    /// - Bounded string generation
-    pub fn to_sdp(&self) -> String {
-        // Precondition: session must be valid
-        assert!(
-            self.media_count <= MAX_MEDIA_SECTIONS as u8,
-            "Media count must be bounded"
-        );
+    /// - Bounded string generation: more than `MAX_MEDIA_SECTIONS` sections or more than
+    ///   `MAX_SDP_SIZE` bytes of output are errors
+    pub fn to_sdp(&self) -> Result<String, SdpError> {
+        if self.media.len() > MAX_MEDIA_SECTIONS {
+            return Err(SdpError::TooManyMedia {
+                count: self.media.len(),
+                max: MAX_MEDIA_SECTIONS,
+            });
+        }
 
         let mut lines = Vec::new();
 
@@ -313,38 +325,35 @@ impl SessionDescription {
 
         // BUNDLE
         if self.bundle_group_len > 0 {
-            let bundle = std::str::from_utf8(&self.bundle_group[..self.bundle_group_len as usize])
-                .unwrap_or("");
-            lines.push(format!("a=group:BUNDLE {}", bundle));
+            lines.push(format!("a=group:BUNDLE {}", self.bundle()));
         }
 
         // Media sections
-        for i in 0..self.media_count as usize {
-            if let Some(ref media) = self.media[i] {
-                lines.push(media.to_sdp());
-            }
+        for media in &self.media {
+            lines.push(media.to_sdp());
         }
 
         let result = lines.join("\r\n") + "\r\n";
-
-        // Postcondition: result must be parseable (paired assertion)
-        assert!(
-            result.len() <= MAX_SDP_SIZE,
-            "Generated SDP must not exceed MAX_SDP_SIZE"
-        );
+        if result.len() > MAX_SDP_SIZE {
+            return Err(SdpError::TooLarge {
+                size: result.len(),
+                max: MAX_SDP_SIZE,
+            });
+        }
 
         // Postcondition: result should be re-parseable (validation)
         #[cfg(debug_assertions)]
         {
             if let Ok(reparsed) = SdpParser::parse(&result) {
                 assert_eq!(
-                    reparsed.media_count, self.media_count,
+                    reparsed.media.len(),
+                    self.media.len(),
                     "Re-parsed SDP must have same media count"
                 );
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Create an answer from an offer.
@@ -363,7 +372,7 @@ impl SessionDescription {
         our_pwd: &str,
         our_fingerprint: &DtlsFingerprint,
     ) -> Result<SessionDescription, SdpError> {
-        if self.media_count == 0 {
+        if self.media.is_empty() {
             return Err(SdpError::InvalidFormat {
                 reason: "offer must have at least one media section",
             });
@@ -395,22 +404,21 @@ impl SessionDescription {
         }
 
         // Process each media section
-        for i in 0..self.media_count as usize {
-            if let Some(ref offer_media) = self.media[i] {
-                let answer_media = Self::create_answer_media(
-                    offer_media,
-                    our_ufrag,
-                    our_pwd,
-                    our_fingerprint,
-                    answer_setup,
-                )?;
-                answer.add_media(answer_media)?;
-            }
+        for offer_media in &self.media {
+            let answer_media = Self::create_answer_media(
+                offer_media,
+                our_ufrag,
+                our_pwd,
+                our_fingerprint,
+                answer_setup,
+            )?;
+            answer.add_media(answer_media)?;
         }
 
         // Postcondition: answer must have same media count as offer
         assert_eq!(
-            answer.media_count, self.media_count,
+            answer.media.len(),
+            self.media.len(),
             "Answer must have same media count as offer"
         );
 
@@ -637,7 +645,7 @@ mod tests {
         sdp.set_session_name("Test Session");
         sdp.set_ice_credentials("testufrag", "testpwd1234567890123456");
 
-        let output = sdp.to_sdp();
+        let output = sdp.to_sdp().unwrap();
         assert!(output.starts_with("v=0"));
         assert!(output.contains("s=Test Session"));
         assert!(output.contains("a=ice-ufrag:testufrag"));
@@ -649,7 +657,7 @@ mod tests {
         let media = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
 
         sdp.add_media(media).unwrap();
-        assert_eq!(sdp.media_count, 1);
+        assert_eq!(sdp.media.len(), 1);
     }
 
     #[test]
@@ -674,6 +682,32 @@ mod tests {
         // Now should succeed
         let result = sdp.set_bundle(&["0", "1"]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_set_bundle_over_the_limit_is_an_error() {
+        let mut sdp = SessionDescription::new(12345);
+        let mids: Vec<String> = (0..MAX_MEDIA_SECTIONS)
+            .map(|i| format!("{:0>16}", i))
+            .collect();
+        for mid in &mids {
+            let mut media =
+                MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+            media.mid = Some(Mid::new(mid));
+            sdp.add_media(media).unwrap();
+        }
+        let refs: Vec<&str> = mids.iter().map(String::as_str).collect();
+        // 32 mids of 16 characters: the longest valid group, kept whole.
+        sdp.set_bundle(&refs).unwrap();
+        assert_eq!(sdp.bundle(), mids.join(" "));
+        // One byte more is an error, and the previous group stays.
+        let over = format!("{} x", mids.join(" "));
+        assert!(over.len() > MAX_BUNDLE_LEN);
+        assert!(matches!(
+            sdp.set_bundle_value(&over),
+            Err(SdpError::TooLarge { .. })
+        ));
+        assert_eq!(sdp.bundle(), mids.join(" "));
     }
 
     #[test]

@@ -40,7 +40,8 @@ pub use media::{
     MediaDescription, MediaType, Mid, Msid, Rid, SimulcastAttr, SsrcGroup, TransportProtocol,
 };
 pub use negotiator::{
-    default_supported_codecs, CodecCapability, CodecType, OfferMline, RecycledMline, SdpNegotiator,
+    default_supported_codecs, offered_extmaps, CodecCapability, CodecType, OfferMline,
+    RecycledMline, SdpNegotiator, TrackMline,
 };
 pub use parser::SdpParser;
 pub use printer::SdpPrinter;
@@ -51,7 +52,10 @@ pub use session::{Origin, SessionDescription, Timing};
 // ============================================================================
 
 /// Maximum number of media sections in an SDP.
-pub const MAX_MEDIA_SECTIONS: usize = 8;
+///
+/// A 10-client call needs 20 m-lines per session, and the negotiator gives each new
+/// sendonly m-line an unused PT from 96-127, so ≈ 30 is the practical ceiling anyway.
+pub const MAX_MEDIA_SECTIONS: usize = 32;
 
 /// Maximum number of codecs per media section.
 pub const MAX_CODECS_PER_MEDIA: usize = 16;
@@ -65,16 +69,22 @@ pub const MAX_SSRCS_PER_MEDIA: usize = 8;
 /// Maximum number of header extensions per media section.
 pub const MAX_EXTMAPS_PER_MEDIA: usize = 16;
 
-/// Maximum SDP size in bytes.
-pub const MAX_SDP_SIZE: usize = 65536;
+/// Maximum SDP size in bytes (32 m-lines with extmaps and rtcp-fb fit well below it).
+pub const MAX_SDP_SIZE: usize = 131_072;
+
+/// Maximum length of a `mid` in bytes.
+pub const MAX_MID_LEN: usize = 16;
+
+/// Maximum length of the BUNDLE group value: every mid plus a separator.
+pub const MAX_BUNDLE_LEN: usize = MAX_MEDIA_SECTIONS * (MAX_MID_LEN + 1);
 
 /// SDP version (always 0).
 pub const SDP_VERSION: u8 = 0;
 
 // Compile-time assertions for bounds (TigerStyle)
 const _: () = assert!(
-    MAX_MEDIA_SECTIONS == 8,
-    "MAX_MEDIA_SECTIONS must be exactly 8 per WebRTC spec"
+    MAX_MEDIA_SECTIONS <= 32,
+    "MAX_MEDIA_SECTIONS is bounded by the dynamic PT range (96-127)"
 );
 const _: () = assert!(
     MAX_CODECS_PER_MEDIA == 16,
@@ -89,8 +99,13 @@ const _: () = assert!(
     "MAX_SSRCS_PER_MEDIA must be bounded for simulcast scenarios"
 );
 const _: () = assert!(
-    MAX_SDP_SIZE == 65536,
-    "MAX_SDP_SIZE must be 64KB to prevent DoS attacks"
+    MAX_SDP_SIZE == 128 * 1024,
+    "MAX_SDP_SIZE must be 128KB to prevent DoS attacks"
+);
+
+const _: () = assert!(
+    MAX_BUNDLE_LEN <= u16::MAX as usize,
+    "bundle_group_len is a u16"
 );
 
 // Assert string buffer sizes are reasonable

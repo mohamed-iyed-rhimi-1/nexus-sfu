@@ -141,6 +141,20 @@ pub fn default_supported_codecs() -> Vec<CodecCapability> {
     ]
 }
 
+/// The header extensions the SFU offers on an m-line of `media_kind` (0 = audio), as
+/// `(id, uri)` in the shape [`SdpNegotiator::create_ordered_offer`] takes.
+///
+/// The IDs are the fixed table the data plane rewrites with
+/// (`nexus_media::rtp::extensions`, design note §11.2): one definition for both.
+pub fn offered_extmaps(media_kind: u8) -> impl Iterator<Item = (u8, &'static str)> {
+    let kind = if media_kind == 0 {
+        nexus_core::MediaKind::Audio
+    } else {
+        nexus_core::MediaKind::Video
+    };
+    nexus_media::rtp::extensions::offered(kind).map(|e| (e.id, e.uri))
+}
+
 /// Recycled m-line descriptor for renegotiation offers.
 ///
 /// Contains the exact codecs and extensions negotiated in the initial
@@ -156,6 +170,10 @@ pub struct RecycledMline<'a> {
     /// even if our answer didn't include them (RFC 8843 §9.2).
     pub offer_pts: &'a [u8],
     pub extmaps: &'a [super::ExtMap],
+    /// RTCP feedback offered for every codec of the m-line, as `(type, params)`
+    /// (`("nack", "pli")`, `("ccm", "fir")`; params may be empty). Publish m-lines use
+    /// this to ask the publisher for keyframes (R1).
+    pub rtcp_fbs: &'a [(&'a str, &'a str)],
     /// Direction from the server's answer. Recycled m-lines must preserve
     /// this so Chrome doesn't reject direction changes on existing transceivers.
     pub direction: super::Direction,
@@ -167,11 +185,27 @@ pub enum OfferMline<'a> {
     /// An m-line described explicitly: mid, kind, codecs, direction.
     Recycled(RecycledMline<'a>),
     /// A sendonly m-line forwarding a subscribed track (`media_kind`: 0 = audio).
+    ///
+    /// `stream_id` and `cname` are shared by all of a publisher's tracks so the
+    /// subscriber can lip-sync them; the m-line announces one msid,
+    /// `<stream_id> nexus-track-<mid>`, both as `a=msid` and in `a=ssrc:<ssrc> msid:`.
     Track {
         ssrc: u32,
         media_kind: u8,
         mid: &'a str,
+        stream_id: &'a str,
+        cname: &'a str,
     },
+}
+
+/// A subscribed track for [`SdpNegotiator::create_renegotiation_offer`].
+#[derive(Debug, Clone, Copy)]
+pub struct TrackMline<'a> {
+    pub ssrc: u32,
+    pub media_kind: u8,
+    pub mid: &'a str,
+    pub stream_id: &'a str,
+    pub cname: &'a str,
 }
 
 /// SDP negotiator for WebRTC offer/answer.
@@ -312,7 +346,7 @@ impl SdpNegotiator {
         let answer = self.create_answer(&offer)?;
 
         // Serialize to SDP string
-        let answer_sdp = SdpPrinter::print(&answer);
+        let answer_sdp = SdpPrinter::print(&answer)?;
 
         // Postcondition: answer must be valid SDP
         assert!(!answer_sdp.is_empty(), "Generated answer must not be empty");
@@ -329,14 +363,14 @@ impl SdpNegotiator {
     fn create_answer(&self, offer: &SessionDescription) -> Result<SessionDescription, SdpError> {
         // Precondition: offer must have media sections
         // Return error instead of panicking for graceful error handling
-        if offer.media_count == 0 {
+        if offer.media.is_empty() {
             return Err(SdpError::InvalidFormat {
                 reason: "Offer must have at least one media section",
             });
         }
         // TigerStyle: secondary assertion for bounded media count
         debug_assert!(
-            offer.media_count <= super::MAX_MEDIA_SECTIONS as u8,
+            offer.media.len() <= super::MAX_MEDIA_SECTIONS,
             "Media count must be bounded"
         );
 
@@ -353,14 +387,10 @@ impl SdpNegotiator {
         answer.set_setup(answer_setup);
 
         // RFC 8858: WebRTC mandates rtcp-mux. Reject offers without it.
-        for i in 0..offer.media_count as usize {
-            if let Some(ref m) = offer.media[i] {
-                if !m.rtcp_mux {
-                    return Err(SdpError::InvalidFormat {
-                        reason: "WebRTC requires rtcp-mux on all media sections (RFC 8858)",
-                    });
-                }
-            }
+        if offer.media.iter().any(|m| !m.rtcp_mux) {
+            return Err(SdpError::InvalidFormat {
+                reason: "WebRTC requires rtcp-mux on all media sections (RFC 8858)",
+            });
         }
 
         // Copy BUNDLE group if present
@@ -370,16 +400,15 @@ impl SdpNegotiator {
         }
 
         // Process each media section
-        for i in 0..offer.media_count as usize {
-            if let Some(ref offer_media) = offer.media[i] {
-                let answer_media = self.create_answer_media(offer_media, answer_setup)?;
-                answer.add_media(answer_media)?;
-            }
+        for offer_media in &offer.media {
+            let answer_media = self.create_answer_media(offer_media, answer_setup)?;
+            answer.add_media(answer_media)?;
         }
 
         // Postcondition: answer must have same media count as offer
         assert_eq!(
-            answer.media_count, offer.media_count,
+            answer.media.len(),
+            offer.media.len(),
             "Answer must have same media count as offer"
         );
 
@@ -410,11 +439,14 @@ impl SdpNegotiator {
         offer_media: &MediaDescription,
         answer_setup: DtlsSetup,
     ) -> Result<MediaDescription, SdpError> {
-        // Precondition: offer media must have codecs
-        assert!(
-            offer_media.codec_count > 0 || offer_media.format_count > 0,
-            "Offer media must have codecs or formats"
-        );
+        // An offered m-line without RTP codecs (a data channel, `m=application ...
+        // webrtc-datachannel`, or formats that are not payload types) cannot be answered
+        // here: an error for the caller, never a panic (the offer is peer input).
+        if offer_media.codec_count == 0 && offer_media.format_count == 0 {
+            return Err(SdpError::NoCommonCodec {
+                media_type: offer_media.media_type.as_str().to_string(),
+            });
+        }
 
         let mut media = MediaDescription::new(
             offer_media.media_type,
@@ -649,34 +681,32 @@ impl SdpNegotiator {
 
         // Precondition: SDP must be valid with bounded media count
         assert!(
-            sdp.media_count <= super::MAX_MEDIA_SECTIONS as u8,
+            sdp.media.len() <= super::MAX_MEDIA_SECTIONS,
             "Media count must be bounded by MAX_MEDIA_SECTIONS"
         );
 
         let mut candidates = Vec::with_capacity(MAX_TOTAL_CANDIDATES);
 
         // Iterate through all media sections
-        for i in 0..sdp.media_count as usize {
-            if let Some(ref media) = sdp.media[i] {
-                // Respect MAX_CANDIDATES_PER_MEDIA bound per media section
-                let media_candidate_limit =
-                    (media.candidate_count as usize).min(super::MAX_CANDIDATES_PER_MEDIA);
+        for media in &sdp.media {
+            // Respect MAX_CANDIDATES_PER_MEDIA bound per media section
+            let media_candidate_limit =
+                (media.candidate_count as usize).min(super::MAX_CANDIDATES_PER_MEDIA);
 
-                for j in 0..media_candidate_limit {
-                    // Check total candidates bound
-                    if candidates.len() >= MAX_TOTAL_CANDIDATES {
-                        break;
-                    }
-
-                    if let Some(ref candidate) = media.candidates[j] {
-                        candidates.push(candidate.clone());
-                    }
-                }
-
-                // Early exit if we've hit the total limit
+            for j in 0..media_candidate_limit {
+                // Check total candidates bound
                 if candidates.len() >= MAX_TOTAL_CANDIDATES {
                     break;
                 }
+
+                if let Some(ref candidate) = media.candidates[j] {
+                    candidates.push(candidate.clone());
+                }
+            }
+
+            // Early exit if we've hit the total limit
+            if candidates.len() >= MAX_TOTAL_CANDIDATES {
+                break;
             }
         }
 
@@ -716,7 +746,7 @@ impl SdpNegotiator {
     /// to map incoming RTP packets to transceivers and fire `on_track`.
     ///
     /// Recycled m-lines come first, then sendonly m-lines for subscribed
-    /// `tracks` as `(ssrc, media_kind, mid)`; equivalent to
+    /// `tracks`; equivalent to
     /// [`Self::create_ordered_offer`] with that ordering.
     #[allow(clippy::too_many_arguments)]
     pub fn create_renegotiation_offer(
@@ -724,7 +754,7 @@ impl SdpNegotiator {
         session_id: u64,
         session_version: u64,
         existing_mids: &[RecycledMline<'_>],
-        tracks: &[(u32, u8, &str)],
+        tracks: &[TrackMline<'_>],
         mid_ext_id: u8,
         video_extmaps: &[(u8, &str)],
         audio_extmaps: &[(u8, &str)],
@@ -742,15 +772,13 @@ impl SdpNegotiator {
             .iter()
             .cloned()
             .map(OfferMline::Recycled)
-            .chain(
-                tracks
-                    .iter()
-                    .map(|&(ssrc, media_kind, mid)| OfferMline::Track {
-                        ssrc,
-                        media_kind,
-                        mid,
-                    }),
-            )
+            .chain(tracks.iter().map(|t| OfferMline::Track {
+                ssrc: t.ssrc,
+                media_kind: t.media_kind,
+                mid: t.mid,
+                stream_id: t.stream_id,
+                cname: t.cname,
+            }))
             .collect();
         self.create_ordered_offer(
             session_id,
@@ -764,6 +792,77 @@ impl SdpNegotiator {
             negotiated_video_fmtp,
             negotiated_audio_fmtp,
         )
+    }
+
+    /// Add `a=rtcp-fb:<pt> <type> [params]` for every codec in `codecs`.
+    ///
+    /// Bounded: at most `MAX_CODECS_PER_MEDIA` codecs × `rtcp_fbs.len()` entries, and
+    /// more than `MAX_RTCP_FB_PER_MEDIA` in total is an error (the m-line would
+    /// otherwise silently lose feedback it asked for).
+    fn add_rtcp_fbs(
+        media: &mut super::MediaDescription,
+        codecs: &[RtpCodec],
+        rtcp_fbs: &[(&str, &str)],
+    ) -> Result<(), SdpError> {
+        let wanted = codecs.len() * rtcp_fbs.len();
+        if media.rtcp_fb_count as usize + wanted > super::MAX_RTCP_FB_PER_MEDIA {
+            return Err(SdpError::InvalidFormat {
+                reason: "too many rtcp-fb entries for one m-line",
+            });
+        }
+        for codec in codecs {
+            for &(fb_type, params) in rtcp_fbs {
+                assert!(!fb_type.is_empty(), "rtcp-fb type must not be empty");
+                let value = if params.is_empty() {
+                    format!("{} {}", codec.payload_type, fb_type)
+                } else {
+                    format!("{} {} {}", codec.payload_type, fb_type, params)
+                };
+                media.add_rtcp_fb(super::RtcpFeedback::parse(&value)?)?;
+            }
+        }
+        debug_assert!(media.rtcp_fb_count as usize <= super::MAX_RTCP_FB_PER_MEDIA);
+        Ok(())
+    }
+
+    /// Announce a forwarded track: `a=msid:<stream_id> <track>`,
+    /// `a=ssrc:<ssrc> cname:<cname>` and `a=ssrc:<ssrc> msid:<stream_id> <track>`, with
+    /// `track = nexus-track-<mid>`. Both msid lines come from the same two strings, and an
+    /// id too long to store is an error rather than a truncation, so the m-line never
+    /// announces two different msids.
+    fn add_track_identity(
+        media: &mut super::MediaDescription,
+        ssrc: u32,
+        mid: &str,
+        stream_id: &str,
+        cname: &str,
+    ) -> Result<(), SdpError> {
+        assert!(ssrc != 0, "SSRC must be non-zero");
+        let is_token = |s: &str| !s.is_empty() && !s.contains(char::is_whitespace);
+        if !is_token(stream_id) || !is_token(cname) {
+            return Err(SdpError::InvalidFormat {
+                reason: "stream id and cname must be non-empty tokens",
+            });
+        }
+        let track_id = format!("nexus-track-{}", mid);
+        let msid = super::Msid::new(stream_id, &track_id)?;
+        // SsrcInfo::parse refuses a value it cannot store whole (256 bytes).
+        let msid_value = format!("{} {}", stream_id, track_id);
+        media.msid = Some(msid);
+        media.add_ssrc(super::SsrcInfo::parse(&format!(
+            "{} cname:{}",
+            ssrc, cname
+        ))?)?;
+        media.add_ssrc(super::SsrcInfo::parse(&format!(
+            "{} msid:{}",
+            ssrc, msid_value
+        ))?)?;
+        debug_assert!(media.msid.as_ref().is_some_and(|m| format!(
+            "{} {}",
+            m.stream_id(),
+            m.track_id()
+        ) == msid_value));
+        Ok(())
     }
 
     /// Create an offer whose m-lines follow `mlines` in order.
@@ -793,11 +892,13 @@ impl SdpNegotiator {
     ) -> Result<(String, Vec<u8>), SdpError> {
         // Precondition: an offer needs at least one media section
         assert!(!mlines.is_empty(), "Offer must have at least one m-line");
-        // Precondition: bounded media section count
-        assert!(
-            mlines.len() <= super::MAX_MEDIA_SECTIONS,
-            "Total media sections must be <= MAX_MEDIA_SECTIONS"
-        );
+        // Bounded media section count: the caller's limit, reported as an error
+        if mlines.len() > super::MAX_MEDIA_SECTIONS {
+            return Err(SdpError::TooManyMedia {
+                count: mlines.len(),
+                max: super::MAX_MEDIA_SECTIONS,
+            });
+        }
 
         let mut offer = SessionDescription::new(session_id);
         // RFC 3264 §8: o= version MUST be incremented on each new offer
@@ -826,6 +927,14 @@ impl SdpNegotiator {
             OfferMline::Track { .. } => None,
         }) {
             for codec in recycled.codecs {
+                // Recycled codecs come from a peer's answer: a PT outside 0-127 is an
+                // error, not an index past `used_pts`.
+                if codec.payload_type > 127 {
+                    return Err(SdpError::InvalidAttribute {
+                        name: "rtpmap".to_string(),
+                        value: codec.payload_type.to_string(),
+                    });
+                }
                 used_pts[codec.payload_type as usize] = true;
             }
             for &pt in recycled.offer_pts {
@@ -874,6 +983,9 @@ impl SdpNegotiator {
                         let _ = media.add_fmtp(fmtp.clone());
                     }
 
+                    // Requested RTCP feedback, for every codec of the m-line
+                    Self::add_rtcp_fbs(&mut media, recycled.codecs, recycled.rtcp_fbs)?;
+
                     // Use the previously negotiated extensions
                     for ext in recycled.extmaps {
                         let _ = media.add_extmap(ext.clone());
@@ -905,6 +1017,8 @@ impl SdpNegotiator {
                     ssrc,
                     media_kind,
                     mid,
+                    stream_id,
+                    cname,
                 } => {
                     // Precondition: SSRC must be non-zero
                     assert!(ssrc != 0, "SSRC must be non-zero");
@@ -946,6 +1060,12 @@ impl SdpNegotiator {
                     if let Some(codec) = negotiated_codec {
                         let mut c = codec.clone();
                         let original_pt = c.payload_type;
+                        if c.payload_type > 127 {
+                            return Err(SdpError::InvalidAttribute {
+                                name: "rtpmap".to_string(),
+                                value: c.payload_type.to_string(),
+                            });
+                        }
                         if used_pts[c.payload_type as usize] {
                             // Find an unused dynamic PT (96-127, RFC 3551 §6)
                             let mut new_pt = None;
@@ -1058,18 +1178,8 @@ impl SdpNegotiator {
                         });
                     }
 
-                    // Add SSRC with cname and msid attributes (RFC 5576)
-                    let cname_str = format!("nexus-{}", ssrc);
-                    let msid_str = format!("nexus-stream-{} nexus-track-{}", ssrc, mid);
-
-                    let _ = media.add_ssrc(super::SsrcInfo::parse(&format!(
-                        "{} cname:{}",
-                        ssrc, cname_str
-                    ))?);
-                    let _ = media.add_ssrc(super::SsrcInfo::parse(&format!(
-                        "{} msid:{}",
-                        ssrc, msid_str
-                    ))?);
+                    // msid (RFC 8830) and SSRC cname/msid attributes (RFC 5576)
+                    Self::add_track_identity(&mut media, ssrc, mid, stream_id, cname)?;
 
                     // Add local ICE candidates — bounded by MAX_CANDIDATES_PER_MEDIA
                     for candidate in &self.local_candidates {
@@ -1096,7 +1206,7 @@ impl SdpNegotiator {
             offer.set_bundle(&bundle_mids)?;
         }
 
-        let offer_sdp = SdpPrinter::print(&offer);
+        let offer_sdp = SdpPrinter::print(&offer)?;
 
         // Postcondition: offer must be valid SDP
         assert!(
@@ -1147,6 +1257,7 @@ mod tests {
             fmtps: &[],
             offer_pts: &[],
             extmaps: &[],
+            rtcp_fbs: &[],
             direction,
         }
     }
@@ -1163,6 +1274,8 @@ mod tests {
                 ssrc: 1111,
                 media_kind: 1,
                 mid: "0",
+                stream_id: "nexus-7",
+                cname: "nexus-7",
             },
             OfferMline::Recycled(recycled("1", 1, &vp8, Direction::RecvOnly)),
             OfferMline::Recycled(recycled("2", 0, &opus, Direction::Inactive)),
@@ -1173,23 +1286,258 @@ mod tests {
             .unwrap();
         let parsed = SdpParser::parse(&sdp).unwrap();
 
-        assert_eq!(parsed.media_count, 3);
+        assert_eq!(parsed.media.len(), 3);
         let expect = [
             ("0", Direction::SendOnly),
             ("1", Direction::RecvOnly),
             ("2", Direction::Inactive),
         ];
         for (i, (mid, direction)) in expect.iter().enumerate() {
-            let media = parsed.media[i].as_ref().unwrap();
+            let media = &parsed.media[i];
             assert_eq!(media.mid.as_ref().unwrap().as_str(), *mid);
             assert_eq!(media.direction, *direction, "m-line {mid}");
         }
-        assert!(parsed.media[0]
-            .as_ref()
-            .unwrap()
-            .get_ssrc_values()
-            .contains(&1111));
+        assert!(parsed.media[0].get_ssrc_values().contains(&1111));
         assert!(sdp.contains("a=group:BUNDLE 0 1 2"));
+    }
+
+    fn extmap(id: u8, uri: &str) -> super::super::ExtMap {
+        let mut buf = [0u8; 128];
+        buf[..uri.len()].copy_from_slice(uri.as_bytes());
+        super::super::ExtMap {
+            id,
+            direction: None,
+            uri: buf,
+            uri_len: uri.len() as u8,
+        }
+    }
+
+    fn ssrc_attr(info: &super::super::SsrcInfo) -> (&str, &str) {
+        (
+            std::str::from_utf8(&info.attribute[..info.attr_len as usize]).unwrap(),
+            std::str::from_utf8(&info.value[..info.value_len as usize]).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_offered_extmaps_come_from_the_shared_table() {
+        let audio: Vec<_> = offered_extmaps(0).collect();
+        let video: Vec<_> = offered_extmaps(1).collect();
+        assert_eq!(
+            audio,
+            [
+                (1, "urn:ietf:params:rtp-hdrext:sdes:mid"),
+                (2, "urn:ietf:params:rtp-hdrext:ssrc-audio-level")
+            ]
+        );
+        assert_eq!(
+            video,
+            [
+                (1, "urn:ietf:params:rtp-hdrext:sdes:mid"),
+                (3, "urn:3gpp:video-orientation")
+            ]
+        );
+        use nexus_media::rtp::extensions as ext;
+        assert_eq!(audio[1].0, ext::AUDIO_LEVEL);
+        assert_eq!(video[1].0, ext::VIDEO_ORIENTATION);
+    }
+
+    /// 16 publish (recycled) and 16 subscribe (track) m-lines: the full 32 a session
+    /// can carry, with the fixed extmaps and publish rtcp-fb of Phase 1.
+    #[test]
+    fn test_32_mline_offer_with_extmaps_and_rtcp_fb() {
+        use super::super::{Direction, SdpParser, MAX_MEDIA_SECTIONS, MAX_SDP_SIZE};
+        let opus = [RtpCodec::parse(111, "opus/48000/2").unwrap()];
+        let vp8 = [RtpCodec::parse(96, "VP8/90000").unwrap()];
+        let audio_ext: Vec<(u8, &str)> = offered_extmaps(0).collect();
+        let video_ext: Vec<(u8, &str)> = offered_extmaps(1).collect();
+        let audio_maps: Vec<_> = audio_ext.iter().map(|&(i, u)| extmap(i, u)).collect();
+        let video_maps: Vec<_> = video_ext.iter().map(|&(i, u)| extmap(i, u)).collect();
+        let fbs = [("nack", "pli"), ("ccm", "fir")];
+        let mids: Vec<String> = (0..MAX_MEDIA_SECTIONS).map(|i| i.to_string()).collect();
+
+        let mlines: Vec<OfferMline> = mids
+            .iter()
+            .enumerate()
+            .map(|(i, mid)| {
+                let kind = (i % 2) as u8;
+                if i < MAX_MEDIA_SECTIONS / 2 {
+                    OfferMline::Recycled(RecycledMline {
+                        extmaps: if kind == 0 { &audio_maps } else { &video_maps },
+                        rtcp_fbs: &fbs,
+                        ..recycled(
+                            mid,
+                            kind,
+                            if kind == 0 { &opus } else { &vp8 },
+                            Direction::RecvOnly,
+                        )
+                    })
+                } else {
+                    OfferMline::Track {
+                        ssrc: 1000 + i as u32,
+                        media_kind: kind,
+                        mid,
+                        stream_id: "nexus-5",
+                        cname: "nexus-5",
+                    }
+                }
+            })
+            .collect();
+
+        let (sdp, _) = test_negotiator()
+            .create_ordered_offer(
+                1,
+                2,
+                &mlines,
+                1,
+                &video_ext,
+                &audio_ext,
+                Some(&vp8[0]),
+                Some(&opus[0]),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(sdp.len() <= MAX_SDP_SIZE, "offer is {} bytes", sdp.len());
+        let parsed = SdpParser::parse(&sdp).unwrap();
+        assert_eq!(parsed.media.len(), MAX_MEDIA_SECTIONS);
+        assert_eq!(parsed.bundle(), mids.join(" "));
+
+        for (i, media) in parsed.media.iter().enumerate() {
+            let kind_ext = if i % 2 == 0 { &audio_ext } else { &video_ext };
+            let ids: Vec<u8> = media.extmaps.iter().flatten().map(|e| e.id).collect();
+            assert_eq!(
+                ids,
+                kind_ext.iter().map(|e| e.0).collect::<Vec<_>>(),
+                "m-line {i}"
+            );
+            let fbs: Vec<(&str, &str)> = media
+                .rtcp_fbs
+                .iter()
+                .flatten()
+                .map(|f| (f.fb_type_str(), f.params_str()))
+                .collect();
+            if i < MAX_MEDIA_SECTIONS / 2 {
+                let pt = media.codecs[0].as_ref().unwrap().payload_type;
+                assert_eq!(fbs, [("nack", "pli"), ("ccm", "fir")], "m-line {i}");
+                assert!(sdp.contains(&format!("a=rtcp-fb:{pt} ccm fir")));
+                assert!(media.msid.is_none());
+            } else {
+                assert!(media.msid.is_some(), "m-line {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_offer_without_rtp_codecs_is_an_error_not_a_panic() {
+        let fp = ["AB"; 32].join(":");
+        let header = format!(
+            "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
+             a=ice-ufrag:testufrag\r\na=ice-pwd:testpwd12345678901234567890\r\n\
+             a=fingerprint:sha-256 {fp}\r\n"
+        );
+        for mline in [
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:0\r\na=rtcp-mux\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF abc\r\na=mid:0\r\na=rtcp-mux\r\n",
+        ] {
+            let result = test_negotiator().negotiate(&format!("{header}{mline}"));
+            assert!(
+                matches!(result, Err(SdpError::NoCommonCodec { .. })),
+                "{mline}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recycled_codec_pt_above_127_is_an_error() {
+        use super::super::Direction;
+        let bad = [RtpCodec {
+            payload_type: 200,
+            ..RtpCodec::parse(96, "VP8/90000").unwrap()
+        }];
+        let mlines = [OfferMline::Recycled(recycled(
+            "0",
+            1,
+            &bad,
+            Direction::RecvOnly,
+        ))];
+        let result = test_negotiator().create_ordered_offer(
+            1,
+            1,
+            &mlines,
+            1,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(SdpError::InvalidAttribute { .. })));
+    }
+
+    #[test]
+    fn test_track_mline_announces_one_msid() {
+        use super::super::SdpParser;
+        let mlines = [OfferMline::Track {
+            ssrc: 4242,
+            media_kind: 1,
+            mid: "3",
+            stream_id: "nexus-9",
+            cname: "nexus-9",
+        }];
+        let (sdp, _) = test_negotiator()
+            .create_ordered_offer(1, 1, &mlines, 1, &[], &[], None, None, None, None)
+            .unwrap();
+        assert!(sdp.contains("a=msid:nexus-9 nexus-track-3\r\n"));
+        assert!(sdp.contains("a=ssrc:4242 cname:nexus-9\r\n"));
+        assert!(sdp.contains("a=ssrc:4242 msid:nexus-9 nexus-track-3\r\n"));
+
+        let parsed = SdpParser::parse(&sdp).unwrap();
+        let media = &parsed.media[0];
+        let msid = media.msid.as_ref().unwrap();
+        let media_level = format!("{} {}", msid.stream_id(), msid.track_id());
+        let ssrc_level: Vec<&str> = media
+            .ssrcs
+            .iter()
+            .flatten()
+            .map(ssrc_attr)
+            .filter(|(attr, _)| *attr == "msid")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(ssrc_level, [media_level.as_str()]);
+        assert_eq!(sdp.matches("msid:").count(), 2);
+    }
+
+    #[test]
+    fn test_track_identity_that_cannot_be_stored_is_an_error() {
+        let long = "s".repeat(super::super::Msid::MAX_ID_LEN + 1);
+        let offer = |stream_id: &str, cname: &str| {
+            let mlines = [OfferMline::Track {
+                ssrc: 1,
+                media_kind: 0,
+                mid: "0",
+                stream_id,
+                cname,
+            }];
+            test_negotiator().create_ordered_offer(
+                1,
+                1,
+                &mlines,
+                1,
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert!(offer(&long, "c").is_err());
+        assert!(offer("", "c").is_err());
+        assert!(offer("a b", "c").is_err());
+        assert!(offer("s", &"c".repeat(257)).is_err());
+        assert!(offer("s", "c").is_ok());
     }
 
     #[test]
@@ -1204,7 +1552,13 @@ mod tests {
                 7,
                 2,
                 &existing,
-                &[(2222, 1, "1")],
+                &[TrackMline {
+                    ssrc: 2222,
+                    media_kind: 1,
+                    mid: "1",
+                    stream_id: "nexus-7",
+                    cname: "nexus-7",
+                }],
                 1,
                 &[],
                 &[],
@@ -1220,6 +1574,8 @@ mod tests {
                 ssrc: 2222,
                 media_kind: 1,
                 mid: "1",
+                stream_id: "nexus-7",
+                cname: "nexus-7",
             },
         ];
         let (ordered, _) = negotiator
@@ -1684,5 +2040,102 @@ a=rtpmap:111 opus/48000/2
             answer.contains("a=candidate:"),
             "Answer should contain candidate"
         );
+    }
+
+    mod property_tests {
+        use super::*;
+        use crate::sdp::parser::tests::property_tests::{attr_name, attr_value, env_cases};
+        use proptest::prelude::*;
+
+        /// One m-line of an arbitrary offer: kind, format list, rtpmaps, fmtps, rtcp-mux
+        /// and arbitrary attributes. Weighted toward well-formed audio/video m-lines so a
+        /// good share of offers reach the answer path, not only the parser's errors.
+        fn mline() -> impl Strategy<Value = String> {
+            let kind = prop_oneof![
+                8 => prop::sample::select(&["audio", "video"][..]),
+                1 => Just("application"),
+                1 => Just("text"),
+            ];
+            let proto = prop_oneof![
+                8 => Just("UDP/TLS/RTP/SAVPF"),
+                1 => Just("UDP/DTLS/SCTP"),
+                1 => Just("x"),
+            ];
+            let format = prop_oneof![
+                6 => "(96|97|111|0|127|128|255)",
+                1 => "[0-9]{1,3}",
+                1 => Just("webrtc-datachannel".to_string()),
+                1 => "[a-z]{1,5}",
+            ];
+            let codec =
+                prop::sample::select(&["opus", "VP8", "H264", "rtx", "AV1", "red", "zz"][..]);
+            let rate = prop::sample::select(&["48000/2", "90000", "0", "x"][..]);
+            let rtpmap = (prop_oneof![3 => 96u16..=111, 1 => 0u16..300], codec, rate)
+                .prop_map(|(pt, name, rate)| format!("a=rtpmap:{pt} {name}/{rate}"));
+            let fmtp =
+                (0u16..300, 0u16..300).prop_map(|(pt, apt)| format!("a=fmtp:{pt} apt={apt}"));
+            let attr = (attr_name(), attr_value()).prop_map(|(n, v)| format!("a={n}:{v}"));
+            let attrs = prop_oneof![
+                3 => Just(Vec::new()),
+                1 => prop::collection::vec(attr, 1..3),
+            ];
+            (
+                (kind, proto, prop::collection::vec(format, 1..5)),
+                prop::collection::vec(rtpmap, 0..4),
+                prop::collection::vec(fmtp, 0..2),
+                prop::bool::weighted(0.9),
+                attrs,
+                0u16..1000,
+                prop::bool::weighted(0.8),
+            )
+                .prop_map(
+                    |((kind, proto, formats), rtpmaps, fmtps, mux, attrs, mid, good)| {
+                        let mut m = format!(
+                            "m={kind} 9 {proto} {}\r\na=mid:{mid}\r\n",
+                            formats.join(" ")
+                        );
+                        // Usually one codec the negotiator supports for the kind.
+                        if good && kind == "audio" {
+                            m.push_str("a=rtpmap:111 opus/48000/2\r\n");
+                        } else if good && kind == "video" {
+                            m.push_str("a=rtpmap:96 VP8/90000\r\n");
+                        }
+                        for line in rtpmaps.iter().chain(&fmtps).chain(&attrs) {
+                            m.push_str(line);
+                            m.push_str("\r\n");
+                        }
+                        if mux {
+                            m.push_str("a=rtcp-mux\r\n");
+                        }
+                        m
+                    },
+                )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: env_cases(50),
+                ..ProptestConfig::default()
+            })]
+
+            /// `negotiate` on an arbitrary offer (valid session header, arbitrary
+            /// m-lines) returns an answer or an error, never panics: the offer is
+            /// peer input.
+            #[test]
+            fn prop_negotiate_never_panics(mlines in prop::collection::vec(mline(), 1..4)) {
+                let fp = ["AB"; 32].join(":");
+                let mut offer = format!(
+                    "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
+                     a=ice-ufrag:testufrag\r\na=ice-pwd:testpwd12345678901234567890\r\n\
+                     a=fingerprint:sha-256 {fp}\r\na=setup:actpass\r\n"
+                );
+                for m in &mlines {
+                    offer.push_str(m);
+                }
+                if let Ok(answer) = test_negotiator().negotiate(&offer) {
+                    prop_assert!(SdpParser::parse(&answer).is_ok());
+                }
+            }
+        }
     }
 }

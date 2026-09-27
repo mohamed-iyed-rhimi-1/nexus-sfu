@@ -22,8 +22,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, WebSocketStream};
+use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use crate::protocol::SignalMessage;
@@ -37,8 +38,26 @@ use nexus_api::JwtValidator;
 /// Starts at 1 (0 is reserved for "no participant").
 static NEXT_PARTICIPANT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Maximum message size in bytes (64 KB).
-const MAX_MESSAGE_SIZE: usize = 65_536;
+/// Maximum signaling message size in bytes (256 KB). An offer or answer with 32
+/// m-lines (the SDP limit, `MAX_SDP_SIZE` = 128 KB) plus its JSON envelope fits.
+/// A larger text message is dropped and answered with `Error { MESSAGE_TOO_LARGE }`.
+const MAX_MESSAGE_SIZE: usize = 256 * 1024;
+
+/// Largest message or frame the WebSocket layer buffers (1 MB). Without it tungstenite
+/// buffers up to 64 MB before `MAX_MESSAGE_SIZE` is checked; above it the connection is
+/// closed with a protocol error.
+const MAX_WS_BUFFERED_MESSAGE: usize = 1024 * 1024;
+
+const _: () = assert!(MAX_MESSAGE_SIZE < MAX_WS_BUFFERED_MESSAGE);
+
+/// WebSocket settings for every accepted connection.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_WS_BUFFERED_MESSAGE),
+        max_frame_size: Some(MAX_WS_BUFFERED_MESSAGE),
+        ..WebSocketConfig::default()
+    }
+}
 
 /// Ping interval in seconds.
 const PING_INTERVAL_SECS: u64 = 30;
@@ -294,7 +313,7 @@ async fn upgrade_and_handle(
                 format!("TLS handshake failed from {}: {}", peer_addr, e).into()
             },
         )?;
-        let ws_stream = accept_async(tls_stream).await?;
+        let ws_stream = accept_async_with_config(tls_stream, Some(ws_config())).await?;
         handle_connection(
             ws_stream,
             peer_addr,
@@ -305,7 +324,7 @@ async fn upgrade_and_handle(
         )
         .await
     } else {
-        let ws_stream = accept_async(stream).await?;
+        let ws_stream = accept_async_with_config(stream, Some(ws_config())).await?;
         handle_connection(
             ws_stream,
             peer_addr,
@@ -469,6 +488,15 @@ where
                         // Validate message size
                         if text.len() > MAX_MESSAGE_SIZE {
                             warn!("Message too large from {}: {} bytes", peer_addr, text.len());
+                            // Tell the client: otherwise it waits for a reply forever.
+                            let _ = outbound_tx.try_send(SignalMessage::Error {
+                                code: "MESSAGE_TOO_LARGE".to_string(),
+                                message: format!(
+                                    "message of {} bytes exceeds the {} byte limit",
+                                    text.len(),
+                                    MAX_MESSAGE_SIZE
+                                ),
+                            });
                             continue;
                         }
 
@@ -636,6 +664,114 @@ mod tests {
         assert_ne!(a.local_addr(), b.local_addr());
         // Each server has its own connection registry.
         assert!(!Arc::ptr_eq(&a.connections(), &b.connections()));
+    }
+
+    /// A JWT the test server accepts.
+    fn test_token(secret: &str) -> String {
+        let claims = nexus_api::auth::Claims {
+            sub: "size-test".to_string(),
+            exp: u64::MAX / 2,
+            iat: 0,
+        };
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    /// The next text frame from the server, within 5 s.
+    async fn next_text<S>(ws: &mut S) -> String
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let deadline = Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(deadline, ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => return text,
+                Ok(Some(Ok(_))) => continue,
+                other => panic!("expected a text message, got {:?}", other),
+            }
+        }
+    }
+
+    /// The next orchestrator message event, within 5 s.
+    async fn next_message(rx: &mut mpsc::Receiver<OrchestratorEvent>) -> SignalMessage {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("orchestrator event in time")
+                .expect("orchestrator channel open");
+            if let OrchestratorEvent::Message { message, .. } = event {
+                return message;
+            }
+        }
+    }
+
+    /// An answer whose JSON is `len` bytes long, give or take the envelope.
+    fn answer_of(len: usize) -> String {
+        SignalMessage::Answer {
+            sdp: "x".repeat(len),
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_message_size_limits() {
+        let secret = "test-secret-at-least-32-characters-long";
+        let (tx, mut rx) = mpsc::channel(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = Arc::new(
+            WebSocketServer::new(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::new(JwtValidator::new(secret)),
+                shutdown.clone(),
+                tx,
+                "",
+                "",
+            )
+            .unwrap(),
+        );
+        let addr = server.local_addr();
+        let srv = server.clone();
+        let task = tokio::spawn(async move { srv.run().await });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let auth = serde_json::json!({"type": "auth", "token": test_token(secret)});
+        ws.send(Message::Text(auth.to_string())).await.unwrap();
+        assert!(next_text(&mut ws).await.contains("auth_ok"));
+
+        // A 32-m-line offer or answer (≤ 128 KB of SDP) fits with room to spare.
+        let big = answer_of(200 * 1024);
+        assert!(big.len() <= MAX_MESSAGE_SIZE);
+        ws.send(Message::Text(big)).await.unwrap();
+        match next_message(&mut rx).await {
+            SignalMessage::Answer { sdp } => assert_eq!(sdp.len(), 200 * 1024),
+            other => panic!("expected the answer, got {:?}", other),
+        }
+
+        // Over the limit: dropped, answered with an error, connection kept.
+        let too_big = answer_of(300 * 1024);
+        assert!(too_big.len() > MAX_MESSAGE_SIZE && too_big.len() < MAX_WS_BUFFERED_MESSAGE);
+        ws.send(Message::Text(too_big)).await.unwrap();
+        match SignalMessage::from_json(&next_text(&mut ws).await).unwrap() {
+            SignalMessage::Error { code, .. } => assert_eq!(code, "MESSAGE_TOO_LARGE"),
+            other => panic!("expected MESSAGE_TOO_LARGE, got {:?}", other),
+        }
+        ws.send(Message::Text(answer_of(10))).await.unwrap();
+        assert!(matches!(
+            next_message(&mut rx).await,
+            SignalMessage::Answer { .. }
+        ));
+
+        shutdown.store(true, Ordering::Release);
+        let _ = ws.close(None).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     #[test]

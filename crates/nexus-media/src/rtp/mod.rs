@@ -28,6 +28,7 @@
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
 
+pub mod extensions;
 pub mod header;
 pub mod packet;
 

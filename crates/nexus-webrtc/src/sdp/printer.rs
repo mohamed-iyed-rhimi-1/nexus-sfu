@@ -8,9 +8,10 @@
 //! - Explicit formatting
 //! - Minimum 2 assertions per function
 
+use super::error::SdpError;
 use super::media::MediaDescription;
 use super::session::SessionDescription;
-use super::MAX_SDP_SIZE;
+use super::{MAX_MEDIA_SECTIONS, MAX_SDP_SIZE};
 
 /// SDP pretty printer.
 ///
@@ -35,18 +36,21 @@ impl SdpPrinter {
     ///
     /// # Returns
     ///
-    /// A valid SDP string with CRLF line endings.
+    /// A valid SDP string with CRLF line endings; `TooManyMedia` for more than
+    /// `MAX_MEDIA_SECTIONS` sections and `TooLarge` if the output exceeds `MAX_SDP_SIZE`
+    /// (answers copy the offer's rtcp-fb and extmaps, so a large offer can produce one).
     ///
     /// # TigerStyle Compliance
     ///
     /// - Validates output size
     /// - Explicit line ordering per RFC 8866
-    pub fn print(session: &SessionDescription) -> String {
-        // Precondition: session must be valid
-        assert!(
-            session.media_count <= super::MAX_MEDIA_SECTIONS as u8,
-            "Media count must be bounded"
-        );
+    pub fn print(session: &SessionDescription) -> Result<String, SdpError> {
+        if session.media.len() > MAX_MEDIA_SECTIONS {
+            return Err(SdpError::TooManyMedia {
+                count: session.media.len(),
+                max: MAX_MEDIA_SECTIONS,
+            });
+        }
 
         let mut lines = Vec::with_capacity(64);
 
@@ -57,21 +61,21 @@ impl SdpPrinter {
         Self::print_session_groups(session, &mut lines);
 
         // Media sections
-        for i in 0..session.media_count as usize {
-            if let Some(ref media) = session.media[i] {
-                Self::print_media_section(media, &mut lines);
-            }
+        for media in &session.media {
+            Self::print_media_section(media, &mut lines);
         }
 
         let result = lines.join("\r\n") + "\r\n";
 
         // Postcondition: result must not exceed MAX_SDP_SIZE
-        assert!(
-            result.len() <= MAX_SDP_SIZE,
-            "Generated SDP must not exceed MAX_SDP_SIZE"
-        );
+        if result.len() > MAX_SDP_SIZE {
+            return Err(SdpError::TooLarge {
+                size: result.len(),
+                max: MAX_SDP_SIZE,
+            });
+        }
 
-        result
+        Ok(result)
     }
 
     /// Print session header lines (v=, o=, s=, t=).
@@ -137,10 +141,7 @@ impl SdpPrinter {
     /// - Extracted helper for function length compliance
     fn print_session_groups(session: &SessionDescription, lines: &mut Vec<String>) {
         if session.bundle_group_len > 0 {
-            let bundle =
-                std::str::from_utf8(&session.bundle_group[..session.bundle_group_len as usize])
-                    .unwrap_or("");
-            lines.push(format!("a=group:BUNDLE {}", bundle));
+            lines.push(format!("a=group:BUNDLE {}", session.bundle()));
         }
     }
 
@@ -471,7 +472,7 @@ mod tests {
         media.add_codec(codec).unwrap();
         session.add_media(media).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         assert!(sdp.starts_with("v=0\r\n"));
         assert!(sdp.contains("o="));
@@ -498,7 +499,7 @@ mod tests {
         media.add_codec(codec).unwrap();
         session.add_media(media).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         assert!(sdp.contains("m=video 9 UDP/TLS/RTP/SAVPF"));
         assert!(sdp.contains("a=rtpmap:96 VP8/90000"));
@@ -526,7 +527,7 @@ mod tests {
         video.add_codec(vp8).unwrap();
         session.add_media(video).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         assert!(sdp.contains("m=audio"));
         assert!(sdp.contains("m=video"));
@@ -556,7 +557,7 @@ mod tests {
 
         session.set_bundle(&["0", "1"]).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         assert!(sdp.contains("a=group:BUNDLE 0 1"));
     }
@@ -575,7 +576,7 @@ mod tests {
         media.add_codec(codec).unwrap();
         session.add_media(media).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         assert!(sdp.contains("a=sendonly"));
     }
@@ -595,7 +596,7 @@ mod tests {
         media.add_codec(codec).unwrap();
         session.add_media(media).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         assert!(sdp.contains("a=rtcp-mux"));
         assert!(sdp.contains("a=rtcp-rsize"));
@@ -617,14 +618,14 @@ mod tests {
         session.add_media(media).unwrap();
 
         // Print
-        let sdp_str = SdpPrinter::print(&session);
+        let sdp_str = SdpPrinter::print(&session).unwrap();
 
         // Parse back
         let reparsed = SdpParser::parse(&sdp_str).unwrap();
 
         // Verify key fields
         assert_eq!(reparsed.origin.session_id, session.origin.session_id);
-        assert_eq!(reparsed.media_count, session.media_count);
+        assert_eq!(reparsed.media.len(), session.media.len());
         assert!(reparsed.ice_ufrag.is_some());
         assert!(reparsed.fingerprint.is_some());
     }
@@ -642,11 +643,83 @@ mod tests {
         media.add_codec(codec).unwrap();
         session.add_media(media).unwrap();
 
-        let sdp = SdpPrinter::print(&session);
+        let sdp = SdpPrinter::print(&session).unwrap();
 
         // All line endings should be CRLF
         assert!(sdp.contains("\r\n"));
         // Should end with CRLF
         assert!(sdp.ends_with("\r\n"));
+    }
+
+    /// A session with `count` audio m-lines, mids `0..count`, bundled.
+    fn session_with_mlines(count: usize) -> SessionDescription {
+        let mut session = SessionDescription::new(7);
+        session.set_ice_credentials("testufrag", "testpwd1234567890123456");
+        session.set_fingerprint(test_fingerprint());
+        let mids: Vec<String> = (0..count).map(|i| i.to_string()).collect();
+        for mid in &mids {
+            let mut media =
+                MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+            media.mid = Some(Mid::new(mid));
+            media.rtcp_mux = true;
+            media
+                .add_codec(RtpCodec::parse(111, "opus/48000/2").unwrap())
+                .unwrap();
+            session.add_media(media).unwrap();
+        }
+        let mids: Vec<&str> = mids.iter().map(String::as_str).collect();
+        session.set_bundle(&mids).unwrap();
+        session
+    }
+
+    #[test]
+    fn test_roundtrip_20_and_32_mlines_with_bundle() {
+        for count in [20, super::MAX_MEDIA_SECTIONS] {
+            let session = session_with_mlines(count);
+            let reparsed = SdpParser::parse(&SdpPrinter::print(&session).unwrap()).unwrap();
+            assert_eq!(reparsed.media.len(), count);
+            assert_eq!(reparsed.bundle(), session.bundle());
+            assert_eq!(reparsed.bundle().split(' ').count(), count);
+            for (i, media) in reparsed.media.iter().enumerate() {
+                assert_eq!(media.mid.as_ref().unwrap().as_str(), i.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn test_too_many_mlines_is_an_error() {
+        let mut session = session_with_mlines(super::MAX_MEDIA_SECTIONS);
+        let extra = MediaDescription::new(MediaType::Audio, 9, TransportProtocol::UdpTlsRtpSavpf);
+        assert!(matches!(
+            session.add_media(extra.clone()),
+            Err(SdpError::TooManyMedia { .. })
+        ));
+        // Past the bound through the public field: an error, not a panic.
+        session.media.push(extra);
+        assert!(matches!(
+            SdpPrinter::print(&session),
+            Err(SdpError::TooManyMedia { .. })
+        ));
+    }
+
+    #[test]
+    fn test_output_over_max_size_is_an_error_not_a_panic() {
+        // 32 m-lines × 16 fmtp lines of ≈ 250 bytes ≈ 130 KB > MAX_SDP_SIZE.
+        let mut session = session_with_mlines(super::MAX_MEDIA_SECTIONS);
+        let params = format!("96 {}", "x".repeat(250));
+        for media in &mut session.media {
+            for _ in 0..super::super::MAX_CODECS_PER_MEDIA {
+                media
+                    .add_fmtp(crate::sdp::attributes::Fmtp::parse(&params).unwrap())
+                    .unwrap();
+            }
+        }
+        match SdpPrinter::print(&session) {
+            Err(SdpError::TooLarge { size, max }) => {
+                assert_eq!(max, MAX_SDP_SIZE);
+                assert!(size > MAX_SDP_SIZE);
+            }
+            other => panic!("expected TooLarge, got {:?}", other.map(|s| s.len())),
+        }
     }
 }

@@ -45,7 +45,7 @@ pub use handshake::{
     ClientHandshakeState, DtlsClientHandshake, Flight, FragmentBuffer, HandshakeState,
     HandshakeType, SrtpKeys,
 };
-pub use openssl_backend::OpenSslDtlsEngine;
+pub use openssl_backend::{DtlsCertificate, OpenSslDtlsEngine};
 pub use record::{ContentType, FragmentAssembler, RecordLayer};
 pub use session::{DtlsSession, SessionConfig, SessionState, HANDSHAKE_TIMEOUT_MS};
 pub use types::*;

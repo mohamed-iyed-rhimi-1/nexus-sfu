@@ -1,6 +1,6 @@
 # Phase 1 — New data plane, one shard
 
-**State: not started** (plan written 2026-09-26, audited against the code the same day).
+**State: in progress** (1.1-1.4 done; plan written 2026-09-26, audited against the code the same day).
 
 **Design:** [`docs/design/dataplane-v1.md`](../design/dataplane-v1.md) (approved; §16 gives the
 parts and order, §17 the tests), within [`docs/dataplane-design.md`](../dataplane-design.md)
@@ -374,7 +374,8 @@ session.rs, shard/mod.rs, shard/stats.rs, ext.rs (new: the fixed extension table
 
 **Change:**
 - `ext.rs`: the fixed table of note §11.2 as constants (ID, URI, kinds, offered-in-v1),
-  shared later by the negotiator (1.4). ID 4 (transport-cc) and 5 (abs-send-time) are **not
+  shared later by the negotiator (1.4; the table moved to `nexus_media::rtp::extensions`
+  there, and `ext.rs` re-exports it). ID 4 (transport-cc) and 5 (abs-send-time) are **not
   offered** in Phase 1; 10/11 reserved.
 - `rewrite()` complete (note §11.4): an extension element iterator over one-byte and
   two-byte forms (bounded to 16 elements), write mapped elements in one-byte form, drop the
@@ -633,6 +634,94 @@ negotiator.rs, media.rs}`, `crates/nexus-webrtc/src/webrtc/session.rs` (compile 
 - Rtcp-fb offered today (`negotiator.rs:1003-1034`): subscribe video `nack`, `nack pli`,
   `goog-remb`, `transport-cc`; subscribe audio `transport-cc`; publish m-lines none; `ccm
   fir` never.
+- Found while implementing (2026-09-27), corrections to the notes above:
+  - **Two remote panics in the SDP parser**, reached by any client through `Answer.sdp`
+    (exit criterion 6): `parse_line` sliced `&line[2..]` after checking the second
+    *char*, so a line such as `€=x` panicked; `parse_hex_bytes` (`attributes.rs`) sliced
+    byte pairs of a fingerprint with only an even-length guard, so a non-ASCII value
+    panicked. Both are errors now; unit tests and four proptests (arbitrary lines,
+    `<char>=` lines, every attribute name with arbitrary values, fingerprint values),
+    each checked to fail with its fix disabled; 20,000 cases per property found nothing
+    else.
+  - `MAX_SDP_SIZE` had its own const assertion (`== 64 KB`), changed with it.
+    `MAX_MID_LEN` did not exist: `Mid` silently cut at 16 bytes. `Mid::parse` (used by the
+    parser) refuses an empty or longer mid; `Mid::new` stays for our own mids.
+  - BUNDLE was cut at `parser.rs:581` and `session.rs:240` (not `:179`, which is `s=`),
+    from the 26th numeric mid on (not ≈ 22) or at 4 mids of 16 characters.
+    `bundle_group` is `[u8; MAX_BUNDLE_LEN]` (32 × 17) with a `u16` length;
+    `set_bundle_value` refuses an over-long value.
+  - `media_count` is gone (not mirrored): every user iterates `media`.
+  - `SdpPrinter::print` and `SessionDescription::to_sdp` return `Result`: answers copy
+    the offer's rtcp-fb and extmaps, so a 32-m-line answer can exceed 128 KB (≈ 180 KB
+    worst case) and the size assert was reachable.
+  - The old path's `media_count <= 10` asserts (`webrtc/session.rs`) are in
+    `handle_renegotiation_{offer,answer}`, which nothing calls; they return
+    `InvalidConfig` now. The old orchestrator refuses an answer with more than
+    `OLD_PATH_MAX_MLINES` (8) m-lines, since the parser now accepts 32.
+  - The WebSocket server logged oversized messages (`warn!`), it did not drop them
+    silently, but sent nothing back; and tungstenite ran with its defaults (64 MB per
+    message buffered before the check). Now 256 KB with an `Error{MESSAGE_TOO_LARGE}`
+    reply, and 1 MB `max_message_size`/`max_frame_size` (connection closed above).
+  - **Extension table** moved to `nexus_media::rtp::extensions` (owner's decision:
+    neither `nexus-webrtc` nor `nexus-dataplane` depends on the other);
+    `nexus_dataplane::ext` re-exports it, `nexus_webrtc::sdp::offered_extmaps(kind)`
+    yields `(id, uri)` for `create_ordered_offer`.
+  - `RecycledMline::rtcp_fbs` is `&[(type, params)]`, printed for every codec of the
+    m-line; more than `MAX_RTCP_FB_PER_MEDIA` in total is an error (the media type
+    silently drops extras). `OfferMline::Track` gains `stream_id`/`cname`;
+    `create_renegotiation_offer` takes `&[TrackMline]`. An id that `Msid` (128 B) or
+    `SsrcInfo` (256 B) cannot store whole, or that is empty or contains whitespace, is
+    an error, so the two msid lines can never differ. The old path passes today's values
+    (`nexus-stream-<ssrc>`, `nexus-<ssrc>`) and only gains a media-level `a=msid` with
+    the same value.
+  - Track m-lines keep their hard-coded rtcp-fb (`nack`, `nack pli`, `goog-remb`,
+    `transport-cc`): the old path runs on them. 1.5b decides the subscribe set (§12.4:
+    no transport-cc or REMB in v1).
+  - `DtlsCertificate` (`Clone`: refcounted `SslContext`, `Arc<[u8]>` DER) with the key,
+    certificate and context code split out of `new` into `generate_key`,
+    `build_certificate`, `fingerprint_of`, `build_context`; the engine holds a
+    `DtlsCertificate` and `new(role)` = `with_certificate(role, &generate()?)`.
+    `openssl_backend.rs` had no tests: engine-to-engine handshake on one certificate
+    (fingerprints, peer fingerprints, identical exported keys), two sessions on one
+    context, `new` still per engine.
+  - Control-plane memory for 1.7: each engine preallocates `pending_output` of
+    `MAX_BIO_READ` (16 KB) until the `Ssl` is freed.
+  - **Review fixes (2026-09-27), before commit:**
+    - The first publish skipped the old-path m-line cap (only the existing-transport
+      branch checked it): 9-10 kinds produced an offer whose answer `handle_answer`
+      refuses, `offer_pending` stayed set, and `send_ordered_offer`'s assert was
+      reachable. The cap is now checked before `create_transport` for both branches
+      (`TOO_MANY_TRACKS`); test on a real `NegotiationManager`.
+    - `create_answer_media` asserted the offered m-line had codecs or formats: an offer
+      with `m=application ... webrtc-datachannel` (or non-numeric formats) panicked
+      `SdpNegotiator::negotiate`. Now `NoCommonCodec`. `rtpmap` accepted PTs up to 255,
+      and `create_ordered_offer` indexes a 128-entry `used_pts` with recycled and
+      negotiated PTs (which come from answers in 1.5b): `RtpCodec::parse` refuses
+      PT > 127, and `create_ordered_offer` returns an error for one.
+    - Shared DTLS context: session cache off (`SslSessionCacheMode::OFF`). Measured:
+      with `SSL_VERIFY_PEER` and no session id context OpenSSL already caches nothing on
+      the server, so this is defence in depth; the test checks the mode (it was 2,
+      `SERVER`) and that three handshakes leave the cache empty. Serial is a random
+      64-bit number (was 1 for every certificate), `not_before` one day back.
+    - Parser: no meaning-changing truncation. ice-ufrag/pwd are 1-256 ice-chars
+      (RFC 8445 §5.3), msid ids ≤ 128 bytes (`Msid::new`), ssrc attribute ≤ 32 and value
+      ≤ 256 bytes, extmap URI ≤ 128 bytes and id ≠ 0: anything else is a parse error. The
+      remaining cuts (session name, origin, codec name, fmtp params, rtcp-fb, candidate
+      foundation, rid, simulcast) are not read for meaning by the SFU. `Mid::parse`
+      accepts token characters only (RFC 5888), duplicate mids are refused. The m=
+      format list stored PT 0 for every unparsable entry before a valid one; it now
+      skips them (and PTs > 127). ssrc lines beyond 8 per m-line are still dropped
+      (simulcast with RTX needs ≈ 12: after v1).
+    - Proptests: `PROPTEST_CASES` sets the case count (default 50), values up to 300
+      characters (past every field's capacity), a value strategy shaped like ssrc/extmap
+      /rtpmap values, and `prop_negotiate_never_panics` (weighted offers: ≈ 36% produce
+      an answer, the rest exercise the error paths). It catches the old
+      `create_answer_media` assert. 20,000 cases per property found nothing else.
+    - Each new test checked to fail with its fix disabled.
+    - Left for 1.5b (found in the verification, not crashes): the parser accepts extmap
+      ids 1-255; the switch must refuse ids above 14 before writing one-byte header
+      extensions (15 is reserved). On the old path an answer with more than 8 m-lines
+      is refused with `offer_pending` still set, so only that client stalls.
 
 **Tests:**
 - Parser/printer round trip with 20 and 32 m-lines, BUNDLE with all 32 mids intact; 33
@@ -749,6 +838,9 @@ track_stats.rs}`.
   - `register_transport` / `transport_to_participant` are re-keyed by `SessionId`.
   - The old m-line cap constant from 1.4 goes; the limit is `MAX_MEDIA_SECTIONS` with an
     error to the client beyond it (R9).
+  - Subscribe (Track) m-lines still offer `nack`, `nack pli`, `goog-remb`, `transport-cc`
+    (kept in 1.4 for the old path): decide the v1 set here (§12.4: no transport-cc or
+    REMB in v1; the shard ignores NACK from subscribers).
 - `subscription.rs`: `Unsubscribe` commands; `handle_session_established` deleted (active
   on answer; called from `mod.rs:204`, `:332`); viewport / content type without data-plane
   effect. A `Subscribe` request with more than 10 ids is answered with `Error` instead of
@@ -1036,6 +1128,7 @@ parts above already follow the corrected facts.
 | §17.4 | Client signaling handle becomes a command channel | A lock on the shared connection suffices; the task must forward confirmations |
 | §17.5 | Audio and video SRs carry the same CNAME | Only after the loadtest client uses one stream id per client (1.5b) |
 | §17.9 | Page needs no build step | `sdk/dist` is gitignored; token and secure context needed |
+| §11.2 | The table lives in `nexus-dataplane`, shared with the negotiator | It lives in `nexus_media::rtp::extensions` (no dependency between the two crates); `nexus_dataplane::ext` re-exports it |
 
 ## Risks for this phase
 
@@ -1047,7 +1140,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | A 32-m-line session hits signaling size limits | 1.4 raises the SDP and WebSocket limits and turns silent drops into errors; tested with 32 m-lines |
 | The manual browser check is blocked by HTTPS/token setup | 1.8 documents both setups; the SDK and token work can start before 1.5b |
 | Linux-only code (`LinuxIo`, pinning, GRO check) only runs in the container and CI | Container run is part of every I/O part's checkpoint |
-| Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 |
+| Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 (done: two parser panics fixed, fuzz proptests on the parser) |
 | **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3 (done): a shard-wide cap on `DtlsDatagram` events per second (`dtls_budget_per_sweep`, 1,024). 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
 | **Known limit, ICE-lite on-path injection.** STUN authenticates the request, not its source address (RFC 8445). An attacker on the path can drop a fresh nomination and send it from its own address before the original arrives, or replay one older than the last 16 transaction ids, and the session moves to it. Media stays SRTP-encrypted; the real peer is cut off until its next nomination | Inherent to ICE-lite; accepted for v1. 1.2 refuses repeated transaction ids and rate-limits switches. A full fix needs proof of liveness at the new address (e.g. consent from the SFU side) and comes after v1 |
 
@@ -1059,7 +1152,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.2a Shard core: tables, commands, ICE-lite, forwarding | Done | see git log (1.2) | `nexus-dataplane` crate on `MemIo`: slabs, commands, slim STUN scan, address rules, SRTP in, rewrite, fan-out; STUN panic/UB fixes in `nexus-transport`; `tests/shard.rs` incl. proptest |
 | 1.2b Shard core: extensions, RTCP, housekeeping, alloc test | Done | see git log (1.2) | `ext.rs` table + element iterator, full rewrite, `mid` SSRC learning, SR+SDES translation, PLI/FIR with throttle, housekeeping, `ShardStats`, event retention; `tests/alloc.rs` 0 allocations (GCM and CM) |
 | 1.3 Shard thread and I/O | Done | see git log (1.3) | `LinuxIo`/`PortableIo`, park/wake, shard thread, `DataplaneHandle`, `Dataplane::start`, `DataplaneConfig`, `Placement`/`SingleShard`, shard-wide DTLS cap; `tests/loopback.rs`; lost-wake-up fix; review fixes: oversized flood pacing, GRO refusal, concurrent shutdown, bytes sent, closed event channel |
-| 1.4 SDP groundwork, signaling limits, shared certificate | Not started | | |
+| 1.4 SDP groundwork, signaling limits, shared certificate | Done | see git log (1.4) | `media: Vec` (32), BUNDLE 544 B, 128 KB SDP and printer errors, two SDP parser panics fixed + proptests, `Mid::parse`, `rtcp_fbs`, `stream_id`/`cname` with one msid, extension table in `nexus-media`, WebSocket 256 KB + error reply + 1 MB cap, `DtlsCertificate` + `with_certificate`; old-path cap 8 |
 | 1.5a Control-plane pieces | Not started | | |
 | 1.5b Switch (one commit) | Not started | | Early browser check result goes here |
 | 1.7 Benches, memory budget, CI | Not started | | Before C2 |
@@ -1210,3 +1303,40 @@ Add one line per working session: date, part, what was done, what is left.
   tests; flood test no longer races the kernel buffer. macOS: fmt, clippy clean, 1,946
   passed; Linux arm64 (own target volume): clippy clean, 1,952 passed in each of 3 full
   runs; loopback 10/10 on Linux, 5/5 on macOS. Committed. Next: 1.4.
+- 2026-09-27: 1.4 implemented (uncommitted, for review). SDP: `media: Vec` bounded by 32
+  (`media_count` removed), BUNDLE for 32 mids of 16 bytes (error, not truncation),
+  `MAX_SDP_SIZE` 128 KB with `SdpPrinter::print`/`to_sdp` returning `Result`, `Mid::parse`;
+  two remote panics in the SDP parser fixed (multi-byte line type, non-ASCII fingerprint)
+  with unit tests and four fuzz proptests. Negotiator: `RecycledMline::rtcp_fbs`,
+  `OfferMline::Track { stream_id, cname }` with one msid (media-level and per ssrc),
+  `offered_extmaps` from the extension table, now in `nexus_media::rtp::extensions`
+  (re-exported by `nexus_dataplane::ext`). Old path unchanged in behaviour:
+  `OLD_PATH_MAX_MLINES` = 8, answers above it refused, today's msid/cname values, dead
+  renegotiation asserts turned into errors. WebSocket: 256 KB with an
+  `Error{MESSAGE_TOO_LARGE}` reply, 1 MB tungstenite cap. `DtlsCertificate` +
+  `OpenSslDtlsEngine::with_certificate` (first tests of the OpenSSL engine). Each new guard's
+  test checked to fail with its fix disabled. macOS: fmt, clippy clean, 1,966 passed, e2e
+  (old path) 3/3; Linux arm64 container (own target volume): fmt, clippy clean, 1,972
+  passed, 0 failed. Next: review, commit, then 1.5a.
+- 2026-09-27, review fixes for 1.4 (uncommitted, for review): old-path m-line cap checked
+  before the first publish creates a transport (test on a real `NegotiationManager`);
+  `create_answer_media` and PT indexing return errors instead of panicking on offers
+  without RTP codecs or with PT > 127; shared DTLS context with session cache off,
+  random 64-bit serial, `not_before` backdated a day; parser refuses over-capacity
+  ice-ufrag/pwd (and non ice-char), msid, ssrc attributes, extmap URIs, extmap id 0,
+  non-token and duplicate mids, and skips unparsable m= formats; proptests honour
+  `PROPTEST_CASES`, use values up to 300 characters, and `negotiate` is fuzzed on
+  arbitrary offers (20,000 cases per property: no panic). Each new test checked to fail
+  with its fix disabled. macOS: fmt, clippy clean, 1,975 passed, e2e 3/3. Linux arm64
+  container (own target volume): fmt, clippy clean; the first `cargo test --workspace`
+  failed once in `two_party_audio_video` (`tests/e2e.rs:122`, the ≥ 10 packets/s rate
+  check, right after a cold build in the same container; detail not captured), then e2e
+  5/5 alone and `cargo test --workspace --no-fail-fast` 1,981 passed, 0 failed. The
+  one-off failure is unexplained; watch for it. Next: review, commit, then 1.5a.
+- 2026-09-27, review and verification of 1.4: five review fixes (first-publish m-line cap,
+  negotiator assert on offers without formats, PT > 127, DTLS session cache off with random
+  serial, no meaning-changing truncation in the parser, proptests honour `PROPTEST_CASES`
+  and cover `negotiate`) confirmed in code and tests; no browser SDP form found that the
+  stricter parser refuses. macOS: fmt, clippy clean, 1,975 passed, e2e 3/3, SDP proptests
+  at 5,000 cases clean; Linux arm64 (own target volume): clippy clean, 1,981 passed, e2e
+  2/2. Committed. Next: 1.5a.
