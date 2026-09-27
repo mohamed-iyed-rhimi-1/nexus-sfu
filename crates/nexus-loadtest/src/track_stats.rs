@@ -43,6 +43,16 @@ pub struct TrackRxStats {
     pub first_arrival: Instant,
     /// When the last packet arrived.
     pub last_arrival: Instant,
+    /// Publisher SSRC read from the first payload marker (`media::read_marker`).
+    pub marker_ssrc: Option<u32>,
+    /// Payload markers read.
+    pub markers: u64,
+    /// Markers naming another publisher SSRC than the first one.
+    pub marker_mismatches: u64,
+    /// Markers whose frame counter went backwards.
+    pub marker_regressions: u64,
+    /// Frame counter of the last marker.
+    last_marker_frame: u32,
 }
 
 impl TrackRxStats {
@@ -63,7 +73,26 @@ impl TrackRxStats {
             timestamp_regressions: 0,
             first_arrival: now,
             last_arrival: now,
+            marker_ssrc: None,
+            markers: 0,
+            marker_mismatches: 0,
+            marker_regressions: 0,
+            last_marker_frame: 0,
         }
+    }
+
+    fn record_marker(&mut self, ssrc: u32, frame: u32) {
+        match self.marker_ssrc {
+            None => self.marker_ssrc = Some(ssrc),
+            Some(first) if first != ssrc => self.marker_mismatches += 1,
+            Some(_) => {
+                if frame < self.last_marker_frame {
+                    self.marker_regressions += 1;
+                }
+            }
+        }
+        self.markers += 1;
+        self.last_marker_frame = frame;
     }
 
     /// Sequence numbers expected from the first to the highest received.
@@ -132,6 +161,15 @@ impl TrackStatsMap {
         }
     }
 
+    /// Record the payload marker `(marker_ssrc, frame)` of a packet received on
+    /// `ssrc` (after `record` created the track).
+    pub fn record_marker(&self, ssrc: u32, marker_ssrc: u32, frame: u32) {
+        let mut map = self.inner.lock().expect("track stats lock");
+        if let Some(stats) = map.get_mut(&ssrc) {
+            stats.record_marker(marker_ssrc, frame);
+        }
+    }
+
     /// Snapshot of every track, sorted by SSRC.
     pub fn snapshot(&self) -> Vec<TrackRxStats> {
         let map = self.inner.lock().expect("track stats lock");
@@ -171,5 +209,21 @@ mod tests {
 
         map.record(9, "audio", "audio/opus", 16, 0);
         assert_eq!(map.snapshot()[0].missing_packets(), 2, "14 and 15");
+    }
+
+    #[test]
+    fn test_markers() {
+        let map = TrackStatsMap::default();
+        map.record(3, "video", "video/VP8", 1, 0);
+        map.record_marker(3, 77, 1);
+        map.record_marker(3, 77, 2);
+        map.record_marker(3, 77, 1); // backwards
+        map.record_marker(3, 78, 3); // another publisher
+        map.record_marker(4, 77, 1); // unknown track: ignored
+        let t = &map.snapshot()[0];
+        assert_eq!(t.marker_ssrc, Some(77));
+        assert_eq!(t.markers, 4);
+        assert_eq!((t.marker_mismatches, t.marker_regressions), (1, 1));
+        assert_eq!(map.snapshot().len(), 1);
     }
 }

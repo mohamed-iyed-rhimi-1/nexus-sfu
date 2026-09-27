@@ -870,9 +870,12 @@ touches DTLS I/O).
 **Goal:** everything the switch needs that works on the old path too, so the switch commit
 only rewires. One commit.
 
-**Files:** `src/node.rs` (new), `src/sfu.rs`, `src/config/{mod.rs, loader.rs, tests.rs}`,
-`src/main.rs`, `config/*.toml`, `crates/nexus-webrtc/src/sdp/negotiator.rs`,
-`crates/nexus-loadtest/src/{client.rs, media.rs, track_stats.rs}`, `tests/e2e.rs`.
+**Files:** `src/node.rs` (new), `src/sfu.rs`, `src/config/{mod.rs, dataplane.rs (new), loader.rs,
+tests.rs}`, `src/main.rs`, `config/*.toml`, `crates/nexus-webrtc/src/sdp/{negotiator.rs, parser.rs,
+testdata/legacy_offer.sdp}`, `src/orchestrator/transports.rs`,
+`crates/nexus-dataplane/src/shard/{ingress.rs, stats.rs}`, `crates/nexus-dataplane/tests/shard.rs`,
+`crates/nexus-loadtest/src/{announced.rs (new), client.rs, media.rs, track_stats.rs}`,
+`tests/e2e.rs`, `.gitattributes`.
 
 **Change:**
 - `node.rs`: node id generation, `DistributedState`, SWIM and the gossip thread
@@ -898,6 +901,47 @@ announce one stream like a browser; optional); the senders of
   of each SFU offer recorded per mid (`announced_ssrcs()`).
 - `two_party_audio_video` checks the marker. The SSRC comparison stays "published" until
   the switch.
+- **Moved in from 1.5b** (owner's decision, 2026-09-27; none is used by the old path):
+  - Parser: several `a=fingerprint` lines per level keep sha-256 (else the first); a line
+    with an unsupported algorithm (sha-1) is skipped instead of failing the whole parse.
+  - `SsrcAllocator`: a peer SSRC equal to the base (the RTCP SSRC) or to an out SSRC already
+    handed out is refused (`note_peer_ssrc` returns `false`); `allocate` returning `None`
+    consumes no offset; `offset_of`, `mark_registered`, `is_stale` mirror the shard's
+    monotonic `Subscribe` rule for the late-slot rule of 1.5b.
+  - Shard: DTLS only from the selected address (`drop_dtls_unselected`).
+
+**Code notes:**
+- Found while implementing (2026-09-27):
+  - `node.rs` uses `SystemTime` (not `clock::now_ns`) and its own `NodeError`; `Sfu::new`
+    maps it to `SfuError::Worker(WorkerError::InvalidConfig)` with the same "MAX_ACTORS"
+    message, so `Sfu`'s behaviour is unchanged. `Node::stop` joins (at most one probe
+    interval; call it through `spawn_blocking` from async code); `Drop` only signals.
+    `notify_and_drain` (notice, then sleep) is for `server.rs` after the switch.
+  - Config: `DataplaneSettings` lives in the root crate (`src/config/dataplane.rs`), since it
+    converts into `nexus_dataplane::DataplaneConfig`. `reserved_ports` = signaling, API (only
+    if `api.enabled`) and metrics ports, port 0 skipped; `max_sessions` =
+    `ceil(max_webrtc_sessions / shards)`. Production has `realtime_priority = false`: with
+    `cpu_affinity` and `busy_poll_rounds = 256`, SCHED_FIFO would trigger
+    `DataplaneConfig::warnings()` (shard 0 spinning as a real-time thread on core 0).
+  - Negotiator: Track m-line rtcp-fb goes on the **first codec's PT only**, as before (the
+    old path offers the default codec list there); `add_rtcp_fbs` (every codec) is not
+    reused. Too many entries are now an error, not silently dropped. The old path's offer
+    is pinned byte for byte in `testdata/legacy_offer.sdp` (captured before the change;
+    `.gitattributes` keeps its CRLF). It shows the old path's Track video m-line reusing PT
+    96 of a recycled publish m-line: a BUNDLE PT collision, left alone (old path).
+  - Loadtest: VP8 marker read after the payload descriptor only when S is set and the
+    partition is 0 (extended descriptor parsed: PictureID 7/15 bits, TL0PICIDX, TID/KEYIDX).
+    `TrackRxStats` counts `marker_mismatches` (another publisher SSRC) and
+    `marker_regressions` (frame counter backwards) apart. `AnnouncedSsrcs` records the first
+    `a=ssrc` of every sendonly m-line with the offer's `tracks` entry for its mid. Each
+    sender's RTCP is drained (needed for 1.6b's PLI reader).
+  - The e2e old-path self-check (announced SSRCs = published SSRCs, every announced m-line in
+    `Offer.tracks`) passes, so 1.5b can rely on the recording.
+  - **Docker bind mount.** Two container runs read a truncated file through the bind mount
+    right after edits (`src/config/tests.rs` cut mid-line; `default.toml` giving a TOML error
+    at line 1, column 1). The same files were intact inside the container a moment later.
+    Linux checks now run on a copy made inside the container (`rsync --exclude target
+    --exclude .git /host/ /work/`), with the target volume mounted at `/work/target`.
 
 **Checkpoint:** workspace green, e2e 3/3 on the old path, Linux container.
 
@@ -983,18 +1027,38 @@ the loadtest client changes land before, in 1.5b-prep.
   timeout. `DisconnectReason` (`events.rs:26`) gains `DtlsFailed`; `IceFailed`, never
   constructed today, is now used by the ICE-connect timeout.
 - `use_srtp`: `SRTP_AEAD_AES_128_GCM` first.
-- **Shard: DTLS only from the selected address.** `handle_dtls`
-  (`nexus-dataplane/src/shard/ingress.rs:209`) looks the source up in `by_addr`, which
-  holds every address that sent an authenticated binding request and the previous address
-  after a switch. It forwards `DtlsDatagram` only when the source is the session's
-  selected address (`session.addr`), else counts a drop; `SendDatagram` already goes to
-  that address. Test in `tests/shard.rs`: DTLS from a checked but unselected candidate
-  produces no event.
+- **Shard: DTLS only from the selected address:** done in 1.5b-prep (`drop_dtls_unselected`;
+  the address map holds only the selected and, during its grace period, the previous
+  address, so the test sends DTLS from the previous address after a switch).
 - `ServerHandle` users: `main.rs:349`, `harness.rs:66`, `e2e.rs:150` use `media_addrs[0]`.
 - Tests (note §17.1): `two_party_audio_video` compares against the SSRCs each client's offer
-  announced for the peer's tracks (`announced_ssrcs()`, 1.5b-prep; `tests/e2e.rs:61-67`
-  already flags this) plus the marker; `candidate_is_announced_address` uses
-  `media_addrs[0]`.
+  announced for the peer's tracks (`announced_ssrcs()`, 1.5b-prep; `check_received` takes
+  expected and publisher SSRCs separately) plus the marker (it names the peer's published
+  SSRC); one client answers `answering_dtls_role = Client`; `candidate_is_announced_address`
+  uses `media_addrs[0]`.
+- Work on a local branch (`phase-1-switch-wip`) in stages, squashed into the one switch
+  commit on `phase-1`.
+
+**Code notes (planning audit 2026-09-27, before implementation):**
+- `src/sfu.rs` must change too: `Sfu` uses `ColdPathPacket` (`connection_tx` field,
+  `set_connection_tx`, the forward in `process_packet`). Remove the field, the setter and the
+  forward (`Sfu` is not started after the switch).
+- webrtc-rs answers **`a=setup:passive`** to an offer with `a=ice-lite` when no role is set
+  (`webrtc-0.10.1/src/peer_connection/mod.rs:941`), and becomes ICE-controlling (so it
+  nominates). Every default e2e client therefore makes the SFU the DTLS **client**; set
+  `answering_dtls_role = Client` on one client of `two_party_audio_video` so the SFU-as-server
+  path (the browsers' case) stays covered.
+- The shard's address map holds only the selected address and the previous one during its
+  grace period (`switch_to` is its only insert); unselected candidates were already dropped.
+  The DTLS rule (done in 1.5b-prep) therefore only concerns the previous address.
+- `Unpublish` (`mod.rs:264`) has no ownership check: any participant can unpublish any track.
+  Check `TrackRegistry` publisher = sender.
+- A full command queue cannot carry the `CloseSession` of the session it fails: keep failed
+  closes in a bounded list retried by the 1 s sweep.
+- Subscribe m-lines of the old path offer the default codec list (`None` codecs); 1.5b passes
+  VP8/Opus explicitly, and publish slots Opus 111 / VP8 96.
+- Metrics: `MetricsCollector` has no worker feeding it after the switch; `/metrics` reports
+  zeros for worker series until shard stats are exported (note §5.4).
 
 **Code notes (audited 2026-09-26):**
 - Old-path references to replace. `SsrcRouter`/`WorkerPool`: `negotiation.rs` 12, 15,
@@ -1280,7 +1344,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.3 Shard thread and I/O | Done | see git log (1.3) | `LinuxIo`/`PortableIo`, park/wake, shard thread, `DataplaneHandle`, `Dataplane::start`, `DataplaneConfig`, `Placement`/`SingleShard`, shard-wide DTLS cap; `tests/loopback.rs`; lost-wake-up fix; review fixes: oversized flood pacing, GRO refusal, concurrent shutdown, bytes sent, closed event channel |
 | 1.4 SDP groundwork, signaling limits, shared certificate | Done | see git log (1.4) | `media: Vec` (32), BUNDLE 544 B, 128 KB SDP and printer errors, two SDP parser panics fixed + proptests, `Mid::parse`, `rtcp_fbs`, `stream_id`/`cname` with one msid, extension table in `nexus-media`, WebSocket 256 KB + error reply + 1 MB cap, `DtlsCertificate` + `with_certificate`; old-path cap 8 |
 | 1.5a Control-plane pieces | Done | see git log (1.5a) | `ids`, `dtls` (`DtlsHandshake`: lazy role, MTU split, keys by role), `transports` (`SsrcAllocator`, timeouts), `tracks`, `sdp_params`; engine input guards and `DTLS_MTU`; SDP accessors |
-| 1.5b-prep Node module, config, negotiator options, loadtest marker | Not started | | Old path green |
+| 1.5b-prep Node module, config, negotiator options, loadtest marker | Done | see git log (1.5b-prep) | `node.rs`, `[dataplane]` config, `with_ice_lite` + Track rtcp-fb parameter (golden old-path offer), loadtest marker + announced SSRCs; moved in: sha-256 fingerprint choice, `SsrcAllocator` fixes, shard DTLS from the selected address only. Old path green (e2e 3/3) |
 | 1.5b Switch (one commit) | Not started | | Early browser check result goes here |
 | 1.7 Benches, memory budget, CI | Not started | | Before C2 |
 | C2 Old benches | Not started | | |
@@ -1498,3 +1562,22 @@ Add one line per working session: date, part, what was done, what is left.
   `SsrcAllocator` does not check peer SSRCs against `base`, and `allocate` uses up offsets
   when it returns `None`. macOS: fmt, clippy clean, 2,012 passed, e2e 3/3; Linux arm64
   (own target volume): clippy clean, 2,018 passed, e2e 2/2. Committed. Next: 1.5b-prep.
+- 2026-09-27: 1.5b-prep and 1.5b planned in detail against the code (three read-only
+  audits: orchestrator/server, 1.5b-prep targets, dataplane and 1.5a APIs). Owner's
+  decisions: the SsrcAllocator fixes, the sha-256 fingerprint choice and the shard DTLS rule
+  move into 1.5b-prep; 1.5b is built on a local WIP branch and squashed into one commit.
+  Corrections added to 1.5b's code notes (`sfu.rs` must change, webrtc-rs answers `passive`
+  to ice-lite, address map contents, `Unpublish` ownership, closing on a full queue).
+  1.5b-prep implemented (uncommitted, for review): `src/node.rs` (node id with `SystemTime`,
+  `DistributedState`, gossip thread split into `GossipLoop`, shutdown notice; `Sfu` delegates),
+  `[dataplane]` config (`DataplaneSettings`, `to_dataplane_config`, `reserved_ports`,
+  `--shards`, `NEXUS_SHARDS`, four TOMLs), negotiator `with_ice_lite` and Track rtcp-fb
+  parameter with the old path's offer pinned in `testdata/legacy_offer.sdp`, parser keeps
+  the sha-256 fingerprint, `SsrcAllocator` peer/base check, no offsets used on failure and
+  the registration high-water mark, shard `drop_dtls_unselected`, loadtest payload marker
+  (VP8 descriptor parsed), `AnnouncedSsrcs`, kept senders with RTCP drains, one stream id;
+  e2e checks markers and the announced SSRCs. Checked to fail with the fix disabled:
+  fingerprint choice, shard DTLS rule, e2e marker check (wrong SSRC stamped). macOS: fmt,
+  clippy clean, 2,034 passed, 0 failed, e2e 3/3; Linux arm64 container (copy of the repo
+  inside the container, target volume `nexus-dataplane-target`): fmt, clippy clean, 2,040
+  passed, 0 failed, twice. Committed. Next: 1.5b (WIP branch `phase-1-switch-wip`).

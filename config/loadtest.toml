@@ -61,6 +61,18 @@ suspect_timeout_ms = 10000
 fanout = 1
 max_piggyback_updates = 8
 
+[dataplane]
+# New data plane (not started until the switch in Phase 1.5b).
+# Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
+shards = 1                              # Must be 1 in Phase 1
+busy_poll_rounds = 0                    # Park as soon as idle
+pool_buffers = 1024                     # 2 KB packet buffers per shard
+consent_timeout_ms = 30000              # Close a session after 30 s without authenticated traffic
+rebind_silence_ms = 2000                # Accept a new client address after 2 s of silence
+cpu_affinity = false
+realtime_priority = false
+realtime_priority_level = 80
+
 [cluster]
 node_id = 0
 

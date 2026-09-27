@@ -58,17 +58,34 @@ async fn two_party_audio_video() {
     let (a_after, b_after) = (a.track_stats(), b.track_stats());
 
     // Each side receives exactly the other's streams: not its own echoed
-    // back, not a mix. The SFU does not rewrite SSRCs yet (design §3.5); once
-    // it does, compare against the SSRCs it announces instead.
+    // back, not a mix. The old data path forwards the publisher's SSRCs, so the
+    // SSRCs the SFU announces equal the published ones; the payload markers name
+    // the publisher either way.
     let (a_sent, b_sent) = (a.published_ssrcs().await, b.published_ssrcs().await);
     assert_eq!(a_sent.len(), 2, "A publishes audio and video: {a_sent:?}");
     assert_eq!(b_sent.len(), 2, "B publishes audio and video: {b_sent:?}");
-    check_received("A", &a_before, &a_after, &b_sent);
-    check_received("B", &b_before, &b_after, &a_sent);
+    assert_eq!(announced(&a), set(&b_sent), "A's offer announces B's SSRCs");
+    assert_eq!(announced(&b), set(&a_sent), "B's offer announces A's SSRCs");
+    check_received("A", &a_before, &a_after, &b_sent, &b_sent);
+    check_received("B", &b_before, &b_after, &a_sent, &a_sent);
 
     let _ = a.disconnect().await;
     let _ = b.disconnect().await;
     server.shutdown().await.expect("clean shutdown");
+}
+
+fn set(ssrcs: &[u32]) -> BTreeSet<u32> {
+    ssrcs.iter().copied().collect()
+}
+
+/// SSRCs the SFU's latest offer to `client` announces for tracks it sends.
+fn announced(client: &HeadlessClient) -> BTreeSet<u32> {
+    let all = client.announced_ssrcs();
+    assert!(
+        all.iter().all(|a| a.track_id.is_some()),
+        "every announced m-line is listed in the offer's tracks: {all:?}"
+    );
+    all.iter().map(|a| a.ssrc).collect()
 }
 
 async fn wait_for_tracks(a: &HeadlessClient, b: &HeadlessClient, n: usize, timeout: Duration) {
@@ -88,18 +105,21 @@ async fn wait_for_tracks(a: &HeadlessClient, b: &HeadlessClient, n: usize, timeo
 
 /// Per received track over the window: packets arrive at a plausible rate,
 /// sequence numbers are continuous, timestamps advance, and the SSRC stays
-/// the same (exactly one audio and one video stream, no new SSRCs).
+/// the same (exactly one audio and one video stream, no new SSRCs). Arriving
+/// SSRCs are `expected_ssrcs`; the payload markers must name one of
+/// `publisher_ssrcs` (the peer's own) and arrive unchanged.
 fn check_received(
     who: &str,
     before: &[nexus_loadtest::TrackRxStats],
     after: &[nexus_loadtest::TrackRxStats],
-    peer_ssrcs: &[u32],
+    expected_ssrcs: &[u32],
+    publisher_ssrcs: &[u32],
 ) {
     let received: BTreeSet<u32> = after.iter().map(|t| t.ssrc).collect();
-    let expected: BTreeSet<u32> = peer_ssrcs.iter().copied().collect();
     assert_eq!(
-        received, expected,
-        "{who}: must receive exactly the peer's SSRCs"
+        received,
+        set(expected_ssrcs),
+        "{who}: must receive exactly the peer's streams"
     );
     let kinds: BTreeSet<&str> = after.iter().map(|t| t.kind.as_str()).collect();
     assert_eq!(
@@ -111,6 +131,13 @@ fn check_received(
         kinds,
         BTreeSet::from(["audio", "video"]),
         "{who}: {after:?}"
+    );
+
+    let markers: BTreeSet<Option<u32>> = after.iter().map(|t| t.marker_ssrc).collect();
+    assert_eq!(
+        markers.len(),
+        2,
+        "{who}: one publisher SSRC per track: {after:?}"
     );
 
     let window = MEDIA_WINDOW.as_secs();
@@ -133,6 +160,14 @@ fn check_received(
             track.missing_packets()
         );
         assert_eq!(track.timestamp_regressions, 0, "{who}: {track:?}");
+        assert!(track.markers > 0, "{who}: no payload marker: {track:?}");
+        assert_eq!(track.marker_mismatches, 0, "{who}: {track:?}");
+        assert_eq!(track.marker_regressions, 0, "{who}: {track:?}");
+        let publisher = track.marker_ssrc.expect("marker read");
+        assert!(
+            publisher_ssrcs.contains(&publisher),
+            "{who}: marker names {publisher:#x}, not a peer SSRC {publisher_ssrcs:?}"
+        );
         assert_ne!(
             track.last_timestamp, track.first_timestamp,
             "{who}: {track:?}"

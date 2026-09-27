@@ -189,14 +189,29 @@ pub enum OfferMline<'a> {
     /// `stream_id` and `cname` are shared by all of a publisher's tracks so the
     /// subscriber can lip-sync them; the m-line announces one msid,
     /// `<stream_id> nexus-track-<mid>`, both as `a=msid` and in `a=ssrc:<ssrc> msid:`.
+    ///
+    /// `rtcp_fbs` is the feedback the subscriber may send, as `(type, params)`, offered
+    /// on the m-line's first codec only.
     Track {
         ssrc: u32,
         media_kind: u8,
         mid: &'a str,
         stream_id: &'a str,
         cname: &'a str,
+        rtcp_fbs: &'a [(&'a str, &'a str)],
     },
 }
+
+/// Track m-line feedback of the old data path (video): NACK, PLI, REMB, transport-cc.
+pub const LEGACY_TRACK_VIDEO_FBS: &[(&str, &str)] = &[
+    ("nack", ""),
+    ("nack", "pli"),
+    ("goog-remb", ""),
+    ("transport-cc", ""),
+];
+
+/// Track m-line feedback of the old data path (audio): transport-cc.
+pub const LEGACY_TRACK_AUDIO_FBS: &[(&str, &str)] = &[("transport-cc", "")];
 
 /// A subscribed track for [`SdpNegotiator::create_renegotiation_offer`].
 #[derive(Debug, Clone, Copy)]
@@ -206,6 +221,7 @@ pub struct TrackMline<'a> {
     pub mid: &'a str,
     pub stream_id: &'a str,
     pub cname: &'a str,
+    pub rtcp_fbs: &'a [(&'a str, &'a str)],
 }
 
 /// SDP negotiator for WebRTC offer/answer.
@@ -228,6 +244,9 @@ pub struct SdpNegotiator {
     dtls_fingerprint: DtlsFingerprint,
     /// Local ICE candidates to include in SDP.
     local_candidates: Vec<super::IceCandidate>,
+    /// Announce `a=ice-lite` in offers (RFC 8445 §2.5): the SFU answers checks but
+    /// sends none.
+    ice_lite: bool,
 }
 
 impl SdpNegotiator {
@@ -288,6 +307,7 @@ impl SdpNegotiator {
             ice_pwd,
             dtls_fingerprint: fingerprint,
             local_candidates: Vec::new(),
+            ice_lite: false,
         })
     }
 
@@ -305,6 +325,12 @@ impl SdpNegotiator {
     /// These candidates will be added to each media section in the answer.
     pub fn with_candidates(mut self, candidates: Vec<super::IceCandidate>) -> Self {
         self.local_candidates = candidates;
+        self
+    }
+
+    /// Announce `a=ice-lite` at session level in the offers this negotiator builds.
+    pub fn with_ice_lite(mut self, ice_lite: bool) -> Self {
+        self.ice_lite = ice_lite;
         self
     }
 
@@ -778,6 +804,7 @@ impl SdpNegotiator {
                 mid: t.mid,
                 stream_id: t.stream_id,
                 cname: t.cname,
+                rtcp_fbs: t.rtcp_fbs,
             }))
             .collect();
         self.create_ordered_offer(
@@ -820,6 +847,40 @@ impl SdpNegotiator {
                 };
                 media.add_rtcp_fb(super::RtcpFeedback::parse(&value)?)?;
             }
+        }
+        debug_assert!(media.rtcp_fb_count as usize <= super::MAX_RTCP_FB_PER_MEDIA);
+        Ok(())
+    }
+
+    /// Add `a=rtcp-fb:<pt> <type> [params]` on the m-line's first codec only (the
+    /// shape Track m-lines have always had). More than `MAX_RTCP_FB_PER_MEDIA` in total
+    /// is an error.
+    fn add_track_rtcp_fbs(
+        media: &mut super::MediaDescription,
+        rtcp_fbs: &[(&str, &str)],
+    ) -> Result<(), SdpError> {
+        let Some(pt) = media
+            .codecs
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .next()
+            .map(|c| c.payload_type)
+        else {
+            return Ok(());
+        };
+        if media.rtcp_fb_count as usize + rtcp_fbs.len() > super::MAX_RTCP_FB_PER_MEDIA {
+            return Err(SdpError::InvalidFormat {
+                reason: "too many rtcp-fb entries for one m-line",
+            });
+        }
+        for &(fb_type, params) in rtcp_fbs {
+            assert!(!fb_type.is_empty(), "rtcp-fb type must not be empty");
+            let value = if params.is_empty() {
+                format!("{} {}", pt, fb_type)
+            } else {
+                format!("{} {} {}", pt, fb_type, params)
+            };
+            media.add_rtcp_fb(super::RtcpFeedback::parse(&value)?)?;
         }
         debug_assert!(media.rtcp_fb_count as usize <= super::MAX_RTCP_FB_PER_MEDIA);
         Ok(())
@@ -908,6 +969,7 @@ impl SdpNegotiator {
         offer.set_fingerprint(self.dtls_fingerprint.clone());
         // RFC 8842 §5.5: offerer MUST use actpass.
         offer.set_setup(DtlsSetup::Actpass);
+        offer.ice_lite = self.ice_lite;
 
         let mut bundle_mids: Vec<&str> = Vec::with_capacity(mlines.len());
 
@@ -1019,6 +1081,7 @@ impl SdpNegotiator {
                     mid,
                     stream_id,
                     cname,
+                    rtcp_fbs,
                 } => {
                     // Precondition: SSRC must be non-zero
                     assert!(ssrc != 0, "SSRC must be non-zero");
@@ -1114,46 +1177,8 @@ impl SdpNegotiator {
                     media.rtcp_mux = true;
                     media.rtcp_rsize = true;
 
-                    // Add RTCP feedback capabilities so the subscriber's browser
-                    // sends NACK, PLI, REMB, and transport-cc (RFC 4585, RFC 8888).
-                    // Without these, the browser won't send any feedback for subscribed tracks.
-                    // Applied unconditionally for both negotiated and fallback codec paths.
-                    {
-                        let pt = media
-                            .codecs
-                            .iter()
-                            .filter_map(|c| c.as_ref())
-                            .next()
-                            .map(|c| c.payload_type);
-                        if let Some(pt) = pt {
-                            let pt_str = pt.to_string();
-                            if media_kind != 0 {
-                                // Video: nack, nack pli, goog-remb, transport-cc
-                                let _ = media.add_rtcp_fb(
-                                    super::RtcpFeedback::parse(&format!("{} nack", pt_str))
-                                        .unwrap(),
-                                );
-                                let _ = media.add_rtcp_fb(
-                                    super::RtcpFeedback::parse(&format!("{} nack pli", pt_str))
-                                        .unwrap(),
-                                );
-                                let _ = media.add_rtcp_fb(
-                                    super::RtcpFeedback::parse(&format!("{} goog-remb", pt_str))
-                                        .unwrap(),
-                                );
-                                let _ = media.add_rtcp_fb(
-                                    super::RtcpFeedback::parse(&format!("{} transport-cc", pt_str))
-                                        .unwrap(),
-                                );
-                            } else {
-                                // Audio: transport-cc
-                                let _ = media.add_rtcp_fb(
-                                    super::RtcpFeedback::parse(&format!("{} transport-cc", pt_str))
-                                        .unwrap(),
-                                );
-                            }
-                        }
-                    }
+                    // Feedback the subscriber may send (RFC 4585), on the first codec.
+                    Self::add_track_rtcp_fbs(&mut media, rtcp_fbs)?;
 
                     // Use negotiated extmap IDs from the initial exchange (RFC 8843 §9.1).
                     // In a BUNDLE, all m-lines share the same ID space, but each media
@@ -1262,6 +1287,106 @@ mod tests {
         }
     }
 
+    /// The offer the old data path builds (`send_ordered_offer`): recycled publish
+    /// m-lines with the peer's codecs and no rtcp-fb, Track m-lines with the default
+    /// codec list and legacy feedback.
+    fn legacy_offer() -> String {
+        use super::super::Direction;
+        let vp8 = [RtpCodec::parse(96, "VP8/90000").unwrap()];
+        let opus = [RtpCodec::parse(111, "opus/48000/2").unwrap()];
+        let mlines = [
+            OfferMline::Recycled(recycled("0", 1, &vp8, Direction::RecvOnly)),
+            OfferMline::Recycled(recycled("1", 0, &opus, Direction::RecvOnly)),
+            OfferMline::Track {
+                ssrc: 1111,
+                media_kind: 1,
+                mid: "2",
+                stream_id: "nexus-stream-1111",
+                cname: "nexus-1111",
+                rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
+            },
+            OfferMline::Track {
+                ssrc: 2222,
+                media_kind: 0,
+                mid: "3",
+                stream_id: "nexus-stream-2222",
+                cname: "nexus-2222",
+                rtcp_fbs: LEGACY_TRACK_AUDIO_FBS,
+            },
+            OfferMline::Recycled(recycled("4", 1, &vp8, Direction::Inactive)),
+        ];
+        test_negotiator()
+            .create_ordered_offer(42, 3, &mlines, 1, &[], &[], None, None, None, None)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn test_ice_lite_is_announced_once() {
+        let vp8 = [RtpCodec::parse(96, "VP8/90000").unwrap()];
+        let mlines = [OfferMline::Recycled(recycled(
+            "0",
+            1,
+            &vp8,
+            super::super::Direction::RecvOnly,
+        ))];
+        let offer = |lite: bool| {
+            test_negotiator()
+                .with_ice_lite(lite)
+                .create_ordered_offer(1, 1, &mlines, 1, &[], &[], None, None, None, None)
+                .unwrap()
+                .0
+        };
+        let lite = offer(true);
+        assert_eq!(lite.matches("a=ice-lite\r\n").count(), 1);
+        assert!(super::super::SdpParser::parse(&lite).unwrap().ice_lite);
+        assert!(!offer(false).contains("ice-lite"));
+    }
+
+    #[test]
+    fn test_track_rtcp_fb_is_a_parameter() {
+        let offer = |kind: u8, fbs: &[(&str, &str)]| {
+            let mlines = [OfferMline::Track {
+                ssrc: 7,
+                media_kind: kind,
+                mid: "0",
+                stream_id: "nexus-1",
+                cname: "nexus-1",
+                rtcp_fbs: fbs,
+            }];
+            test_negotiator().create_ordered_offer(
+                1,
+                1,
+                &mlines,
+                1,
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let (sdp, _) = offer(1, &[("nack", "pli"), ("ccm", "fir")]).unwrap();
+        // First codec only (VP8, 96), nothing else.
+        assert_eq!(sdp.matches("a=rtcp-fb:").count(), 2, "{sdp}");
+        assert!(sdp.contains("a=rtcp-fb:96 nack pli\r\n"));
+        assert!(sdp.contains("a=rtcp-fb:96 ccm fir\r\n"));
+        let (sdp, _) = offer(0, &[]).unwrap();
+        assert!(!sdp.contains("a=rtcp-fb"));
+        // More than the m-line can hold is an error, not a silent drop.
+        let many = vec![("nack", ""); super::super::MAX_RTCP_FB_PER_MEDIA + 1];
+        assert!(offer(1, &many).is_err());
+    }
+
+    #[test]
+    fn test_legacy_offer_is_unchanged() {
+        // Pinned before the Track m-line rtcp-fb became a parameter (1.5b-prep):
+        // the old data path must keep offering exactly this.
+        let expected = include_str!("testdata/legacy_offer.sdp");
+        assert_eq!(legacy_offer(), expected);
+    }
+
     #[test]
     fn test_ordered_offer_keeps_mline_order_and_directions() {
         use super::super::{Direction, SdpParser};
@@ -1276,6 +1401,7 @@ mod tests {
                 mid: "0",
                 stream_id: "nexus-7",
                 cname: "nexus-7",
+                rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
             },
             OfferMline::Recycled(recycled("1", 1, &vp8, Direction::RecvOnly)),
             OfferMline::Recycled(recycled("2", 0, &opus, Direction::Inactive)),
@@ -1379,6 +1505,11 @@ mod tests {
                         mid,
                         stream_id: "nexus-5",
                         cname: "nexus-5",
+                        rtcp_fbs: if kind == 0 {
+                            LEGACY_TRACK_AUDIO_FBS
+                        } else {
+                            LEGACY_TRACK_VIDEO_FBS
+                        },
                     }
                 }
             })
@@ -1485,6 +1616,7 @@ mod tests {
             mid: "3",
             stream_id: "nexus-9",
             cname: "nexus-9",
+            rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
         }];
         let (sdp, _) = test_negotiator()
             .create_ordered_offer(1, 1, &mlines, 1, &[], &[], None, None, None, None)
@@ -1519,6 +1651,7 @@ mod tests {
                 mid: "0",
                 stream_id,
                 cname,
+                rtcp_fbs: LEGACY_TRACK_AUDIO_FBS,
             }];
             test_negotiator().create_ordered_offer(
                 1,
@@ -1558,6 +1691,7 @@ mod tests {
                     mid: "1",
                     stream_id: "nexus-7",
                     cname: "nexus-7",
+                    rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
                 }],
                 1,
                 &[],
@@ -1576,6 +1710,7 @@ mod tests {
                 mid: "1",
                 stream_id: "nexus-7",
                 cname: "nexus-7",
+                rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
             },
         ];
         let (ordered, _) = negotiator

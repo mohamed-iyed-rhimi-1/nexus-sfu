@@ -132,7 +132,18 @@ fn test_env_var_overrides() {
         "unspecified IP must fail validation"
     );
 
+    // Test 5: shard count
+    env::set_var("NEXUS_SHARDS", "1");
+    let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
+    assert_eq!(config.dataplane.shards, 1);
+    env::set_var("NEXUS_SHARDS", "many");
+    assert!(ConfigLoader::merge_from_env(NexusConfig::default()).is_err());
+    env::set_var("NEXUS_SHARDS", "2");
+    let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
+    assert!(config.validate().is_err(), "Phase 1 runs one shard");
+
     // Cleanup
+    env::remove_var("NEXUS_SHARDS");
     env::remove_var("NEXUS_ANNOUNCED_IPS");
     env::remove_var("NEXUS_JWT_SECRET");
     env::remove_var("NEXUS_TLS_CERT_PATH");
@@ -355,4 +366,117 @@ fn test_shipped_configs_validate() {
             .validate()
             .unwrap_or_else(|e| panic!("{name}.toml is invalid: {e}"));
     }
+}
+
+#[test]
+fn test_dataplane_section_is_optional() {
+    // development.toml without its [dataplane] section still loads, with defaults.
+    let path = format!("{}/config/development.toml", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut kept = String::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line.starts_with('[') {
+            skipping = line.trim() == "[dataplane]";
+        }
+        if !skipping {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    assert!(!kept.contains("[dataplane]"));
+    let config: NexusConfig = toml::from_str(&kept).unwrap();
+    assert_eq!(config.dataplane, DataplaneSettings::default());
+}
+
+#[test]
+fn test_dataplane_config_mapping() {
+    let mut config = NexusConfig::default();
+    config.transport.media_bind_addr = "0.0.0.0:20000".parse().unwrap();
+    config.transport.signaling_bind_addr = "0.0.0.0:8080".parse().unwrap();
+    config.transport.recv_buffer_size_bytes = 1 << 20;
+    config.transport.send_buffer_size_bytes = 2 << 20;
+    config.transport.max_webrtc_sessions = 999;
+    config.api.enabled = true;
+    config.api.bind_addr = "127.0.0.1:8081".to_string();
+    config.metrics.bind_addr = "127.0.0.1:9090".to_string();
+    config.dataplane.busy_poll_rounds = 7;
+    config.dataplane.pool_buffers = 4096;
+    config.dataplane.consent_timeout_ms = 20_000;
+    config.dataplane.rebind_silence_ms = 1_500;
+    config.dataplane.cpu_affinity = true;
+    config.dataplane.realtime_priority = true;
+    config.dataplane.realtime_priority_level = 50;
+
+    let dp = config.to_dataplane_config().unwrap();
+    assert_eq!(dp.shards, 1);
+    assert_eq!(dp.bind_addr, config.transport.media_bind_addr);
+    assert_eq!(dp.recv_buffer_bytes, 1 << 20);
+    assert_eq!(dp.send_buffer_bytes, 2 << 20);
+    assert_eq!(dp.busy_poll_rounds, 7);
+    assert!(dp.cpu_affinity);
+    assert_eq!(dp.realtime_priority, Some(50));
+    assert_eq!(dp.reserved_ports, vec![8080, 8081, 9090]);
+    assert_eq!(dp.rng_seed, None);
+    assert_eq!(dp.shard.pool_buffers, 4096);
+    assert_eq!(dp.shard.max_sessions, 999);
+    assert_eq!(dp.shard.consent_timeout, std::time::Duration::from_secs(20));
+    assert_eq!(
+        dp.shard.rebind_silence,
+        std::time::Duration::from_millis(1_500)
+    );
+    assert!(config.validate().is_ok());
+
+    // Realtime off → no priority; a level that does not fit u8 is an error.
+    config.dataplane.realtime_priority = false;
+    assert_eq!(
+        config.to_dataplane_config().unwrap().realtime_priority,
+        None
+    );
+    config.dataplane.realtime_priority = true;
+    config.dataplane.realtime_priority_level = 300;
+    assert!(config.to_dataplane_config().is_err());
+    config.dataplane.realtime_priority_level = 0;
+    assert!(config.validate().is_err(), "priority 0 is out of 1..=99");
+}
+
+#[test]
+fn test_dataplane_reserved_ports() {
+    let mut config = NexusConfig::default();
+    config.transport.signaling_bind_addr = "127.0.0.1:0".parse().unwrap();
+    config.api.enabled = false;
+    config.api.bind_addr = "127.0.0.1:8081".to_string();
+    config.metrics.bind_addr = "127.0.0.1:9090".to_string();
+    // Ephemeral signaling port and a disabled API reserve nothing.
+    assert_eq!(config.reserved_ports().unwrap(), vec![9090]);
+
+    config.api.enabled = true;
+    config.api.bind_addr = "127.0.0.1:9090".to_string();
+    assert_eq!(config.reserved_ports().unwrap(), vec![9090]);
+
+    config.metrics.bind_addr = "not-an-address".to_string();
+    assert!(config.reserved_ports().is_err());
+}
+
+#[test]
+fn test_dataplane_rejects_invalid_settings() {
+    let refused = |f: &dyn Fn(&mut NexusConfig)| {
+        let mut config = NexusConfig::default();
+        f(&mut config);
+        let err = config.validate().expect_err("must be refused");
+        assert!(err.to_string().contains("dataplane"), "{err}");
+    };
+    refused(&|c| c.dataplane.shards = 0);
+    refused(&|c| c.dataplane.shards = 2);
+    refused(&|c| c.dataplane.pool_buffers = 1);
+    refused(&|c| c.dataplane.rebind_silence_ms = c.dataplane.consent_timeout_ms);
+    // The media port must not be the signaling, API or metrics port.
+    refused(&|c| {
+        c.transport.media_bind_addr = "0.0.0.0:8080".parse().unwrap();
+        c.transport.signaling_bind_addr = "0.0.0.0:8080".parse().unwrap();
+    });
+    refused(&|c| {
+        c.transport.media_bind_addr = "0.0.0.0:9090".parse().unwrap();
+        c.metrics.bind_addr = "127.0.0.1:9090".to_string();
+    });
 }

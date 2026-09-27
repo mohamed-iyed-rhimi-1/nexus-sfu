@@ -632,6 +632,48 @@ fn dtls_events_until_first_authenticated_srtp() {
 }
 
 #[test]
+fn dtls_only_from_the_selected_address() {
+    // After a switch the previous address stays in the address map for its grace
+    // period; DTLS from it must not reach the handshake (replies go to the new one).
+    let t0 = Instant::now();
+    let mut shard = shard(t0);
+    let peer = Peer::new(1, "192.0.2.1:1000", GCM);
+    command(&mut shard, peer.create());
+    run(&mut shard, t0);
+    let (a, b): (SocketAddr, SocketAddr) = (
+        "192.0.2.1:1000".parse().unwrap(),
+        "192.0.2.1:1001".parse().unwrap(),
+    );
+    shard.io_mut().push_inbound(a, peer.binding_request(true));
+    run(&mut shard, t0);
+    shard.io_mut().push_inbound(b, peer.binding_request(true));
+    run(&mut shard, at(t0, 200));
+    assert_eq!(
+        shard.snapshot().addresses,
+        2,
+        "previous address still mapped"
+    );
+    events(&mut shard);
+
+    let dtls = vec![22u8, 0xFE, 0xFD, 0, 0, 1, 2, 3];
+    shard.io_mut().push_inbound(a, dtls.clone());
+    run(&mut shard, at(t0, 210));
+    assert!(events(&mut shard).is_empty());
+    assert_eq!(shard.counters().drop_dtls_unselected, 1);
+
+    shard.io_mut().push_inbound(b, dtls.clone());
+    run(&mut shard, at(t0, 220));
+    assert_eq!(
+        events(&mut shard),
+        vec![Event::DtlsDatagram {
+            id: peer.id,
+            bytes: dtls.into()
+        }]
+    );
+    assert_eq!(shard.counters().drop_dtls_unselected, 1);
+}
+
+#[test]
 fn unknown_ids_are_rejected() {
     let now = Instant::now();
     let mut shard = shard(now);

@@ -28,6 +28,7 @@
 
 #![deny(warnings)]
 
+pub mod announced;
 pub mod cli;
 pub mod client;
 pub mod config;
@@ -43,6 +44,7 @@ pub mod signaling;
 pub mod track_stats;
 
 // Re-export commonly used types at crate root
+pub use announced::{Announced, AnnouncedSsrcs};
 pub use cli::{Cli, Command};
 pub use config::{
     ClientConfig, ClientRole, ConferenceConfig, ConnectionOptions, OutputFormat,

@@ -69,7 +69,7 @@ use nexus_bwe::CongestionController;
 use nexus_media::rtcp::{RtcpHeader, RtcpType};
 use nexus_media::rtp::RtpHeader;
 use nexus_metrics::MetricsCollector;
-use nexus_state::{DistributedState, GossipConfig, SwimProtocol};
+use nexus_state::DistributedState;
 use nexus_transport::arena::PacketArena;
 use nexus_webrtc::webrtc::{
     PacketType, TransportId, TransportState as WebRtcTransportState, WebRtcTransport,
@@ -345,8 +345,8 @@ pub struct Sfu {
     /// SSRC to track routing table.
     ssrc_router: Arc<SsrcRouter>,
 
-    /// Distributed state for CRDT synchronization.
-    distributed_state: Arc<DistributedState>,
+    /// Node id, distributed state (CRDT synchronization) and gossip thread.
+    node: crate::node::Node,
 
     /// GCC congestion controller.
     gcc: Arc<CongestionController>,
@@ -388,15 +388,6 @@ pub struct Sfu {
 
     /// The signaling server's connections, for shutdown notifications.
     signaling_connections: Option<crate::signal::SignalingConnections>,
-
-    /// Gossip thread handle.
-    /// The gossip thread runs the SWIM protocol for cluster membership
-    /// and state synchronization.
-    gossip_thread: Option<std::thread::JoinHandle<()>>,
-
-    /// Gossip shutdown signal sender.
-    /// Used to signal the gossip thread to stop.
-    gossip_shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
 
     /// Drain state for graceful shutdown.
     ///
@@ -485,65 +476,6 @@ impl Sfu {
         // Initialize SSRC router
         let ssrc_router = Arc::new(SsrcRouter::new());
         info!("SSRC router initialized");
-
-        // Initialize distributed state
-        info!("Initializing distributed state...");
-        // Generate unique actor ID for CRDT operations
-        let actor_id: u64 = if config.cluster.node_id > 0 {
-            // Use configured node_id, but validate it's within range
-            let node_id = config.cluster.node_id;
-            if node_id >= nexus_state::MAX_ACTORS as u64 {
-                return Err(SfuError::Worker(WorkerError::InvalidConfig {
-                    message: format!(
-                        "cluster.node_id ({}) must be < MAX_ACTORS ({})",
-                        node_id,
-                        nexus_state::MAX_ACTORS
-                    ),
-                }));
-            }
-            node_id
-        } else {
-            // Auto-generate from machine identity:
-            // hash(hostname + process_id + boot_time)
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-            if let Ok(hostname) = std::env::var("HOSTNAME") {
-                hostname.hash(&mut hasher);
-            } else {
-                // Fallback: use random bytes for uniqueness
-                let random_bytes: [u8; 8] = rand::random();
-                random_bytes.hash(&mut hasher);
-            }
-
-            std::process::id().hash(&mut hasher);
-
-            crate::clock::now_ns().hash(&mut hasher);
-
-            let generated = hasher.finish();
-            // Map to valid range [1, MAX_ACTORS) using modulo
-            // MAX_ACTORS is 256, so valid range is 1..256
-            let mapped = (generated % (nexus_state::MAX_ACTORS as u64 - 1)) + 1;
-            // Ensure non-zero (actor_id 0 is reserved)
-            if mapped == 0 {
-                1
-            } else {
-                mapped
-            }
-        };
-
-        // Precondition: actor_id must be non-zero and within valid range
-        assert!(actor_id > 0, "Actor ID must be non-zero");
-        assert!(
-            actor_id < nexus_state::MAX_ACTORS as u64,
-            "Actor ID must be < MAX_ACTORS ({})",
-            nexus_state::MAX_ACTORS
-        );
-        info!("Node actor ID: {}", actor_id);
-
-        let state_config = nexus_state::DistributedStateConfig::new(actor_id);
-        let distributed_state = Arc::new(DistributedState::new(state_config));
-        info!("Distributed state initialized with actor_id={}", actor_id);
 
         // Initialize GCC congestion controller
         let gcc = Arc::new(CongestionController::new(
@@ -640,9 +572,6 @@ impl Sfu {
             config.memory.ring_buffer_size
         );
 
-        // Initialize gossip protocol for cluster membership
-        info!("Initializing gossip protocol...");
-
         // Create shared shutdown signal for all subsystems
         // Common shutdown signal for coordinated termination
         let shared_shutdown = Arc::new(AtomicBool::new(false));
@@ -664,120 +593,12 @@ impl Sfu {
             }
         };
 
-        let (gossip_shutdown_tx, gossip_shutdown_rx) = std::sync::mpsc::channel::<()>();
-
-        // Create channel for state updates from DistributedState to gossip thread
-        let (state_update_tx, state_update_rx) =
-            std::sync::mpsc::channel::<nexus_state::StateUpdate>();
-
-        // Set the broadcast sender on distributed state
-        distributed_state.set_broadcast_sender(state_update_tx);
-
-        // Create SwimProtocol with gossip config
-        // Use a random port for gossip (0 = OS assigns)
-        let gossip_bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let local_actor_id = actor_id;
-
-        let gossip_config = GossipConfig {
-            probe_interval_ms: config.gossip.probe_interval_ms,
-            ping_timeout_ms: config.gossip.ping_timeout_ms,
-            suspect_timeout_ms: config.gossip.suspect_timeout_ms,
-            fanout: config.gossip.fanout,
-            max_piggyback_updates: config.gossip.max_piggyback_updates,
-            seed_peers: config.gossip.seed_peers.clone(),
-        };
-
-        let mut swim_protocol =
-            SwimProtocol::new(local_actor_id, gossip_bind_addr, gossip_config.clone()).map_err(
-                |e| {
-                    SfuError::Worker(WorkerError::InvalidConfig {
-                        message: format!("Failed to create SwimProtocol: {:?}", e),
-                    })
-                },
-            )?;
-
-        // Set distributed state for CRDT updates
-        swim_protocol.set_distributed_state(distributed_state.clone());
-
-        // Add seed peers from config
-        for seed_peer in &config.gossip.seed_peers {
-            if let Err(e) = swim_protocol.add_seed_peer(seed_peer.actor_id, seed_peer.addr) {
-                warn!("Failed to add seed peer {}: {:?}", seed_peer.addr, e);
-            } else {
-                info!(
-                    "Added seed peer: actor_id={}, addr={}",
-                    seed_peer.actor_id, seed_peer.addr
-                );
-            }
-        }
-
-        let gossip_addr = swim_protocol.local_addr();
-        info!("Gossip protocol bound to {}", gossip_addr);
-
-        // Spawn dedicated gossip thread
-        let probe_interval_ms = config.gossip.probe_interval_ms;
-        let distributed_state_for_gossip = distributed_state.clone();
-        let shared_shutdown_for_gossip = shared_shutdown.clone();
-        let gossip_thread = std::thread::Builder::new()
-            .name("nexus-gossip".into())
-            .spawn(move || {
-                info!("Gossip thread started");
-
-                loop {
-                    // Check shared shutdown signal
-                    if shared_shutdown_for_gossip.load(Ordering::Acquire) {
-                        info!("Gossip thread detected shared shutdown signal");
-                        break;
-                    }
-
-                    // Check for shutdown signal (non-blocking)
-                    if gossip_shutdown_rx.try_recv().is_ok() {
-                        info!("Gossip thread received shutdown signal");
-                        break;
-                    }
-
-                    // Process any pending state updates from DistributedState
-                    // and enqueue them into the gossip piggyback queue
-                    while let Ok(update) = state_update_rx.try_recv() {
-                        swim_protocol.broadcast_state_update(update);
-                    }
-
-                    // Run probe cycle and handle any newly dead nodes
-                    match swim_protocol.run_probe_cycle() {
-                        Ok(dead_nodes) => {
-                            // Handle node failures - remove state owned by dead nodes
-                            for dead_actor_id in dead_nodes {
-                                let (tracks_removed, subs_removed) =
-                                    distributed_state_for_gossip.handle_node_failure(dead_actor_id);
-                                if tracks_removed > 0 || subs_removed > 0 {
-                                    info!(
-                                        "Handled node failure for actor {}: removed {} tracks, {} subscriptions",
-                                        dead_actor_id, tracks_removed, subs_removed
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Gossip probe cycle error: {:?}", e);
-                        }
-                    }
-
-                    // Process incoming messages
-                    if let Err(e) = swim_protocol.recv_loop_iteration() {
-                        warn!("Gossip recv error: {:?}", e);
-                    }
-
-                    // Sleep for probe interval
-                    std::thread::sleep(std::time::Duration::from_millis(probe_interval_ms));
-                }
-
-                info!("Gossip thread stopped");
+        // Node identity, distributed state and gossip (src/node.rs).
+        let node = crate::node::Node::start(&config, shared_shutdown.clone()).map_err(|e| {
+            SfuError::Worker(WorkerError::InvalidConfig {
+                message: e.to_string(),
             })
-            .map_err(|e| SfuError::Worker(WorkerError::InvalidConfig {
-                message: format!("Failed to spawn gossip thread: {:?}", e),
-            }))?;
-
-        info!("Gossip thread spawned");
+        })?;
         info!("Nexus SFU MVP initialization complete");
 
         // Create drain state before moving config
@@ -788,7 +609,7 @@ impl Sfu {
             arena,
             worker_pool: Some(Arc::new(RwLock::new(worker_pool))),
             ssrc_router,
-            distributed_state,
+            node,
             gcc,
             transport: Some(transport),
             media_local_addr,
@@ -798,8 +619,6 @@ impl Sfu {
             shutdown_tx: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             signaling_connections: None,
-            gossip_thread: Some(gossip_thread),
-            gossip_shutdown_tx: Some(gossip_shutdown_tx),
             drain_state: Arc::new(DrainState::new(drain_timeout_ms)),
             metrics,
             worker_queue_drops: DropTracker::default(),
@@ -875,7 +694,7 @@ impl Sfu {
     /// Get the distributed state.
     #[inline]
     pub fn distributed_state(&self) -> &Arc<DistributedState> {
-        &self.distributed_state
+        self.node.distributed_state()
     }
 
     /// Get the WebRTC transport.
@@ -2230,58 +2049,10 @@ impl Sfu {
     ///
     /// - Requirement 10.3: Notify participants of shutdown
     async fn notify_participants_of_shutdown(&self) {
-        let Some(connections) = self.signaling_connections.clone() else {
+        let Some(connections) = self.signaling_connections.as_ref() else {
             return;
         };
-        let drain_seconds = self.config.drain_timeout_ms / 1000;
-
-        let shutdown_msg = crate::signal::SignalMessage::ServerShutdown {
-            reason: "Server shutting down for maintenance".to_string(),
-            drain_seconds,
-        };
-
-        let mut notified: u32 = 0;
-        const MAX_NOTIFICATIONS: u32 = 10_000;
-
-        // Bounded iteration over all connections
-        for entry in connections.iter() {
-            if notified >= MAX_NOTIFICATIONS {
-                tracing::warn!(
-                    "Notification limit reached ({}), some participants not notified",
-                    MAX_NOTIFICATIONS
-                );
-                break;
-            }
-
-            let participant_id = *entry.key();
-
-            match entry.value().sender.try_send(shutdown_msg.clone()) {
-                Ok(()) => {
-                    notified += 1;
-                    tracing::debug!(participant_id, "Shutdown notification sent");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        participant_id,
-                        error = %e,
-                        "Failed to send shutdown notification"
-                    );
-                }
-            }
-        }
-
-        // Postcondition: bounded
-        assert!(
-            notified <= MAX_NOTIFICATIONS,
-            "Notification count must be bounded"
-        );
-
-        info!(
-            notified,
-            total_connections = connections.len(),
-            drain_seconds,
-            "Shutdown notifications sent"
-        );
+        crate::node::notify_shutdown(connections, self.config.drain_timeout_ms / 1000);
     }
 
     /// Check if the SFU is in drain mode.
@@ -2341,17 +2112,7 @@ impl Sfu {
 
         // Shutdown gossip thread
         info!("Shutting down gossip thread...");
-        if let Some(tx) = self.gossip_shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(handle) = self.gossip_thread.take() {
-            // Wait for gossip thread to finish (with timeout)
-            let join_result = handle.join();
-            match join_result {
-                Ok(()) => info!("Gossip thread shutdown complete"),
-                Err(_) => warn!("Gossip thread panicked during shutdown"),
-            }
-        }
+        self.node.stop();
 
         // Shutdown WebRTC transport
         info!("Shutting down WebRTC transport...");
@@ -2398,7 +2159,7 @@ impl Sfu {
             arena_free_slots: self.arena.free_count(),
             arena_capacity: self.arena.capacity(),
             ssrc_count: self.ssrc_router.len() as u32,
-            room_count: self.distributed_state.room_count() as u32,
+            room_count: self.node.distributed_state().room_count() as u32,
             bwe_estimate_bps: self.bwe().estimated_bandwidth_bps(),
             bwe_target_bps: self.bwe().target_bitrate_bps(),
             webrtc_session_count: webrtc_stats.0,
@@ -2418,12 +2179,7 @@ impl Drop for Sfu {
             self.shared_shutdown.store(true, Ordering::SeqCst);
 
             // Shutdown gossip thread synchronously
-            if let Some(tx) = self.gossip_shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            if let Some(handle) = self.gossip_thread.take() {
-                let _ = handle.join();
-            }
+            self.node.stop();
 
             // Shutdown worker pool synchronously
             if let Some(pool_arc) = self.worker_pool.take() {
@@ -2526,55 +2282,9 @@ mod tests {
         assert_eq!(stats.bwe_estimate_bps, 0);
         assert_eq!(stats.bwe_target_bps, 0);
     }
-
+    // Node id tests: src/node.rs. `Sfu::new` maps `NodeError` like before.
     #[tokio::test]
-    async fn test_actor_id_explicit_node_id() {
-        let mut config = NexusConfig::default();
-        config.transport.media_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.transport.signaling_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.worker.num_workers = 1;
-        config.memory.arena_size_mb = 16;
-        config.cluster.node_id = 42; // Explicit node_id
-
-        let mut sfu = Sfu::new(config).await.unwrap();
-
-        // Verify the distributed state uses the configured node_id
-        let state_actor_id = sfu.distributed_state.local_actor();
-        assert_eq!(
-            state_actor_id, 42,
-            "Actor ID should match configured node_id"
-        );
-
-        sfu.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_actor_id_auto_generated() {
-        let mut config = NexusConfig::default();
-        config.transport.media_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.transport.signaling_bind_addr = "127.0.0.1:0".parse().unwrap();
-        config.worker.num_workers = 1;
-        config.memory.arena_size_mb = 16;
-        config.cluster.node_id = 0; // Auto-generate
-
-        let mut sfu = Sfu::new(config).await.unwrap();
-
-        // Verify the actor_id is non-zero and within valid range
-        let state_actor_id = sfu.distributed_state.local_actor();
-        assert!(
-            state_actor_id > 0,
-            "Auto-generated actor ID must be non-zero"
-        );
-        assert!(
-            state_actor_id < nexus_state::MAX_ACTORS as u64,
-            "Auto-generated actor ID must be < MAX_ACTORS"
-        );
-
-        sfu.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_actor_id_invalid_node_id() {
+    async fn test_sfu_invalid_node_id() {
         let mut config = NexusConfig::default();
         config.transport.media_bind_addr = "127.0.0.1:0".parse().unwrap();
         config.transport.signaling_bind_addr = "127.0.0.1:0".parse().unwrap();
@@ -2582,16 +2292,11 @@ mod tests {
         config.memory.arena_size_mb = 16;
         config.cluster.node_id = 1000; // Invalid: > MAX_ACTORS (256)
 
-        let result = Sfu::new(config).await;
-        assert!(result.is_err(), "Should fail with node_id >= MAX_ACTORS");
-
-        if let Err(SfuError::Worker(WorkerError::InvalidConfig { message })) = result {
-            assert!(
-                message.contains("MAX_ACTORS"),
-                "Error message should mention MAX_ACTORS constraint"
-            );
-        } else {
-            panic!("Expected InvalidConfig error");
+        match Sfu::new(config).await {
+            Err(SfuError::Worker(WorkerError::InvalidConfig { message })) => {
+                assert!(message.contains("MAX_ACTORS"), "{}", message)
+            }
+            _ => panic!("Expected InvalidConfig error"),
         }
     }
 }

@@ -103,6 +103,9 @@ counters! {
     drop_stun_auth,
     /// DTLS or SRTP from an address no session selected.
     drop_unknown_addr,
+    /// DTLS from a session's address that is not the selected one (the previous
+    /// address during its grace period after a switch).
+    drop_dtls_unselected,
     /// DTLS after `PeerSrtpVerified`.
     drop_dtls_verified,
     /// DTLS beyond the session's per-second budget.

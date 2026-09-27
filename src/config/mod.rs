@@ -2,12 +2,14 @@
 // TigerStyle: Explicit types, units in names, comprehensive validation
 
 mod api;
+mod dataplane;
 mod ice;
 mod loader;
 mod validation;
 mod watcher;
 
 pub use api::ApiConfig;
+pub use dataplane::DataplaneSettings;
 pub use ice::{
     IceServerConfig, TurnServerConfig, GOOGLE_STUN_SERVERS, MAX_STUN_SERVERS, MAX_TURN_SERVERS,
 };
@@ -67,6 +69,9 @@ pub struct NexusConfig {
     /// Cluster configuration for multi-node deployment.
     #[serde(default)]
     pub cluster: ClusterConfig,
+    /// New data plane: shard count and shard settings (note §14).
+    #[serde(default)]
+    pub dataplane: DataplaneSettings,
     /// Graceful drain timeout in milliseconds.
     /// When shutdown is initiated, the SFU will continue forwarding packets
     /// for this duration before terminating connections.
@@ -118,6 +123,7 @@ impl NexusConfig {
         validate_core_config("logging", self.logging.validate())?;
         self.ice_servers.validate()?;
         self.cluster.validate()?;
+        self.validate_dataplane()?;
 
         // Validate drain_timeout_ms
         if self.drain_timeout_ms == 0 {
@@ -229,6 +235,7 @@ impl Default for NexusConfig {
             logging: LoggingConfig::default(),
             ice_servers: IceServerConfig::default(),
             cluster: ClusterConfig::default(),
+            dataplane: DataplaneSettings::default(),
             drain_timeout_ms: default_drain_timeout_ms(),
         }
     }

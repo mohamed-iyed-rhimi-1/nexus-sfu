@@ -17,7 +17,9 @@ use nexus_state::gossip::types::TrackInfo;
 use nexus_state::DistributedState;
 use nexus_transport::dtls::DtlsRole;
 use nexus_transport::ice::{Candidate, IceCredentials, MAX_CANDIDATES};
-use nexus_webrtc::sdp::{MediaType, OfferMline, SdpNegotiator};
+use nexus_webrtc::sdp::{
+    MediaType, OfferMline, SdpNegotiator, LEGACY_TRACK_AUDIO_FBS, LEGACY_TRACK_VIDEO_FBS,
+};
 use nexus_webrtc::webrtc::{TransportId, WebRtcTransport};
 
 use super::ParticipantHandle;
@@ -1186,6 +1188,11 @@ impl NegotiationManager {
                                 mid: slot.mid.as_str(),
                                 stream_id: stream_id.as_str(),
                                 cname: cname.as_str(),
+                                rtcp_fbs: if slot.kind == 0 {
+                                    LEGACY_TRACK_AUDIO_FBS
+                                } else {
+                                    LEGACY_TRACK_VIDEO_FBS
+                                },
                             }
                         }
                         // Track gone (publisher left): keep the position, send nothing

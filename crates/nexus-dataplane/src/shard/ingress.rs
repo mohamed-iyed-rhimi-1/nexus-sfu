@@ -205,13 +205,19 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         }
     }
 
-    /// DTLS goes to the control plane until the peer's SRTP is verified.
+    /// DTLS goes to the control plane until the peer's SRTP is verified, and only
+    /// from the selected address: the handshake's replies go there (`SendDatagram`),
+    /// so a datagram from any other address would mix two peers into one handshake.
     fn handle_dtls(&mut self, d: Datagram) {
         let Some(&idx) = self.by_addr.get(&d.addr) else {
             self.counters.drop_unknown_addr += 1;
             return;
         };
         let session = self.sessions.get_mut(idx);
+        if session.addr != Some(d.addr) {
+            self.counters.drop_dtls_unselected += 1;
+            return;
+        }
         if session.srtp_verified {
             self.counters.drop_dtls_verified += 1;
             return;

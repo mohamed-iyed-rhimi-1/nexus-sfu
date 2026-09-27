@@ -65,6 +65,7 @@ impl ConfigLoader {
     /// - `NEXUS_TLS_CERT_PATH`: TLS certificate path (quic.cert_path, requires nexus-signal)
     /// - `NEXUS_TLS_KEY_PATH`: TLS key path (quic.key_path, requires nexus-signal)
     /// - `NEXUS_WORKER_COUNT`: Number of worker threads (worker.num_workers)
+    /// - `NEXUS_SHARDS`: Number of data-plane shards (dataplane.shards)
     /// - `NEXUS_ARENA_SIZE_MB`: Packet arena size in MB (memory.arena_size_mb)
     /// - `NEXUS_LOG_LEVEL`: Log level (logging.level)
     /// - `NEXUS_METRICS_ADDR`: Metrics bind address (metrics.bind_addr)
@@ -97,6 +98,12 @@ impl ConfigLoader {
             config.worker.num_workers = workers
                 .parse()
                 .map_err(|_| ConfigError::invalid("NEXUS_WORKER_COUNT", "must be u32"))?;
+        }
+
+        if let Ok(shards) = env::var("NEXUS_SHARDS") {
+            config.dataplane.shards = shards
+                .parse()
+                .map_err(|_| ConfigError::invalid("NEXUS_SHARDS", "must be u16"))?;
         }
 
         if let Ok(arena_mb) = env::var("NEXUS_ARENA_SIZE_MB") {

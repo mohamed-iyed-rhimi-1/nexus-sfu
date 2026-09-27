@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_core::{ParticipantId, TrackId};
-use nexus_signal::SignalMessage;
+use nexus_signal::{OfferTrack, SignalMessage};
 use tokio::sync::Mutex;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -22,12 +22,16 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
+use crate::announced::{Announced, AnnouncedSsrcs};
 use crate::config::{ClientConfig, ClientRole};
 use crate::error::ClientError;
-use crate::media::{AudioGenerator, AudioPattern, VideoGenerator, VideoPattern};
+use crate::media::{
+    read_marker, stamp_marker, AudioGenerator, AudioPattern, VideoGenerator, VideoPattern,
+};
 use crate::metrics::ClientMetrics;
 use crate::signaling::SignalingConnection;
 use crate::track_stats::{TrackRxStats, TrackStatsMap};
@@ -112,6 +116,11 @@ pub struct HeadlessClient {
     announced_tracks: Vec<TrackId>,
     /// What was received on each remote track, by SSRC
     track_stats: TrackStatsMap,
+    /// Senders of the published video and audio tracks
+    video_sender: Option<Arc<RTCRtpSender>>,
+    audio_sender: Option<Arc<RTCRtpSender>>,
+    /// SSRCs the SFU's latest offer announces for the tracks it sends us
+    announced: AnnouncedSsrcs,
 }
 
 impl HeadlessClient {
@@ -140,6 +149,9 @@ impl HeadlessClient {
             ice_connected: Arc::new(AtomicBool::new(false)),
             announced_tracks: Vec::new(),
             track_stats: TrackStatsMap::default(),
+            video_sender: None,
+            audio_sender: None,
+            announced: AnnouncedSsrcs::default(),
         })
     }
 
@@ -446,6 +458,15 @@ impl HeadlessClient {
                                     rtp_packet.header.sequence_number,
                                     rtp_packet.header.timestamp,
                                 );
+                                if let Some((marker_ssrc, frame)) =
+                                    read_marker(kind == "video", &rtp_packet.payload)
+                                {
+                                    track_stats.record_marker(
+                                        rtp_packet.header.ssrc,
+                                        marker_ssrc,
+                                        frame,
+                                    );
+                                }
                                 if pkt_count <= 3 {
                                     tracing::info!(
                                         "RTP pkt #{}: ssrc={} pt={} seq={} ts={} marker={} payload_len={}",
@@ -529,8 +550,8 @@ impl HeadlessClient {
         };
 
         match msg {
-            SignalMessage::Offer { sdp, .. } => {
-                answer_offer(&peer_connection, &signaling, sdp).await?;
+            SignalMessage::Offer { sdp, tracks } => {
+                answer_offer(&peer_connection, &signaling, sdp, &tracks, &self.announced).await?;
                 Ok(Some(Pumped::Offer))
             }
             SignalMessage::IceCandidate {
@@ -627,7 +648,8 @@ impl HeadlessClient {
             actual: self.state.as_str(),
         })?);
 
-        // Create video track with VP8 codec
+        // Both tracks in one stream, as a browser's camera + microphone.
+        let stream_id = format!("loadtest-{}", rand_id());
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: "video/VP8".to_string(),
@@ -637,10 +659,8 @@ impl HeadlessClient {
                 rtcp_feedback: vec![],
             },
             format!("video-{}", rand_id()),
-            format!("loadtest-video-{}", rand_id()),
+            stream_id.clone(),
         ));
-
-        // Create audio track with Opus codec
         let audio_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: "audio/opus".to_string(),
@@ -650,25 +670,27 @@ impl HeadlessClient {
                 rtcp_feedback: vec![],
             },
             format!("audio-{}", rand_id()),
-            format!("loadtest-audio-{}", rand_id()),
+            stream_id,
         ));
 
-        // Add tracks to peer connection
-        let _video_sender = peer_connection
+        let video_sender = peer_connection
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(|e| ClientError::MediaError(format!("Failed to add video track: {}", e)))?;
-
-        let _audio_sender = peer_connection
+        let audio_sender = peer_connection
             .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(|e| ClientError::MediaError(format!("Failed to add audio track: {}", e)))?;
+        // RTCP from the SFU (receiver reports, PLI) must be read for the
+        // interceptors to process it.
+        spawn_rtcp_drain(Arc::clone(&video_sender));
+        spawn_rtcp_drain(Arc::clone(&audio_sender));
 
-        // Store tracks
         self.video_track = Some(Arc::clone(&video_track));
         self.audio_track = Some(Arc::clone(&audio_track));
+        self.video_sender = Some(Arc::clone(&video_sender));
+        self.audio_sender = Some(Arc::clone(&audio_sender));
 
-        // Create stop flag for background task
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.publishing_stop_flag = Some(Arc::clone(&stop_flag));
 
@@ -689,50 +711,16 @@ impl HeadlessClient {
         self.wait_for_ice(timeout).await?;
         tracing::debug!("Publish negotiation complete");
 
-        // Start background media generation AFTER renegotiation is complete
-        // so the track senders are fully bound and write_sample succeeds.
-        let video_track_clone = Arc::clone(&video_track);
-        let audio_track_clone = Arc::clone(&audio_track);
-        let stop_flag_clone = Arc::clone(&stop_flag);
-
-        tokio::spawn(async move {
-            let mut video_gen = VideoGenerator::new(320, 240, 15, VideoPattern::ColorBars);
-            let mut audio_gen = AudioGenerator::new(48000, 1, AudioPattern::Tone(440));
-
-            let frame_duration = Duration::from_millis(1000 / 15); // 15 fps
-            let audio_samples_per_frame = 480; // 10ms at 48kHz
-
-            while !stop_flag_clone.load(Ordering::Relaxed) {
-                let frame_start = Instant::now();
-
-                let video_frame = video_gen.next_encoded_frame(VIDEO_BITRATE_BPS);
-                let video_sample = Sample {
-                    data: video_frame.data.into(),
-                    duration: frame_duration,
-                    ..Default::default()
-                };
-                if video_track_clone.write_sample(&video_sample).await.is_err() {
-                    break;
-                }
-
-                let audio_samples = audio_gen.next_samples(audio_samples_per_frame as usize);
-                let audio_bytes: Vec<u8> =
-                    audio_samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-                let audio_sample = Sample {
-                    data: audio_bytes.into(),
-                    duration: frame_duration,
-                    ..Default::default()
-                };
-                if audio_track_clone.write_sample(&audio_sample).await.is_err() {
-                    break;
-                }
-
-                let elapsed = frame_start.elapsed();
-                if elapsed < frame_duration {
-                    tokio::time::sleep(frame_duration - elapsed).await;
-                }
-            }
-        });
+        // Start media AFTER negotiation so the senders are bound (their SSRCs
+        // known, write_sample succeeds).
+        let video_ssrc = sender_ssrc(&video_sender).await;
+        let audio_ssrc = sender_ssrc(&audio_sender).await;
+        spawn_media_loop(
+            video_track,
+            audio_track,
+            [video_ssrc, audio_ssrc],
+            stop_flag,
+        );
 
         // Update metrics to track that we're publishing
         self.metrics.packets_received = 0; // Reset for publishing session
@@ -953,6 +941,12 @@ impl HeadlessClient {
         ssrcs
     }
 
+    /// The m-lines the SFU's latest offer announces for tracks it sends this client
+    /// (mid, track id, SSRC).
+    pub fn announced_ssrcs(&self) -> Vec<Announced> {
+        self.announced.snapshot()
+    }
+
     /// Per-track receive statistics, by SSRC.
     pub fn track_stats(&self) -> Vec<TrackRxStats> {
         self.track_stats.snapshot()
@@ -1114,6 +1108,7 @@ impl HeadlessClient {
         {
             let signaling = Arc::clone(self.signaling.as_ref().unwrap());
             let peer_connection = Arc::clone(self.peer_connection.as_ref().unwrap());
+            let announced = self.announced.clone();
             let stop_flag = Arc::new(AtomicBool::new(false));
             self.signaling_stop_flag = Some(Arc::clone(&stop_flag));
 
@@ -1131,9 +1126,17 @@ impl HeadlessClient {
                                 std::mem::discriminant(&msg)
                             );
                             match msg {
-                                SignalMessage::Offer { sdp, .. } => {
+                                SignalMessage::Offer { sdp, tracks } => {
                                     tracing::info!("[bg-signaling] Received renegotiation offer");
-                                    match answer_offer(&peer_connection, &signaling, sdp).await {
+                                    match answer_offer(
+                                        &peer_connection,
+                                        &signaling,
+                                        sdp,
+                                        &tracks,
+                                        &announced,
+                                    )
+                                    .await
+                                    {
                                         Ok(()) => tracing::info!(
                                             "[bg-signaling] Renegotiation answer sent"
                                         ),
@@ -1213,19 +1216,87 @@ enum Pumped {
     Other,
 }
 
+/// The first SSRC of a sender (0 if it has none).
+async fn sender_ssrc(sender: &RTCRtpSender) -> u32 {
+    let params = sender.get_parameters().await;
+    params.encodings.first().map_or(0, |e| e.ssrc)
+}
+
+/// Read a sender's incoming RTCP until the sender closes.
+fn spawn_rtcp_drain(sender: Arc<RTCRtpSender>) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1500];
+        while sender.read(&mut buf).await.is_ok() {}
+    });
+}
+
+/// Feed synthetic video (15 fps) and audio to the published tracks until `stop`.
+/// Every frame and audio sample starts with the payload marker (publisher SSRC,
+/// frame counter) of `media::stamp_marker`; `ssrcs` is `[video, audio]`.
+fn spawn_media_loop(
+    video_track: Arc<TrackLocalStaticSample>,
+    audio_track: Arc<TrackLocalStaticSample>,
+    ssrcs: [u32; 2],
+    stop: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut video_gen = VideoGenerator::new(320, 240, 15, VideoPattern::ColorBars);
+        let mut audio_gen = AudioGenerator::new(48000, 1, AudioPattern::Tone(440));
+        let frame_duration = Duration::from_millis(1000 / 15);
+        let audio_samples_per_frame = 480; // 10 ms at 48 kHz
+        let mut frame: u32 = 0;
+
+        while !stop.load(Ordering::Relaxed) {
+            let frame_start = Instant::now();
+            frame = frame.wrapping_add(1);
+
+            let mut video = video_gen.next_encoded_frame(VIDEO_BITRATE_BPS).data;
+            stamp_marker(&mut video, ssrcs[0], frame);
+            let video_sample = Sample {
+                data: video.into(),
+                duration: frame_duration,
+                ..Default::default()
+            };
+            if video_track.write_sample(&video_sample).await.is_err() {
+                break;
+            }
+
+            let samples = audio_gen.next_samples(audio_samples_per_frame);
+            let mut audio: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+            stamp_marker(&mut audio, ssrcs[1], frame);
+            let audio_sample = Sample {
+                data: audio.into(),
+                duration: frame_duration,
+                ..Default::default()
+            };
+            if audio_track.write_sample(&audio_sample).await.is_err() {
+                break;
+            }
+
+            let elapsed = frame_start.elapsed();
+            if elapsed < frame_duration {
+                tokio::time::sleep(frame_duration - elapsed).await;
+            }
+        }
+    });
+}
+
 /// Apply an SFU offer and reply with our answer (the SFU is the sole offerer)
 async fn answer_offer(
     peer_connection: &RTCPeerConnection,
     signaling: &Mutex<SignalingConnection>,
     sdp: String,
+    tracks: &[OfferTrack],
+    announced: &AnnouncedSsrcs,
 ) -> Result<(), ClientError> {
     tracing::debug!("Received SFU offer:\n{}", sdp);
-    let offer = RTCSessionDescription::offer(sdp)
+    let offer = RTCSessionDescription::offer(sdp.clone())
         .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
     peer_connection
         .set_remote_description(offer)
         .await
         .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
+    announced.update(&sdp, tracks);
 
     let answer = peer_connection
         .create_answer(None)

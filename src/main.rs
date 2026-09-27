@@ -50,6 +50,8 @@ struct Args {
     signal_addr: Option<SocketAddr>,
     /// Number of worker threads override.
     num_workers: Option<u32>,
+    /// Number of data-plane shards override.
+    shards: Option<u16>,
     /// Log level override.
     log_level: Option<String>,
     /// Log file path override.
@@ -69,6 +71,7 @@ impl Args {
             media_addr: None,
             signal_addr: None,
             num_workers: None,
+            shards: None,
             log_level: None,
             log_file: None,
             help: false,
@@ -106,6 +109,12 @@ impl Args {
                     i += 1;
                     if i < args.len() {
                         result.num_workers = args[i].parse().ok();
+                    }
+                }
+                "--shards" => {
+                    i += 1;
+                    if i < args.len() {
+                        result.shards = args[i].parse().ok();
                     }
                 }
                 "--log-level" => {
@@ -151,6 +160,7 @@ OPTIONS:
     --media-addr <ADDR>     Media (RTP/RTCP) bind address [default: 0.0.0.0:10000]
     --signal-addr <ADDR>    Signaling (WebSocket) bind address [default: 0.0.0.0:8080]
     --workers <NUM>         Number of worker threads [default: auto-detect]
+    --shards <NUM>          Number of data-plane shards [default: 1]
     --log-level <LEVEL>     Log level: trace, debug, info, warn, error [default: info]
     --log-file <PATH>       Optional log file path for file output
 
@@ -230,6 +240,9 @@ fn load_config(args: &Args) -> Result<NexusConfig, String> {
     }
     if let Some(workers) = args.num_workers {
         config.worker.num_workers = workers;
+    }
+    if let Some(shards) = args.shards {
+        config.dataplane.shards = shards;
     }
     if let Some(ref level) = args.log_level {
         config.logging.level = level.parse().map_err(|e: String| e)?;

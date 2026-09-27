@@ -48,6 +48,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod forward;
+pub mod node;
 pub mod orchestrator;
 pub mod proto;
 pub mod server;

@@ -1,7 +1,8 @@
 //! SDP parser.
 
 use super::attributes::{
-    Direction, DtlsFingerprint, DtlsSetup, ExtMap, Fmtp, IceCandidate, RtpCodec, SsrcInfo,
+    Direction, DtlsFingerprint, DtlsSetup, ExtMap, FingerprintAlgorithm, Fmtp, IceCandidate,
+    RtpCodec, SsrcInfo,
 };
 use super::error::SdpError;
 use super::media::{IcePwd, IceUfrag, MediaDescription, MediaType, Mid, TransportProtocol};
@@ -213,6 +214,22 @@ impl SdpParser {
         // Parse new media section
         *current_media = Some(Self::parse_media_line(value, line_num)?);
         Ok(())
+    }
+
+    /// Keep one fingerprint per level: sha-256 (the only one the SFU checks) over any
+    /// other algorithm, else the first line.
+    fn keep_preferred_fingerprint(slot: &mut Option<DtlsFingerprint>, fp: DtlsFingerprint) {
+        let replace = match slot {
+            None => true,
+            Some(kept) => {
+                kept.algorithm != FingerprintAlgorithm::Sha256
+                    && fp.algorithm == FingerprintAlgorithm::Sha256
+            }
+        };
+        if replace {
+            *slot = Some(fp);
+        }
+        debug_assert!(slot.is_some());
     }
 
     /// Validate session has required WebRTC fields.
@@ -529,12 +546,19 @@ impl SdpParser {
             // DTLS attributes
             "fingerprint" => {
                 if let Some(v) = attr_value {
-                    let fp = DtlsFingerprint::parse(v)?;
-                    if let Some(ref mut media) = current_media {
-                        media.fingerprint = Some(fp);
-                    } else {
-                        session.fingerprint = Some(fp);
-                    }
+                    // RFC 8122 §5: a level may carry several fingerprints. A line with an
+                    // algorithm we do not support (sha-1) is skipped; if none is usable,
+                    // `validate_session` reports the fingerprint missing.
+                    let fp = match DtlsFingerprint::parse(v) {
+                        Ok(fp) => fp,
+                        Err(SdpError::UnsupportedFingerprintAlgorithm { .. }) => return Ok(()),
+                        Err(e) => return Err(e),
+                    };
+                    let slot = match current_media {
+                        Some(ref mut media) => &mut media.fingerprint,
+                        None => &mut session.fingerprint,
+                    };
+                    Self::keep_preferred_fingerprint(slot, fp);
                 }
             }
 
@@ -1194,10 +1218,58 @@ a=fingerprint:sha-1 AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12
 m=audio 9 UDP/TLS/RTP/SAVPF 111
 "#;
 
+        // The sha-1 line is skipped, which leaves no usable fingerprint.
         let result = SdpParser::parse(sdp);
+        assert!(matches!(result, Err(SdpError::MissingFingerprint)));
+    }
+
+    fn fingerprint_line(algorithm: &str, bytes: usize, byte: u8) -> String {
+        let hex: Vec<String> = (0..bytes).map(|_| format!("{:02X}", byte)).collect();
+        format!("a=fingerprint:{} {}", algorithm, hex.join(":"))
+    }
+
+    fn sdp_with_fingerprints(lines: &[String]) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
+             a=ice-ufrag:testufrag\r\na=ice-pwd:testpwd1234567890123456\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{}\r\n",
+            lines.join("\r\n")
+        )
+    }
+
+    #[test]
+    fn test_several_fingerprints_keep_sha256() {
+        use super::super::attributes::FingerprintAlgorithm;
+        let sha1 = fingerprint_line("sha-1", 20, 0x11);
+        let sha256 = fingerprint_line("sha-256", 32, 0x22);
+        let sha384 = fingerprint_line("sha-384", 48, 0x33);
+        let sha512 = fingerprint_line("sha-512", 64, 0x44);
+
+        let kept = |lines: &[String]| {
+            let session = SdpParser::parse(&sdp_with_fingerprints(lines)).unwrap();
+            session.media[0].fingerprint.clone().unwrap()
+        };
+        // sha-1 first is skipped, sha-256 kept.
+        let fp = kept(&[sha1.clone(), sha256.clone()]);
+        assert_eq!(fp.algorithm, FingerprintAlgorithm::Sha256);
+        assert_eq!(fp.value[..32], [0x22; 32]);
+        // sha-256 wins over a later sha-384 and an earlier sha-512.
+        assert_eq!(
+            kept(&[sha256.clone(), sha384.clone()]).algorithm,
+            FingerprintAlgorithm::Sha256
+        );
+        assert_eq!(
+            kept(&[sha512.clone(), sha256]).algorithm,
+            FingerprintAlgorithm::Sha256
+        );
+        // Without sha-256 the first usable line is kept, whole (no truncation).
+        let fp = kept(&[sha384, sha512]);
+        assert_eq!(fp.algorithm, FingerprintAlgorithm::Sha384);
+        assert_eq!(fp.value_len, 48);
+        // Only unsupported algorithms: no usable fingerprint.
         assert!(matches!(
-            result,
-            Err(SdpError::UnsupportedFingerprintAlgorithm { .. })
+            SdpParser::parse(&sdp_with_fingerprints(&[sha1])),
+            Err(SdpError::MissingFingerprint)
         ));
     }
 

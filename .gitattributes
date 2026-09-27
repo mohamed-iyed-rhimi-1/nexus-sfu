@@ -1,0 +1,2 @@
+# SDP fixtures are compared byte for byte (CRLF line endings).
+crates/nexus-webrtc/src/sdp/testdata/*.sdp -text

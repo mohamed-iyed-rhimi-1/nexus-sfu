@@ -52,10 +52,15 @@ pub fn random_ice_params() -> IceParams {
 /// Outbound SSRCs of one session (note §9.3): `base + offset`, the offset strictly
 /// increasing from 1 (offset 0 is the session's RTCP SSRC), skipping 0 and the peer's
 /// own SSRCs. An SSRC is never handed out twice.
+///
+/// It also mirrors the shard's rule for `Subscribe`: the offsets registered on the
+/// shard must strictly increase. `high_water` is the largest registered offset; an SSRC
+/// at or below it (`is_stale`) can no longer be registered and needs a fresh one.
 #[derive(Clone, Debug)]
 pub struct SsrcAllocator {
     base: u32,
     next_offset: u32,
+    high_water: u32,
     peer_ssrcs: Vec<u32>,
 }
 
@@ -67,6 +72,7 @@ impl SsrcAllocator {
         Self {
             base,
             next_offset: 1,
+            high_water: 0,
             peer_ssrcs: Vec::new(),
         }
     }
@@ -94,30 +100,59 @@ impl SsrcAllocator {
         self.base
     }
 
-    /// Avoid `ssrc` from now on (the peer announced it). Beyond `MAX_PEER_SSRCS` the
-    /// SSRC is ignored: a collision is then left to chance (2^-32 per SSRC).
-    pub fn note_peer_ssrc(&mut self, ssrc: u32) {
+    /// Avoid `ssrc` from now on (the peer announced it). `false` when the peer's SSRC
+    /// is one this session already uses: the base (its RTCP SSRC) or an out SSRC handed
+    /// out before. The caller refuses that m-line. Beyond `MAX_PEER_SSRCS` the SSRC is
+    /// not remembered: a later collision is then left to chance (2^-32 per SSRC).
+    #[must_use]
+    pub fn note_peer_ssrc(&mut self, ssrc: u32) -> bool {
+        if self.offset_of(ssrc) < self.next_offset {
+            return false;
+        }
         if !self.peer_ssrcs.contains(&ssrc) && self.peer_ssrcs.len() < MAX_PEER_SSRCS {
             self.peer_ssrcs.push(ssrc);
         }
+        true
     }
 
-    /// The next out SSRC; `None` when the offsets are used up.
+    /// The next out SSRC; `None` when the offsets are used up. A `None` consumes no
+    /// offset.
     pub fn allocate(&mut self) -> Option<u32> {
+        let mut offset = self.next_offset;
         for _ in 0..ALLOCATE_TRIES {
-            if self.next_offset > MAX_OUT_SSRC_OFFSET {
+            if offset > MAX_OUT_SSRC_OFFSET {
                 return None;
             }
-            let offset = self.next_offset;
-            self.next_offset += 1;
             let ssrc = self.base.wrapping_add(offset);
             if ssrc != 0 && !self.peer_ssrcs.contains(&ssrc) {
-                assert!(ssrc.wrapping_sub(self.base) == offset && offset >= 1);
+                assert!(offset >= self.next_offset && offset > self.high_water);
+                self.next_offset = offset + 1;
                 return Some(ssrc);
             }
+            offset += 1;
         }
         // Only reachable if 0 and every noted peer SSRC sit in a row; try again later.
         None
+    }
+
+    /// The offset of `ssrc` from the base (0 for the base itself).
+    pub fn offset_of(&self, ssrc: u32) -> u32 {
+        ssrc.wrapping_sub(self.base)
+    }
+
+    /// `ssrc` (handed out by `allocate`) was registered on the shard by `Subscribe`.
+    /// Precondition: it is not stale.
+    pub fn mark_registered(&mut self, ssrc: u32) {
+        let offset = self.offset_of(ssrc);
+        assert!(offset > self.high_water, "out SSRC offsets must increase");
+        assert!(offset < self.next_offset, "SSRC was not handed out");
+        self.high_water = offset;
+    }
+
+    /// `true` when `ssrc` can no longer be registered: its offset is at or below one
+    /// the shard already accepted.
+    pub fn is_stale(&self, ssrc: u32) -> bool {
+        self.offset_of(ssrc) <= self.high_water
     }
 }
 
@@ -286,7 +321,7 @@ mod tests {
         let base = ssrcs.base();
         let peer: Vec<u32> = (0..8).map(|i| base.wrapping_add(10 + 3 * i)).collect();
         for &p in &peer {
-            ssrcs.note_peer_ssrc(p);
+            assert!(ssrcs.note_peer_ssrc(p));
         }
         let mut last_offset = 0u32;
         for _ in 0..10_000 {
@@ -324,6 +359,49 @@ mod tests {
         assert_eq!(ssrcs.allocate(), Some(5 + MAX_OUT_SSRC_OFFSET));
         assert_eq!(ssrcs.allocate(), None);
         assert_eq!(ssrcs.allocate(), None);
+    }
+
+    #[test]
+    fn allocation_failure_consumes_no_offset() {
+        // Offsets 1..=66 all collide with peer SSRCs (66 = ALLOCATE_TRIES): the first
+        // allocation gives up, and a later one continues from offset 1.
+        let mut ssrcs = SsrcAllocator::new(1_000);
+        ssrcs.peer_ssrcs = (1..=ALLOCATE_TRIES).map(|o| 1_000 + o).collect();
+        assert_eq!(ssrcs.allocate(), None);
+        assert_eq!(ssrcs.next_offset, 1);
+        ssrcs.peer_ssrcs.truncate(10);
+        assert_eq!(ssrcs.allocate(), Some(1_011));
+        assert_eq!(ssrcs.allocate(), Some(1_012));
+    }
+
+    #[test]
+    fn peer_ssrc_colliding_with_the_session_is_refused() {
+        let mut ssrcs = SsrcAllocator::new(500);
+        assert!(!ssrcs.note_peer_ssrc(500), "the base is the RTCP SSRC");
+        let out = ssrcs.allocate().unwrap();
+        assert!(!ssrcs.note_peer_ssrc(out), "already handed out");
+        assert!(ssrcs.note_peer_ssrc(out + 1));
+        assert!(ssrcs.note_peer_ssrc(out + 1), "noting twice is fine");
+        assert_eq!(ssrcs.allocate(), Some(out + 2), "a noted SSRC is skipped");
+        assert!(
+            ssrcs.note_peer_ssrc(499),
+            "below the base is a large offset"
+        );
+    }
+
+    #[test]
+    fn registration_follows_the_shards_rule() {
+        let mut ssrcs = SsrcAllocator::new(100);
+        let a = ssrcs.allocate().unwrap();
+        let b = ssrcs.allocate().unwrap();
+        let c = ssrcs.allocate().unwrap();
+        assert!(!ssrcs.is_stale(a) && !ssrcs.is_stale(b));
+        assert!(ssrcs.is_stale(100), "the base is always stale");
+        // b registered first (a's m-line was declined or answered later): a is stale.
+        ssrcs.mark_registered(b);
+        assert!(ssrcs.is_stale(a) && ssrcs.is_stale(b) && !ssrcs.is_stale(c));
+        ssrcs.mark_registered(c);
+        assert!(std::panic::catch_unwind(move || ssrcs.mark_registered(a)).is_err());
     }
 
     #[test]

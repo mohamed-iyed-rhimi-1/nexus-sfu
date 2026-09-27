@@ -41,7 +41,7 @@ pub use media::{
 };
 pub use negotiator::{
     default_supported_codecs, offered_extmaps, CodecCapability, CodecType, OfferMline,
-    RecycledMline, SdpNegotiator, TrackMline,
+    RecycledMline, SdpNegotiator, TrackMline, LEGACY_TRACK_AUDIO_FBS, LEGACY_TRACK_VIDEO_FBS,
 };
 pub use parser::SdpParser;
 pub use printer::SdpPrinter;
