@@ -1924,6 +1924,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-dataplane"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "nexus-core",
+ "nexus-media",
+ "nexus-transport",
+ "proptest",
+ "rustc-hash",
+]
+
+[[package]]
 name = "nexus-dst"
 version = "0.1.0"
 dependencies = [

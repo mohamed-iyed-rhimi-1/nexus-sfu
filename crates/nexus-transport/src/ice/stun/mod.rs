@@ -57,9 +57,13 @@ pub use attributes::{
     ATTR_XOR_PEER_ADDRESS,
     ATTR_XOR_RELAYED_ADDRESS,
 };
-pub use integrity::{compute_message_integrity, verify_message_integrity};
+pub use integrity::{
+    compute_message_integrity, sign_message, verify_fingerprint, verify_message_integrity,
+};
 pub use message::{StunClass, StunMessage, StunMethod, STUN_HEADER_SIZE, STUN_MAGIC_COOKIE};
-pub use server::{create_binding_indication, StunServer};
+pub use server::{
+    create_binding_indication, create_binding_request, generate_transaction_id, StunServer,
+};
 
 /// Maximum STUN message size (from RFC 5389).
 pub const STUN_MAX_MESSAGE_SIZE: u32 = 548;
@@ -209,5 +213,89 @@ mod tests {
         // Not RTCP
         assert!(!is_rtcp(&[0x80, 96])); // RTP with dynamic PT
         assert!(!is_rtcp(&[]));
+    }
+
+    // ------------------------------------------------------------------
+    // Network input never panics (Phase 1.2a)
+    // ------------------------------------------------------------------
+
+    /// A binding request whose only attribute is USERNAME with `username`.
+    fn request_with_username(username: &[u8]) -> Vec<u8> {
+        let padded = username.len().div_ceil(4) * 4;
+        let mut msg = vec![0u8; STUN_HEADER_SIZE + 4 + padded];
+        msg[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        msg[2..4].copy_from_slice(&((4 + padded) as u16).to_be_bytes());
+        msg[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        msg[20..22].copy_from_slice(&ATTR_USERNAME.to_be_bytes());
+        msg[22..24].copy_from_slice(&(username.len() as u16).to_be_bytes());
+        msg[24..24 + username.len()].copy_from_slice(username);
+        msg
+    }
+
+    #[test]
+    fn username_that_is_not_utf8_is_rejected() {
+        let msg = request_with_username(&[b'a', 0xFF, 0xFE, b':', b'b']);
+        assert!(StunMessage::parse(&msg).is_err());
+
+        let ok = request_with_username(b"abcd:efgh");
+        let parsed = StunMessage::parse(&ok).expect("valid UTF-8 username parses");
+        assert_eq!(parsed.get_username(), Some("abcd:efgh"));
+    }
+
+    #[test]
+    fn oversized_attribute_value_is_an_error() {
+        let value = [0u8; attributes::MAX_DATA_LEN + 1];
+        assert!(StunAttribute::parse(ATTR_DATA, &value, &[0u8; 12]).is_err());
+    }
+
+    #[test]
+    fn empty_local_ufrag_in_username_does_not_panic() {
+        let creds = crate::ice::IceCredentials {
+            local_ufrag: "local".into(),
+            local_pwd: "password".into(),
+        };
+        let mut buf = [0u8; message::STUN_BUFFER_SIZE];
+        let tid = generate_transaction_id();
+        let len = create_binding_request(&mut buf, &tid, ":remote", 1, true, 7, false, "password");
+        let mut server = StunServer::with_defaults();
+        let src = "192.0.2.1:5000".parse().unwrap();
+        let response = server.handle_request(&buf[..len], src, &creds);
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn empty_local_password_does_not_panic() {
+        let creds = crate::ice::IceCredentials {
+            local_ufrag: "local".into(),
+            local_pwd: String::new(),
+        };
+        let mut buf = [0u8; message::STUN_BUFFER_SIZE];
+        let tid = generate_transaction_id();
+        let len = create_binding_request(&mut buf, &tid, "local:r", 1, true, 7, false, "x");
+        let mut server = StunServer::with_defaults();
+        let src = "192.0.2.1:5000".parse().unwrap();
+        assert!(matches!(
+            server.handle_request(&buf[..len], src, &creds),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn integrity_and_fingerprint_refuse_bad_offsets_and_keys() {
+        let msg = request_with_username(b"abcd:efgh");
+        let hmac = [0u8; 20];
+        assert!(!verify_message_integrity(
+            &msg,
+            msg.len() + 1,
+            &hmac,
+            b"key"
+        ));
+        assert!(!verify_message_integrity(&msg, 4, &hmac, b"key"));
+        assert!(!verify_message_integrity(&msg, 20, &hmac, b""));
+        assert!(!verify_message_integrity(&msg, 20, &hmac, &[1u8; 257]));
+        assert!(!verify_message_integrity(&msg[..10], 20, &hmac, b"key"));
+        assert!(!verify_fingerprint(&msg, msg.len() + 1, 0));
+        assert!(!verify_fingerprint(&msg, 0, 0));
+        assert!(!verify_fingerprint(&msg[..10], 20, 0));
     }
 }

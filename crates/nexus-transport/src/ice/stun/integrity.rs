@@ -106,6 +106,17 @@ pub fn verify_message_integrity(
     // Precondition: expected HMAC must be 20 bytes (TigerStyle Phase 4.2)
     assert!(expected_hmac.len() == 20, "Expected HMAC must be 20 bytes");
 
+    // Offsets and keys can come from network input: refuse instead of
+    // reaching compute_message_integrity's asserts.
+    if data.len() < STUN_HEADER_SIZE
+        || integrity_offset < STUN_HEADER_SIZE
+        || integrity_offset > data.len()
+        || key.is_empty()
+        || key.len() > 256
+    {
+        return false;
+    }
+
     let computed = compute_message_integrity(data, integrity_offset, key);
 
     // Assertion: computed HMAC must be 20 bytes (TigerStyle Phase 4.2)
@@ -183,6 +194,13 @@ pub fn compute_fingerprint(data: &[u8], fingerprint_offset: usize) -> u32 {
 ///
 /// true if valid, false otherwise.
 pub fn verify_fingerprint(data: &[u8], fingerprint_offset: usize, expected_fp: u32) -> bool {
+    // Offsets can come from network input: refuse instead of asserting.
+    if data.len() < STUN_HEADER_SIZE
+        || fingerprint_offset < STUN_HEADER_SIZE
+        || fingerprint_offset > data.len()
+    {
+        return false;
+    }
     let computed = compute_fingerprint(data, fingerprint_offset);
     computed == expected_fp
 }

@@ -276,6 +276,64 @@ rewrite.rs, pool.rs, shard/mod.rs, shard/io.rs (MemIo only)}`, `tests/shard.rs`;
   extension element iterator (only `get_extension_value`, per id); 1.2b writes one.
 - `demux.rs`'s RTCP range is 72..=79 (its comment claims 64-71 too) and its validators
   `format!` on invalid input: do not reuse.
+- Found while implementing (2026-09-26):
+  - More STUN asserts reachable from input: `StunAttribute::parse` had a
+    `debug_assert!(len <= 1200)` (fires in debug builds, now an error);
+    `verify_message_integrity`/`verify_fingerprint` asserted on offsets and key length (now
+    `false`); `StunServer` panicked on an empty local password. All fixed, with tests.
+  - The scan also rejects a USERNAME that is not UTF-8; only the local half is compared.
+  - **Liveness timestamp:** the session keeps `last_rx_selected`, updated only by
+    authenticated packets from the *selected* address. If authenticated STUN from another
+    candidate refreshed it, a peer checking a second pair would block rebinding forever.
+  - Random rewrite offsets come from a shard-local SplitMix64 seeded by
+    `ShardConfig::rng_seed` (deterministic tests, no clock).
+  - 1.1's "no forward jump ≥ 2^15" precondition does **not** hold by construction (first
+    draft claimed it did; review found it): when forwarding to one subscriber pauses (no
+    address, empty pool, unmapped PT) while the publisher continues, the next packet can be
+    ≥ 2^15 ahead of the last one sent and the outbound estimate refuses it and every later
+    one. The rewrite now rebases (the subscriber's stream continues right after its last
+    packet, the timestamp advanced by the wall time, note §11.5's rule) when the input is
+    more than `REBASE_GAP` (2^14) ahead of the last forwarded packet, more than
+    `REORDER_LIMIT` (64) behind it (inbound SRTP refuses anything that old, so the input
+    moved on by 2^15 or more), or when `REBASE_IDLE` (5 s) passed since the last forwarded
+    packet (over a long pause the input seq can wrap into a small step). The rewrite
+    returns its state change and the shard commits it only after `protect_rtp` succeeds,
+    so an unsent packet does not start a stream or move `last_out_*`.
+  - `InstallSrtp` carries `Box<SrtpInstall { local, remote }>` (the profile is inside
+    `KeyMaterial`); `size_of::<Command>()` is ≤ 72 B (`IceParams` inline).
+  - `RemoveTrack` removes the subscriptions to the track; a later `Unsubscribe` for one of
+    them gets `CommandRejected{UnknownSubscription}`, which 1.5b ignores.
+  - Events go through an `EventSink` trait (tokio sender in 1.3, `Vec` in tests), so the
+    crate has no tokio dependency. `DtlsDatagram` is never retained when the sink is full.
+  - **Review fixes (2026-09-26), before commit:**
+    - DTLS flood: a peer that passed STUN but sends no SRTP could copy every datagram into
+      the event channel all sessions share and starve other handshakes. Now at most
+      `DTLS_BUDGET_PER_SWEEP` (32) DTLS datagrams per session per second, checked before
+      the copy.
+    - Lost events: `PeerSrtpVerified` and `ConsentLost` flags are set only when the sink
+      or retention queue accepted the event (else the next packet / sweep retries);
+      a refused `AddressSelected` is re-sent by the sweep. Before, a full queue lost them
+      for good and the session leaked.
+    - Switch flapping: at most one address switch per `MIN_SWITCH_INTERVAL` (100 ms). A
+      nomination refused by the interval is stored (the latest one wins; a nomination of
+      the current address cancels it) and applied as soon as the interval has passed.
+    - Replay: the last 16 binding-request transaction ids per session are remembered; a
+      repeated id is answered but never moves the session. An on-path attacker replaying a
+      captured nomination from its own address no longer takes the session. Residual: a
+      request older than the last 16 can still be replayed (after ≈ 1 minute of browser
+      consent checks); see the ICE-lite injection risk below.
+    - Previous address kept at least `PREV_ADDR_GRACE` (1 s) after a switch, not until
+      the next sweep (which could be immediate).
+    - One translated SR per SSRC per compound (a compound of 16 SRs sent 16 per
+      subscriber).
+    - Extension parsing: in the one-byte form any ID-0 byte is one byte of padding, as in
+      libwebrtc. `Subscribe` also rejects an ext map that maps two ids to one subscriber
+      id, reuses the `mid` id, or maps publisher id 0.
+    - After `ConsentLost` is delivered, the shard emits nothing more for that session
+      (`drop_after_consent`): the control plane is closing it.
+    - Each regression test was checked to fail with its fix disabled.
+  - Only `rustc-hash` and `crossbeam-queue` were added in 1.2; `mio` and `libc` come with
+    1.3's I/O.
 - New direct dependencies, versions as locked: `mio` 1.1.1 (features `os-poll`, `os-ext`;
   `net` is not needed with `SourceFd`), `crossbeam-queue` 0.3.12, `rustc-hash` 2.1.1,
   `libc` 0.2.180. `crossbeam-queue` and `rustc-hash` are only transitive today.
@@ -348,6 +406,17 @@ session.rs, shard/mod.rs, shard/stats.rs, ext.rs (new: the fixed extension table
   `PliPacket::parse` (`:253`) is allocation-free. `FirPacket`, `ReceiverReport`,
   `NackPacket`, `RembPacket` parse into `Vec`s: not used on the shard.
 - RTP padding: keep the P bit and copy the padding with the payload.
+- Found while implementing (2026-09-26):
+  - `demux_compound` keeps going past 16 blocks silently; the shard compares the blocks'
+    total length with the datagram and drops a compound that is not fully covered.
+  - Keyframe throttle: `last_pli` is set only when a PLI was actually sent, so a request
+    made before the publisher has SRTP, an address or a known SSRC does not suppress the
+    next one.
+  - `Subscribe` rejects extension ids above 14 (`RejectReason::InvalidSpec`): the rewrite
+    writes the one-byte form only.
+  - `tests/alloc.rs` counts per thread, only around `Shard::iterate`; the peers'
+    `SrtpContext`s and test bookkeeping run outside the window. Checked to fail (10,000
+    allocations) with a `vec!` injected into the fan-out.
 
 **Tests:**
 - Rewrite: table-driven over input headers (no extensions, one-byte, two-byte, with CSRCs,
@@ -918,14 +987,16 @@ The note's §19 risks stand; these are the ones the audit added.
 | The manual browser check is blocked by HTTPS/token setup | 1.8 documents both setups; the SDK and token work can start before 1.5b |
 | Linux-only code (`LinuxIo`, pinning, GRO check) only runs in the container and CI | Container run is part of every I/O part's checkpoint |
 | Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 |
+| **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3: a shard-wide cap on `DtlsDatagram` events per second. 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
+| **Known limit, ICE-lite on-path injection.** STUN authenticates the request, not its source address (RFC 8445). An attacker on the path can drop a fresh nomination and send it from its own address before the original arrives, or replay one older than the last 16 transaction ids, and the session moves to it. Media stays SRTP-encrypted; the real peer is cut off until its next nomination | Inherent to ICE-lite; accepted for v1. 1.2 refuses repeated transaction ids and rate-limits switches. A full fix needs proof of liveness at the new address (e.g. consent from the SFU side) and comes after v1 |
 
 ## Status
 
 | Part | State | Commits | Notes |
 |------|-------|---------|-------|
 | 1.1 SRTP per direction | Done | see git log (1.1) | ring GCM, `direction.rs`, `index.rs`, robustness tests; ROC reorder bug fixed; review fixes: outbound registration (monotonic offsets), pinned inbound SSRCs |
-| 1.2a Shard core: tables, commands, ICE-lite, forwarding | Not started | | |
-| 1.2b Shard core: extensions, RTCP, housekeeping, alloc test | Not started | | |
+| 1.2a Shard core: tables, commands, ICE-lite, forwarding | Done | see git log (1.2) | `nexus-dataplane` crate on `MemIo`: slabs, commands, slim STUN scan, address rules, SRTP in, rewrite, fan-out; STUN panic/UB fixes in `nexus-transport`; `tests/shard.rs` incl. proptest |
+| 1.2b Shard core: extensions, RTCP, housekeeping, alloc test | Done | see git log (1.2) | `ext.rs` table + element iterator, full rewrite, `mid` SSRC learning, SR+SDES translation, PLI/FIR with throttle, housekeeping, `ShardStats`, event retention; `tests/alloc.rs` 0 allocations (GCM and CM) |
 | 1.3 Shard thread and I/O | Not started | | |
 | 1.4 SDP groundwork, signaling limits, shared certificate | Not started | | |
 | 1.5a Control-plane pieces | Not started | | |
@@ -942,7 +1013,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
 | 1.9 Documents, merge | Not started | | |
 
-Exit criteria: 1 ☐ e2e · 2 ☐ 0 allocations · 3 ☐ 25 KB budget · 4 ☐ browsers · 5 ☐ old path
+Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ☐ 25 KB budget · 4 ☐ browsers · 5 ☐ old path
 deleted · 6 ☐ no panic on input · 7 ☐ documents.
 
 ### Session log
@@ -981,3 +1052,56 @@ Add one line per working session: date, part, what was done, what is left.
   regression tests (fail without the fix). Verified: fmt, clippy, all tests on macOS
   (1,842) and Linux arm64 (1,843, incl. e2e). Committed. Next: 1.2a (register the session's
   `rtcp_ssrc` at offset 0 from the SSRC base).
+- 2026-09-26: 1.2a and 1.2b implemented (uncommitted, for review). New crate
+  `nexus-dataplane` (shard on `MemIo`, explicit `now`): commands and events, slabs and id
+  maps, ICE-lite slim STUN scan with nomination and 2 s rebinding, SRTP in and out,
+  rewrite with extension mapping and subscriber `mid`, fan-out, `mid` SSRC learning, SR +
+  SDES translation, PLI/FIR with 500 ms throttle and PLI on `Subscribe`/`InstallSrtp`,
+  housekeeping (consent, SSRC eviction, stale address, `ShardStats`), 256-event retention.
+  STUN input panics and the `get_username` UB fixed in `nexus-transport`. Tests:
+  `tests/shard.rs` (22; its proptest fed raw, unauthenticated datagrams only),
+  `tests/alloc.rs` (0 allocations over 10,000 RTP without header extensions + 100 each of
+  SR, PLI, RR, NACK; GCM and CM). fmt, clippy and `cargo test --workspace`
+  green on macOS and in the Linux container (arm64), `alloc.rs` included. Exit criterion 2
+  is met once committed.
+  Next: review and commit, then 1.3.
+- 2026-09-26, review of 1.2 (separate session): found a shared-channel DTLS flood, events
+  lost on a full queue (session leak), address flapping, nomination replay, subscriptions
+  dying after a > 2^15 forwarding gap, and five smaller issues. All fixed with regression
+  tests (each fails without its fix); code notes above. 1,914 tests pass on macOS, 1,915 in the
+  Linux container (arm64), clippy clean on both. Next: commit, then 1.3.
+- 2026-09-27, verification review of 1.2: the earlier test claims were weaker than stated:
+  the proptest never authenticated, so it did not reach the RTP parser, rewrite, extension
+  or RTCP code; `alloc.rs` measured no header extensions, STUN or FIR; the resubscribe test
+  compared two different SSRCs and could not fail. Fixed:
+  - Rewrite rebases also when the input is > 64 behind the last forwarded packet, and after
+    a 5 s forwarding pause (a wrapped seq looks like a small step); unit test for the wrap.
+  - A nomination refused by the 100 ms switch limit is stored (latest wins) and applied
+    when the interval passes; test.
+  - No events for a session after its `ConsentLost`; the full-sink test no longer expects
+    `PeerSrtpVerified` after it and now checks the suppression.
+  - New proptest: random RTP/RTCP plaintexts (both extension forms, CSRCs, padding, bad
+    lengths, SR/PLI/FIR blocks) protected with the peers' keys; every output must decrypt
+    and parse at its receiver. Measured over 256 cases: ≈ 2,400 forwarded packets, 380
+    malformed headers, 140 rebases, 700 authenticated compounds (440 malformed), 64
+    translated SRs, 36 forwarded PLIs. The raw-datagram proptest stays.
+  - `alloc.rs`: every forwarded packet goes through the extension rewrite (mid and audio
+    level in, audio level mapped and the subscriber's mid out), and each round adds a STUN
+    binding request and a FIR. Checked: an allocation injected on the STUN path is caught
+    (100 = one per round).
+  - Resubscribe test: an orchestrator re-using the retired SSRC is refused; one subscriber
+    SRTP context decrypts both subscriptions and a per-SSRC RFC 3711 index tracker finds no
+    repeat. With the shard check and `SrtpOutbound::register`'s rule both disabled, the test
+    fails (120 packets instead of 80: the retired SSRC is sent again).
+  - Known limits added to the risks: aggregate DTLS pressure and ICE-lite on-path
+    injection.
+  Every new or changed check was run with its fix disabled and fails. fmt, clippy clean;
+  `cargo test --workspace` 1,918 passed on macOS; Linux container (arm64, own target
+  volume `nexus-dataplane-target`): fmt, clippy clean, 1,919 passed, 0 failed. Stopped for
+  review; not committed.
+- 2026-09-27, verification of the 1.2 fixes (separate session): gap rebase (incl. wrap after
+  a long pause), deferred nominations, no events after `ConsentLost`, authenticated-plaintext
+  proptest, extended `alloc.rs` and the resubscribe test checked in the code. 1,918 tests on
+  macOS, 1,919 on Linux arm64 with a fresh target volume (the earlier config-test failure
+  came from a shared Docker target volume mounted at another path, not from the code).
+  Committed. Exit criterion 2 met. Next: 1.3 (use your own Docker target volume).

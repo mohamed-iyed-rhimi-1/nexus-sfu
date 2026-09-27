@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest"]
+members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-dataplane", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest"]
 resolver = "2"
 
 [package]
@@ -186,6 +186,9 @@ opt-level = 3
 # Generic cipher code (ctr over aes) is instantiated in nexus-transport, so it
 # needs optimizing too. opt-level 1 keeps debug info and readable backtraces.
 [profile.dev.package.nexus-transport]
+opt-level = 1
+# The shard's packet path (rewrite, fan-out) runs in e2e and alloc tests.
+[profile.dev.package.nexus-dataplane]
 opt-level = 1
 
 [profile.release]

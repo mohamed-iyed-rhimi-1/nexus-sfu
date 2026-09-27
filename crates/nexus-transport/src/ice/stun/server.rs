@@ -101,6 +101,12 @@ impl StunServer {
             STUN_HEADER_SIZE
         );
 
+        // Responses are signed with the local password; an empty one would
+        // reach compute_message_integrity's key assert.
+        if credentials.local_pwd.is_empty() {
+            return Ok(None);
+        }
+
         // Parse the message
         let (msg, integrity_ctx) = self.parse_with_integrity(data)?;
 
@@ -177,11 +183,10 @@ impl StunServer {
         };
         let local_ufrag = &username[..colon_pos];
 
-        // Postcondition: local_ufrag extracted from USERNAME must be non-empty
-        assert!(
-            !local_ufrag.is_empty(),
-            "local_ufrag parsed from USERNAME must not be empty"
-        );
+        // A peer can send USERNAME ":x"; an empty ufrag never matches.
+        if local_ufrag.is_empty() {
+            return Err(Some((400, "Bad Request")));
+        }
 
         // 3. Validate local_ufrag matches our credentials
         if local_ufrag != credentials.local_ufrag {

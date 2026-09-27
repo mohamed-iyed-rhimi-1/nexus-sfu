@@ -245,8 +245,9 @@ impl StunMessage {
     pub fn get_username(&self) -> Option<&str> {
         for i in 0..self.attribute_count as usize {
             if let Some(StunAttribute::Username { value, len }) = &self.attributes[i] {
-                // Safety: we only store valid UTF-8
-                return Some(unsafe { std::str::from_utf8_unchecked(&value[..*len as usize]) });
+                // Parsing rejects non-UTF-8 usernames; checked again here
+                // because the attribute fields are public.
+                return std::str::from_utf8(&value[..*len as usize]).ok();
             }
         }
         None

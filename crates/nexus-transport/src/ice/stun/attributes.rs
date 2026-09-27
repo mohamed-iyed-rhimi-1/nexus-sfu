@@ -147,14 +147,13 @@ impl StunAttribute {
         value: &[u8],
         transaction_id: &[u8; 12],
     ) -> Result<Option<Self>, IceError> {
-        // For external input, use debug_assert to catch programming errors
-        // Individual attribute parsers will return errors for invalid data
-        debug_assert!(
-            value.len() <= MAX_DATA_LEN,
-            "Attribute value length {} exceeds maximum {}",
-            value.len(),
-            MAX_DATA_LEN
-        );
+        // Network input: an oversized value is an error, not a panic.
+        if value.len() > MAX_DATA_LEN {
+            return Err(IceError::StunInvalidAttribute {
+                attr_type,
+                reason: "attribute value too long",
+            });
+        }
 
         // Dispatch to specialized parsers based on attribute type category
         let attr = match attr_type {
@@ -233,6 +232,13 @@ impl StunAttribute {
                     return Err(IceError::StunInvalidAttribute {
                         attr_type,
                         reason: "username too long",
+                    });
+                }
+                // get_username hands the bytes out as &str.
+                if std::str::from_utf8(value).is_err() {
+                    return Err(IceError::StunInvalidAttribute {
+                        attr_type,
+                        reason: "username is not UTF-8",
                     });
                 }
                 let mut buf = [0u8; MAX_USERNAME_LEN];
