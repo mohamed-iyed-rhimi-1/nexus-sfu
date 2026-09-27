@@ -1,80 +1,81 @@
-//! NegotiationManager: transport creation, ICE gathering, SDP offer/answer,
-//! MID tracking, track registration.
+//! NegotiationManager: sessions, SDP offers and answers, and the m-lines of each
+//! participant (design note §6.1, §6.2, §6.5).
+//!
+//! The SFU is always the offerer. A participant's m-lines keep their mid and position
+//! in every offer (RFC 3264 §8); publish m-lines become `AddTrack` commands and answered
+//! subscribe m-lines `Subscribe` commands when the answer arrives.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use nexus_dataplane::{
+    Command, SessionId, SubscriptionId, TrackId as DpTrackId, TrackRef, MAX_SUBS_PER_SESSION,
+    MAX_TRACKS_PER_SESSION,
+};
+use nexus_media::rtp::extensions;
+use nexus_state::gossip::types::TrackInfo as StateTrackInfo;
+use nexus_transport::dtls::DtlsRole;
+use nexus_transport::ice::{Candidate, MAX_CANDIDATES};
+use nexus_webrtc::sdp::{
+    offered_extmaps, Direction, DtlsFingerprint, ExtMap, FingerprintAlgorithm, MediaDescription,
+    OfferMline, RecycledMline, RtpCodec, SdpNegotiator, SdpParser, SessionDescription,
+    MAX_MEDIA_SECTIONS,
+};
 use tracing::{debug, info, warn};
 
-use crate::forward::SsrcRouter;
 use crate::signal::{OfferTrack, SignalMessage};
-use crate::types::{MediaKind, TrackId};
-use crate::worker::{WorkerMessage, WorkerPool};
-use nexus_state::gossip::types::TrackInfo;
-use nexus_state::DistributedState;
-use nexus_transport::dtls::DtlsRole;
-use nexus_transport::ice::{Candidate, IceCredentials, MAX_CANDIDATES};
-use nexus_webrtc::sdp::{
-    MediaType, OfferMline, SdpNegotiator, LEGACY_TRACK_AUDIO_FBS, LEGACY_TRACK_VIDEO_FBS,
-};
-use nexus_webrtc::webrtc::{TransportId, WebRtcTransport};
+use crate::types::TrackId;
 
+use super::events::DisconnectReason;
+use super::plane::Plane;
+use super::sdp_params::{sub_spec, track_spec};
+use super::tracks::TrackInfo;
 use super::ParticipantHandle;
 
-const MAX_TRACKS_PER_PARTICIPANT: u32 = 10;
-/// Most m-lines one session can carry (publish + subscribe + inactive) on the old
-/// path. Its own constant, so raising the SDP bound (`MAX_MEDIA_SECTIONS`, 32) does not
-/// change what the old path accepts (`webrtc/session.rs` handles at most 10); Phase 1.5b
-/// replaces it with `MAX_MEDIA_SECTIONS`.
-const OLD_PATH_MAX_MLINES: usize = 8;
-const _: () = assert!(OLD_PATH_MAX_MLINES <= nexus_webrtc::sdp::MAX_MEDIA_SECTIONS);
-const MAX_PARTICIPANTS_PER_ROOM: u32 = 1_000;
+/// Most participants notified of one published track.
+const MAX_PARTICIPANTS_PER_ROOM: usize = 1_000;
+/// RTCP feedback on video m-lines, both directions (note §12.4): keyframe requests.
+/// No NACK, REMB or transport-cc in v1.
+const V1_VIDEO_FBS: &[(&str, &str)] = &[("nack", "pli"), ("ccm", "fir")];
+/// Audio m-lines ask for no feedback.
+const V1_AUDIO_FBS: &[(&str, &str)] = &[];
+/// Offers repeated after invalid answers in a row before the m-lines are released.
+const MAX_REOFFERS: u8 = 1;
 
-/// ICE gathering lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GatheringState {
-    #[default]
-    Idle,
-    InProgress,
-    Complete,
-    Failed,
-}
-
-/// Events from ICE gathering background tasks.
-#[derive(Debug)]
-pub enum IceGatheringEvent {
-    Candidate {
-        participant_id: u64,
-        transport_id: TransportId,
-        candidate: Candidate,
-        generation: u32,
-    },
-    Complete {
-        participant_id: u64,
-        transport_id: TransportId,
-        generation: u32,
-    },
-    Failed {
-        participant_id: u64,
-        transport_id: TransportId,
-        generation: u32,
-        reason: String,
-    },
+/// A subscribe m-line: the forwarded track, its subscription id and out SSRC
+/// (allocated when the slot is filled), and whether the shard has the subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubSlot {
+    /// Signaling track id.
+    pub track: TrackId,
+    /// Data-plane subscription id.
+    pub sub: SubscriptionId,
+    /// SSRC the SFU sends the track under on this m-line.
+    pub out_ssrc: u32,
+    /// `Subscribe` was pushed (the answer accepted the m-line).
+    pub on_shard: bool,
 }
 
 /// What a negotiated m-line carries. Once offered, an m-line keeps its mid and
-/// position in every later offer (RFC 3264 §8); only its role changes.
+/// position in every later offer; only its role changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MlineRole {
     /// Participant publishes to the SFU (recvonly from the SFU's side).
     Publish,
-    /// SFU forwards this subscribed track (sendonly).
-    Subscribe(TrackId),
+    /// SFU forwards a subscribed track (sendonly).
+    Subscribe(SubSlot),
     /// No longer used; reusable by a later subscription of the same kind.
     Inactive,
+}
+
+impl MlineRole {
+    /// The subscribed track, for a subscribe m-line.
+    pub fn subscribed_track(&self) -> Option<TrackId> {
+        match self {
+            MlineRole::Subscribe(slot) => Some(slot.track),
+            _ => None,
+        }
+    }
 }
 
 /// One m-line of a participant's session.
@@ -87,11 +88,12 @@ pub struct MlineSlot {
 }
 
 /// Per-participant negotiation state.
+#[derive(Default)]
 pub struct NegotiationState {
-    pub transport_id: Option<TransportId>,
+    /// The participant's data-plane session, from its first offer on.
+    pub session: Option<SessionId>,
+    /// Tracks registered from this participant's answers.
     pub published_tracks: Vec<TrackId>,
-    pub published_kinds: Vec<(String, String)>,
-    pub pending_mid_map: Vec<(TrackId, String)>,
     pub offer_pending: bool,
     pub renegotiation_needed: bool,
     /// Next mid to allocate for a new m-line.
@@ -102,92 +104,54 @@ pub struct NegotiationState {
     pub unregistered_publish_mids: Vec<String>,
     /// Publish request that arrived while an offer was outstanding.
     pub pending_publish: Option<Vec<(String, String)>>,
-    pub mid_ext_id: u8,
-    pub twcc_ext_id: u8,
-    pub gathering_state: GatheringState,
-    pub gathering_generation: u32,
-    pub candidates_trickled: u8,
-    /// Cached subscribed track IDs for deferred renegotiation.
+    /// Subscription set to offer once the outstanding offer is answered.
     pub last_subscribed_track_ids: Vec<TrackId>,
+    /// Local candidates were trickled (once per session).
+    pub candidates_sent: bool,
+    /// Invalid answers in a row (bounds the re-offers after them).
+    pub invalid_answers: u8,
     /// SDP session ID (RFC 3264 §8).
     pub session_id: u64,
     /// SDP session version, incremented per offer (RFC 3264 §8).
     pub session_version: u64,
 }
 
-impl Default for NegotiationState {
+impl NegotiationState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Why an answer was not applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// No offer outstanding (or no such participant): ignored.
+    NotExpected,
+    /// Unparsable, or not an answer to the offer: the offer is settled.
+    Invalid,
+}
+
+/// What an answer changed, for the other managers.
+#[derive(Debug, Default)]
+pub struct AnswerOutcome {
+    /// Tracks whose subscriptions went onto the shard.
+    pub activated: Vec<TrackId>,
+}
+
+pub struct NegotiationManager {
+    pub(crate) states: HashMap<u64, NegotiationState>,
+}
+
+impl Default for NegotiationManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl NegotiationState {
+impl NegotiationManager {
     pub fn new() -> Self {
         Self {
-            transport_id: None,
-            published_tracks: Vec::with_capacity(MAX_TRACKS_PER_PARTICIPANT as usize),
-            published_kinds: Vec::new(),
-            pending_mid_map: Vec::new(),
-            offer_pending: false,
-            renegotiation_needed: false,
-            next_mid_index: 0,
-            mlines: Vec::new(),
-            unregistered_publish_mids: Vec::new(),
-            pending_publish: None,
-            mid_ext_id: 1,
-            twcc_ext_id: 0,
-            gathering_state: GatheringState::Idle,
-            gathering_generation: 0,
-            candidates_trickled: 0,
-            last_subscribed_track_ids: Vec::new(),
-            session_id: 0,
-            session_version: 0,
-        }
-    }
-}
-
-pub struct NegotiationManager {
-    pub(crate) states: HashMap<u64, NegotiationState>,
-    webrtc_transport: Arc<WebRtcTransport>,
-    ssrc_router: Arc<SsrcRouter>,
-    worker_pool: Arc<RwLock<WorkerPool>>,
-    distributed_state: Arc<DistributedState>,
-    pub ice_gather_tx: mpsc::UnboundedSender<IceGatheringEvent>,
-    pub ice_gather_rx: mpsc::UnboundedReceiver<IceGatheringEvent>,
-    /// Host candidate addresses (see `candidates.rs`); never unspecified.
-    candidate_addrs: Arc<[SocketAddr]>,
-}
-
-impl NegotiationManager {
-    pub fn new(
-        webrtc_transport: Arc<WebRtcTransport>,
-        ssrc_router: Arc<SsrcRouter>,
-        worker_pool: Arc<RwLock<WorkerPool>>,
-        distributed_state: Arc<DistributedState>,
-        candidate_addrs: Vec<SocketAddr>,
-    ) -> Self {
-        assert!(
-            !candidate_addrs.is_empty(),
-            "at least one ICE candidate address"
-        );
-        assert!(candidate_addrs.len() <= MAX_CANDIDATES as usize);
-        for addr in &candidate_addrs {
-            assert!(
-                !addr.ip().is_unspecified(),
-                "candidate {addr} is unspecified"
-            );
-            assert!(addr.port() != 0, "candidate {addr} has no port");
-        }
-        let (ice_gather_tx, ice_gather_rx) = mpsc::unbounded_channel();
-        Self {
             states: HashMap::with_capacity(1024),
-            webrtc_transport,
-            ssrc_router,
-            worker_pool,
-            distributed_state,
-            ice_gather_tx,
-            ice_gather_rx,
-            candidate_addrs: candidate_addrs.into(),
         }
     }
 
@@ -195,69 +159,37 @@ impl NegotiationManager {
         self.states.insert(participant_id, NegotiationState::new());
     }
 
-    pub fn remove_participant(&mut self, participant_id: u64) -> Option<NegotiationState> {
-        self.states.remove(&participant_id)
+    /// The participant's data-plane session.
+    pub fn session(&self, participant_id: u64) -> Option<SessionId> {
+        self.states.get(&participant_id).and_then(|s| s.session)
     }
 
-    /// Get the transport_id for a participant (used by other managers).
-    /// Transport of a participant whose session is already established and
-    /// has no offer outstanding, i.e. a renegotiation just completed on it.
-    pub fn settled_established_transport(&self, participant_id: u64) -> Option<TransportId> {
-        let state = self.states.get(&participant_id)?;
-        let tid = state.transport_id?;
-        if state.offer_pending {
-            return None;
-        }
-        let established = self
-            .webrtc_transport
-            .with_session(tid, |ws| ws.is_established())
-            .unwrap_or(false);
-        established.then_some(tid)
-    }
+    // ── Sessions ─────────────────────────────────────────────────────
 
-    pub fn transport_id(&self, participant_id: u64) -> Option<TransportId> {
-        self.states
-            .get(&participant_id)
-            .and_then(|s| s.transport_id)
-    }
-
-    /// Get the SRTP key material for a participant's transport.
-    pub fn get_srtp_key_material(
-        &self,
+    /// The participant's session, created (with `CreateSession`) on first use.
+    fn ensure_session(
+        &mut self,
         participant_id: u64,
-    ) -> Option<(
-        nexus_transport::srtp::KeyMaterial,
-        nexus_transport::srtp::SrtpPolicy,
-        u64,
-    )> {
-        let tid = self.transport_id(participant_id)?;
-        self.webrtc_transport
-            .with_session(tid, |ws| ws.get_srtp_key_material())
-            .flatten()
-    }
-
-    /// Take the pending_mid_map for media activation.
-    pub fn take_pending_mid_map(&mut self, participant_id: u64) -> Vec<(TrackId, String)> {
-        self.states
-            .get_mut(&participant_id)
-            .map(|s| std::mem::take(&mut s.pending_mid_map))
-            .unwrap_or_default()
-    }
-
-    /// Get the selected remote address for a participant's transport.
-    pub fn selected_remote_addr(&self, participant_id: u64) -> Option<SocketAddr> {
-        let tid = self.transport_id(participant_id)?;
-        self.webrtc_transport
-            .with_session(tid, |ws| ws.selected_pair().map(|(_, remote)| remote))
-            .flatten()
-    }
-
-    pub fn ssrc_router(&self) -> &Arc<SsrcRouter> {
-        &self.ssrc_router
-    }
-
-    pub fn webrtc_transport(&self) -> &Arc<WebRtcTransport> {
-        &self.webrtc_transport
+        sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
+    ) -> Option<SessionId> {
+        let state = self.states.get_mut(&participant_id)?;
+        if let Some(id) = state.session {
+            return Some(id);
+        }
+        let room = sessions.get(&participant_id).and_then(|h| h.room_id);
+        let Some(id) = plane.create_session(participant_id, room) else {
+            send_error(sessions, participant_id, "SESSION_FAILED", "No session");
+            return None;
+        };
+        state.session = Some(id);
+        state.session_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1);
+        state.session_version = 0;
+        assert!(state.session.is_some());
+        Some(id)
     }
 
     // ── Publish ──────────────────────────────────────────────────────
@@ -268,364 +200,259 @@ impl NegotiationManager {
         kinds: &[String],
         contents: &[String],
         sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
     ) {
-        if participant_id == 0
-            || kinds.len() != contents.len()
-            || kinds.len() > MAX_TRACKS_PER_PARTICIPANT as usize
+        if participant_id == 0 || kinds.len() != contents.len() {
+            return;
+        }
+        if sessions
+            .get(&participant_id)
+            .and_then(|h| h.room_id)
+            .is_none()
         {
-            return;
-        }
-
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Only audio/video m-lines are offered
-        let published_kinds: Vec<(String, String)> = kinds
-            .iter()
-            .zip(contents.iter())
-            .filter(|(k, _)| k.as_str() == "audio" || k.as_str() == "video")
-            .map(|(k, c)| (k.clone(), c.clone()))
-            .collect();
-        if published_kinds.is_empty() {
-            return;
-        }
-
-        // One offer at a time: retry this publish once the pending answer arrives
-        if state.offer_pending {
-            state.pending_publish = Some(published_kinds);
-            return;
-        }
-
-        // The old path offers at most OLD_PATH_MAX_MLINES m-lines, first offer included:
-        // a larger offer would get an answer handle_answer refuses, leaving offer_pending
-        // set for good.
-        if state.mlines.len() + published_kinds.len() > OLD_PATH_MAX_MLINES {
             send_error(
                 sessions,
                 participant_id,
-                "TOO_MANY_TRACKS",
-                "Too many m-lines",
+                "NOT_IN_ROOM",
+                "Must join a room first",
             );
             return;
         }
-        state.published_kinds = published_kinds.clone();
-
-        // Existing transport (from an earlier publish or a subscription): append
-        // publish m-lines after the negotiated ones and re-offer the session.
-        if let Some(transport_id) = state.transport_id {
-            let mut new_mids = Vec::with_capacity(published_kinds.len());
-            for (kind, _content) in &published_kinds {
-                let mid = state.next_mid_index.to_string();
-                state.next_mid_index += 1;
-                state.mlines.push(MlineSlot {
-                    mid: mid.clone(),
-                    kind: u8::from(kind.as_str() == "video"),
-                    role: MlineRole::Publish,
-                });
-                new_mids.push(mid);
-            }
-            state.unregistered_publish_mids = new_mids;
-            self.send_ordered_offer(participant_id, transport_id, sessions);
+        let Some(state) = self.states.get_mut(&participant_id) else {
             return;
-        }
-
-        let (transport_id, ice_creds, dtls_fingerprint) =
-            match Self::create_transport(&self.webrtc_transport, participant_id, sessions) {
-                Some(t) => t,
-                None => return,
-            };
-        state.transport_id = Some(transport_id);
-
-        // Build SDP offer with RFC 3264 §8 session versioning
-        let session_id_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        state.session_id = session_id_ts;
-        state.session_version = 1;
-
-        let mut sdp = nexus_webrtc::sdp::SessionDescription::new(session_id_ts);
-        sdp.set_session_name("Nexus SFU");
-        sdp.set_ice_credentials(&ice_creds.local_ufrag, &ice_creds.local_pwd);
-        sdp.set_fingerprint(nexus_webrtc::sdp::DtlsFingerprint {
-            algorithm: nexus_webrtc::sdp::FingerprintAlgorithm::Sha256,
-            value: {
-                let mut v = [0u8; 64];
-                v[..32].copy_from_slice(&dtls_fingerprint);
-                v
-            },
-            value_len: 32,
-        });
-        sdp.set_setup(nexus_webrtc::sdp::DtlsSetup::Actpass);
-
-        for (idx, (kind, _content)) in published_kinds.iter().enumerate() {
-            let media_type = match kind.as_str() {
-                "audio" => nexus_webrtc::sdp::MediaType::Audio,
-                "video" => nexus_webrtc::sdp::MediaType::Video,
-                _ => continue,
-            };
-            let mut media = nexus_webrtc::sdp::MediaDescription::new(
-                media_type,
-                9,
-                nexus_webrtc::sdp::TransportProtocol::UdpTlsRtpSavpf,
-            );
-            let mid = idx.to_string();
-            media.mid = Some(nexus_webrtc::sdp::Mid::new(&mid));
-            media.direction = nexus_webrtc::sdp::Direction::RecvOnly;
-            state.mlines.push(MlineSlot {
-                mid: mid.clone(),
-                kind: u8::from(media_type == nexus_webrtc::sdp::MediaType::Video),
-                role: MlineRole::Publish,
-            });
-            state.unregistered_publish_mids.push(mid);
-            media.rtcp_mux = true;
-            if let Some(c) = publish_codec(media_type == nexus_webrtc::sdp::MediaType::Audio) {
-                let _ = media.add_codec(c);
-            }
-            let _ = sdp.add_media(media);
-        }
-
-        state.next_mid_index = state.mlines.len() as u32;
-
-        let offer_sdp = match nexus_webrtc::sdp::SdpPrinter::print(&sdp) {
-            Ok(sdp) => sdp,
-            Err(e) => {
-                warn!("Offer for participant {} failed: {:?}", participant_id, e);
-                return;
-            }
         };
-        send_to(
-            sessions,
-            participant_id,
-            SignalMessage::Offer {
-                sdp: offer_sdp,
-                tracks: Vec::new(),
-            },
-        );
-
-        state.offer_pending = true;
-        self.start_ice_gathering(participant_id, transport_id);
+        // Only audio/video m-lines are offered.
+        let published: Vec<(String, String)> = kinds
+            .iter()
+            .zip(contents)
+            .filter(|(k, _)| k.as_str() == "audio" || k.as_str() == "video")
+            .map(|(k, c)| (k.clone(), c.clone()))
+            .collect();
+        if published.is_empty() {
+            return;
+        }
+        // The shard holds at most MAX_TRACKS_PER_SESSION tracks per session: published,
+        // in the outstanding offer, and queued.
+        let queued = state.pending_publish.as_ref().map_or(0, Vec::len);
+        let tracks = state.published_tracks.len() + state.unregistered_publish_mids.len() + queued;
+        if tracks + published.len() > MAX_TRACKS_PER_SESSION
+            || state.mlines.len() + published.len() > MAX_MEDIA_SECTIONS
+        {
+            let message = format!("At most {MAX_TRACKS_PER_SESSION} published tracks");
+            send_error(sessions, participant_id, "TOO_MANY_TRACKS", &message);
+            return;
+        }
+        // One offer at a time: queue this publish until the pending answer arrives.
+        if state.offer_pending {
+            state
+                .pending_publish
+                .get_or_insert_with(Vec::new)
+                .extend(published);
+            return;
+        }
+        if self
+            .ensure_session(participant_id, sessions, plane)
+            .is_none()
+        {
+            return;
+        }
+        let state = self.states.get_mut(&participant_id).expect("state exists");
+        for (kind, _content) in &published {
+            let kind = u8::from(kind.as_str() == "video");
+            let mid = Self::claim_mline(state, kind, MlineRole::Publish);
+            state.unregistered_publish_mids.push(mid);
+        }
+        self.send_ordered_offer(participant_id, sessions, plane);
     }
 
-    /// Create a WebRTC session for a participant (SFU is the DTLS server).
-    /// Reports SESSION_FAILED to the participant on error.
-    fn create_transport(
-        webrtc_transport: &WebRtcTransport,
-        participant_id: u64,
-        sessions: &HashMap<u64, ParticipantHandle>,
-    ) -> Option<(TransportId, IceCredentials, [u8; 32])> {
-        let dtls_params =
-            nexus_webrtc::webrtc::DtlsParameters::new(nexus_webrtc::webrtc::DtlsRole::Server);
-        let transport_id = match webrtc_transport.create_session(dtls_params) {
-            Ok(id) => id,
-            Err(e) => {
-                send_error(
-                    sessions,
-                    participant_id,
-                    "SESSION_FAILED",
-                    &format!("{:?}", e),
-                );
-                return None;
-            }
-        };
-        let created = webrtc_transport.with_session(transport_id, |ws| {
-            (ws.local_ice_credentials().clone(), *ws.dtls_fingerprint())
-        });
-        match created {
-            Some((creds, fp)) => Some((transport_id, creds, fp)),
-            None => {
-                send_error(
-                    sessions,
-                    participant_id,
-                    "SESSION_FAILED",
-                    "Session not found after creation",
-                );
-                None
-            }
+    /// Put `role` on an inactive m-line of `kind`, else on a new one; returns its mid.
+    /// The caller checked `MAX_MEDIA_SECTIONS`.
+    fn claim_mline(state: &mut NegotiationState, kind: u8, role: MlineRole) -> String {
+        if let Some(free) = state
+            .mlines
+            .iter_mut()
+            .find(|s| s.role == MlineRole::Inactive && s.kind == kind)
+        {
+            free.role = role;
+            return free.mid.clone();
         }
+        assert!(
+            state.mlines.len() < MAX_MEDIA_SECTIONS,
+            "m-line count checked"
+        );
+        let mid = state.next_mid_index.to_string();
+        state.next_mid_index += 1;
+        state.mlines.push(MlineSlot {
+            mid: mid.clone(),
+            kind,
+            role,
+        });
+        mid
     }
 
     // ── Answer ───────────────────────────────────────────────────────
 
-    /// Parse SDP answer, set ICE creds, register tracks.
-    /// Does NOT activate media — that happens in SubscriptionManager
-    /// when SessionEvent::Established fires.
+    /// Apply an answer to the outstanding offer: DTLS role and fingerprint, `AddTrack`
+    /// per publish m-line, `Subscribe` per accepted subscribe m-line.
     pub fn handle_answer(
         &mut self,
         participant_id: u64,
         sdp: &str,
         sessions: &HashMap<u64, ParticipantHandle>,
-    ) {
-        if participant_id == 0 || sdp.is_empty() {
-            return;
-        }
-
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
+        plane: &mut Plane,
+    ) -> AnswerOutcome {
+        let mut outcome = AnswerOutcome::default();
+        let (id, answer) = match self.accept_answer(participant_id, sdp, sessions) {
+            Ok(accepted) => accepted,
+            Err(Refused::Invalid) => {
+                // The offer is settled: what waited for it goes out now, and what it
+                // carried is offered again (once) so the client does not stall.
+                self.after_answer(participant_id, sessions, plane);
+                self.retry_unanswered(participant_id, sessions, plane);
+                return outcome;
+            }
+            Err(Refused::NotExpected) => return outcome,
         };
-        let transport_id = match state.transport_id {
-            Some(id) => id,
-            None => return,
-        };
-
-        let answer = match nexus_webrtc::sdp::SdpParser::parse(sdp) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(
-                    "Failed to parse answer SDP from {}: {:?}",
-                    participant_id, e
-                );
-                return;
-            }
-        };
-        // The parser accepts up to MAX_MEDIA_SECTIONS (32); the old path never offers
-        // more than OLD_PATH_MAX_MLINES, so an answer with more is not an answer to it.
-        if answer.media.len() > OLD_PATH_MAX_MLINES {
-            warn!(
-                "Answer from {} has {} m-lines, more than the {} offered at most",
-                participant_id,
-                answer.media.len(),
-                OLD_PATH_MAX_MLINES
-            );
-            return;
+        if !Self::apply_dtls(participant_id, id, &answer, plane) {
+            return outcome;
         }
-
-        // Extract remote ICE credentials
-        let (remote_ufrag, remote_pwd) = Self::extract_ice_creds(&answer);
-        if let (Some(ufrag), Some(pwd)) = (remote_ufrag, remote_pwd) {
-            self.webrtc_transport.with_session_mut(transport_id, |ws| {
-                ws.set_remote_ice_credentials(IceCredentials {
-                    local_ufrag: ufrag,
-                    local_pwd: pwd,
-                });
-            });
-        }
-
-        // DTLS role from the answer's a=setup (we offered actpass). Fixed by
-        // the first answer; later answers must agree.
-        let role = match Self::dtls_role_from_answer(&answer) {
-            Ok(role) => role,
-            Err(reason) => {
-                warn!("Answer from participant {}: {}", participant_id, reason);
-                return;
-            }
-        };
-        let role_result = self.webrtc_transport.with_session_mut(transport_id, |ws| {
-            if ws.dtls_role() == role {
-                Ok(())
-            } else {
-                ws.set_dtls_role(role)
-            }
-        });
-        if let Some(Err(e)) = role_result {
-            warn!(
-                "Participant {} changed a=setup after DTLS started: {:?}",
-                participant_id, e
-            );
-            return;
-        }
-
-        // Pin the peer's DTLS certificate. Until this is set the session
-        // will not trust the handshake; on mismatch it fails.
-        match Self::extract_fingerprint(&answer) {
-            Some(fingerprint) => {
-                let result = self
-                    .webrtc_transport
-                    .with_session_mut(transport_id, |ws| ws.set_remote_fingerprint(fingerprint));
-                if let Some(Err(e)) = result {
-                    warn!(
-                        "DTLS fingerprint check failed for participant {}: {}",
-                        participant_id, e
-                    );
-                    return;
-                }
-            }
-            None => {
-                warn!(
-                    "Answer from participant {} has no SHA-256 fingerprint",
-                    participant_id
-                );
-                return;
-            }
-        }
-
-        // Register published tracks from the m-lines this offer added for publishing
-        // (subscription m-lines in the same answer are not the participant's media).
+        let state = self.states.get_mut(&participant_id).expect("accepted");
+        state.invalid_answers = 0;
         let publish_mids = std::mem::take(&mut state.unregistered_publish_mids);
         state.offer_pending = false;
-
-        if !publish_mids.is_empty() {
-            self.register_tracks_from_sdp(participant_id, &answer, &publish_mids, sessions);
-        }
-
-        // Update MID mappings and collect renegotiation flag
-        let needs_renego = {
-            let state = match self.states.get_mut(&participant_id) {
-                Some(s) => s,
-                None => return,
-            };
-            let mid_ext_id = state.mid_ext_id;
-            let pool = self.worker_pool.read();
-            for (track_id, mid_str) in &state.pending_mid_map {
-                let mid_bytes = mid_str.as_bytes();
-                let mut mid_value = [0u8; 4];
-                let mid_len = mid_bytes.len().min(4);
-                mid_value[..mid_len].copy_from_slice(&mid_bytes[..mid_len]);
-                let _ = pool.send_to_track(
-                    *track_id,
-                    WorkerMessage::SetTrackMid {
-                        track_id: *track_id,
-                        mid_ext_id,
-                        mid_value,
-                        mid_value_len: mid_len as u8,
-                    },
-                );
+        for media in &answer.media {
+            let is_publish = media
+                .mid
+                .as_ref()
+                .is_some_and(|m| publish_mids.iter().any(|p| p == m.as_str()));
+            if is_publish {
+                self.register_publish(participant_id, id, media, sessions, plane);
             }
-            let needed = state.renegotiation_needed;
-            state.renegotiation_needed = false;
-            needed
-        };
-
-        if needs_renego {
-            let cached_ids = self
-                .states
-                .get(&participant_id)
-                .map(|s| s.last_subscribed_track_ids.clone())
-                .unwrap_or_default();
-            self.trigger_subscriber_renegotiation(participant_id, &cached_ids, sessions);
         }
-
-        // Publish that arrived while the previous offer was outstanding. If the
-        // subscription renegotiation above sent an offer, it queues again.
-        let pending_publish = self
-            .states
-            .get_mut(&participant_id)
-            .and_then(|s| s.pending_publish.take());
-        if let Some(published) = pending_publish {
-            let (kinds, contents): (Vec<String>, Vec<String>) = published.into_iter().unzip();
-            self.handle_publish(participant_id, &kinds, &contents, sessions);
-        }
-
+        outcome.activated =
+            self.register_subscriptions(participant_id, id, &answer, sessions, plane);
+        self.after_answer(participant_id, sessions, plane);
         info!("Answer processed from participant {}", participant_id);
+        outcome
     }
 
-    /// Our DTLS role given the answerer's `a=setup` (RFC 8842 §5.2): the
-    /// answerer's `active` makes us the server, `passive` the client. A
-    /// missing attribute keeps the server role, as before.
-    fn dtls_role_from_answer(
-        sdp: &nexus_webrtc::sdp::SessionDescription,
-    ) -> Result<DtlsRole, &'static str> {
-        use nexus_webrtc::sdp::DtlsSetup;
-        let mut setup = sdp.setup;
-        for media in &sdp.media {
-            if setup.is_some() {
-                break;
+    /// The parsed answer, if it answers the outstanding offer (same mids, same order).
+    /// An unusable answer settles the offer with an error to the client (`Invalid`).
+    fn accept_answer(
+        &mut self,
+        participant_id: u64,
+        sdp: &str,
+        sessions: &HashMap<u64, ParticipantHandle>,
+    ) -> Result<(SessionId, SessionDescription), Refused> {
+        let state = self
+            .states
+            .get_mut(&participant_id)
+            .ok_or(Refused::NotExpected)?;
+        let (Some(id), true) = (state.session, state.offer_pending) else {
+            debug!(
+                "Answer from {} without an outstanding offer",
+                participant_id
+            );
+            return Err(Refused::NotExpected);
+        };
+        match SdpParser::parse(sdp) {
+            Ok(answer) if Self::mids_match(&answer, &state.mlines) => Ok((id, answer)),
+            result => {
+                warn!("Invalid answer from {}: {:?}", participant_id, result.err());
+                state.offer_pending = false;
+                send_error(sessions, participant_id, "INVALID_ANSWER", "Answer refused");
+                Err(Refused::Invalid)
             }
-            setup = media.setup;
         }
+    }
+
+    /// After an invalid answer with nothing else offered: offer the unanswered publish
+    /// and subscribe m-lines again, once in a row. A second invalid answer releases the
+    /// publish m-lines (inactive; the client may publish again) instead of looping.
+    fn retry_unanswered(
+        &mut self,
+        participant_id: u64,
+        sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
+    ) {
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return;
+        };
+        let unanswered_subs = state
+            .mlines
+            .iter()
+            .any(|m| matches!(m.role, MlineRole::Subscribe(s) if !s.on_shard));
+        if state.offer_pending || (state.unregistered_publish_mids.is_empty() && !unanswered_subs) {
+            return;
+        }
+        state.invalid_answers = state.invalid_answers.saturating_add(1);
+        if state.invalid_answers <= MAX_REOFFERS {
+            self.send_ordered_offer(participant_id, sessions, plane);
+            return;
+        }
+        let mids = std::mem::take(&mut state.unregistered_publish_mids);
+        for slot in state.mlines.iter_mut().filter(|m| mids.contains(&m.mid)) {
+            slot.role = MlineRole::Inactive;
+        }
+        warn!(
+            "Participant {} answered {} offers wrongly; publish m-lines released",
+            participant_id, state.invalid_answers
+        );
+    }
+
+    /// The answer has one m-line per offered m-line, same mids, same order.
+    fn mids_match(answer: &SessionDescription, mlines: &[MlineSlot]) -> bool {
+        answer.media.len() == mlines.len()
+            && answer
+                .media
+                .iter()
+                .zip(mlines)
+                .all(|(m, slot)| m.mid.as_ref().is_some_and(|mid| mid.as_str() == slot.mid))
+    }
+
+    /// DTLS role and fingerprint from the answer into the handshake. `false` when the
+    /// session is being closed.
+    fn apply_dtls(
+        participant_id: u64,
+        id: SessionId,
+        answer: &SessionDescription,
+        plane: &mut Plane,
+    ) -> bool {
+        let params = Self::dtls_role_from_answer(answer).and_then(|role| {
+            Ok((
+                role,
+                Self::extract_fingerprint(answer).ok_or("no sha-256 fingerprint")?,
+            ))
+        });
+        let result = match (params, plane.transports.get_mut(id)) {
+            (Ok((role, fingerprint)), Some(entry)) => entry
+                .dtls
+                .on_answer(role, fingerprint)
+                .map_err(|e| e.to_string()),
+            (Err(reason), _) => Err(reason.to_string()),
+            (_, None) => return false,
+        };
+        match result {
+            Ok(progress) => {
+                plane.send_datagrams(id, progress.datagrams);
+                if progress.completed {
+                    plane.install_srtp(id);
+                }
+                true
+            }
+            Err(reason) => {
+                warn!("Answer from participant {}: {}", participant_id, reason);
+                plane.close_participant(participant_id, DisconnectReason::DtlsFailed);
+                false
+            }
+        }
+    }
+
+    /// Our DTLS role given the answerer's `a=setup` (RFC 8842 §5.2): the answerer's
+    /// `active` (or no attribute) makes us the server, `passive` the client.
+    fn dtls_role_from_answer(sdp: &SessionDescription) -> Result<DtlsRole, &'static str> {
+        use nexus_webrtc::sdp::DtlsSetup;
+        let setup = sdp.setup.or_else(|| sdp.media.iter().find_map(|m| m.setup));
         match setup {
             None | Some(DtlsSetup::Active) => Ok(DtlsRole::Server),
             Some(DtlsSetup::Passive) => Ok(DtlsRole::Client),
@@ -634,675 +461,707 @@ impl NegotiationManager {
         }
     }
 
-    /// SHA-256 DTLS fingerprint from the session level, else the first
-    /// m-line that has one (bundled m-lines share one transport).
-    fn extract_fingerprint(sdp: &nexus_webrtc::sdp::SessionDescription) -> Option<[u8; 32]> {
-        let session_fp = sdp.fingerprint.as_ref();
-        let media_fp = sdp.media.iter().find_map(|m| m.fingerprint.as_ref());
-        let fp = session_fp.or(media_fp)?;
-        if fp.algorithm != nexus_webrtc::sdp::FingerprintAlgorithm::Sha256 || fp.value_len != 32 {
-            return None;
-        }
+    /// The first SHA-256 DTLS fingerprint, session level first, then the m-lines in
+    /// order (bundled m-lines share one transport). Other algorithms are skipped, never
+    /// truncated into a SHA-256 value.
+    fn extract_fingerprint(sdp: &SessionDescription) -> Option<[u8; 32]> {
+        let fp = sdp
+            .fingerprint
+            .iter()
+            .chain(sdp.media.iter().filter_map(|m| m.fingerprint.as_ref()))
+            .find(|fp| fp.algorithm == FingerprintAlgorithm::Sha256 && fp.value_len == 32)?;
         let mut out = [0u8; 32];
         out.copy_from_slice(&fp.value[..32]);
         Some(out)
     }
 
-    fn extract_ice_creds(
-        sdp: &nexus_webrtc::sdp::SessionDescription,
-    ) -> (Option<String>, Option<String>) {
-        if sdp.ice_ufrag.is_some() && sdp.ice_pwd.is_some() {
-            return (
-                sdp.ice_ufrag.as_ref().map(|u| u.as_str().to_string()),
-                sdp.ice_pwd.as_ref().map(|p| p.as_str().to_string()),
-            );
-        }
-        for media in &sdp.media {
-            if media.ice_ufrag.is_some() && media.ice_pwd.is_some() {
-                return (
-                    media.ice_ufrag.as_ref().map(|u| u.as_str().to_string()),
-                    media.ice_pwd.as_ref().map(|p| p.as_str().to_string()),
-                );
-            }
-        }
-        (None, None)
-    }
-
-    // ── ICE Gathering ────────────────────────────────────────────────
-
-    fn start_ice_gathering(&mut self, participant_id: u64, transport_id: TransportId) {
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
-        };
-        state.gathering_generation = state.gathering_generation.wrapping_add(1);
-        state.gathering_state = GatheringState::InProgress;
-        state.candidates_trickled = 0;
-        let generation = state.gathering_generation;
-
-        let tx = self.ice_gather_tx.clone();
-        let addrs = Arc::clone(&self.candidate_addrs);
-        tokio::spawn(async move {
-            for (idx, addr) in addrs.iter().enumerate() {
-                // Distinct interface index: distinct local preference and priority.
-                let candidate = Candidate::new_host(*addr, 1, idx as u8);
-                let _ = tx.send(IceGatheringEvent::Candidate {
-                    participant_id,
-                    transport_id,
-                    candidate,
-                    generation,
-                });
-            }
-            let _ = tx.send(IceGatheringEvent::Complete {
-                participant_id,
-                transport_id,
-                generation,
-            });
-        });
-    }
-
-    pub fn dispatch_ice_event(
-        &mut self,
-        event: IceGatheringEvent,
-        sessions: &HashMap<u64, ParticipantHandle>,
-    ) {
-        match event {
-            IceGatheringEvent::Candidate {
-                participant_id,
-                transport_id,
-                candidate,
-                generation,
-            } => {
-                self.handle_ice_candidate_discovered(
-                    participant_id,
-                    transport_id,
-                    candidate,
-                    generation,
-                    sessions,
-                );
-            }
-            IceGatheringEvent::Complete {
-                participant_id,
-                transport_id,
-                generation,
-            } => {
-                self.handle_ice_gathering_complete(
-                    participant_id,
-                    transport_id,
-                    generation,
-                    sessions,
-                );
-            }
-            IceGatheringEvent::Failed {
-                participant_id,
-                transport_id: _,
-                generation,
-                reason: _,
-            } => {
-                self.handle_ice_gathering_failed(participant_id, generation, sessions);
-            }
-        }
-    }
-
-    fn handle_ice_candidate_discovered(
+    /// Queued renegotiation and publish, once an answer settled the offer.
+    fn after_answer(
         &mut self,
         participant_id: u64,
-        _transport_id: TransportId,
-        candidate: Candidate,
-        generation: u32,
         sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
     ) {
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return;
         };
-        if state.gathering_generation != generation {
-            return;
+        let renegotiate = std::mem::take(&mut state.renegotiation_needed);
+        let pending_publish = state.pending_publish.take();
+        if renegotiate {
+            let ids = state.last_subscribed_track_ids.clone();
+            self.trigger_subscriber_renegotiation(participant_id, &ids, sessions, plane);
         }
-        if state.candidates_trickled >= MAX_CANDIDATES as u8 {
-            return;
-        }
-
-        let candidate_sdp = candidate.to_sdp_string();
-        send_to(
-            sessions,
-            participant_id,
-            SignalMessage::IceCandidate {
-                candidate: candidate_sdp,
-                sdp_mid: Some("0".to_string()),
-                sdp_mline_index: Some(0),
-            },
-        );
-        state.candidates_trickled += 1;
-
-        if let Some(tid) = state.transport_id {
-            self.webrtc_transport.with_session_mut(tid, |ws| {
-                let _ = ws.add_local_candidate(candidate);
-            });
+        // If the renegotiation above sent an offer, this publish queues again.
+        if let Some(published) = pending_publish {
+            let (kinds, contents): (Vec<String>, Vec<String>) = published.into_iter().unzip();
+            self.handle_publish(participant_id, &kinds, &contents, sessions, plane);
         }
     }
 
-    fn handle_ice_gathering_complete(
+    // ── Tracks ───────────────────────────────────────────────────────
+
+    /// One track per answered publish m-line: `AddTrack`, the registry, the cluster
+    /// state, and `TrackPublished` to the room.
+    fn register_publish(
         &mut self,
         participant_id: u64,
-        transport_id: TransportId,
-        generation: u32,
+        id: SessionId,
+        media: &MediaDescription,
         sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
     ) {
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
+        let Some(room) = sessions.get(&participant_id).and_then(|h| h.room_id) else {
+            return; // left the room while the offer was outstanding
         };
-        if state.gathering_generation != generation {
-            return;
-        }
-        state.gathering_state = GatheringState::Complete;
-
-        send_to(sessions, participant_id, SignalMessage::EndOfCandidates);
-
-        self.webrtc_transport.with_session_mut(transport_id, |ws| {
-            let _ = ws.mark_gathering_complete();
-            let _ = ws.start_connectivity_checks();
-        });
-    }
-
-    fn handle_ice_gathering_failed(
-        &mut self,
-        participant_id: u64,
-        generation: u32,
-        sessions: &HashMap<u64, ParticipantHandle>,
-    ) {
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
-        };
-        if state.gathering_generation != generation {
-            return;
-        }
-        state.gathering_state = GatheringState::Failed;
-        send_to(sessions, participant_id, SignalMessage::EndOfCandidates);
-    }
-
-    // ── Trickle ICE ──────────────────────────────────────────────────
-
-    pub fn handle_candidate(&mut self, participant_id: u64, candidate_str: &str) {
-        if participant_id == 0 || candidate_str.is_empty() {
-            return;
-        }
-
-        let tid = match self
+        let published = self
             .states
             .get(&participant_id)
-            .and_then(|s| s.transport_id)
-        {
-            Some(id) => id,
-            None => return,
-        };
-
-        let candidate = match Candidate::from_sdp(candidate_str) {
-            Ok(c) => c,
+            .map_or(0, |s| s.published_tracks.len());
+        if published >= MAX_TRACKS_PER_SESSION {
+            send_error(sessions, participant_id, "TOO_MANY_TRACKS", "Track limit");
+            return;
+        }
+        let cname = format!("nexus-{participant_id}");
+        let spec = match track_spec(media, cname.as_bytes()) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => return,
             Err(e) => {
-                debug!("Invalid trickle candidate from {}: {:?}", participant_id, e);
+                send_error(sessions, participant_id, "INVALID_TRACK", &e.to_string());
                 return;
             }
         };
-
-        self.webrtc_transport.with_session_mut(tid, |ws| {
-            let _ = ws.add_remote_candidate(candidate);
-            let _ = ws.start_connectivity_checks();
-        });
+        let Some(entry) = plane.transports.get_mut(id) else {
+            return;
+        };
+        let shard = entry.shard;
+        // The peer's SSRCs must not collide with the session's own (RTCP SSRC, out SSRCs).
+        let ssrcs = media.get_ssrc_values();
+        if !ssrcs.iter().all(|&s| entry.ssrcs.note_peer_ssrc(s)) {
+            send_error(sessions, participant_id, "SSRC_COLLISION", "SSRC in use");
+            return;
+        }
+        let duplicate = spec.ssrc.is_some()
+            && plane.tracks.by_publisher(participant_id).iter().any(|t| {
+                plane
+                    .tracks
+                    .get(*t)
+                    .is_some_and(|i| i.spec.ssrc == spec.ssrc)
+            });
+        if duplicate {
+            send_error(
+                sessions,
+                participant_id,
+                "DUPLICATE_SSRC",
+                "SSRC published twice",
+            );
+            return;
+        }
+        let track = plane.ids.track();
+        let command = Command::AddTrack {
+            id,
+            track,
+            spec: Box::new(spec),
+        };
+        if !plane.push(shard, command, participant_id) {
+            return;
+        }
+        let audio = spec.kind == nexus_core::MediaKind::Audio;
+        let info = TrackInfo {
+            publisher: participant_id,
+            session: id,
+            shard,
+            room,
+            spec,
+            content_type: if audio { 2 } else { 0 },
+        };
+        assert!(plane.tracks.insert(track, info), "track ids are fresh");
+        let state_info = StateTrackInfo {
+            track_type: u8::from(!audio),
+            content_type: if audio { 2 } else { 0 },
+            codec: 0,
+            bitrate_kbps: 0,
+            owner_node: 0,
+        };
+        let _ = plane.state.add_track(track.get(), state_info);
+        if let Some(state) = self.states.get_mut(&participant_id) {
+            state.published_tracks.push(track.get());
+        }
+        info!(
+            "Track {} registered: participant={}, ssrc={:?}",
+            track.get(),
+            participant_id,
+            spec.ssrc
+        );
+        notify_track_published(participant_id, track.get(), audio, sessions, plane);
     }
 
-    // ── Track Registration ───────────────────────────────────────────
-
-    /// Register the participant's published tracks from the SSRCs on the
-    /// answer's `publish_mids` m-lines.
-    fn register_tracks_from_sdp(
+    /// `Subscribe` for every accepted subscribe m-line not yet on the shard, in
+    /// increasing out-SSRC offset (the shard's monotonic rule). Returns their tracks.
+    fn register_subscriptions(
         &mut self,
         participant_id: u64,
-        sdp: &nexus_webrtc::sdp::SessionDescription,
-        publish_mids: &[String],
+        id: SessionId,
+        answer: &SessionDescription,
         sessions: &HashMap<u64, ParticipantHandle>,
-    ) {
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
+        plane: &mut Plane,
+    ) -> Vec<TrackId> {
+        let mut activated = Vec::new();
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return activated;
         };
-        let room_id = sessions.get(&participant_id).and_then(|h| h.room_id);
-
-        let mut notifications: Vec<(u64, SignalMessage)> = Vec::with_capacity(64);
-        // Bounded: handle_answer refuses answers with more than OLD_PATH_MAX_MLINES.
-        for media in &sdp.media {
-            let is_publish_mline = media
-                .mid
-                .as_ref()
-                .is_some_and(|mid| publish_mids.iter().any(|p| p == mid.as_str()));
-            if !is_publish_mline {
+        let Some(entry) = plane.transports.get(id) else {
+            return activated;
+        };
+        let (shard, ssrcs) = (entry.shard, &entry.ssrcs);
+        let mut pending: Vec<(u32, usize)> = state
+            .mlines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| match slot.role {
+                MlineRole::Subscribe(s) if !s.on_shard && !ssrcs.is_stale(s.out_ssrc) => {
+                    Some((ssrcs.offset_of(s.out_ssrc), i))
+                }
+                _ => None,
+            })
+            .collect();
+        pending.sort_unstable();
+        for (_, index) in pending {
+            let MlineRole::Subscribe(slot) = state.mlines[index].role else {
                 continue;
-            }
-            let ssrc_values = media.get_ssrc_values();
-            for &ssrc in ssrc_values.iter().take(8) {
-                if ssrc == 0 {
+            };
+            let track = DpTrackId::new(slot.track);
+            let Some(info) = plane.tracks.get(track) else {
+                continue; // unpublished meanwhile: the next offer turns it inactive
+            };
+            let source = TrackRef {
+                shard: info.shard,
+                track,
+            };
+            let spec = match sub_spec(&answer.media[index], &info.spec, slot.out_ssrc, source) {
+                Ok(Some(spec)) => spec,
+                Ok(None) => continue, // declined: stays off the shard
+                Err(e) => {
+                    send_error(sessions, participant_id, "SUBSCRIBE_FAILED", &e.to_string());
                     continue;
                 }
-                if state.published_tracks.len() >= MAX_TRACKS_PER_PARTICIPANT as usize {
-                    break;
-                }
-
-                // Detect duplicate SSRCs — skip if already registered
-                if self.ssrc_router.lookup(ssrc).is_some() {
-                    warn!(
-                        "Duplicate SSRC {} from participant {}, skipping",
-                        ssrc, participant_id
-                    );
-                    continue;
-                }
-
-                let kind = if media.media_type == MediaType::Audio {
-                    MediaKind::Audio
-                } else {
-                    MediaKind::Video
-                };
-
-                let mut pool = self.worker_pool.write();
-                match pool.assign_track(ssrc, kind) {
-                    Ok((track_id, worker_id)) => {
-                        if let Err(e) = self.ssrc_router.register(ssrc, track_id, worker_id) {
-                            warn!("Failed to register SSRC {}: {:?}", ssrc, e);
-                            continue;
-                        }
-
-                        let content_type = if kind == MediaKind::Audio { 2 } else { 0 };
-                        let track_info = TrackInfo {
-                            track_type: if kind == MediaKind::Audio { 0 } else { 1 },
-                            content_type,
-                            codec: 0,
-                            bitrate_kbps: 0,
-                            owner_node: 0,
-                        };
-                        let _ = self.distributed_state.add_track(track_id, track_info);
-                        state.published_tracks.push(track_id);
-
-                        if state.twcc_ext_id != 0 {
-                            let _ = pool.send_to_track(
-                                track_id,
-                                WorkerMessage::SetTrackTwccExtId {
-                                    track_id,
-                                    twcc_ext_id: state.twcc_ext_id,
-                                },
-                            );
-                        }
-
-                        if let Some(rid) = room_id {
-                            let participants = self.distributed_state.get_participants(rid);
-                            for &pid in participants.iter().take(MAX_PARTICIPANTS_PER_ROOM as usize)
-                            {
-                                if pid == participant_id {
-                                    continue;
-                                }
-                                notifications.push((
-                                    pid,
-                                    SignalMessage::TrackPublished {
-                                        publisher_id: participant_id,
-                                        track_id,
-                                        kind: if kind == MediaKind::Audio {
-                                            "audio".to_string()
-                                        } else {
-                                            "video".to_string()
-                                        },
-                                        content: match content_type {
-                                            1 => "screen",
-                                            2 => "audio",
-                                            _ => "camera",
-                                        }
-                                        .to_string(),
-                                    },
-                                ));
-                            }
-                        }
-                        info!(
-                            "Track {} registered: SSRC={}, worker={}, kind={:?}",
-                            track_id, ssrc, worker_id, kind
-                        );
-                    }
-                    Err(e) => warn!("Failed to assign track for SSRC {}: {:?}", ssrc, e),
-                }
+            };
+            let command = Command::Subscribe {
+                id,
+                sub: slot.sub,
+                track,
+                spec: Box::new(spec),
+            };
+            if !plane.push(shard, command, participant_id) {
+                break;
             }
+            if let Some(entry) = plane.transports.get_mut(id) {
+                entry.ssrcs.mark_registered(slot.out_ssrc);
+            }
+            state.mlines[index].role = MlineRole::Subscribe(SubSlot {
+                on_shard: true,
+                ..slot
+            });
+            activated.push(slot.track);
         }
-
-        for (pid, msg) in notifications {
-            send_to(sessions, pid, msg);
-        }
+        activated
     }
 
     // ── Renegotiation ────────────────────────────────────────────────
 
+    /// Offer the current subscription set now, or once the outstanding offer is
+    /// answered.
+    pub fn request_renegotiation(
+        &mut self,
+        participant_id: u64,
+        track_ids: Vec<TrackId>,
+        sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
+    ) {
+        match self.states.get_mut(&participant_id) {
+            Some(state) if state.offer_pending => {
+                state.renegotiation_needed = true;
+                state.last_subscribed_track_ids = track_ids;
+            }
+            Some(_) => {
+                self.trigger_subscriber_renegotiation(participant_id, &track_ids, sessions, plane)
+            }
+            None => {}
+        }
+    }
+
     /// Offer the participant its current subscription set (`track_ids`).
     ///
-    /// Subscriptions map onto m-lines: new tracks reuse an inactive m-line of
-    /// the same kind or append one; dropped tracks turn inactive. Subscribe-only
-    /// participants get their transport on the first subscription.
+    /// New tracks reuse an inactive m-line of the same kind or append one, with a fresh
+    /// subscription id and out SSRC; dropped tracks turn inactive (`Unsubscribe` if the
+    /// shard had them). Subscribe-only participants get their session here.
     pub fn trigger_subscriber_renegotiation(
         &mut self,
         participant_id: u64,
         track_ids: &[TrackId],
         sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
     ) {
-        let existing_transport = match self.states.get(&participant_id) {
-            Some(s) => s.transport_id,
-            None => return,
+        let has_session = self.session(participant_id).is_some();
+        if !has_session && track_ids.is_empty() {
+            return; // nothing negotiated and nothing to subscribe
+        }
+        let Some(id) = self.ensure_session(participant_id, sessions, plane) else {
+            return;
         };
-        let transport_id = match existing_transport {
-            Some(id) => id,
-            // Nothing negotiated and nothing to subscribe: no offer needed
-            None if track_ids.is_empty() => return,
-            None => {
-                match Self::create_transport(&self.webrtc_transport, participant_id, sessions) {
-                    Some((id, _, _)) => id,
-                    None => return,
-                }
-            }
-        };
-
-        // Resolve kinds before borrowing state mutably
+        self.drop_subscriptions_except(participant_id, track_ids, plane);
         let kinds: Vec<(TrackId, u8)> = track_ids
             .iter()
-            .take(OLD_PATH_MAX_MLINES)
-            .map(|&tid| {
-                let kind = self
-                    .distributed_state
-                    .get_track(tid)
-                    .map(|info| info.track_type)
-                    .unwrap_or(1);
-                (tid, kind)
+            .filter_map(|&t| {
+                let info = plane.tracks.get(DpTrackId::new(t))?;
+                Some((t, u8::from(info.kind() == nexus_core::MediaKind::Video)))
             })
             .collect();
-
-        let state = match self.states.get_mut(&participant_id) {
-            Some(s) => s,
-            None => return,
-        };
-        if existing_transport.is_none() {
-            state.transport_id = Some(transport_id);
-            state.session_id = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            state.session_version = 0;
-        }
+        let state = self.states.get_mut(&participant_id).expect("state exists");
         state.last_subscribed_track_ids = track_ids.to_vec();
+        for (track, kind) in kinds {
+            if state
+                .mlines
+                .iter()
+                .any(|s| s.role.subscribed_track() == Some(track))
+            {
+                continue;
+            }
+            // The shard holds at most MAX_SUBS_PER_SESSION subscriptions per session.
+            let subscribed = state
+                .mlines
+                .iter()
+                .filter(|s| s.role.subscribed_track().is_some());
+            let has_mline = state.mlines.len() < MAX_MEDIA_SECTIONS
+                || state
+                    .mlines
+                    .iter()
+                    .any(|s| s.role == MlineRole::Inactive && s.kind == kind);
+            if subscribed.count() >= MAX_SUBS_PER_SESSION || !has_mline {
+                let message = format!("At most {MAX_SUBS_PER_SESSION} subscriptions");
+                send_error(sessions, participant_id, "TOO_MANY_TRACKS", &message);
+                break;
+            }
+            let Some(slot) = Self::new_sub_slot(track, id, plane) else {
+                send_error(sessions, participant_id, "SSRC_EXHAUSTED", "No SSRC left");
+                break;
+            };
+            Self::claim_mline(state, kind, MlineRole::Subscribe(slot));
+        }
+        self.send_ordered_offer(participant_id, sessions, plane);
+    }
 
-        // Dropped subscriptions keep their m-line position but go inactive
+    fn new_sub_slot(track: TrackId, id: SessionId, plane: &mut Plane) -> Option<SubSlot> {
+        let out_ssrc = plane.transports.get_mut(id)?.ssrcs.allocate()?;
+        Some(SubSlot {
+            track,
+            sub: plane.ids.subscription(),
+            out_ssrc,
+            on_shard: false,
+        })
+    }
+
+    /// Subscribe m-lines whose track is not in `keep` turn inactive; the shard's
+    /// subscription is removed (`Unsubscribe`) if it had one.
+    fn drop_subscriptions_except(
+        &mut self,
+        participant_id: u64,
+        keep: &[TrackId],
+        plane: &mut Plane,
+    ) {
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return;
+        };
+        let Some(id) = state.session else {
+            return;
+        };
+        let Some(shard) = plane.transports.get(id).map(|e| e.shard) else {
+            return;
+        };
         for slot in state.mlines.iter_mut() {
-            if let MlineRole::Subscribe(tid) = slot.role {
-                if !track_ids.contains(&tid) {
+            let MlineRole::Subscribe(sub) = slot.role else {
+                continue;
+            };
+            if keep.contains(&sub.track) {
+                continue;
+            }
+            slot.role = MlineRole::Inactive;
+            if sub.on_shard {
+                let _ = plane.push(shard, Command::Unsubscribe { sub: sub.sub }, participant_id);
+            }
+        }
+    }
+
+    /// Unsubscribed tracks: their m-lines turn inactive at once, so an answer to an
+    /// outstanding offer does not put them on the shard.
+    pub fn drop_subscriptions(
+        &mut self,
+        participant_id: u64,
+        tracks: &[TrackId],
+        plane: &mut Plane,
+    ) {
+        let keep: Vec<TrackId> = self
+            .states
+            .get(&participant_id)
+            .map(|s| {
+                s.mlines
+                    .iter()
+                    .filter_map(|m| m.role.subscribed_track())
+                    .filter(|t| !tracks.contains(t))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.drop_subscriptions_except(participant_id, &keep, plane);
+    }
+
+    /// The publisher unpublished the track of its m-line `mid`: the m-line turns
+    /// inactive and can carry a later publish or subscription of its kind.
+    pub fn release_publish(&mut self, participant_id: u64, track: TrackId, mid: &[u8]) {
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return;
+        };
+        state.published_tracks.retain(|&t| t != track);
+        if let Some(slot) = state
+            .mlines
+            .iter_mut()
+            .find(|s| s.role == MlineRole::Publish && s.mid.as_bytes() == mid)
+        {
+            slot.role = MlineRole::Inactive;
+        }
+    }
+
+    /// Tracks removed from the shard (unpublished, or their publisher left): every
+    /// m-line forwarding them turns inactive. Returns the affected participants.
+    pub fn forget_tracks(&mut self, tracks: &[TrackId]) -> Vec<u64> {
+        let mut affected = Vec::new();
+        for (&participant_id, state) in self.states.iter_mut() {
+            for slot in state.mlines.iter_mut() {
+                if slot
+                    .role
+                    .subscribed_track()
+                    .is_some_and(|t| tracks.contains(&t))
+                {
                     slot.role = MlineRole::Inactive;
+                    if !affected.contains(&participant_id) {
+                        affected.push(participant_id);
+                    }
                 }
             }
         }
-        for (tid, kind) in kinds {
-            let already = state
-                .mlines
-                .iter()
-                .any(|s| s.role == MlineRole::Subscribe(tid));
-            if already {
-                continue;
-            }
-            if let Some(slot) = state
-                .mlines
-                .iter_mut()
-                .find(|s| s.role == MlineRole::Inactive && s.kind == kind)
-            {
-                slot.role = MlineRole::Subscribe(tid);
-            } else if state.mlines.len() < OLD_PATH_MAX_MLINES {
-                let mid = state.next_mid_index.to_string();
-                state.next_mid_index += 1;
-                state.mlines.push(MlineSlot {
-                    mid,
-                    kind,
-                    role: MlineRole::Subscribe(tid),
-                });
-            } else {
-                warn!(
-                    "Participant {} at {} m-lines, not offering track {}",
-                    participant_id, OLD_PATH_MAX_MLINES, tid
-                );
-            }
-        }
-
-        self.send_ordered_offer(participant_id, transport_id, sessions);
+        affected.sort_unstable();
+        affected
     }
 
-    /// Build and send an offer from the participant's m-lines, in order.
-    ///
-    /// Publish m-lines are recvonly with the publish codec, subscriptions are
-    /// sendonly with the forwarded track's SSRC, inactive ones stay as
-    /// placeholders. Starts ICE gathering on a transport's first offer.
+    // ── Offers ───────────────────────────────────────────────────────
+
+    /// Build and send an offer from the participant's m-lines, in order: publish
+    /// m-lines recvonly, subscriptions sendonly under their out SSRC, inactive ones as
+    /// placeholders. The first offer is followed by the session's candidates.
     fn send_ordered_offer(
         &mut self,
         participant_id: u64,
-        transport_id: TransportId,
         sessions: &HashMap<u64, ParticipantHandle>,
+        plane: &mut Plane,
     ) {
-        let state = match self.states.get(&participant_id) {
-            Some(s) => s,
-            None => return,
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return;
+        };
+        let Some(id) = state.session else {
+            return;
         };
         if state.mlines.is_empty() {
             return;
         }
-        assert!(
-            state.mlines.len() <= OLD_PATH_MAX_MLINES,
-            "m-line count must be bounded"
+        assert!(state.mlines.len() <= MAX_MEDIA_SECTIONS);
+        Self::refresh_stale_slots(state, id, plane);
+        let version = state.session_version + 1;
+        let (sdp, tracks) = match build_offer(state, id, version, plane) {
+            Ok(offer) => offer,
+            Err(e) => {
+                warn!("Offer for participant {} failed: {}", participant_id, e);
+                send_error(sessions, participant_id, "OFFER_FAILED", &e);
+                return;
+            }
+        };
+        info!(
+            "Offer sent to participant {} with {} m-lines ({} subscribed)",
+            participant_id,
+            state.mlines.len(),
+            tracks.len()
         );
-
-        let (ice_ufrag, ice_pwd, dtls_fp) =
-            match self.webrtc_transport.with_session(transport_id, |ws| {
-                let creds = ws.local_ice_credentials().clone();
-                (creds.local_ufrag, creds.local_pwd, *ws.dtls_fingerprint())
-            }) {
-                Some(v) => v,
-                None => {
-                    send_error(
-                        sessions,
-                        participant_id,
-                        "SESSION_NOT_FOUND",
-                        "Session gone",
-                    );
-                    return;
-                }
-            };
-        let negotiator = match SdpNegotiator::with_defaults(
-            ice_ufrag,
-            ice_pwd,
-            nexus_webrtc::sdp::DtlsFingerprint {
-                algorithm: nexus_webrtc::sdp::FingerprintAlgorithm::Sha256,
-                value: {
-                    let mut v = [0u8; 64];
-                    v[..32].copy_from_slice(&dtls_fp);
-                    v
-                },
-                value_len: 32,
-            },
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!("Negotiator failed: {:?}", e);
-                return;
-            }
-        };
-
-        let audio_codec: Vec<nexus_webrtc::sdp::RtpCodec> =
-            publish_codec(true).into_iter().collect();
-        let video_codec: Vec<nexus_webrtc::sdp::RtpCodec> =
-            publish_codec(false).into_iter().collect();
-        let mut mid_map: Vec<(TrackId, String)> = Vec::new();
-        // Per slot: the forwarded SSRC and its announced (stream id, cname). Today's
-        // values: every track is its own stream (1.5b switches to one per publisher).
-        let track_ids: Vec<Option<(u32, String, String)>> = state
-            .mlines
-            .iter()
-            .map(|slot| match slot.role {
-                MlineRole::Subscribe(tid) => {
-                    self.ssrc_router.lookup_ssrc_by_track(tid).map(|ssrc| {
-                        (
-                            ssrc,
-                            format!("nexus-stream-{ssrc}"),
-                            format!("nexus-{ssrc}"),
-                        )
-                    })
-                }
-                _ => None,
-            })
-            .collect();
-        let mlines: Vec<OfferMline> = state
-            .mlines
-            .iter()
-            .zip(&track_ids)
-            .map(|(slot, track)| {
-                let codecs: &[nexus_webrtc::sdp::RtpCodec] = if slot.kind == 0 {
-                    &audio_codec
-                } else {
-                    &video_codec
-                };
-                let recycled = |direction| {
-                    OfferMline::Recycled(nexus_webrtc::sdp::RecycledMline {
-                        mid: slot.mid.as_str(),
-                        media_kind: slot.kind,
-                        codecs,
-                        fmtps: &[],
-                        offer_pts: &[],
-                        extmaps: &[],
-                        rtcp_fbs: &[],
-                        direction,
-                    })
-                };
-                match slot.role {
-                    MlineRole::Publish => recycled(nexus_webrtc::sdp::Direction::RecvOnly),
-                    MlineRole::Subscribe(tid) => match track {
-                        Some((ssrc, stream_id, cname)) => {
-                            mid_map.push((tid, slot.mid.clone()));
-                            OfferMline::Track {
-                                ssrc: *ssrc,
-                                media_kind: slot.kind,
-                                mid: slot.mid.as_str(),
-                                stream_id: stream_id.as_str(),
-                                cname: cname.as_str(),
-                                rtcp_fbs: if slot.kind == 0 {
-                                    LEGACY_TRACK_AUDIO_FBS
-                                } else {
-                                    LEGACY_TRACK_VIDEO_FBS
-                                },
-                            }
-                        }
-                        // Track gone (publisher left): keep the position, send nothing
-                        None => recycled(nexus_webrtc::sdp::Direction::Inactive),
-                    },
-                    MlineRole::Inactive => recycled(nexus_webrtc::sdp::Direction::Inactive),
-                }
-            })
-            .collect();
-
-        let session_id = state.session_id;
-        let session_version = state.session_version + 1;
-        let offer_sdp = match negotiator.create_ordered_offer(
-            session_id,
-            session_version,
-            &mlines,
-            state.mid_ext_id,
-            &[],
-            &[],
-            None,
-            None,
-            None,
-            None,
-        ) {
-            Ok((sdp, _)) => sdp,
-            Err(e) => {
-                warn!("Offer for participant {} failed: {:?}", participant_id, e);
-                return;
-            }
-        };
-
         send_to(
             sessions,
             participant_id,
-            SignalMessage::Offer {
-                sdp: offer_sdp,
-                tracks: mid_map
-                    .iter()
-                    .map(|(track_id, mid)| OfferTrack {
-                        track_id: *track_id,
-                        mid: mid.clone(),
-                    })
-                    .collect(),
-            },
+            SignalMessage::Offer { sdp, tracks },
         );
-
-        let needs_gathering = match self.states.get_mut(&participant_id) {
-            Some(state) => {
-                info!(
-                    "Offer sent to participant {} with {} m-lines ({} subscribed)",
-                    participant_id,
-                    state.mlines.len(),
-                    mid_map.len()
-                );
-                state.pending_mid_map = mid_map;
-                state.offer_pending = true;
-                state.renegotiation_needed = false;
-                state.session_version = session_version;
-                state.gathering_state == GatheringState::Idle
-            }
-            None => return,
-        };
-        if needs_gathering {
-            self.start_ice_gathering(participant_id, transport_id);
+        state.offer_pending = true;
+        state.renegotiation_needed = false;
+        state.session_version = version;
+        if !state.candidates_sent {
+            state.candidates_sent = true;
+            trickle_candidates(participant_id, id, sessions, plane);
         }
+    }
+
+    /// A subscribe m-line whose SSRC was offered but never registered, while a later
+    /// one was: the shard would refuse it (`OutSsrcNotMonotonic`), so it gets a fresh
+    /// SSRC in this offer.
+    fn refresh_stale_slots(state: &mut NegotiationState, id: SessionId, plane: &mut Plane) {
+        let Some(entry) = plane.transports.get_mut(id) else {
+            return;
+        };
+        for slot in state.mlines.iter_mut() {
+            let MlineRole::Subscribe(sub) = slot.role else {
+                continue;
+            };
+            if sub.on_shard || !entry.ssrcs.is_stale(sub.out_ssrc) {
+                continue;
+            }
+            slot.role = match entry.ssrcs.allocate() {
+                Some(out_ssrc) => MlineRole::Subscribe(SubSlot { out_ssrc, ..sub }),
+                None => MlineRole::Inactive,
+            };
+        }
+    }
+
+    // ── ICE ──────────────────────────────────────────────────────────
+
+    /// Remote candidates are accepted and ignored: the SFU is ICE-lite and learns the
+    /// peer's address from its checks.
+    pub fn handle_candidate(&mut self, participant_id: u64, candidate: &str) {
+        debug!(
+            "Candidate from {} ignored ({} bytes)",
+            participant_id,
+            candidate.len()
+        );
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────
 
-    pub fn cleanup_participant(&mut self, participant_id: u64) {
-        if let Some(state) = self.states.remove(&participant_id) {
-            // Remove published tracks
-            for &track_id in &state.published_tracks {
-                self.ssrc_router.remove_by_track(track_id);
-                if let Ok(mut pool) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.worker_pool.write()
-                })) {
-                    let _ = pool.remove_track(track_id);
-                }
-                self.distributed_state.remove_track(track_id);
-            }
-            // Remove WebRTC session
-            if let Some(tid) = state.transport_id {
-                self.webrtc_transport.remove_session(tid);
-            }
+    /// Close the participant's session and remove its tracks. Returns the removed
+    /// tracks (their subscribers renegotiate).
+    pub fn cleanup_participant(
+        &mut self,
+        participant_id: u64,
+        room: Option<u32>,
+        plane: &mut Plane,
+    ) -> Vec<TrackId> {
+        let state = self.states.remove(&participant_id);
+        let removed: Vec<TrackId> = plane
+            .tracks
+            .remove_publisher(participant_id)
+            .into_iter()
+            .map(|t| t.get())
+            .collect();
+        for &track in &removed {
+            plane.state.remove_track(track);
         }
+        // CloseSession removes the session's tracks and subscriptions on the shard.
+        if let Some(id) = state.and_then(|s| s.session) {
+            plane.close_session(id, room);
+        }
+        removed
     }
 }
 
-/// Codec the SFU offers on a publisher's upstream m-line.
-///
-/// Payload types match the negotiator's defaults (opus 111, VP8 96) that
-/// subscriber m-lines use, since forwarded packets keep the publisher's PT.
-/// Audio and video must not share a PT within one BUNDLE (RFC 8843 §9.2).
-fn publish_codec(audio: bool) -> Option<nexus_webrtc::sdp::RtpCodec> {
+/// The SDP and `Offer.tracks` of the participant's current m-lines.
+fn build_offer(
+    state: &NegotiationState,
+    id: SessionId,
+    version: u64,
+    plane: &Plane,
+) -> Result<(String, Vec<OfferTrack>), String> {
+    let entry = plane.transports.get(id).ok_or("no session")?;
+    let ufrag = String::from_utf8_lossy(&entry.ice.local_ufrag).into_owned();
+    let pwd = String::from_utf8_lossy(&entry.ice.local_pwd).into_owned();
+    let mut value = [0u8; 64];
+    value[..32].copy_from_slice(plane.certificate().fingerprint());
+    let fingerprint = DtlsFingerprint {
+        algorithm: FingerprintAlgorithm::Sha256,
+        value,
+        value_len: 32,
+    };
+    let negotiator = SdpNegotiator::with_defaults(ufrag, pwd, fingerprint)
+        .map_err(|e| format!("{e:?}"))?
+        .with_ice_lite(true);
+    let codecs = [publish_codec(true)?, publish_codec(false)?];
+    let extmaps = [publish_extmaps(0)?, publish_extmaps(1)?];
+    let offered: [Vec<(u8, &str)>; 2] =
+        [offered_extmaps(0).collect(), offered_extmaps(1).collect()];
+    // Per slot: (stream id = cname) of the forwarded track's publisher.
+    let identities: Vec<Option<String>> = state
+        .mlines
+        .iter()
+        .map(|slot| {
+            let track = slot.role.subscribed_track()?;
+            let info = plane.tracks.get(DpTrackId::new(track))?;
+            Some(format!("nexus-{}", info.publisher))
+        })
+        .collect();
+    let mut tracks = Vec::new();
+    let mlines: Vec<OfferMline> = state
+        .mlines
+        .iter()
+        .zip(&identities)
+        .map(|(slot, identity)| {
+            let k = usize::from(slot.kind);
+            let fbs = if slot.kind == 0 {
+                V1_AUDIO_FBS
+            } else {
+                V1_VIDEO_FBS
+            };
+            let recycled = |direction, rtcp_fbs| {
+                OfferMline::Recycled(RecycledMline {
+                    mid: slot.mid.as_str(),
+                    media_kind: slot.kind,
+                    codecs: std::slice::from_ref(&codecs[k]),
+                    fmtps: &[],
+                    offer_pts: &[],
+                    extmaps: &extmaps[k],
+                    rtcp_fbs,
+                    direction,
+                })
+            };
+            match (slot.role, identity) {
+                (MlineRole::Publish, _) => recycled(Direction::RecvOnly, fbs),
+                (MlineRole::Subscribe(sub), Some(identity)) => {
+                    tracks.push(OfferTrack {
+                        track_id: sub.track,
+                        mid: slot.mid.clone(),
+                    });
+                    OfferMline::Track {
+                        ssrc: sub.out_ssrc,
+                        media_kind: slot.kind,
+                        mid: slot.mid.as_str(),
+                        stream_id: identity.as_str(),
+                        cname: identity.as_str(),
+                        rtcp_fbs: fbs,
+                        // VP8 is 96 and Opus 111 on every m-line: a PT never moves
+                        // between offers (the shard keeps the first answer's map).
+                        keep_pt: true,
+                    }
+                }
+                // Track gone, or no longer used: keep the position, send nothing.
+                _ => recycled(Direction::Inactive, &[]),
+            }
+        })
+        .collect();
+    let (sdp, _) = negotiator
+        .create_ordered_offer(
+            state.session_id,
+            version,
+            &mlines,
+            extensions::MID,
+            &offered[1],
+            &offered[0],
+            Some(&codecs[1]),
+            Some(&codecs[0]),
+            None,
+            None,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+    Ok((sdp, tracks))
+}
+
+/// Codec the SFU offers: VP8 96 for video, Opus 111 for audio, on every m-line of the
+/// kind, publish and subscribe alike. The PT maps to the same codec across the BUNDLE
+/// (the MID extension demuxes) and never changes between offers (`keep_pt`), so the
+/// shard's PT map from the first answer stays right.
+fn publish_codec(audio: bool) -> Result<RtpCodec, String> {
     let (pt, spec) = if audio {
         (111, "opus/48000/2")
     } else {
         (96, "VP8/90000")
     };
-    nexus_webrtc::sdp::RtpCodec::parse(pt, spec).ok()
+    RtpCodec::parse(pt, spec).map_err(|e| format!("{e:?}"))
 }
 
-fn send_to(sessions: &HashMap<u64, ParticipantHandle>, participant_id: u64, msg: SignalMessage) {
+/// The fixed extension table (note §11.2) as `a=extmap` entries for a kind.
+fn publish_extmaps(kind: u8) -> Result<Vec<ExtMap>, String> {
+    offered_extmaps(kind)
+        .map(|(id, uri)| {
+            let bytes = uri.as_bytes();
+            let mut buf = [0u8; 128];
+            buf.get_mut(..bytes.len())
+                .ok_or(format!("extmap URI {uri} too long"))?
+                .copy_from_slice(bytes);
+            Ok(ExtMap {
+                id,
+                direction: None,
+                uri: buf,
+                uri_len: bytes.len() as u8,
+            })
+        })
+        .collect()
+}
+
+/// The session's shard candidates as trickled `IceCandidate`s, then end-of-candidates
+/// (`a=ice-options:trickle` stays in the offer; the SFU starts no checks).
+fn trickle_candidates(
+    participant_id: u64,
+    id: SessionId,
+    sessions: &HashMap<u64, ParticipantHandle>,
+    plane: &Plane,
+) {
+    let Some(entry) = plane.transports.get(id) else {
+        return;
+    };
+    let candidates = plane.candidates(entry.shard);
+    for (index, addr) in candidates.iter().take(MAX_CANDIDATES as usize).enumerate() {
+        // Distinct interface index: distinct local preference and priority.
+        let candidate = Candidate::new_host(*addr, 1, index as u8);
+        send_to(
+            sessions,
+            participant_id,
+            SignalMessage::IceCandidate {
+                candidate: candidate.to_sdp_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+            },
+        );
+    }
+    send_to(sessions, participant_id, SignalMessage::EndOfCandidates);
+}
+
+/// `TrackPublished` to the publisher's room peers.
+fn notify_track_published(
+    publisher: u64,
+    track_id: TrackId,
+    audio: bool,
+    sessions: &HashMap<u64, ParticipantHandle>,
+    plane: &Plane,
+) {
+    let Some(room) = sessions.get(&publisher).and_then(|h| h.room_id) else {
+        return;
+    };
+    let participants = plane.state.get_participants(room);
+    for &pid in participants.iter().take(MAX_PARTICIPANTS_PER_ROOM) {
+        if pid == publisher {
+            continue;
+        }
+        send_to(
+            sessions,
+            pid,
+            SignalMessage::TrackPublished {
+                publisher_id: publisher,
+                track_id,
+                kind: if audio { "audio" } else { "video" }.to_string(),
+                content: if audio { "audio" } else { "camera" }.to_string(),
+            },
+        );
+    }
+}
+
+pub(crate) fn send_to(
+    sessions: &HashMap<u64, ParticipantHandle>,
+    participant_id: u64,
+    msg: SignalMessage,
+) {
     if let Some(handle) = sessions.get(&participant_id) {
         let _ = handle.outbound_tx.try_send(msg);
     }
 }
 
-fn send_error(
+pub(crate) fn send_error(
     sessions: &HashMap<u64, ParticipantHandle>,
     participant_id: u64,
     code: &str,
@@ -1322,7 +1181,7 @@ fn send_error(
 mod tests {
     use super::*;
 
-    fn answer(setup_line: &str, media_setup_line: &str) -> nexus_webrtc::sdp::SessionDescription {
+    fn answer(setup_line: &str, media_setup_line: &str) -> SessionDescription {
         let fp = ["AB"; 32].join(":");
         let sdp = format!(
             "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
@@ -1330,81 +1189,11 @@ mod tests {
              a=fingerprint:sha-256 {fp}\r\n{setup_line}\
              m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n{media_setup_line}"
         );
-        nexus_webrtc::sdp::SdpParser::parse(&sdp).unwrap()
-    }
-
-    /// A manager on the old path's real components, with one worker.
-    fn manager() -> (NegotiationManager, std::net::UdpSocket) {
-        use std::os::fd::AsRawFd;
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let config = nexus_webrtc::webrtc::TransportConfig::default()
-            .with_bind_addr("127.0.0.1:0".parse().unwrap());
-        let transport = WebRtcTransport::new(config).unwrap();
-        transport.start().unwrap();
-        let transport = Arc::new(transport);
-        let pool = WorkerPool::new(1, 16, socket.as_raw_fd(), false, false, 0).unwrap();
-        let state = Arc::new(DistributedState::new(
-            nexus_state::DistributedStateConfig::new(1),
-        ));
-        let manager = NegotiationManager::new(
-            transport,
-            Arc::new(SsrcRouter::new()),
-            Arc::new(RwLock::new(pool)),
-            state,
-            vec![socket.local_addr().unwrap()],
-        );
-        (manager, socket)
-    }
-
-    fn handle(
-        participant_id: u64,
-    ) -> (
-        HashMap<u64, ParticipantHandle>,
-        mpsc::Receiver<SignalMessage>,
-    ) {
-        let (tx, rx) = mpsc::channel(16);
-        let handle = ParticipantHandle {
-            outbound_tx: tx,
-            room_id: None,
-            published_tracks: Vec::new(),
-        };
-        (HashMap::from([(participant_id, handle)]), rx)
-    }
-
-    #[tokio::test]
-    async fn test_first_publish_over_the_old_path_cap_is_refused() {
-        let (mut manager, _socket) = manager();
-        let (sessions, mut rx) = handle(7);
-        manager.add_participant(7);
-        let kinds: Vec<String> = (0..=OLD_PATH_MAX_MLINES)
-            .map(|i| if i % 2 == 0 { "audio" } else { "video" }.to_string())
-            .collect();
-        let contents = vec!["camera".to_string(); kinds.len()];
-
-        manager.handle_publish(7, &kinds, &contents, &sessions);
-
-        match rx.try_recv() {
-            Ok(SignalMessage::Error { code, .. }) => assert_eq!(code, "TOO_MANY_TRACKS"),
-            other => panic!("expected TOO_MANY_TRACKS, got {:?}", other),
-        }
-        let state = &manager.states[&7];
-        assert!(
-            state.transport_id.is_none(),
-            "no transport for a refused publish"
-        );
-        assert!(!state.offer_pending);
-        assert!(state.mlines.is_empty());
-
-        // At the cap: offered.
-        let kinds = &kinds[..OLD_PATH_MAX_MLINES];
-        manager.handle_publish(7, kinds, &contents[..kinds.len()], &sessions);
-        let sent = rx.try_recv();
-        assert!(matches!(sent, Ok(SignalMessage::Offer { .. })), "{sent:?}");
-        assert_eq!(manager.states[&7].mlines.len(), OLD_PATH_MAX_MLINES);
+        SdpParser::parse(&sdp).unwrap()
     }
 
     #[test]
-    fn test_dtls_role_from_answer_setup() {
+    fn dtls_role_from_answer_setup() {
         let role = |s: &str, m: &str| NegotiationManager::dtls_role_from_answer(&answer(s, m));
         assert_eq!(role("a=setup:active\r\n", ""), Ok(DtlsRole::Server));
         assert_eq!(role("a=setup:passive\r\n", ""), Ok(DtlsRole::Client));
@@ -1412,5 +1201,59 @@ mod tests {
         assert_eq!(role("", "a=setup:passive\r\n"), Ok(DtlsRole::Client));
         assert_eq!(role("", ""), Ok(DtlsRole::Server));
         assert!(role("a=setup:actpass\r\n", "").is_err());
+        assert!(role("a=setup:holdconn\r\n", "").is_err());
+    }
+
+    #[test]
+    fn only_a_sha256_fingerprint_is_used() {
+        let sdp = answer("", "");
+        assert_eq!(
+            NegotiationManager::extract_fingerprint(&sdp),
+            Some([0xAB; 32])
+        );
+        let fp = ["CD"; 48].join(":");
+        let sdp = SdpParser::parse(&format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             a=ice-ufrag:testufrag\r\na=ice-pwd:testpwd12345678901234567890\r\n\
+             a=fingerprint:sha-384 {fp}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            NegotiationManager::extract_fingerprint(&sdp),
+            None,
+            "never truncated"
+        );
+    }
+
+    #[test]
+    fn first_sha256_fingerprint_across_levels() {
+        // Session level has only sha-384; the m-line has sha-256: that one is used.
+        let sha384 = ["CD"; 48].join(":");
+        let sha256 = ["EF"; 32].join(":");
+        let sdp = SdpParser::parse(&format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             a=ice-ufrag:testufrag\r\na=ice-pwd:testpwd12345678901234567890\r\n\
+             a=fingerprint:sha-384 {sha384}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=fingerprint:sha-256 {sha256}\r\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            NegotiationManager::extract_fingerprint(&sdp),
+            Some([0xEF; 32])
+        );
+    }
+
+    #[test]
+    fn publish_extmaps_are_the_fixed_table() {
+        let audio = publish_extmaps(0).unwrap();
+        let video = publish_extmaps(1).unwrap();
+        assert!(audio.iter().any(|e| e.id == extensions::MID));
+        assert!(audio.iter().any(|e| e.id == extensions::AUDIO_LEVEL));
+        assert!(video.iter().any(|e| e.id == extensions::VIDEO_ORIENTATION));
+        assert!(!video.iter().any(|e| e.id == extensions::AUDIO_LEVEL));
+        assert!(audio
+            .iter()
+            .chain(&video)
+            .all(|e| e.id <= 14 && e.uri_len > 0));
     }
 }

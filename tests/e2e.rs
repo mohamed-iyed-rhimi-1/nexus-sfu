@@ -15,13 +15,15 @@
 #[path = "e2e/harness.rs"]
 mod harness;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use harness::*;
 use nexus_loadtest::client::HeadlessClient;
 use nexus_loadtest::lossy::{Direction, LossRule, LossRules, PacketClass};
 use nexus_loadtest::signaling::SignalingConnection;
+use nexus_sfu::nexus_transport::dtls::DtlsRole;
+use nexus_sfu::nexus_transport::srtp::ProtectionProfile;
 use nexus_sfu::signal::SignalMessage;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 
@@ -35,9 +37,14 @@ async fn two_party_audio_video() {
     init_logging();
     let server = start_server().await;
 
-    let mut a = HeadlessClient::new(client_config(&server, "two-party"))
-        .await
-        .unwrap();
+    // A answers a=setup:active (the SFU is the DTLS server, as with browsers); B
+    // keeps webrtc-rs's default against an ICE-lite offer, passive (the SFU is the
+    // DTLS client).
+    let a_config = nexus_loadtest::ClientConfig {
+        answering_dtls_role: Some(DTLSRole::Client),
+        ..client_config(&server, "two-party")
+    };
+    let mut a = HeadlessClient::new(a_config).await.unwrap();
     let mut b = HeadlessClient::new(client_config(&server, "two-party"))
         .await
         .unwrap();
@@ -57,35 +64,82 @@ async fn two_party_audio_video() {
     tokio::time::sleep(MEDIA_WINDOW).await;
     let (a_after, b_after) = (a.track_stats(), b.track_stats());
 
-    // Each side receives exactly the other's streams: not its own echoed
-    // back, not a mix. The old data path forwards the publisher's SSRCs, so the
-    // SSRCs the SFU announces equal the published ones; the payload markers name
-    // the publisher either way.
+    // Each side receives exactly the other's streams: not its own echoed back,
+    // not a mix. The SFU rewrites SSRCs (note §9.3): what arrives is what its
+    // offer announced, never the publisher's own SSRC, and each announced SSRC
+    // carries the payload of one publisher track of the same kind (its marker).
     let (a_sent, b_sent) = (a.published_ssrcs().await, b.published_ssrcs().await);
     assert_eq!(a_sent.len(), 2, "A publishes audio and video: {a_sent:?}");
     assert_eq!(b_sent.len(), 2, "B publishes audio and video: {b_sent:?}");
-    assert_eq!(announced(&a), set(&b_sent), "A's offer announces B's SSRCs");
-    assert_eq!(announced(&b), set(&a_sent), "B's offer announces A's SSRCs");
-    check_received("A", &a_before, &a_after, &b_sent, &b_sent);
-    check_received("B", &b_before, &b_after, &a_sent, &a_sent);
+    let a_expected = expected_streams(&a, &b).await;
+    let b_expected = expected_streams(&b, &a).await;
+    for ssrc in a_expected.keys() {
+        assert!(!b_sent.contains(ssrc), "SSRC {ssrc:#x} is not rewritten");
+    }
+    for ssrc in b_expected.keys() {
+        assert!(!a_sent.contains(ssrc), "SSRC {ssrc:#x} is not rewritten");
+    }
+    check_received("A", &a_before, &a_after, &a_expected);
+    check_received("B", &b_before, &b_after, &b_expected);
+
+    // Both DTLS roles, AES-GCM negotiated (note §9: GCM first).
+    let established = server.established();
+    let role_of = |client: &HeadlessClient| {
+        let id = client.participant_id().expect("joined");
+        let session = established.iter().find(|e| e.participant == id);
+        session.unwrap_or_else(|| panic!("no DTLS session for {id}: {established:?}"))
+    };
+    let (a_dtls, b_dtls) = (role_of(&a), role_of(&b));
+    assert_eq!(a_dtls.role, DtlsRole::Server, "A answered active");
+    assert_eq!(
+        b_dtls.role,
+        DtlsRole::Client,
+        "B answered passive (ICE-lite default)"
+    );
+    assert_eq!(
+        a_dtls.profile,
+        ProtectionProfile::AeadAes128Gcm,
+        "{a_dtls:?}"
+    );
+    assert_eq!(
+        b_dtls.profile,
+        ProtectionProfile::AeadAes128Gcm,
+        "{b_dtls:?}"
+    );
+
+    // The media went through the shard (stats are published every second).
+    let shard = server.dataplane().stats(nexus_dataplane::ShardId::new(0));
+    assert!(shard.counters.tx_datagrams > 0, "{shard:?}");
+    assert_eq!(shard.counters.drop_dtls_unselected, 0, "{shard:?}");
+    assert_eq!(shard.counters.commands_rejected, 0, "{shard:?}");
 
     let _ = a.disconnect().await;
     let _ = b.disconnect().await;
     server.shutdown().await.expect("clean shutdown");
 }
 
-fn set(ssrcs: &[u32]) -> BTreeSet<u32> {
-    ssrcs.iter().copied().collect()
-}
-
-/// SSRCs the SFU's latest offer to `client` announces for tracks it sends.
-fn announced(client: &HeadlessClient) -> BTreeSet<u32> {
-    let all = client.announced_ssrcs();
-    assert!(
-        all.iter().all(|a| a.track_id.is_some()),
-        "every announced m-line is listed in the offer's tracks: {all:?}"
+/// For each SSRC the SFU's latest offer to `receiver` announces: the m-line's kind
+/// and the SSRC `publisher` publishes that kind under (what the payload marker names).
+async fn expected_streams(
+    receiver: &HeadlessClient,
+    publisher: &HeadlessClient,
+) -> BTreeMap<u32, (String, u32)> {
+    let announced = receiver.announced_ssrcs();
+    assert_eq!(
+        announced.len(),
+        2,
+        "offered the peer's two tracks: {announced:?}"
     );
-    all.iter().map(|a| a.ssrc).collect()
+    let mut expected = BTreeMap::new();
+    for a in announced {
+        assert!(a.track_id.is_some(), "m-line {} not in Offer.tracks", a.mid);
+        let published = publisher
+            .published_ssrc(a.kind == "video")
+            .await
+            .expect("publisher SSRC");
+        expected.insert(a.ssrc, (a.kind, published));
+    }
+    expected
 }
 
 async fn wait_for_tracks(a: &HeadlessClient, b: &HeadlessClient, n: usize, timeout: Duration) {
@@ -105,39 +159,25 @@ async fn wait_for_tracks(a: &HeadlessClient, b: &HeadlessClient, n: usize, timeo
 
 /// Per received track over the window: packets arrive at a plausible rate,
 /// sequence numbers are continuous, timestamps advance, and the SSRC stays
-/// the same (exactly one audio and one video stream, no new SSRCs). Arriving
-/// SSRCs are `expected_ssrcs`; the payload markers must name one of
-/// `publisher_ssrcs` (the peer's own) and arrive unchanged.
+/// the same (exactly one audio and one video stream, no new SSRCs). The arriving
+/// SSRCs are the keys of `expected`; each carries the kind and the publisher SSRC
+/// its payload markers must name, unchanged.
 fn check_received(
     who: &str,
     before: &[nexus_loadtest::TrackRxStats],
     after: &[nexus_loadtest::TrackRxStats],
-    expected_ssrcs: &[u32],
-    publisher_ssrcs: &[u32],
+    expected: &BTreeMap<u32, (String, u32)>,
 ) {
     let received: BTreeSet<u32> = after.iter().map(|t| t.ssrc).collect();
+    let wanted: BTreeSet<u32> = expected.keys().copied().collect();
     assert_eq!(
-        received,
-        set(expected_ssrcs),
+        received, wanted,
         "{who}: must receive exactly the peer's streams"
     );
-    let kinds: BTreeSet<&str> = after.iter().map(|t| t.kind.as_str()).collect();
     assert_eq!(
         after.len(),
         2,
         "{who}: exactly two SSRCs received: {after:?}"
-    );
-    assert_eq!(
-        kinds,
-        BTreeSet::from(["audio", "video"]),
-        "{who}: {after:?}"
-    );
-
-    let markers: BTreeSet<Option<u32>> = after.iter().map(|t| t.marker_ssrc).collect();
-    assert_eq!(
-        markers.len(),
-        2,
-        "{who}: one publisher SSRC per track: {after:?}"
     );
 
     let window = MEDIA_WINDOW.as_secs();
@@ -152,10 +192,10 @@ fn check_received(
             track.kind,
             track.ssrc
         );
-        let expected = track.expected_packets();
+        let span = track.expected_packets();
         assert!(
-            track.missing_packets() * 100 <= expected,
-            "{who}: {} track lost {} of {expected} packets on loopback",
+            track.missing_packets() * 100 <= span,
+            "{who}: {} track lost {} of {span} packets on loopback",
             track.kind,
             track.missing_packets()
         );
@@ -163,10 +203,13 @@ fn check_received(
         assert!(track.markers > 0, "{who}: no payload marker: {track:?}");
         assert_eq!(track.marker_mismatches, 0, "{who}: {track:?}");
         assert_eq!(track.marker_regressions, 0, "{who}: {track:?}");
-        let publisher = track.marker_ssrc.expect("marker read");
-        assert!(
-            publisher_ssrcs.contains(&publisher),
-            "{who}: marker names {publisher:#x}, not a peer SSRC {publisher_ssrcs:?}"
+        let (kind, publisher) = &expected[&track.ssrc];
+        assert_eq!(&track.kind, kind, "{who}: {track:?}");
+        assert_eq!(
+            track.marker_ssrc,
+            Some(*publisher),
+            "{who}: SSRC {:#x} must carry publisher SSRC {publisher:#x}",
+            track.ssrc
         );
         assert_ne!(
             track.last_timestamp, track.first_timestamp,
@@ -182,7 +225,7 @@ async fn candidate_is_announced_address() {
     let _serial = SERIAL.lock().await;
     init_logging();
     let server = start_server().await;
-    let expected = std::net::SocketAddr::new(announced_ip(), server.media_addr().port());
+    let expected = std::net::SocketAddr::new(announced_ip(), server.media_addrs()[0].port());
     assert_eq!(server.candidate_addrs(), &[expected]);
 
     let options = client_config(&server, "candidates").connection;
@@ -281,6 +324,10 @@ async fn dtls_survives_lost_first_flight() {
         dropped[13], 1,
         "dropped the SFU's ClientHello: {dropped:02x?}"
     );
+    let established = server.established();
+    assert_eq!(established.len(), 1, "{established:?}");
+    assert_eq!(established[0].role, DtlsRole::Client);
+    assert_eq!(established[0].profile, ProtectionProfile::AeadAes128Gcm);
 
     let _ = client.disconnect().await;
     server.shutdown().await.expect("clean shutdown");

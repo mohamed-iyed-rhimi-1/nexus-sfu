@@ -420,8 +420,6 @@ pub struct Sfu {
     arena_drops: DropTracker,
 
     packets_processed: u64,
-    /// Cold-path channel: STUN/DTLS packets → ConnectionMonitor in orchestrator.
-    connection_tx: Option<mpsc::Sender<crate::orchestrator::events::ColdPathPacket>>,
 }
 
 impl Sfu {
@@ -624,18 +622,7 @@ impl Sfu {
             worker_queue_drops: DropTracker::default(),
             arena_drops: DropTracker::default(),
             packets_processed: 0,
-            connection_tx: None,
         })
-    }
-
-    /// Get the SFU configuration.
-    #[inline]
-    /// Set the cold-path channel sender for STUN/DTLS packets.
-    pub fn set_connection_tx(
-        &mut self,
-        tx: mpsc::Sender<crate::orchestrator::events::ColdPathPacket>,
-    ) {
-        self.connection_tx = Some(tx);
     }
 
     /// Address the media socket is bound to, with the real port when the
@@ -1186,14 +1173,9 @@ impl Sfu {
                 return;
             }
 
-            // Cold path: STUN/DTLS → ConnectionMonitor via channel
+            // STUN/DTLS went to the old orchestrator, which now drives the new data
+            // plane: `Sfu` is no longer started (Phase 1.5b) and drops them.
             if packet_type == PacketType::Stun || packet_type == PacketType::Dtls {
-                if let Some(ref tx) = self.connection_tx {
-                    let _ = tx.try_send(crate::orchestrator::events::ColdPathPacket {
-                        data: data.to_vec(),
-                        source_addr,
-                    });
-                }
                 return;
             }
 

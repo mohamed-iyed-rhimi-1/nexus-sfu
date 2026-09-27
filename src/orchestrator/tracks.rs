@@ -22,6 +22,9 @@ pub struct TrackInfo {
     pub session: SessionId,
     /// Publisher's shard.
     pub shard: ShardId,
+    /// The room the track was published in: only participants of this room may
+    /// subscribe to it.
+    pub room: u32,
     /// What the publisher's answer said (kind, mid, SSRC, codec, extension ids), plus the
     /// SFU-assigned cname `nexus-{publisher}`.
     pub spec: TrackSpec,
@@ -133,6 +136,7 @@ mod tests {
             publisher,
             session: SessionId::new(publisher),
             shard: ShardId::new(0),
+            room: 1,
             spec: TrackSpec {
                 kind,
                 mid: MidValue::new(b"0").unwrap(),

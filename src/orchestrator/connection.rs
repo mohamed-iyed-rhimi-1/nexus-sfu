@@ -1,267 +1,175 @@
-//! ConnectionMonitor: owns the WebRTC connection lifecycle.
+//! Connection lifecycle on the data plane's events (design note §6.3, §6.4).
 //!
-//! Processes STUN/DTLS packets forwarded from the packet loop,
-//! runs timer-driven polls (ICE pacing, DTLS retransmit, consent, cleanup),
-//! and emits `SessionEvent`s when sessions transition state.
+//! The shard runs ICE-lite and moves DTLS datagrams; this module runs the DTLS
+//! handshake on them, installs SRTP when it completes, frees the OpenSSL state once the
+//! peer's SRTP authenticates, and closes sessions on `ConsentLost` and the timeouts.
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::time::{interval, Duration, Interval};
-use tracing::{debug, info};
+use nexus_dataplane::{Event, RejectReason, SessionId};
+use tokio::time::{interval, Interval, MissedTickBehavior};
+use tracing::{debug, error, info, warn};
 
-use nexus_webrtc::webrtc::{SessionState, TransportId, WebRtcTransport};
+use super::dtls::{HandshakeError, Progress};
+use super::events::DisconnectReason;
+use super::plane::Plane;
+use super::transports::Expired;
 
-use super::events::{ColdPathPacket, DisconnectReason, SessionEvent};
+/// DTLS retransmission timer period.
+pub const DTLS_TICK: Duration = Duration::from_millis(200);
+/// Timeout sweep period (ICE connect, DTLS handshake, pending closes).
+pub const SWEEP_TICK: Duration = Duration::from_secs(1);
 
-/// Idle timeout before session cleanup.
-const SESSION_IDLE_TIMEOUT_SECS: u64 = 30;
-
-/// Shared UDP send capability.
-///
-/// Uses a raw UdpSocket for sending STUN/DTLS responses.
-/// The packet loop keeps its own MediaTransport for recv + send.
-#[derive(Clone)]
-pub struct PacketSender {
-    socket: Arc<std::net::UdpSocket>,
+/// The orchestrator's timers.
+pub struct ConnectionTimers {
+    /// Drives `poll_dtls`.
+    pub dtls: Interval,
+    /// Drives `sweep`.
+    pub sweep: Interval,
 }
 
-impl PacketSender {
-    pub fn new(socket: Arc<std::net::UdpSocket>) -> Self {
-        Self { socket }
+impl ConnectionTimers {
+    pub fn new() -> Self {
+        let mut dtls = interval(DTLS_TICK);
+        let mut sweep = interval(SWEEP_TICK);
+        dtls.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Self { dtls, sweep }
     }
+}
 
-    #[inline]
-    pub fn send(&self, data: &[u8], dest: SocketAddr) {
-        if let Err(e) = self.socket.send_to(data, dest) {
-            debug!("PacketSender: failed to send to {}: {:?}", dest, e);
+impl Default for ConnectionTimers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Handle one data-plane event.
+pub fn handle_event(event: Event, plane: &mut Plane) {
+    match event {
+        Event::DtlsDatagram { id, bytes } => on_dtls_datagram(id, &bytes, plane),
+        Event::AddressSelected { id, addr, reason } => {
+            let Some(entry) = plane.transports.get_mut(id) else {
+                return;
+            };
+            let first = entry.mark_address_selected(Instant::now());
+            info!(participant = entry.participant, %addr, ?reason, "address selected");
+            if first {
+                let result = entry.dtls.on_address_selected();
+                apply_progress(id, result, plane);
+            }
+        }
+        Event::PeerSrtpVerified { id } => {
+            if let Some(entry) = plane.transports.get_mut(id) {
+                let freed = entry.dtls.free_ssl();
+                debug!(participant = entry.participant, freed, "peer SRTP verified");
+            }
+        }
+        Event::ConsentLost { id } => {
+            if let Some(participant) = plane.transports.participant_of(id) {
+                info!(participant, "consent lost");
+                plane.close_participant(participant, DisconnectReason::ConsentExpired);
+            }
+        }
+        Event::CommandRejected { id, reason } => on_rejected(id, reason, plane),
+    }
+}
+
+fn on_dtls_datagram(id: SessionId, bytes: &[u8], plane: &mut Plane) {
+    let Some(entry) = plane.transports.get_mut(id) else {
+        return;
+    };
+    match entry.dtls.process(bytes) {
+        Err(HandshakeError::InvalidDatagram(len)) => {
+            debug!(
+                participant = entry.participant,
+                len, "DTLS datagram refused"
+            );
+        }
+        result => apply_progress(id, result, plane),
+    }
+}
+
+/// Send a handshake step's datagrams and install SRTP when it completed; a failed
+/// step closes the session.
+fn apply_progress(id: SessionId, result: Result<Progress, HandshakeError>, plane: &mut Plane) {
+    let Some(participant) = plane.transports.participant_of(id) else {
+        return;
+    };
+    match result {
+        Ok(progress) => {
+            plane.send_datagrams(id, progress.datagrams);
+            if progress.completed {
+                plane.install_srtp(id);
+            }
+        }
+        Err(e) => {
+            warn!(participant, "DTLS handshake failed: {e}");
+            plane.close_participant(participant, DisconnectReason::DtlsFailed);
         }
     }
 }
 
-/// Monitors WebRTC connection lifecycle via timers and cold-path packets.
-pub struct ConnectionMonitor {
-    webrtc_transport: Arc<WebRtcTransport>,
-    packet_sender: PacketSender,
-    /// Sessions already known to be Established — avoids duplicate events.
-    established: HashSet<u64>,
-    /// Timer intervals (public so orchestrator can use them in select!).
-    pub ice_interval: Interval,
-    pub dtls_interval: Interval,
-    pub consent_interval: Interval,
-    pub cleanup_interval: Interval,
+/// A refused command. Unknown ids are expected after removals (a `RemoveTrack` takes
+/// the subscriptions to the track with it). Anything else closes the participant: the
+/// orchestrator checks the limits and specs before it sends, so a refusal means the
+/// shard is full (`Overloaded`) or the two disagree (`Internal`). The event names the
+/// session, not the track or subscription, so the registration cannot be undone
+/// selectively; a session whose tables disagree with the shard's is not kept.
+fn on_rejected(id: Option<SessionId>, reason: RejectReason, plane: &mut Plane) {
+    let participant = id.and_then(|id| plane.transports.participant_of(id));
+    let close = match reason {
+        RejectReason::UnknownSession
+        | RejectReason::UnknownTrack
+        | RejectReason::UnknownSubscription => {
+            debug!(?participant, ?reason, "command for a removed object");
+            return;
+        }
+        RejectReason::SessionLimit | RejectReason::TrackLimit | RejectReason::SubscriptionLimit => {
+            warn!(?participant, ?reason, "shard limit reached");
+            DisconnectReason::Overloaded
+        }
+        _ => {
+            error!(
+                ?participant,
+                ?reason,
+                "shard refused a command: orchestrator bug"
+            );
+            DisconnectReason::Internal
+        }
+    };
+    match participant {
+        Some(p) => plane.close_participant(p, close),
+        None => warn!(?id, ?reason, "refused command for an unknown session"),
+    }
 }
 
-impl ConnectionMonitor {
-    pub fn new(webrtc_transport: Arc<WebRtcTransport>, packet_sender: PacketSender) -> Self {
-        Self {
-            webrtc_transport,
-            packet_sender,
-            established: HashSet::with_capacity(256),
-            ice_interval: interval(Duration::from_millis(50)),
-            dtls_interval: interval(Duration::from_millis(200)),
-            consent_interval: interval(Duration::from_secs(5)),
-            cleanup_interval: interval(Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS)),
-        }
-    }
-
-    /// Process a STUN or DTLS packet forwarded from the packet loop.
-    /// Returns any session lifecycle events triggered by the packet.
-    pub fn process_incoming(&mut self, packet: ColdPathPacket) -> Vec<SessionEvent> {
-        let mut out_buf = [0u8; 2048];
-        let result =
-            self.webrtc_transport
-                .process_packet(&packet.data, packet.source_addr, &mut out_buf);
-
-        match result {
-            Ok(Some((session_id, incoming_data))) => {
-                use nexus_webrtc::webrtc::IncomingData;
-                match incoming_data {
-                    IncomingData::Stun(response) => {
-                        self.packet_sender.send(&response, packet.source_addr);
-                    }
-                    IncomingData::Dtls(response) => {
-                        self.packet_sender.send(&response, packet.source_addr);
-                    }
-                    IncomingData::StunAndDtls(stun_response, dtls_flight) => {
-                        self.packet_sender.send(&stun_response, packet.source_addr);
-                        self.packet_sender.send(&dtls_flight, packet.source_addr);
-                    }
-                    // RTP/RTCP should not arrive here — packet loop handles them inline.
-                    IncomingData::Rtp(_) | IncomingData::Rtcp(_) | IncomingData::None => {}
-                }
-                self.check_established(session_id)
-            }
-            Ok(None) => Vec::new(),
-            Err(e) => {
-                debug!(
-                    "Cold-path packet error from {}: {:?}",
-                    packet.source_addr, e
-                );
-                Vec::new()
-            }
-        }
-    }
-
-    /// Poll ICE connectivity checks and retransmissions for all sessions.
-    pub fn poll_ice(&mut self) -> Vec<SessionEvent> {
-        let session_ids = self.webrtc_transport.session_ids();
-        let mut events = Vec::new();
-
-        for session_id in session_ids {
-            let poll_result = self
-                .webrtc_transport
-                .with_session_mut(session_id, |session| {
-                    let (packets, dtls_flight) = session.poll_ice_outbound();
-                    let remote = session.remote_addr();
-                    if !packets.is_empty() || dtls_flight.is_some() {
-                        Some((packets, dtls_flight, remote))
-                    } else {
-                        None
-                    }
-                });
-
-            if let Some(Some((packets, dtls_flight, remote))) = poll_result {
-                for (dest_addr, stun_request) in &packets {
-                    self.packet_sender.send(stun_request, *dest_addr);
-                }
-                if let Some(ref dtls_data) = dtls_flight {
-                    if let Some(addr) = remote {
-                        self.packet_sender.send(dtls_data, addr);
-                    }
-                }
-                events.extend(self.check_established(session_id));
-            }
-        }
-        events
-    }
-
-    /// Poll DTLS retransmissions for sessions in DtlsHandshaking state.
-    pub fn poll_dtls(&mut self) -> Vec<SessionEvent> {
-        let session_ids = self.webrtc_transport.session_ids();
-        let mut events = Vec::new();
-
-        for session_id in session_ids {
-            let dtls_result = self
-                .webrtc_transport
-                .with_session_mut(session_id, |session| session.poll_dtls_retransmit());
-
-            if let Some(Some((dest_addr, data))) = dtls_result {
-                self.packet_sender.send(&data, dest_addr);
-                events.extend(self.check_established(session_id));
-            }
-        }
-        events
-    }
-
-    /// Send consent keepalives to all established sessions (RFC 7675).
-    ///
-    /// Uses STUN Binding Requests with proper credentials per RFC 7675 §5.1.
-    /// Falls back to Binding Indications if credentials are unavailable.
-    pub fn poll_consent(&mut self) -> Vec<SessionEvent> {
-        let failed = self.webrtc_transport.check_consent_freshness();
-        let mut events = Vec::new();
-
-        // Emit Disconnected for sessions that failed consent
-        for session_id in &failed {
-            let sid = session_id.value();
-            self.established.remove(&sid);
-            events.push(SessionEvent::Disconnected {
-                session_id: sid,
-                reason: DisconnectReason::ConsentExpired,
-            });
-        }
-
-        // Send STUN binding requests to healthy established sessions
-        let session_ids = self.webrtc_transport.session_ids();
-        for sid in session_ids {
-            let consent_info = self.webrtc_transport.with_session(sid, |session| {
-                if session.state() != SessionState::Established {
-                    return None;
-                }
-                let remote = session.remote_addr()?;
-                let local_creds = session.local_ice_credentials();
-                let remote_ufrag = session.remote_ice_ufrag()?.to_string();
-                let remote_pwd = session.remote_ice_pwd()?.to_string();
-                Some((
-                    remote,
-                    local_creds.local_ufrag.clone(),
-                    remote_ufrag,
-                    remote_pwd,
-                ))
-            });
-
-            if let Some(Some((remote, local_ufrag, remote_ufrag, remote_pwd))) = consent_info {
-                // RFC 7675: Use Binding Request with proper USERNAME and MESSAGE-INTEGRITY
-                let username = format!("{}:{}", remote_ufrag, local_ufrag);
-                let txn: [u8; 12] = rand::random();
-                let mut buf = [0u8; 256];
-                let len = nexus_transport::ice::stun::server::create_binding_request(
-                    &mut buf,
-                    &txn,
-                    &username,
-                    0,     // Priority: not relevant for consent
-                    false, // SFU is controlled agent
-                    0,     // Tie-breaker: not relevant for consent
-                    false, // No USE-CANDIDATE for consent
-                    &remote_pwd,
-                );
-                self.packet_sender.send(&buf[..len], remote);
-            } else if let Some(Some(remote)) = self.webrtc_transport.with_session(sid, |session| {
-                if session.state() == SessionState::Established {
-                    session.remote_addr()
-                } else {
-                    None
-                }
-            }) {
-                // Fallback: Binding Indication if credentials not yet available
-                let mut buf = [0u8; 20];
-                let txn: [u8; 12] = rand::random();
-                let len = nexus_transport::ice::stun::create_binding_indication(&mut buf, &txn);
-                self.packet_sender.send(&buf[..len], remote);
-            }
-        }
-        events
-    }
-
-    /// Remove idle sessions and emit Disconnected events.
-    pub fn cleanup_idle(&mut self) -> Vec<SessionEvent> {
-        let removed = self
-            .webrtc_transport
-            .cleanup_idle_sessions(SESSION_IDLE_TIMEOUT_SECS);
-        let mut events = Vec::with_capacity(removed.len());
-
-        for session_id in removed {
-            let sid = session_id.value();
-            self.established.remove(&sid);
-            events.push(SessionEvent::Disconnected {
-                session_id: sid,
-                reason: DisconnectReason::IdleTimeout,
-            });
-            info!("Cleaned up idle session {}", sid);
-        }
-        events
-    }
-
-    /// Check if a session just transitioned to Established.
-    /// Returns a one-shot event if this is the first time we see it.
-    fn check_established(&mut self, transport_id: TransportId) -> Vec<SessionEvent> {
-        let sid = transport_id.value();
-        if self.established.contains(&sid) {
-            return Vec::new();
-        }
-
-        let is_established = self.webrtc_transport.with_session(transport_id, |session| {
-            session.state() == SessionState::Established
+/// DTLS retransmissions for every running handshake.
+pub fn poll_dtls(plane: &mut Plane) {
+    for id in plane.transports.handshaking() {
+        let Some(entry) = plane.transports.get_mut(id) else {
+            continue;
+        };
+        let result = entry.dtls.handle_timeout().map(|datagrams| Progress {
+            datagrams,
+            completed: false,
         });
-
-        if is_established == Some(true) {
-            self.established.insert(sid);
-            info!("Session {} established", sid);
-            vec![SessionEvent::Established { session_id: sid }]
-        } else {
-            Vec::new()
-        }
+        apply_progress(id, result, plane);
     }
+}
+
+/// Close sessions whose ICE-connect or DTLS timeout expired; retry pending closes.
+pub fn sweep(plane: &mut Plane, now: Instant) {
+    for (id, expired) in plane.transports.sweep(now) {
+        let Some(participant) = plane.transports.participant_of(id) else {
+            continue;
+        };
+        let reason = match expired {
+            Expired::IceConnect => DisconnectReason::IceFailed,
+            Expired::DtlsHandshake => DisconnectReason::DtlsFailed,
+        };
+        info!(participant, ?expired, "session timed out");
+        plane.close_participant(participant, reason);
+    }
+    plane.retry_pending_closes();
 }

@@ -275,14 +275,13 @@ fn build_context(pkey: &PKey<Private>, x509: &X509) -> Result<SslContext, DtlsEr
     ctx.set_cipher_list("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256")
         .map_err(|e| err("ciphers", e))?;
 
-    // SRTP profiles — prefer AES128_CM_SHA1_80 for interoperability.
-    // While RFC 8827 §6.5 recommends GCM, webrtc-rs (used in loadtest)
-    // and some browser versions have incomplete GCM-SRTP support.
-    // AES128_CM_SHA1_80 is universally supported. GCM is offered as
-    // fallback for clients that prefer it.
+    // SRTP profiles: AEAD_AES_128_GCM first (RFC 8827 §6.5; design note §9:
+    // GCM on ring is the fast path), AES128_CM_SHA1_80 for peers without GCM.
+    // As DTLS server, OpenSSL picks the first profile of this list the client
+    // offers; as client, the peer's server chooses.
     ctx.set_tlsext_use_srtp(&format!(
         "{}:{}",
-        SRTP_AES128_CM_SHA1_80, SRTP_AEAD_AES_128_GCM
+        SRTP_AEAD_AES_128_GCM, SRTP_AES128_CM_SHA1_80
     ))
     .map_err(|e| err("srtp ext", e))?;
 

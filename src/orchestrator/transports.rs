@@ -289,6 +289,18 @@ impl Transports {
         self.entries.get(&id).map(|entry| entry.participant)
     }
 
+    /// Sessions whose DTLS handshake is running (retransmission timer), in id order.
+    pub fn handshaking(&self) -> Vec<SessionId> {
+        let mut ids: Vec<SessionId> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.dtls.holds_ssl() && !e.dtls.is_complete() && !e.dtls.is_failed())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Sessions whose ICE-connect or DTLS timeout expired at `now`, in id order.
     pub fn sweep(&self, now: Instant) -> Vec<(SessionId, Expired)> {
         let mut expired: Vec<(SessionId, Expired)> = self

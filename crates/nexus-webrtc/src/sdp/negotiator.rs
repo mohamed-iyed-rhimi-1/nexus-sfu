@@ -192,6 +192,12 @@ pub enum OfferMline<'a> {
     ///
     /// `rtcp_fbs` is the feedback the subscriber may send, as `(type, params)`, offered
     /// on the m-line's first codec only.
+    ///
+    /// `keep_pt`: offer the negotiated codec under its own PT even if another m-line
+    /// uses that PT. Right when every m-line maps the PT to the same codec (the MID
+    /// extension demuxes, as in browsers' own offers), and required for a stable
+    /// offer: without it the PT of this m-line changes as soon as a later offer adds
+    /// a recycled m-line holding it, while the sender keeps using the old one.
     Track {
         ssrc: u32,
         media_kind: u8,
@@ -199,6 +205,7 @@ pub enum OfferMline<'a> {
         stream_id: &'a str,
         cname: &'a str,
         rtcp_fbs: &'a [(&'a str, &'a str)],
+        keep_pt: bool,
     },
 }
 
@@ -805,6 +812,7 @@ impl SdpNegotiator {
                 stream_id: t.stream_id,
                 cname: t.cname,
                 rtcp_fbs: t.rtcp_fbs,
+                keep_pt: false,
             }))
             .collect();
         self.create_ordered_offer(
@@ -1082,6 +1090,7 @@ impl SdpNegotiator {
                     stream_id,
                     cname,
                     rtcp_fbs,
+                    keep_pt,
                 } => {
                     // Precondition: SSRC must be non-zero
                     assert!(ssrc != 0, "SSRC must be non-zero");
@@ -1129,7 +1138,7 @@ impl SdpNegotiator {
                                 value: c.payload_type.to_string(),
                             });
                         }
-                        if used_pts[c.payload_type as usize] {
+                        if used_pts[c.payload_type as usize] && !keep_pt {
                             // Find an unused dynamic PT (96-127, RFC 3551 §6)
                             let mut new_pt = None;
                             for pt in 96..=127u8 {
@@ -1304,6 +1313,7 @@ mod tests {
                 stream_id: "nexus-stream-1111",
                 cname: "nexus-1111",
                 rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
+                keep_pt: false,
             },
             OfferMline::Track {
                 ssrc: 2222,
@@ -1312,6 +1322,7 @@ mod tests {
                 stream_id: "nexus-stream-2222",
                 cname: "nexus-2222",
                 rtcp_fbs: LEGACY_TRACK_AUDIO_FBS,
+                keep_pt: false,
             },
             OfferMline::Recycled(recycled("4", 1, &vp8, Direction::Inactive)),
         ];
@@ -1353,6 +1364,7 @@ mod tests {
                 stream_id: "nexus-1",
                 cname: "nexus-1",
                 rtcp_fbs: fbs,
+                keep_pt: false,
             }];
             test_negotiator().create_ordered_offer(
                 1,
@@ -1380,6 +1392,36 @@ mod tests {
     }
 
     #[test]
+    fn test_keep_pt_offers_the_codec_under_its_own_pt() {
+        use super::super::Direction;
+        let vp8 = RtpCodec::parse(96, "VP8/90000").unwrap();
+        let publish = [vp8.clone()];
+        let offer = |keep_pt: bool| {
+            let mlines = [
+                OfferMline::Track {
+                    ssrc: 7,
+                    media_kind: 1,
+                    mid: "0",
+                    stream_id: "nexus-1",
+                    cname: "nexus-1",
+                    rtcp_fbs: &[],
+                    keep_pt,
+                },
+                OfferMline::Recycled(recycled("1", 1, &publish, Direction::RecvOnly)),
+            ];
+            test_negotiator()
+                .create_ordered_offer(1, 2, &mlines, 1, &[], &[], Some(&vp8), None, None, None)
+                .unwrap()
+        };
+        // Remapped away from the recycled m-line's 96 without keep_pt...
+        assert_eq!(offer(false).1, vec![97]);
+        // ...kept with it, so the m-line's PT is the same in every offer.
+        let (sdp, pts) = offer(true);
+        assert_eq!(pts, vec![96]);
+        assert_eq!(sdp.matches("a=rtpmap:96 VP8/90000").count(), 2, "{sdp}");
+    }
+
+    #[test]
     fn test_legacy_offer_is_unchanged() {
         // Pinned before the Track m-line rtcp-fb became a parameter (1.5b-prep):
         // the old data path must keep offering exactly this.
@@ -1402,6 +1444,7 @@ mod tests {
                 stream_id: "nexus-7",
                 cname: "nexus-7",
                 rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
+                keep_pt: false,
             },
             OfferMline::Recycled(recycled("1", 1, &vp8, Direction::RecvOnly)),
             OfferMline::Recycled(recycled("2", 0, &opus, Direction::Inactive)),
@@ -1510,6 +1553,7 @@ mod tests {
                         } else {
                             LEGACY_TRACK_VIDEO_FBS
                         },
+                        keep_pt: false,
                     }
                 }
             })
@@ -1617,6 +1661,7 @@ mod tests {
             stream_id: "nexus-9",
             cname: "nexus-9",
             rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
+            keep_pt: false,
         }];
         let (sdp, _) = test_negotiator()
             .create_ordered_offer(1, 1, &mlines, 1, &[], &[], None, None, None, None)
@@ -1652,6 +1697,7 @@ mod tests {
                 stream_id,
                 cname,
                 rtcp_fbs: LEGACY_TRACK_AUDIO_FBS,
+                keep_pt: false,
             }];
             test_negotiator().create_ordered_offer(
                 1,
@@ -1711,6 +1757,7 @@ mod tests {
                 stream_id: "nexus-7",
                 cname: "nexus-7",
                 rtcp_fbs: LEGACY_TRACK_VIDEO_FBS,
+                keep_pt: false,
             },
         ];
         let (ordered, _) = negotiator

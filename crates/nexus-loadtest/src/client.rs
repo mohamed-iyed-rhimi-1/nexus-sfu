@@ -926,6 +926,16 @@ impl HeadlessClient {
             .is_some_and(|pc| pc.connection_state() == RTCPeerConnectionState::Connected)
     }
 
+    /// SSRC of the published `video` (else audio) track, once publishing started.
+    pub async fn published_ssrc(&self, video: bool) -> Option<u32> {
+        let sender = if video {
+            self.video_sender.as_ref()
+        } else {
+            self.audio_sender.as_ref()
+        }?;
+        Some(sender_ssrc(sender).await).filter(|&ssrc| ssrc != 0)
+    }
+
     /// SSRCs this client sends on (one per published track).
     pub async fn published_ssrcs(&self) -> Vec<u32> {
         let Some(pc) = self.peer_connection.as_ref() else {

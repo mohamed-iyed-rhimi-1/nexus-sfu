@@ -306,6 +306,12 @@ impl ApiServer {
         assert!(self.state.is_ready.load(Ordering::SeqCst));
     }
 
+    /// A handle that sets `/ready` while the server runs (`run` consumes the server):
+    /// the SFU turns it off when its data plane stops.
+    pub fn readiness(&self) -> Readiness {
+        Readiness(Arc::clone(&self.state))
+    }
+
     /// Run the API server.
     ///
     /// This method blocks until the server is shut down.
@@ -390,6 +396,23 @@ async fn jwt_auth_middleware(
 /// No authentication required.
 async fn health_handler() -> impl IntoResponse {
     Json(HealthResponse { status: "ok" })
+}
+
+/// Sets what `/ready` reports, from outside the running server.
+#[derive(Clone)]
+pub struct Readiness(Arc<AppState>);
+
+impl Readiness {
+    /// `/ready` returns 200 when `ready`, else 503.
+    pub fn set(&self, ready: bool) {
+        self.0.set_ready(ready);
+        debug_assert_eq!(self.get(), ready);
+    }
+
+    /// What `/ready` reports now.
+    pub fn get(&self) -> bool {
+        self.0.is_ready.load(Ordering::SeqCst)
+    }
 }
 
 /// GET /ready - Readiness check endpoint
@@ -600,6 +623,17 @@ mod tests {
         assert!(!server.state.is_ready.load(Ordering::SeqCst));
         server.set_ready();
         assert!(server.state.is_ready.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_readiness_handle_turns_ready_off() {
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let server = ApiServer::new(addr, &test_secret(), None);
+        let readiness = server.readiness();
+        server.set_ready();
+        assert!(readiness.get());
+        readiness.set(false);
+        assert!(!server.state.is_ready.load(Ordering::SeqCst));
     }
 
     #[test]

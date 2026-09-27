@@ -1039,6 +1039,102 @@ the loadtest client changes land before, in 1.5b-prep.
 - Work on a local branch (`phase-1-switch-wip`) in stages, squashed into the one switch
   commit on `phase-1`.
 
+**Code notes (implementation, 2026-09-27):**
+- New `src/orchestrator/plane.rs` (a file the plan did not list): `Plane` holds the
+  dataplane handle, placement, shard candidates, the certificate, `Transports`,
+  `TrackRegistry`, `IdAllocator` and the `DistributedState`. Every command goes through
+  `Plane::push`; a full queue records the participant as closing (`Overloaded`) and the
+  operation stops. `close_session` falls back to `pending_close`, retried by the 1 s sweep.
+  Failures anywhere (DTLS, consent, timeouts, shard refusals of orchestrator bugs) are
+  recorded with `close_participant` and handled by `SessionOrchestrator::settle` after each
+  step: `Error{<reason code>}` to the client, room leave, cleanup.
+- `SessionEvent` is gone with `ColdPathPacket`: `events.rs` keeps `DisconnectReason`
+  (`ConsentExpired`, `IceFailed`, `DtlsFailed`, `Overloaded`, `Internal`; `IdleTimeout`
+  removed) with the error code sent to the client.
+- Candidates are trickled synchronously after the first offer (no gathering task or
+  channel); remote candidates are ignored.
+- Publish m-lines: VP8 96 / Opus 111, the fixed extmaps, rtcp-fb `nack pli` + `ccm fir`
+  on video. Subscribe m-lines: VP8/Opus passed explicitly (remapped by the negotiator when
+  a publish m-line holds the PT), `stream_id` = `cname` = `nexus-{publisher}`, same rtcp-fb.
+- An answer is applied only if it has the offered mids in order; otherwise `INVALID_ANSWER`
+  and the offer is settled. Unknown track ids in `Subscribe` are left out of `Subscribed`.
+- `Unpublish` and a publisher leaving: `RemoveTrack`/`CloseSession`, then every subscriber
+  m-line of those tracks turns inactive and the subscribers are re-offered.
+- `use_srtp` is `AEAD_AES_128_GCM:AES128_CM_SHA1_80`; the "DTLS established" log carries
+  the role and the negotiated profile. E2E: GCM with both roles.
+- `ServerHandle`: `media_addrs()`, `dataplane()` (stats), `is_finished()` = shards
+  stopped; `shutdown` = notice + drain, shared flag, tasks, then `dataplane.shutdown()` and
+  gossip stop in `spawn_blocking`. `MetricsCollector::new(shards)`: no worker feeds it.
+
+**Code notes (review fixes, 2026-09-27):**
+- **Rooms.** `Publish` needs a room (`NOT_IN_ROOM`); `TrackInfo.room` records where a track
+  was published, and `Subscribe` accepts only tracks of the subscriber's room (others are
+  left out of `Subscribed`, as unknown ids are).
+- **Limits are the shard's.** Published tracks per session ≤ `MAX_TRACKS_PER_SESSION` (10),
+  counting registered, in-offer and queued ones; subscriptions ≤ `MAX_SUBS_PER_SESSION` (31);
+  beyond either, `TOO_MANY_TRACKS`. Both constants are re-exported by `nexus-dataplane`.
+- **Shard refusals close.** `CommandRejected` names the session, not the track or the
+  subscription, so a registration cannot be undone selectively: `SessionLimit`,
+  `TrackLimit`, `SubscriptionLimit` close the participant as `Overloaded`, any other
+  refusal (`InvalidSpec`, `SsrcInUse`, `OutSsrcNotMonotonic`, ...) as `Internal`. Only
+  unknown-id refusals (expected after removals) are logged and ignored.
+- **Publish flow.** A `Publish` during an open offer is appended to the queue (bounded by the
+  track limit), not overwritten; `INVALID_ANSWER` settles the offer and replays the queued
+  publish/renegotiation; `Unpublish` turns the publish m-line inactive, and the next publish
+  or subscription of that kind reuses it (`claim_mline`).
+- **Fingerprint.** The first sha-256 fingerprint, session level then m-lines in order.
+- **Stable PTs (found by the browser check).** A participant that subscribed before it
+  published had its subscribe m-line's VP8 moved from 96 to 97 by the next offer (the
+  negotiator remapped Track PTs that collide with a recycled m-line), while the shard kept
+  the first answer's PT map: Chrome counted the packets and decoded nothing. The e2e
+  clients always publish first, so they never saw it. `OfferMline::Track { keep_pt }`
+  offers the codec under its own PT; the orchestrator sets it (VP8 is 96 and Opus 111 on
+  every m-line, the MID extension demuxes); the old path passes `false` and its pinned
+  offer is unchanged. Regression test `subscribe_mline_keeps_its_pt_when_a_publish_mline_follows`.
+- **Observability.** `ServerHandle::established()` lists established sessions with the
+  SFU's DTLS role and the SRTP profile (last 1,024); e2e asserts the role per client and
+  AES-GCM. `/ready` turns 503 when the data plane stops (`Readiness` handle in `nexus-api`).
+- **Tests match their claims.** Orchestrator tests use a barrier (`CloseSession` of an id
+  never created, whose rejection names it) and read the shard's gauges (tracks, sessions,
+  subscriptions) and `commands_rejected`; the full-queue test uses a `CommandSink` double
+  and shows the close retried once the queue has room; closes check the error code sent.
+  The e2e marker check maps each received SSRC, through the offer's announced SSRC and its
+  kind, to the one publisher SSRC its payload must name.
+- **`/metrics`:** nothing feeds `MetricsCollector`'s worker series after the switch; they
+  read zero until shard stats are exported in 1.7.
+
+**Code notes (last fixes before the squash, 2026-09-27):**
+- `Join` while already in a room is refused (`ALREADY_IN_ROOM`): switching kept the old
+  room's membership and the participant's tracks and subscriptions there, and left it a
+  member of both rooms. Leaving (which ends the session) comes first.
+- After `INVALID_ANSWER` with nothing queued, the unanswered publish and subscribe m-lines
+  are offered again, once (`MAX_REOFFERS`); a second invalid answer in a row releases the
+  publish m-lines (inactive, reusable) instead of looping. A valid answer resets the count.
+- Tests: a shard refusal after the tracks were registered undoes `TrackRegistry` and
+  `DistributedState` and sends `TrackUnpublished` to the room; a republish on a reused
+  m-line with the same SSRC (Chrome reuses the transceiver) is accepted by the shard.
+- `/ready` reports 503 from the start of the shutdown drain (the API keeps answering
+  `/health` until the tasks stop after the drain). `.playwright-mcp/` is ignored.
+
+**Early browser check (2026-09-27, note §17.9 steps 1-2):**
+- Setup: the SFU from this branch (`target/debug/nexus-sfu`, `config/development.toml` with
+  plain WebSocket and the API moved to 18081, `NEXUS_ANNOUNCED_IPS` = the LAN address),
+  a scratch page (two participants in one tab, canvas video and oscillator audio, token
+  minted with WebCrypto) served from `localhost`, driven through Playwright.
+- **Chrome 153 (headless):** both participants publish and receive audio and video through
+  the new path. Offers carry `a=ice-lite`; Chrome is ICE controlling and DTLS client (the
+  SFU is DTLS server); `srtpCipher` = `SRTP_AEAD_AES_128_GCM` (the SFU logs
+  `AeadAes128Gcm`); received SSRCs differ from the sent ones (rewritten); video decoded on
+  both sides (≈ 650 frames in 20 s, one keyframe each); ≈ 1,100 audio packets each way,
+  decoded without concealment. No warning or error in the SFU log.
+- First run failed on the subscriber that subscribed before publishing (0 frames decoded):
+  the PT bug above, fixed and re-run.
+- Received audio level reads 0 in headless Chrome, as for a direct peer-to-peer call in the
+  same page (checked): no audio output device, not the SFU.
+- **Firefox: deferred to 1.8** (owner's decision, 2026-09-27). The browser tooling here runs
+  Chromium only. Left for the owner
+  (and a headed Chrome with real devices) before 1.5b is committed, or in 1.8 at the latest.
+
 **Code notes (planning audit 2026-09-27, before implementation):**
 - `src/sfu.rs` must change too: `Sfu` uses `ColdPathPacket` (`connection_tx` field,
   `set_connection_tx`, the forward in `process_packet`). Remove the field, the setter and the
@@ -1332,6 +1428,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | Linux-only code (`LinuxIo`, pinning, GRO check) only runs in the container and CI | Container run is part of every I/O part's checkpoint |
 | Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 (done: two parser panics fixed, fuzz proptests on the parser) |
 | **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3 (done): a shard-wide cap on `DtlsDatagram` events per second (`dtls_budget_per_sweep`, 1,024). 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
+| **Known limit, room authorization (v1 item).** Tokens carry no room claim: any authenticated user can join any room by id (sequential) and subscribe to its tracks. 1.5b confines subscriptions to the subscriber's own room and refuses a second `Join`, but not the first | Added to the v1 scope (`dataplane-design.md` §2, revision 2026-09-27); not in Phase 1 unless decided otherwise. Needs a room claim in the JWT (`nexus-api`), checks in `Create`/`Join`, and the dev token of 1.8 minting it |
 | **Known limit, ICE-lite on-path injection.** STUN authenticates the request, not its source address (RFC 8445). An attacker on the path can drop a fresh nomination and send it from its own address before the original arrives, or replay one older than the last 16 transaction ids, and the session moves to it. Media stays SRTP-encrypted; the real peer is cut off until its next nomination | Inherent to ICE-lite; accepted for v1. 1.2 refuses repeated transaction ids and rate-limits switches. A full fix needs proof of liveness at the new address (e.g. consent from the SFU side) and comes after v1 |
 
 ## Status
@@ -1345,7 +1442,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.4 SDP groundwork, signaling limits, shared certificate | Done | see git log (1.4) | `media: Vec` (32), BUNDLE 544 B, 128 KB SDP and printer errors, two SDP parser panics fixed + proptests, `Mid::parse`, `rtcp_fbs`, `stream_id`/`cname` with one msid, extension table in `nexus-media`, WebSocket 256 KB + error reply + 1 MB cap, `DtlsCertificate` + `with_certificate`; old-path cap 8 |
 | 1.5a Control-plane pieces | Done | see git log (1.5a) | `ids`, `dtls` (`DtlsHandshake`: lazy role, MTU split, keys by role), `transports` (`SsrcAllocator`, timeouts), `tracks`, `sdp_params`; engine input guards and `DTLS_MTU`; SDP accessors |
 | 1.5b-prep Node module, config, negotiator options, loadtest marker | Done | see git log (1.5b-prep) | `node.rs`, `[dataplane]` config, `with_ice_lite` + Track rtcp-fb parameter (golden old-path offer), loadtest marker + announced SSRCs; moved in: sha-256 fingerprint choice, `SsrcAllocator` fixes, shard DTLS from the selected address only. Old path green (e2e 3/3) |
-| 1.5b Switch (one commit) | Not started | | Early browser check result goes here |
+| 1.5b Switch (one commit) | Done | see git log (1.5b) | New path live: e2e 3/3 (both DTLS roles, AES-GCM), SSRCs rewritten. Early browser check: Chrome 153 passes (GCM, ICE-lite, media both ways) after the stable-PT fix; Firefox deferred to 1.8 (owner's decision) |
 | 1.7 Benches, memory budget, CI | Not started | | Before C2 |
 | C2 Old benches | Not started | | |
 | C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Not started | | |
@@ -1581,3 +1678,52 @@ Add one line per working session: date, part, what was done, what is left.
   clippy clean, 2,034 passed, 0 failed, e2e 3/3; Linux arm64 container (copy of the repo
   inside the container, target volume `nexus-dataplane-target`): fmt, clippy clean, 2,040
   passed, 0 failed, twice. Committed. Next: 1.5b (WIP branch `phase-1-switch-wip`).
+- 2026-09-27: 1.5b implemented on branch `phase-1-switch-wip` (uncommitted, for review):
+  the orchestrator runs on `nexus-dataplane` (new `plane.rs`; `negotiation.rs`,
+  `subscription.rs`, `connection.rs`, `events.rs`, `mod.rs` rewritten; `server.rs` starts
+  `Node` and `Dataplane`; `Sfu` no longer started and no longer forwards STUN/DTLS).
+  Orchestrator tests on a real one-shard data plane (answers made by rewriting offers):
+  tracks added, late declined slot re-offered with a fresh SSRC (fails with the rule
+  disabled), unpublish and publisher leave turn subscriber m-lines inactive, >10 ids, wrong
+  mids, consent lost and shard refusals close, full queue closes and retries the close.
+  E2E on the new path: `two_party_audio_video` receives the announced (rewritten) SSRCs,
+  markers name the publisher, shard counters checked; DTLS client (webrtc-rs default
+  `passive` against ICE-lite) and server (client A `active`) both complete; AES-GCM
+  negotiated. macOS: fmt, clippy clean, 2,043 passed, 0 failed, e2e 3/3; Linux arm64
+  container: fmt, clippy clean, 2,049 passed, 0 failed, e2e 5/5 runs. Left: early browser
+  check (Chrome, Firefox; note §17.9 steps 1-2), review, squash-commit onto `phase-1`.
+- 2026-09-27: 1.5b review fixes (uncommitted, for review): publish needs a room and
+  subscribers only get their room's tracks; the shard's per-session limits (10 tracks, 31
+  subscriptions) enforced with `TOO_MANY_TRACKS`; shard refusals close the participant
+  (`Overloaded` for limits, `Internal` otherwise); queued publishes appended, replayed after
+  `INVALID_ANSWER`; unpublished m-lines reused; first sha-256 fingerprint across levels;
+  `ServerHandle::established()` (role, SRTP profile) asserted in e2e; `/ready` follows the
+  data plane; orchestrator tests read shard gauges behind an id-matched barrier, the
+  full-queue test shows the retried close succeeding, error codes checked; e2e marker
+  check per received SSRC. Each new check was run with its fix disabled and fails. Early
+  browser check in headless Chrome 153 found subscribe m-lines changing PT between offers
+  (fixed: `OfferMline::Track { keep_pt }`); re-run passes (details in the 1.5b notes).
+  macOS: fmt, clippy clean, 2,053 passed, 0 failed, e2e 5/5 runs; Linux arm64 container
+  (repo copied in, target volume `nexus-dataplane-target`): fmt, clippy clean, 2,059
+  passed, 0 failed, e2e 5/5 runs. Left: Firefox (not available here), review, squash-commit.
+- 2026-09-27: last 1.5b fixes before the squash (uncommitted, for review): a second `Join`
+  is refused (`ALREADY_IN_ROOM`; no ghost membership, the old room's subscriptions stay
+  the old room's); after `INVALID_ANSWER` with nothing queued the unanswered m-lines are
+  offered once more, then released; refusal test registers tracks first and checks the
+  registry, cluster state and `TrackUnpublished` are undone; same-SSRC republish on a
+  reused m-line accepted; `/ready` 503 during the shutdown drain; `.playwright-mcp/`
+  ignored; `publish_codec` doc updated. Room authorization added to the v1 scope
+  (`dataplane-design.md` §2 and revision log; risks table here). Each new check fails with
+  its fix disabled. macOS: fmt, clippy clean, 2,054 passed, 0 failed, e2e 5/5 runs; Linux
+  arm64 container (repo copied in, target volume `nexus-dataplane-target`): fmt, clippy
+  clean, 2,060 passed, 0 failed, e2e 5/5 runs. Left: Firefox check, squash-commit.
+- 2026-09-27, verification of the last 1.5b fixes: `ALREADY_IN_ROOM`, one re-offer then
+  release after `INVALID_ANSWER`, refusal undo on registered tracks, same-SSRC republish,
+  `/ready` 503 during the drain confirmed in code and tests. macOS: fmt, clippy clean, 2,054
+  passed, e2e 5/5; Linux arm64 (own target volume): clippy clean, 2,060 passed, e2e 5/5.
+  Firefox deferred to 1.8 (owner's decision). Left for later parts: Leave then Join on the
+  same WebSocket is silently ignored (the session is removed; changing rooms needs a
+  reconnect; SDK side in 1.8); `invalid_answers` is not reset when m-lines are released,
+  and unanswered subscribe m-lines are not released; room authorization has no phase yet.
+  Squash-committed onto `phase-1`. Next: 1.7 (benches, memory budget, CI), then the
+  deletions.

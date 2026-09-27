@@ -107,6 +107,21 @@ impl RoomManager {
             return;
         }
 
+        // One room per participant: switching would keep the old room's membership,
+        // tracks and subscriptions. Leave (which ends the session) first.
+        if sessions
+            .get(&participant_id)
+            .is_some_and(|h| h.room_id.is_some())
+        {
+            send_error(
+                sessions,
+                participant_id,
+                "ALREADY_IN_ROOM",
+                "Already in a room",
+            );
+            return;
+        }
+
         let room_id_u32 = room_id as u32;
 
         if !self.distributed_state.room_exists(room_id_u32) {

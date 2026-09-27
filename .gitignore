@@ -12,3 +12,6 @@ sdk/dist/
 
 # macOS Finder metadata
 .DS_Store
+
+# Playwright MCP session files (browser checks)
+.playwright-mcp/

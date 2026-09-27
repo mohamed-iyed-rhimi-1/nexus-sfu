@@ -359,7 +359,7 @@ async fn main() -> ExitCode {
         }
     };
     info!(
-        media = %server.media_addr(),
+        media = ?server.media_addrs(),
         signaling = %server.signaling_addr(),
         candidates = ?server.candidate_addrs(),
         "Nexus SFU running"
@@ -378,7 +378,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Wait for SIGTERM or SIGINT, or for the packet loop to stop on its own.
+/// Wait for SIGTERM or SIGINT, or for the data plane to stop on its own.
 async fn wait_for_shutdown_signal(server: &nexus_sfu::server::ServerHandle) {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
@@ -390,7 +390,7 @@ async fn wait_for_shutdown_signal(server: &nexus_sfu::server::ServerHandle) {
             _ = sigint.recv() => { info!("Received SIGINT"); return; }
             _ = check.tick() => {
                 if server.is_finished() {
-                    warn!("Packet loop stopped; shutting down");
+                    warn!("Data plane stopped; shutting down");
                     return;
                 }
             }

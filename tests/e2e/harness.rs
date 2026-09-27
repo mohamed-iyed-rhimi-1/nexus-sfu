@@ -16,8 +16,8 @@ pub const JWT_SECRET: &str = "e2e-test-secret-at-least-32-characters";
 /// Signaling and ICE deadline for one client step.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Servers are started one test at a time: each runs a spinning ingress
-/// thread and worker, and CI runners have few cores.
+/// Servers are started one test at a time: each runs a shard thread and a
+/// gossip thread beside the clients, and CI runners have few cores.
 pub static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Log to stderr when `RUST_LOG` is set (`cargo test -- --nocapture`).
@@ -42,7 +42,7 @@ pub fn announced_ip() -> IpAddr {
         .expect("e2e tests need a non-loopback IPv4 interface")
 }
 
-/// Server config: every port ephemeral, plain WebSocket, one worker.
+/// Server config: every port ephemeral, plain WebSocket, one shard.
 pub fn test_config() -> NexusConfig {
     let mut config = NexusConfig::default();
     config.transport.media_bind_addr = "0.0.0.0:0".parse().unwrap();
@@ -58,12 +58,14 @@ pub fn test_config() -> NexusConfig {
     config.memory.arena_size_mb = 16;
     config.drain_timeout_ms = 50;
     config.cluster.node_id = 1;
+    config.dataplane.shards = 1;
     config
 }
 
 pub async fn start_server() -> ServerHandle {
     let server = server::start(test_config()).await.expect("server starts");
-    assert_ne!(server.media_addr().port(), 0);
+    assert_eq!(server.media_addrs().len(), 1, "one shard");
+    assert_ne!(server.media_addrs()[0].port(), 0);
     assert_ne!(server.signaling_addr().port(), 0);
     server
 }

@@ -28,4 +28,4 @@ pub mod rest;
 
 pub use auth::JwtValidator;
 pub use error::ApiError;
-pub use rest::ApiServer;
+pub use rest::{ApiServer, Readiness};

@@ -47,6 +47,7 @@ pub use ids::{
 };
 pub use placement::{Placement, ShardLoad, SingleShard};
 pub use pool::{BufRef, BufferPool, BUF_SIZE};
+pub use session::{MAX_SUBS_PER_SESSION, MAX_TRACKS_PER_SESSION};
 #[cfg(target_os = "linux")]
 pub use shard::io::{udp_gro_enabled, LinuxIo};
 pub use shard::io::{

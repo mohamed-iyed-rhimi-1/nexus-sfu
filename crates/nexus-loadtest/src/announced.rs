@@ -16,6 +16,8 @@ pub const MAX_ANNOUNCED: usize = 64;
 pub struct Announced {
     /// The m-line's mid.
     pub mid: String,
+    /// `audio` or `video` (the m-line's media type).
+    pub kind: String,
     /// Track id from the offer's `tracks`, if listed.
     pub track_id: Option<u64>,
     /// First SSRC the m-line announces.
@@ -34,12 +36,13 @@ impl AnnouncedSsrcs {
         let parsed = parse_sendonly_ssrcs(sdp);
         let mut map = self.inner.lock().expect("announced lock");
         map.clear();
-        for (mid, ssrc) in parsed {
+        for (mid, kind, ssrc) in parsed {
             let track_id = tracks.iter().find(|t| t.mid == mid).map(|t| t.track_id);
             map.insert(
                 mid.clone(),
                 Announced {
                     mid,
+                    kind,
                     track_id,
                     ssrc,
                 },
@@ -57,14 +60,16 @@ impl AnnouncedSsrcs {
     }
 }
 
-/// `(mid, first ssrc)` of every sendonly m-line of `sdp` that has both.
-pub fn parse_sendonly_ssrcs(sdp: &str) -> Vec<(String, u32)> {
+/// `(mid, kind, first ssrc)` of every sendonly m-line of `sdp` that has a mid and an
+/// SSRC.
+pub fn parse_sendonly_ssrcs(sdp: &str) -> Vec<(String, String, u32)> {
     let mut found = Vec::new();
     // Text before the first m= is the session level.
     for section in sdp.split("\nm=").skip(1) {
         if found.len() >= MAX_ANNOUNCED {
             break;
         }
+        let kind = section.split(' ').next().unwrap_or("").to_string();
         let mut mid = None;
         let mut ssrc = None;
         let mut sendonly = false;
@@ -79,7 +84,7 @@ pub fn parse_sendonly_ssrcs(sdp: &str) -> Vec<(String, u32)> {
             }
         }
         if let (true, Some(mid), Some(ssrc)) = (sendonly, mid, ssrc) {
-            found.push((mid, ssrc));
+            found.push((mid, kind, ssrc));
         }
     }
     found
@@ -100,7 +105,10 @@ mod tests {
     fn sendonly_mlines_with_their_first_ssrc() {
         assert_eq!(
             parse_sendonly_ssrcs(OFFER),
-            vec![("1".to_string(), 1111), ("2".to_string(), 2222)]
+            vec![
+                ("1".to_string(), "video".to_string(), 1111),
+                ("2".to_string(), "audio".to_string(), 2222)
+            ]
         );
     }
 
@@ -116,6 +124,10 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!((all[0].track_id, all[0].ssrc), (Some(9), 1111));
         assert_eq!((all[1].track_id, all[1].ssrc), (None, 2222));
+        assert_eq!(
+            (all[0].kind.as_str(), all[1].kind.as_str()),
+            ("video", "audio")
+        );
         announced.update("v=0\r\n", &[]);
         assert!(announced.snapshot().is_empty());
     }
