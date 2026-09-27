@@ -221,7 +221,12 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             self.counters.drop_dtls_budget += 1;
             return;
         }
+        if self.dtls_budget == 0 {
+            self.counters.drop_dtls_shard_budget += 1;
+            return;
+        }
         session.dtls_budget -= 1;
+        self.dtls_budget -= 1;
         let id = session.id;
         let bytes: Box<[u8]> = self.pool.buf(d.buf)[..d.len].into();
         self.emit(Event::DtlsDatagram { id, bytes });
@@ -349,9 +354,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     ) {
         let count = self.tracks.get(tidx).subscribers.len();
         for i in 0..count {
-            if self.tx.is_full() {
-                self.flush();
-            }
+            self.flush_if_full();
             let sidx = self.tracks.get(tidx).subscribers[i];
             self.forward(sidx, src, len, header, now);
         }

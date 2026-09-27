@@ -1,13 +1,16 @@
 //! The shard: state tables and one loop iteration (note §3.2).
 //!
-//! 1.2 runs `iterate` from tests with an explicit `now`; 1.3 adds the thread,
-//! parking and real sockets around it.
+//! `iterate` takes an explicit `now`: tests drive it on `MemIo`, and the
+//! shard thread (`runner.rs`) calls it in a loop with parking (`park.rs`)
+//! on a real socket (`io.rs`).
 
 mod commands;
 mod housekeeping;
 mod ingress;
 pub mod io;
+pub mod park;
 mod rtcp;
+pub(crate) mod runner;
 pub mod stats;
 
 use std::collections::VecDeque;
@@ -18,7 +21,7 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::ArrayQueue;
 use rustc_hash::FxHashMap;
 
-use crate::command::{Command, Event, EventSink};
+use crate::command::{Command, Event, EventSink, Refused};
 use crate::config::{ConfigError, ShardConfig};
 use crate::ice::UFRAG_LEN;
 use crate::ids::{SessionId, SubscriptionId, TrackId};
@@ -28,7 +31,7 @@ use crate::session::{Session, SessionIdx, SubIdx, TrackIdx};
 use crate::slab::Slab;
 use crate::subscription::Subscription;
 use crate::track::PublishedTrack;
-use io::{Datagram, DatagramIo, RecvBatch, SendBatch};
+use io::{Datagram, DatagramIo, RecvBatch, RecvResult, SendBatch};
 use stats::{ShardCounters, ShardStats};
 
 /// Capacity of the command queue (note §5.3).
@@ -46,12 +49,18 @@ pub const MIN_SWITCH_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the previous address stays mapped after a switch, so packets
 /// already in flight from it still authenticate.
 pub const PREV_ADDR_GRACE: Duration = Duration::from_secs(1);
+/// Longest park while retained events or deferred nominations wait: both
+/// are retried only by `iterate`.
+pub const PARK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-/// What one iteration did (1.3 uses it to decide when to park).
+/// What one iteration did (the shard thread uses it to decide when to park).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IterationStats {
-    /// Datagrams received.
+    /// Datagrams received and handled.
     pub received: usize,
+    /// Datagrams taken from the socket, including those dropped before
+    /// handling (truncated, unreadable source): any of them is work.
+    pub taken: usize,
     /// The receive source was drained.
     pub would_block: bool,
     /// Commands handled.
@@ -102,6 +111,12 @@ pub struct Shard<I: DatagramIo, S: EventSink> {
     /// Events the sink refused, retried every iteration; never grows.
     pending: VecDeque<Event>,
     next_housekeeping: Instant,
+    /// DTLS datagrams all sessions may still pass before the next sweep.
+    dtls_budget: u32,
+    /// `rx_datagrams` and time at the last sweep, for the `rx_pps` gauge.
+    last_sweep: (u64, Instant),
+    /// Datagrams per second over the last sweep interval.
+    rx_pps: u64,
 }
 
 impl<I: DatagramIo, S: EventSink> Shard<I, S> {
@@ -133,6 +148,9 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             pending_switches: Vec::with_capacity(config.max_sessions as usize),
             pending: VecDeque::with_capacity(EVENT_RETENTION),
             next_housekeeping: now + HOUSEKEEPING_INTERVAL,
+            dtls_budget: config.dtls_budget_per_sweep,
+            last_sweep: (0, now),
+            rx_pps: 0,
             config,
         })
     }
@@ -157,12 +175,17 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     /// again, retry retained events, run housekeeping when due.
     pub fn iterate(&mut self, now: Instant) -> IterationStats {
         self.counters.iterations += 1;
-        // A receive error counts as an empty batch; 1.3's backends count it.
-        let received = self
-            .io
-            .recv_batch(&mut self.rx, &mut self.pool)
-            .unwrap_or_default();
+        // A receive error counts as an empty batch.
+        let received = match self.io.recv_batch(&mut self.rx, &mut self.pool) {
+            Ok(received) => received,
+            Err(_) => {
+                self.counters.rx_errors += 1;
+                RecvResult::default()
+            }
+        };
         debug_assert!(received.received == self.rx.len());
+        self.counters.rx_truncated += received.truncated as u64;
+        self.counters.rx_unreadable += received.unreadable as u64;
         for i in 0..self.rx.len() {
             let datagram = self.rx.get(i);
             self.handle_datagram(datagram, now);
@@ -184,6 +207,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         debug_assert!(self.tx.is_empty());
         IterationStats {
             received: received.received,
+            taken: received.taken(),
             would_block: received.would_block,
             commands,
         }
@@ -214,6 +238,36 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         &self.counters
     }
 
+    /// A command is waiting in the queue (checked before parking).
+    pub fn commands_pending(&self) -> bool {
+        !self.commands.is_empty()
+    }
+
+    /// Latest time a parked shard must run again: the next housekeeping, or
+    /// sooner while retained events or deferred nominations wait for a
+    /// retry that only `iterate` makes.
+    pub fn park_deadline(&self, now: Instant) -> Instant {
+        let retry = !self.pending.is_empty() || !self.pending_switches.is_empty();
+        let deadline = if retry {
+            self.next_housekeeping.min(now + PARK_RETRY_INTERVAL)
+        } else {
+            self.next_housekeeping
+        };
+        debug_assert!(deadline <= now.max(self.next_housekeeping) + PARK_RETRY_INTERVAL);
+        deadline
+    }
+
+    /// Adds a park to the counters (the runner parks, the shard counts).
+    pub fn count_park(&mut self) {
+        self.counters.parks += 1;
+    }
+
+    /// Publishes the counters now (the runner calls it once on exit, so the
+    /// final values are readable after shutdown).
+    pub fn publish_stats(&self) {
+        self.stats.publish(&self.counters, self.gauges());
+    }
+
     /// Table sizes.
     pub fn snapshot(&self) -> ShardSnapshot {
         ShardSnapshot {
@@ -240,10 +294,17 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
 
     /// Queues a datagram in `buf`; flushes first when the batch is full.
     fn send(&mut self, buf: BufRef, len: usize, addr: SocketAddr) {
+        self.flush_if_full();
+        self.tx.push(Datagram { buf, len, addr });
+    }
+
+    /// Flushes in the middle of a fan-out when the send batch is full
+    /// (counted: a burst larger than `SEND_BATCH` must not block or drop).
+    fn flush_if_full(&mut self) {
         if self.tx.is_full() {
+            self.counters.tx_full_flushes += 1;
             self.flush();
         }
-        self.tx.push(Datagram { buf, len, addr });
     }
 
     /// Sends the queued datagrams.
@@ -252,19 +313,20 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             return;
         }
         let queued = self.tx.len();
-        let bytes: usize = self.tx.iter().map(|d| d.len).sum();
         let sent = self.io.flush(&mut self.tx, &mut self.pool);
-        debug_assert!(sent <= queued && self.tx.is_empty());
-        self.counters.tx_datagrams += sent as u64;
-        self.counters.tx_bytes += if sent == queued { bytes as u64 } else { 0 };
-        self.counters.drop_send_failed += (queued - sent) as u64;
+        debug_assert!(sent.datagrams <= queued && self.tx.is_empty());
+        self.counters.tx_datagrams += sent.datagrams as u64;
+        self.counters.tx_bytes += sent.bytes as u64;
+        self.counters.drop_send_failed += (queued - sent.datagrams) as u64;
     }
 
     /// Hands an event to the sink. When it is full, the event waits in the
     /// retention queue (order kept), except `DtlsDatagram`, which is dropped
     /// (the peer retransmits). A full retention queue drops and counts.
     /// Returns whether the event was delivered or retained; callers whose
-    /// state depends on delivery retry later.
+    /// state depends on delivery retry later. A closed sink (the control
+    /// plane is gone) drops and counts, and reports the event handled: no
+    /// one is listening, retries would only repeat the drop.
     fn emit(&mut self, event: Event) -> bool {
         // After ConsentLost the control plane is closing the session: it
         // hears nothing more about it (the event counts as handled, so no
@@ -278,7 +340,11 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         let event = if self.pending.is_empty() || dtls {
             match self.events.try_send(event) {
                 Ok(()) => return true,
-                Err(event) => event,
+                Err(Refused::Full(event)) => event,
+                Err(Refused::Closed(_)) => {
+                    self.counters.drop_event_closed += 1;
+                    return true;
+                }
             }
         } else {
             event
@@ -306,12 +372,17 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     }
 
     /// Retries retained events, oldest first, until the sink refuses one.
+    /// A closed sink drops them all (counted).
     fn push_pending(&mut self) {
         // Bounded by EVENT_RETENTION.
         while let Some(event) = self.pending.pop_front() {
-            if let Err(event) = self.events.try_send(event) {
-                self.pending.push_front(event);
-                return;
+            match self.events.try_send(event) {
+                Ok(()) => {}
+                Err(Refused::Full(event)) => {
+                    self.pending.push_front(event);
+                    return;
+                }
+                Err(Refused::Closed(_)) => self.counters.drop_event_closed += 1,
             }
         }
     }

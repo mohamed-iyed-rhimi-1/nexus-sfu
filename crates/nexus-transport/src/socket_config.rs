@@ -28,7 +28,7 @@ pub const DEFAULT_BUFFER_SIZE: i32 = 16 * 1024 * 1024;
 /// Minimum acceptable buffer size: 1MB.
 pub const MIN_ACCEPTABLE_BUFFER_SIZE: i32 = 1024 * 1024;
 
-/// UDP_GRO socket option (Linux 4.18+).
+/// UDP_GRO socket option (Linux 5.0+).
 #[cfg(target_os = "linux")]
 pub const UDP_GRO: libc::c_int = 104;
 

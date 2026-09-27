@@ -13,8 +13,13 @@ categories = ["multimedia", "network-programming"]
 nexus-core = { path = "../nexus-core" }
 nexus-media = { path = "../nexus-media" }
 nexus-transport = { path = "../nexus-transport" }
+core_affinity = "0.8"
 crossbeam-queue = "0.3"
+libc = "0.2"
+mio = { version = "1.1", features = ["os-poll", "os-ext"] }
 rustc-hash = "2"
+tokio = { version = "1.44", default-features = false, features = ["sync"] }
+tracing = "0.1"
 
 [dev-dependencies]
 proptest = "1.4"

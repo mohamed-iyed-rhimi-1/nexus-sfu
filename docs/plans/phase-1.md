@@ -491,6 +491,67 @@ shard/io.rs, shard/park.rs, shard/mod.rs}`, `tests/loopback.rs` (new).
   config instead of asserted (the originals go in C1+C3).
 - `configure_high_performance_socket` is not unused: `io_uring.rs:335` calls it (deleted in
   C5).
+- Found while implementing (2026-09-27):
+  - **Dual-stack addresses.** A socket bound to `::` receives IPv4 peers as `::ffff:a.b.c.d`;
+    the shard keys `by_addr` on `SocketAddr` and reports `AddressSelected`. Both backends
+    normalise v4-mapped sources to `V4` and send to `V4` destinations through the v4-mapped
+    form on an IPv6 socket (macOS `send_to` refuses a `V4` address there).
+  - **One bad destination.** `sendmmsg` stops at the first failing message. `EAGAIN` /
+    `ENOBUFS` drop the rest of the batch (counted); any other errno (unreachable, wrong
+    family) drops only that datagram and the send continues (bounded by the batch).
+  - **macOS truncation is silent.** `recv_from` reports none, so `PortableIo` receives into
+    a scratch buffer of `BUF_SIZE + 1` and drops a datagram that fills it (one copy per
+    datagram on macOS). The truncation check runs on both platforms.
+  - **Parking and retries.** Retained events and deferred nominations are only retried by
+    `iterate`: the park timeout is capped at `PARK_RETRY_INTERVAL` (10 ms) while either
+    waits, else it is the next housekeeping. A receive that got nothing without
+    `WouldBlock` (pool dry, `EINTR`) parks ≤ 1 ms: mio is edge-triggered.
+  - **tokio.** The note's "no tokio" means no runtime on shard threads: the crate depends on
+    tokio with the `sync` feature only, for the event channel (`try_send` needs no runtime).
+    tokio was already in the tree through `nexus-transport`.
+  - **Random offsets.** `ShardConfig::rng_seed` was a constant default: `DataplaneConfig`
+    takes `rng_seed: Option<u64>` and `None` seeds from the standard library's per-process
+    hash keys (tests pass `Some`).
+  - **Lost wake-up on Linux** (found by the Linux run, 4 failures in 5): the `Parker` did not
+    own the `mio::Waker`, only the producers' `Wake` did. A producer that woke the shard and
+    then dropped the last `Wake` closed the eventfd, and closing an fd removes its pending
+    readiness from epoll, so the wake-up vanished (kqueue keeps it: macOS never failed). The
+    `Parker` now holds the waker too; 15/15 runs pass.
+  - **Unsafe** is confined to `shard/io/linux.rs` (a submodule of `io.rs`): `recvmmsg`,
+    `sendmmsg`, `sched_setscheduler`, the `UDP_GRO` query, sockaddr conversion. `LinuxIo` is
+    `unsafe impl Send`: its header arrays hold raw pointers, rewritten before every call.
+  - **Shard-wide DTLS cap** (risk table): `ShardConfig::dtls_budget_per_sweep` (1,024 per
+    second), checked after the per-session budget, counted in `drop_dtls_shard_budget`.
+  - New counters `parks`, `rx_truncated`, `rx_errors`, `drop_dtls_shard_budget`; gauge
+    `rx_pps` (feeds `ShardLoad`). Stats are also published when a shard stops.
+  - `DataplaneHandle::take_events()` hands out the receiver once; `shutdown()` is idempotent
+    and also runs on drop. A drop guard clears `running` if a shard thread panics. Release
+    builds use `panic = "abort"`, so a shard panic ends the process there: the drop guard
+    and `is_running() == false` after a panic are a debug/test path only; in release,
+    `is_running()` only turns false after `shutdown`.
+  - **Review fixes (2026-09-27), before commit:**
+    - An all-dropped receive batch (truncated or unreadable source) counted as idle and
+      parked 1 ms, pacing an oversized flood to ≈ 64 datagrams per ms. `IterationStats`
+      now carries `taken` (every datagram taken from the socket) and the runner treats any
+      as work. Deterministic test in `runner.rs` (500 all-truncated batches: 585 ms with
+      the old rule, < 1 ms now) and a loopback test (media arrives after 2,000 oversized
+      datagrams, sent only after a STUN probe shows the flood drained; session log).
+    - `LinuxIo::new` refuses a socket with UDP_GRO on; `udp_gro_enabled` maps
+      `ENOPROTOOPT` to `false` (kernels before 5.0 lack the option; the
+      `socket_config.rs` comment said 4.18, which is `UDP_SEGMENT`).
+    - The burst test with 3 subscribers never exceeded `SEND_BATCH` (64 × 3 = 192): it
+      now uses 5, and `tests/shard.rs` proves the mid-batch flush deterministically with
+      the new counter `tx_full_flushes` (one `iterate`, 64 packets, 5 subscribers).
+    - `shutdown` holds the threads lock across the joins: a concurrent caller returned
+      while shards still ran (test: two callers, 20 rounds; fails without the fix).
+    - `DatagramIo::flush` returns `Sent { datagrams, bytes }`, so `tx_bytes` counts what
+      was sent on a partial failure (Linux: `msg_len` per message). `EventSink` returns
+      `Refused::{Full, Closed}`; a closed channel is counted in `drop_event_closed` and
+      never retained. `zeroed_box` is bounded by an `unsafe trait Zeroable` implemented
+      for the three C structs. `DataplaneConfig::warnings()` (logged by `validate`) flags
+      `realtime_priority` with `busy_poll_rounds > 0` and `cpu_affinity` (shard 0
+      busy-polls as SCHED_FIFO on core 0). New counters: `rx_unreadable`,
+      `tx_full_flushes`, `drop_event_closed`.
 
 **Tests** (`tests/loopback.rs`, Linux and macOS):
 - Two in-process peers on real UDP sockets against a running shard: STUN, nomination,
@@ -987,7 +1048,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | The manual browser check is blocked by HTTPS/token setup | 1.8 documents both setups; the SDK and token work can start before 1.5b |
 | Linux-only code (`LinuxIo`, pinning, GRO check) only runs in the container and CI | Container run is part of every I/O part's checkpoint |
 | Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 |
-| **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3: a shard-wide cap on `DtlsDatagram` events per second. 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
+| **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3 (done): a shard-wide cap on `DtlsDatagram` events per second (`dtls_budget_per_sweep`, 1,024). 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
 | **Known limit, ICE-lite on-path injection.** STUN authenticates the request, not its source address (RFC 8445). An attacker on the path can drop a fresh nomination and send it from its own address before the original arrives, or replay one older than the last 16 transaction ids, and the session moves to it. Media stays SRTP-encrypted; the real peer is cut off until its next nomination | Inherent to ICE-lite; accepted for v1. 1.2 refuses repeated transaction ids and rate-limits switches. A full fix needs proof of liveness at the new address (e.g. consent from the SFU side) and comes after v1 |
 
 ## Status
@@ -997,7 +1058,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.1 SRTP per direction | Done | see git log (1.1) | ring GCM, `direction.rs`, `index.rs`, robustness tests; ROC reorder bug fixed; review fixes: outbound registration (monotonic offsets), pinned inbound SSRCs |
 | 1.2a Shard core: tables, commands, ICE-lite, forwarding | Done | see git log (1.2) | `nexus-dataplane` crate on `MemIo`: slabs, commands, slim STUN scan, address rules, SRTP in, rewrite, fan-out; STUN panic/UB fixes in `nexus-transport`; `tests/shard.rs` incl. proptest |
 | 1.2b Shard core: extensions, RTCP, housekeeping, alloc test | Done | see git log (1.2) | `ext.rs` table + element iterator, full rewrite, `mid` SSRC learning, SR+SDES translation, PLI/FIR with throttle, housekeeping, `ShardStats`, event retention; `tests/alloc.rs` 0 allocations (GCM and CM) |
-| 1.3 Shard thread and I/O | Not started | | |
+| 1.3 Shard thread and I/O | Done | see git log (1.3) | `LinuxIo`/`PortableIo`, park/wake, shard thread, `DataplaneHandle`, `Dataplane::start`, `DataplaneConfig`, `Placement`/`SingleShard`, shard-wide DTLS cap; `tests/loopback.rs`; lost-wake-up fix; review fixes: oversized flood pacing, GRO refusal, concurrent shutdown, bytes sent, closed event channel |
 | 1.4 SDP groundwork, signaling limits, shared certificate | Not started | | |
 | 1.5a Control-plane pieces | Not started | | |
 | 1.5b Switch (one commit) | Not started | | Early browser check result goes here |
@@ -1105,3 +1166,47 @@ Add one line per working session: date, part, what was done, what is left.
   macOS, 1,919 on Linux arm64 with a fresh target volume (the earlier config-test failure
   came from a shared Docker target volume mounted at another path, not from the code).
   Committed. Exit criterion 2 met. Next: 1.3 (use your own Docker target volume).
+- 2026-09-27: 1.3 implemented (uncommitted, for review). `nexus-dataplane` runs on real
+  sockets and threads: `LinuxIo` (`recvmmsg`/`sendmmsg`, IPv4/IPv6, `MSG_TRUNC` dropped,
+  one bad destination drops one datagram), `PortableIo` (scratch buffer detects truncation),
+  v4-mapped addresses normalised, `mio` park/wake protocol, shard thread with busy-poll and
+  a drop guard, `DataplaneHandle` (commands, events once, stats, loads, `is_running`,
+  idempotent `shutdown`), `DataplaneConfig` (Phase 1: one shard, port range vs reserved
+  ports, buffer and priority checks, per-process seed), `Placement`/`SingleShard`, pinning
+  and SCHED_FIFO (best effort), shard-wide DTLS cap, counters `parks`, `rx_truncated`,
+  `rx_errors`, `drop_dtls_shard_budget`, gauge `rx_pps`. The Linux run found a lost wake-up
+  (eventfd closed with the last `Wake`, see code notes); fixed. Tests: backend conformance
+  on both platforms, park unit tests, `tests/loopback.rs` (media over IPv4, IPv6 and
+  dual-stack; wake; shutdown; burst > send batch; flood; idle CPU `#[ignore]`; GRO off on
+  Linux), shard DTLS cap and park deadline. Each new safeguard checked to fail with its fix
+  disabled. Measured (Linux arm64 container / macOS): wake round trip median 1.2 ms / 0.3
+  ms, max 2.5 ms / 0.9 ms; shutdown 0.45 ms / 0.37 ms; idle CPU over 1 s 0.2 ms / 0.1 ms.
+  fmt, clippy clean; `cargo test --workspace` 1,945 passed on Linux, 1,940 on macOS
+  (Linux-only tests account for the difference), 0 failed. Next: review and commit, then 1.4.
+- 2026-09-27, review of 1.3 (verified findings), fixed (uncommitted, for review): taken
+  datagrams count as work (an oversized flood no longer parks 1 ms per batch); `LinuxIo`
+  refuses UDP_GRO, `ENOPROTOOPT` read as off, GRO kernel version corrected; burst test on 5
+  subscribers plus a deterministic mid-batch flush test (`tx_full_flushes`); `shutdown`
+  safe under concurrent callers; `flush` reports bytes actually sent; closed event channel
+  counted apart (`drop_event_closed`) and not retained; `Zeroable` bound for `zeroed_box`;
+  config warning for SCHED_FIFO + busy-poll on core 0; `panic = "abort"` note. Each new
+  test checked to fail with its fix disabled (flood drain 585 ms with the old rule; GRO
+  refusal on Linux; concurrent shutdown; closed channel). Linux arm64 container (own target
+  volume `nexus-dataplane-target`): fmt, clippy clean, 1,952 passed, 0 failed; wake median
+  1.0 ms / max 2.0 ms, 20 packets after the flood in 0.25 ms, 2 mid-batch flushes in the
+  loopback burst. macOS: fmt, clippy clean, 1,946 passed, 0 failed. Next: review, commit,
+  then 1.4.
+- 2026-09-27, fix before commit (uncommitted, for review): `media_arrives_after_an_oversized_flood`
+  failed under the full workspace on Linux (0 of 20: the media reached a still-full socket
+  buffer and the kernel dropped it). The test no longer sends into a full buffer: after the
+  flood the publisher sends a binding request every 10 ms until one is answered (the queue
+  is FIFO, so an answer means the flood before it was consumed; published stats refresh
+  only once per second, too coarse to time the drain), asserts the drain took < 500 ms,
+  then requires all 20 packets. The pacing regression stays covered by `runner.rs`.
+  `cargo test --workspace` in the Linux container (own volume `nexus-dataplane-target`)
+  three times: 1,952 passed, 0 failed each run; drain 0.26 / 0.17 / 0.13 ms. fmt and
+  clippy clean. macOS: 1,946 passed, 0 failed. Next: review, commit, then 1.4.
+- 2026-09-27, verification of the 1.3 fixes: all five review fixes confirmed in code and
+  tests; flood test no longer races the kernel buffer. macOS: fmt, clippy clean, 1,946
+  passed; Linux arm64 (own target volume): clippy clean, 1,952 passed in each of 3 full
+  runs; loopback 10/10 on Linux, 5/5 on macOS. Committed. Next: 1.4.

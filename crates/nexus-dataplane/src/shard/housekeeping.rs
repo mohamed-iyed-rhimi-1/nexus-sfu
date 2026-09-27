@@ -15,6 +15,7 @@ use crate::shard::io::DatagramIo;
 impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     /// Runs the sweep over every session, then publishes the counters.
     pub(super) fn housekeeping(&mut self, now: Instant) {
+        self.dtls_budget = self.config.dtls_budget_per_sweep;
         let slots = self.sessions.slot_count();
         assert!(slots <= self.config.max_sessions as usize);
         for index in 0..slots {
@@ -22,12 +23,24 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
                 self.sweep_session(idx, now);
             }
         }
-        let gauges = Gauges {
+        let (last_rx, last_at) = self.last_sweep;
+        let elapsed_ms = now.saturating_duration_since(last_at).as_millis() as u64;
+        let received = self.counters.rx_datagrams - last_rx;
+        if elapsed_ms > 0 {
+            self.rx_pps = received.saturating_mul(1_000) / elapsed_ms;
+        }
+        self.last_sweep = (self.counters.rx_datagrams, now);
+        self.stats.publish(&self.counters, self.gauges());
+    }
+
+    /// Table sizes and rates for `ShardStats`.
+    pub(super) fn gauges(&self) -> Gauges {
+        Gauges {
             sessions: self.sessions.len() as u64,
             tracks: self.tracks.len() as u64,
             subscriptions: self.subs.len() as u64,
-        };
-        self.stats.publish(&self.counters, gauges);
+            rx_pps: self.rx_pps,
+        }
     }
 
     fn sweep_session(&mut self, idx: SessionIdx, now: Instant) {

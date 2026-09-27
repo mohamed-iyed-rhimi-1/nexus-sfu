@@ -105,9 +105,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         self.tracks.get_mut(tidx).layers[0].last_sr = Some(sr);
         let count = self.tracks.get(tidx).subscribers.len();
         for i in 0..count {
-            if self.tx.is_full() {
-                self.flush();
-            }
+            self.flush_if_full();
             let track = self.tracks.get(tidx);
             let sub = self.subs.get(track.subscribers[i]);
             let session = self.sessions.get_mut(sub.session);
@@ -165,9 +163,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     /// `PLI_THROTTLE` (note §12.3). Nothing is sent, and the throttle is not
     /// armed, while the publisher has no SRTP, address or known SSRC.
     pub(super) fn request_keyframe(&mut self, tidx: TrackIdx, now: Instant) {
-        if self.tx.is_full() {
-            self.flush();
-        }
+        self.flush_if_full();
         let track = self.tracks.get(tidx);
         if track
             .last_pli

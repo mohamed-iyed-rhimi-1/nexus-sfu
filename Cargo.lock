@@ -1859,6 +1859,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1927,12 +1928,17 @@ dependencies = [
 name = "nexus-dataplane"
 version = "0.1.0"
 dependencies = [
+ "core_affinity",
  "crossbeam-queue",
+ "libc",
+ "mio 1.1.1",
  "nexus-core",
  "nexus-media",
  "nexus-transport",
  "proptest",
  "rustc-hash",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

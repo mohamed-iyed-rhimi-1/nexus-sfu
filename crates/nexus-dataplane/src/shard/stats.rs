@@ -19,6 +19,7 @@ macro_rules! counters {
             sessions: AtomicU64,
             tracks: AtomicU64,
             subscriptions: AtomicU64,
+            rx_pps: AtomicU64,
         }
 
         impl ShardStats {
@@ -28,6 +29,7 @@ macro_rules! counters {
                 self.sessions.store(gauges.sessions, Ordering::Relaxed);
                 self.tracks.store(gauges.tracks, Ordering::Relaxed);
                 self.subscriptions.store(gauges.subscriptions, Ordering::Relaxed);
+                self.rx_pps.store(gauges.rx_pps, Ordering::Relaxed);
             }
 
             /// The last published values.
@@ -40,6 +42,7 @@ macro_rules! counters {
                         sessions: self.sessions.load(Ordering::Relaxed),
                         tracks: self.tracks.load(Ordering::Relaxed),
                         subscriptions: self.subscriptions.load(Ordering::Relaxed),
+                        rx_pps: self.rx_pps.load(Ordering::Relaxed),
                     },
                 }
             }
@@ -56,6 +59,8 @@ pub struct Gauges {
     pub tracks: u64,
     /// Subscriptions.
     pub subscriptions: u64,
+    /// Datagrams received per second over the last sweep interval.
+    pub rx_pps: u64,
 }
 
 /// A read of `ShardStats`.
@@ -70,16 +75,26 @@ pub struct ShardStatsSnapshot {
 counters! {
     /// Loop iterations.
     iterations,
+    /// Times the shard thread parked (note §3.3).
+    parks,
     /// Datagrams received.
     rx_datagrams,
     /// Bytes received.
     rx_bytes,
+    /// Received datagrams larger than a pool buffer, dropped.
+    rx_truncated,
+    /// Receive calls that failed with an error other than `WouldBlock`.
+    rx_errors,
+    /// Datagrams dropped because their source address was unreadable.
+    rx_unreadable,
     /// Datagrams handed to the I/O backend and sent.
     tx_datagrams,
     /// Bytes sent.
     tx_bytes,
     /// Datagrams the backend could not send.
     drop_send_failed,
+    /// Flushes forced by a full send batch in the middle of a fan-out.
+    tx_full_flushes,
     /// First byte in no RFC 7983 range.
     drop_unclassified,
     /// STUN that is not a valid binding request for a known ufrag.
@@ -92,6 +107,8 @@ counters! {
     drop_dtls_verified,
     /// DTLS beyond the session's per-second budget.
     drop_dtls_budget,
+    /// DTLS beyond the shard's per-second budget (all sessions together).
+    drop_dtls_shard_budget,
     /// SRTP/SRTCP for a session without SRTP.
     drop_no_srtp,
     /// SRTP/SRTCP that failed authentication, replay or length checks.
@@ -110,6 +127,9 @@ counters! {
     drop_pool_empty,
     /// Event sink and retention queue full.
     drop_event_full,
+    /// Events dropped because the event channel is closed (control plane
+    /// gone).
+    drop_event_closed,
     /// Events for a session after its `ConsentLost` (not sent).
     drop_after_consent,
     /// `SendDatagram` for a session without an address, or too large.
@@ -165,6 +185,7 @@ mod tests {
             sessions: 2,
             tracks: 1,
             subscriptions: 4,
+            rx_pps: 250,
         };
         stats.publish(&counters, gauges);
         assert_eq!(stats.load(), ShardStatsSnapshot { counters, gauges });

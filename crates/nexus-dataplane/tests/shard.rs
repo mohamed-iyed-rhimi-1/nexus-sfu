@@ -4,7 +4,7 @@ mod support;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nexus_dataplane::{
     Command, Event, ExtIds, RejectReason, SelectReason, SubscriptionId, TrackId,
@@ -304,6 +304,33 @@ fn ts(p: &[u8]) -> u32 {
 }
 fn ssrc(p: &[u8]) -> u32 {
     u32::from_be_bytes(p[8..12].try_into().unwrap())
+}
+
+/// One receive batch of 64 packets to 5 subscribers is 320 datagrams, more
+/// than `SEND_BATCH` (256): the fan-out flushes in the middle of the batch
+/// and nothing is lost.
+#[test]
+fn fan_out_beyond_the_send_batch_flushes_mid_batch() {
+    let mut call = call(GCM, 5);
+    let flushes = call.shard.counters().tx_full_flushes;
+    for i in 0..nexus_dataplane::RECV_BATCH as u16 {
+        let packet = call
+            .publisher
+            .rtp(PUB_SSRC, 100 + i, 960 * u32::from(i), &[1; 50]);
+        let from = call.publisher.addr;
+        call.shard.io_mut().push_inbound(from, packet);
+    }
+    // One iteration receives the whole batch.
+    let stats = call.shard.iterate(call.now);
+    assert_eq!(stats.received, nexus_dataplane::RECV_BATCH);
+    assert!(
+        call.shard.counters().tx_full_flushes > flushes,
+        "flushed mid-batch"
+    );
+    let received = call.received();
+    for packets in &received {
+        assert_eq!(packets.len(), nexus_dataplane::RECV_BATCH);
+    }
 }
 
 #[test]
@@ -983,9 +1010,9 @@ struct Bounded {
 }
 
 impl nexus_dataplane::EventSink for Bounded {
-    fn try_send(&mut self, event: Event) -> Result<(), Event> {
+    fn try_send(&mut self, event: Event) -> Result<(), nexus_dataplane::Refused> {
         if self.events.len() >= self.room {
-            return Err(event);
+            return Err(nexus_dataplane::Refused::Full(event));
         }
         self.events.push(event);
         Ok(())
@@ -1081,6 +1108,94 @@ fn dtls_flood_is_capped_per_session_and_second() {
     assert_eq!(dtls(events(&mut shard)), 1);
 }
 
+#[test]
+fn dtls_flood_is_capped_per_shard_and_second() {
+    let t0 = Instant::now();
+    let config = nexus_dataplane::ShardConfig {
+        pool_buffers: 512,
+        max_sessions: 64,
+        dtls_budget_per_sweep: 1_000,
+        ..Default::default()
+    };
+    let io = nexus_dataplane::MemIo::new();
+    let mut shard = nexus_dataplane::Shard::new(config, io, Vec::new(), t0).expect("valid config");
+    let peers: Vec<Peer> = (1..=40)
+        .map(|n| Peer::new(n, &format!("192.0.2.{n}:1000"), GCM))
+        .collect();
+    for peer in &peers {
+        command(&mut shard, peer.create());
+        run(&mut shard, t0);
+        let request = peer.binding_request(true);
+        shard.io_mut().push_inbound(peer.addr, request);
+        run(&mut shard, t0);
+    }
+    events(&mut shard);
+    // Each session stays within its own budget of 32; together they send
+    // 1,280, over the shard's 1,000.
+    for peer in &peers {
+        for _ in 0..32 {
+            let record = vec![22, 0xFE, 0xFD, 0];
+            shard.io_mut().push_inbound(peer.addr, record);
+        }
+    }
+    run(&mut shard, t0);
+    let dtls = |events: Vec<Event>| {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::DtlsDatagram { .. }))
+            .count()
+    };
+    assert_eq!(dtls(events(&mut shard)), 1_000);
+    assert_eq!(shard.counters().drop_dtls_shard_budget, 280);
+    assert_eq!(shard.counters().drop_dtls_budget, 0);
+
+    // The sweep refills the shard's budget.
+    run(&mut shard, at(t0, 1_000));
+    let record = vec![22, 0xFE, 0xFD, 0];
+    shard.io_mut().push_inbound(peers[39].addr, record);
+    run(&mut shard, at(t0, 1_000));
+    assert_eq!(dtls(events(&mut shard)), 1);
+}
+
+/// A sink whose receiver is gone.
+struct Closed;
+
+impl nexus_dataplane::EventSink for Closed {
+    fn try_send(&mut self, event: Event) -> Result<(), nexus_dataplane::Refused> {
+        Err(nexus_dataplane::Refused::Closed(event))
+    }
+}
+
+/// A closed event channel (control plane gone) is counted apart from a full
+/// one, and nothing waits in the retention queue for it.
+#[test]
+fn closed_event_channel_is_counted_and_not_retained() {
+    let t0 = Instant::now();
+    let config = nexus_dataplane::ShardConfig {
+        pool_buffers: 512,
+        max_sessions: 8,
+        ..Default::default()
+    };
+    let io = nexus_dataplane::MemIo::new();
+    let mut shard = nexus_dataplane::Shard::new(config, io, Closed, t0).unwrap();
+    for n in 0..300 {
+        let rejected = Command::Unsubscribe {
+            sub: SubscriptionId::new(n + 1),
+        };
+        assert!(shard.push_command(rejected).is_ok());
+    }
+    for _ in 0..10 {
+        shard.iterate(t0);
+    }
+    let counters = shard.counters();
+    assert_eq!(counters.drop_event_closed, 300);
+    assert_eq!(counters.drop_event_full, 0);
+    assert_eq!(
+        shard.park_deadline(t0),
+        t0 + nexus_dataplane::shard::HOUSEKEEPING_INTERVAL
+    );
+}
+
 /// Fills the shard's 256-event retention while the sink takes nothing more.
 fn fill_retention(
     shard: &mut nexus_dataplane::Shard<nexus_dataplane::MemIo, Bounded>,
@@ -1106,6 +1221,36 @@ fn session_events(shard: &nexus_dataplane::Shard<nexus_dataplane::MemIo, Bounded
         .filter(|e| !matches!(e, Event::CommandRejected { .. }))
         .cloned()
         .collect()
+}
+
+/// A parked shard wakes for retries: while events wait in the retention
+/// queue it parks at most `PARK_RETRY_INTERVAL`, else until housekeeping.
+#[test]
+fn park_deadline_is_short_while_events_wait() {
+    use nexus_dataplane::shard::{HOUSEKEEPING_INTERVAL, PARK_RETRY_INTERVAL};
+    let t0 = Instant::now();
+    let config = nexus_dataplane::ShardConfig {
+        pool_buffers: 512,
+        max_sessions: 8,
+        ..Default::default()
+    };
+    let sink = Bounded {
+        room: 0,
+        events: Vec::new(),
+    };
+    let mut shard =
+        nexus_dataplane::Shard::new(config, nexus_dataplane::MemIo::new(), sink, t0).unwrap();
+    shard.iterate(t0);
+    assert_eq!(shard.park_deadline(t0), t0 + HOUSEKEEPING_INTERVAL);
+    fill_retention(&mut shard, t0);
+    assert_eq!(shard.park_deadline(t0), t0 + PARK_RETRY_INTERVAL);
+    // Never later than the housekeeping.
+    let late = t0 + HOUSEKEEPING_INTERVAL - Duration::from_millis(1);
+    assert_eq!(shard.park_deadline(late), t0 + HOUSEKEEPING_INTERVAL);
+    // Drained: back to the housekeeping deadline.
+    shard.events_mut().room = usize::MAX;
+    shard.iterate(t0);
+    assert_eq!(shard.park_deadline(t0), t0 + HOUSEKEEPING_INTERVAL);
 }
 
 #[test]

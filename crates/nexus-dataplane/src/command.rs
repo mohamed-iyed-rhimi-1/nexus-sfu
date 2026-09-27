@@ -268,12 +268,21 @@ pub enum RejectReason {
 /// Where a shard puts its events. Implemented for a tokio sender in 1.3;
 /// tests use a `Vec`.
 pub trait EventSink {
-    /// Hands the event over without blocking; gives it back when full.
-    fn try_send(&mut self, event: Event) -> Result<(), Event>;
+    /// Hands the event over without blocking; gives it back when refused.
+    fn try_send(&mut self, event: Event) -> Result<(), Refused>;
+}
+
+/// Why a sink refused an event (it is handed back).
+#[derive(Debug)]
+pub enum Refused {
+    /// Full for now: the shard retains or drops the event, and retries.
+    Full(Event),
+    /// Closed for good: the receiver is gone.
+    Closed(Event),
 }
 
 impl EventSink for Vec<Event> {
-    fn try_send(&mut self, event: Event) -> Result<(), Event> {
+    fn try_send(&mut self, event: Event) -> Result<(), Refused> {
         self.push(event);
         Ok(())
     }
