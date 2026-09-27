@@ -39,8 +39,13 @@ use super::crypto::SrtpKeyMaterial;
 use super::error::DtlsError;
 use super::types::DtlsRole;
 
-/// Maximum bytes read from BIO per call.
-const MAX_BIO_READ: usize = 16384;
+/// Maximum bytes read from BIO per call, and the largest datagram `process` accepts.
+pub const MAX_BIO_READ: usize = 16384;
+
+/// Path MTU given to OpenSSL: handshake messages are fragmented into records that fit
+/// datagrams of this size (the memory BIO cannot report one; without it OpenSSL falls
+/// back to its minimum). Callers split the output at record boundaries.
+pub const DTLS_MTU: u32 = 1200;
 
 /// `SSL_ctrl` command behind `DTLSv1_handle_timeout` (a macro in `ssl.h`, so
 /// not exported by openssl-sys).
@@ -78,8 +83,9 @@ impl MemBio {
 
     /// Feed incoming network data (DTLS records from UDP).
     fn feed(&mut self, data: &[u8]) {
-        assert!(!data.is_empty(), "feed data must not be empty");
-        assert!(data.len() <= MAX_BIO_READ, "feed data exceeds MAX_BIO_READ");
+        // `process` checks the length before calling (network input never panics).
+        debug_assert!(!data.is_empty(), "feed data must not be empty");
+        debug_assert!(data.len() <= MAX_BIO_READ, "feed data exceeds MAX_BIO_READ");
         self.incoming.extend_from_slice(data);
     }
 
@@ -293,7 +299,8 @@ fn build_context(pkey: &PKey<Private>, x509: &X509) -> Result<SslContext, DtlsEr
     // Disable session tickets and the session cache (not needed for DTLS-SRTP): the
     // context is shared by every session of the process, so a server-side cache would
     // keep one entry per handshake, process-wide.
-    ctx.set_options(SslOptions::NO_TICKET);
+    // NO_QUERY_MTU: the MTU comes from `DTLS_MTU` (set per `Ssl`), not from the BIO.
+    ctx.set_options(SslOptions::NO_TICKET | SslOptions::NO_QUERY_MTU);
     ctx.set_session_cache_mode(SslSessionCacheMode::OFF);
     Ok(ctx.build())
 }
@@ -437,13 +444,18 @@ impl OpenSslDtlsEngine {
     /// Change the DTLS role before the handshake starts (the role is only
     /// known once the SDP answer's `a=setup` arrives; the certificate, and so
     /// the fingerprint already sent in the offer, stays the same).
-    pub fn set_role(&mut self, role: DtlsRole) {
-        assert!(
-            !self.started,
-            "DTLS role is fixed once the handshake starts"
-        );
+    ///
+    /// # Errors
+    /// `InvalidState` once the handshake has started (the role is fixed then).
+    pub fn set_role(&mut self, role: DtlsRole) -> Result<(), DtlsError> {
+        if self.started {
+            return Err(DtlsError::invalid_state(
+                "DTLS role is fixed once the handshake starts",
+            ));
+        }
         self.role = role;
         assert_eq!(self.role, role);
+        Ok(())
     }
 
     /// Start the DTLS handshake.
@@ -452,12 +464,20 @@ impl OpenSslDtlsEngine {
     /// For server role: prepares to accept ClientHello.
     ///
     /// Returns outgoing DTLS records to send over UDP.
+    ///
+    /// # Errors
+    /// `InvalidState` if the handshake was already started; `HandshakeFailed` on an
+    /// OpenSSL error.
     pub fn start_handshake(&mut self) -> Result<Vec<u8>, DtlsError> {
-        assert!(!self.started, "handshake already started");
+        if self.started {
+            return Err(DtlsError::invalid_state("handshake already started"));
+        }
         self.started = true;
 
         let mut ssl = Ssl::new(&self.certificate.ctx)
             .map_err(|e| DtlsError::handshake_failed(format!("SSL new: {}", e)))?;
+        ssl.set_mtu(DTLS_MTU)
+            .map_err(|e| DtlsError::handshake_failed(format!("SSL mtu: {}", e)))?;
 
         if self.role == DtlsRole::Server {
             ssl.set_accept_state();
@@ -499,10 +519,16 @@ impl OpenSslDtlsEngine {
     ///
     /// # Returns
     /// - `Ok(outgoing_data)` — DTLS records to send back over UDP
-    /// - `Err` — Fatal handshake error
+    /// - `Err` — Fatal handshake error, or a datagram that is empty or longer than
+    ///   `MAX_BIO_READ` (network input: refused, never a panic)
     pub fn process(&mut self, data: &[u8]) -> Result<Vec<u8>, DtlsError> {
-        assert!(!data.is_empty(), "process data must not be empty");
-        assert!(data.len() <= MAX_BIO_READ, "data exceeds MAX_BIO_READ");
+        if data.is_empty() || data.len() > MAX_BIO_READ {
+            return Err(DtlsError::invalid_state(format!(
+                "DTLS datagram of {} bytes (1..={} accepted)",
+                data.len(),
+                MAX_BIO_READ
+            )));
+        }
 
         if let Some(mut mid) = self.mid_handshake.take() {
             // Feed incoming data to the read BIO
@@ -834,6 +860,97 @@ mod tests {
         let yesterday = openssl::asn1::Asn1Time::days_from_now(0).unwrap();
         let diff = a.not_before().diff(&yesterday).unwrap();
         assert_eq!(diff.days, 1, "not_before one day in the past: {:?}", diff);
+    }
+
+    /// Record sizes (header included) of a buffer of whole DTLS records.
+    fn record_sizes(mut buf: &[u8]) -> Vec<usize> {
+        let mut sizes = Vec::new();
+        while !buf.is_empty() {
+            assert!(buf.len() >= 13, "truncated record header");
+            let len = 13 + u16::from_be_bytes([buf[11], buf[12]]) as usize;
+            assert!(buf.len() >= len, "truncated record");
+            sizes.push(len);
+            buf = &buf[len..];
+        }
+        sizes
+    }
+
+    /// Every record of both sides' flights fits `DTLS_MTU`, the certificate flight
+    /// included, and OpenSSL fragments at `DTLS_MTU` rather than at its minimum.
+    #[test]
+    fn flights_are_cut_into_records_that_fit_the_mtu() {
+        let certificate = DtlsCertificate::generate().unwrap();
+        let mut client = OpenSslDtlsEngine::new(DtlsRole::Client).unwrap();
+        let mut server = OpenSslDtlsEngine::with_certificate(DtlsRole::Server, &certificate);
+        assert!(server.start_handshake().unwrap().is_empty());
+        let hello = client.start_handshake().unwrap();
+        let server_flight = server.process(&hello).unwrap();
+        let client_flight = client.process(&server_flight).unwrap();
+        for flight in [&hello, &server_flight, &client_flight] {
+            let sizes = record_sizes(flight);
+            assert!(!sizes.is_empty());
+            assert!(sizes.iter().all(|&n| n <= DTLS_MTU as usize), "{:?}", sizes);
+        }
+        // The server flight carries the certificate: more than one small record.
+        // The certificate message fits one record: OpenSSL used `DTLS_MTU`, not its
+        // 256-byte minimum (measured: 320-byte record here, ≤ 180 without the MTU).
+        let largest = record_sizes(&server_flight).into_iter().max().unwrap();
+        assert!(largest > certificate.der().len(), "{} bytes", largest);
+        let finished = server.process(&client_flight).unwrap();
+        client.process(&finished).unwrap();
+        assert!(client.is_established() && server.is_established());
+    }
+
+    /// Network input: empty and oversized datagrams are errors in every state, never a
+    /// panic (they were `assert!`s).
+    #[test]
+    fn process_refuses_empty_and_oversized_datagrams_in_every_state() {
+        let oversized = vec![22u8; MAX_BIO_READ + 1];
+        let check = |engine: &mut OpenSslDtlsEngine| {
+            assert!(engine.process(&[]).is_err());
+            assert!(engine.process(&oversized).is_err());
+        };
+        let mut idle = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        check(&mut idle);
+        let mut client = OpenSslDtlsEngine::new(DtlsRole::Client).unwrap();
+        let mut server = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        server.start_handshake().unwrap();
+        check(&mut server);
+        handshake_started(&mut client, &mut server);
+        check(&mut client);
+        check(&mut server);
+        // A maximal datagram of garbage is refused by OpenSSL or ignored, not a panic.
+        let _ = server.process(&vec![0xAB; MAX_BIO_READ]);
+    }
+
+    /// `handshake` for a server that was already started.
+    fn handshake_started(client: &mut OpenSslDtlsEngine, server: &mut OpenSslDtlsEngine) {
+        let mut to_server = client.start_handshake().unwrap();
+        for _ in 0..16 {
+            if client.is_established() && server.is_established() {
+                return;
+            }
+            let to_client = server.process(&to_server).unwrap();
+            if to_client.is_empty() {
+                break;
+            }
+            to_server = client.process(&to_client).unwrap();
+            if to_server.is_empty() {
+                break;
+            }
+        }
+        assert!(client.is_established() && server.is_established());
+    }
+
+    #[test]
+    fn role_and_start_are_errors_once_started() {
+        let mut engine = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        engine.set_role(DtlsRole::Client).unwrap();
+        engine.set_role(DtlsRole::Server).unwrap();
+        engine.start_handshake().unwrap();
+        assert!(engine.set_role(DtlsRole::Client).is_err());
+        assert_eq!(engine.role(), DtlsRole::Server);
+        assert!(engine.start_handshake().is_err());
     }
 
     #[test]

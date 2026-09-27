@@ -110,7 +110,7 @@ pub struct ExtIds {
 }
 
 /// A publish m-line as the publisher's answer described it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrackSpec {
     /// Audio or video.
     pub kind: MediaKind,
@@ -173,7 +173,7 @@ pub struct ExtMap {
 }
 
 /// A subscribe m-line, as both answers described it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubSpec {
     /// The SFU-chosen SSRC announced in the subscriber's SDP.
     pub out_ssrc: u32,

@@ -38,14 +38,14 @@ mod types;
 
 pub use crypto::{
     compute_ecdhe_shared_secret_ring, generate_ecdhe_keypair_ring, CipherSuite, KeyMaterial,
-    SrtpProfile,
+    SrtpKeyMaterial, SrtpProfile,
 };
 pub use error::DtlsError;
 pub use handshake::{
     ClientHandshakeState, DtlsClientHandshake, Flight, FragmentBuffer, HandshakeState,
     HandshakeType, SrtpKeys,
 };
-pub use openssl_backend::{DtlsCertificate, OpenSslDtlsEngine};
+pub use openssl_backend::{DtlsCertificate, OpenSslDtlsEngine, DTLS_MTU, MAX_BIO_READ};
 pub use record::{ContentType, FragmentAssembler, RecordLayer};
 pub use session::{DtlsSession, SessionConfig, SessionState, HANDSHAKE_TIMEOUT_MS};
 pub use types::*;

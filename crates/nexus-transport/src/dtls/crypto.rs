@@ -171,6 +171,19 @@ impl SrtpProfile {
     pub const fn is_aead(self) -> bool {
         matches!(self, Self::AeadAes128Gcm | Self::AeadAes256Gcm)
     }
+
+    /// The SRTP layer's profile with the same id (both follow RFC 5764 / RFC 7714
+    /// numbering; key and salt lengths agree, checked in the tests).
+    #[inline]
+    pub const fn protection_profile(self) -> crate::srtp::ProtectionProfile {
+        use crate::srtp::ProtectionProfile as P;
+        match self {
+            Self::Aes128CmHmacSha1_80 => P::Aes128CmHmacSha1_80,
+            Self::Aes128CmHmacSha1_32 => P::Aes128CmHmacSha1_32,
+            Self::AeadAes128Gcm => P::AeadAes128Gcm,
+            Self::AeadAes256Gcm => P::AeadAes256Gcm,
+        }
+    }
 }
 
 // Compile-time assertions for SrtpProfile
@@ -914,6 +927,17 @@ impl Aes128GcmContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protection_profile_matches_id_and_lengths() {
+        for id in [0x0001u16, 0x0002, 0x0007, 0x0008] {
+            let dtls = SrtpProfile::from_u16(id).unwrap();
+            let srtp = dtls.protection_profile();
+            assert_eq!(srtp as u16, id);
+            assert_eq!(srtp.key_len(), dtls.key_length());
+            assert_eq!(srtp.salt_len(), dtls.salt_length());
+        }
+    }
 
     // ========================================================================
     // PRF Tests

@@ -1593,7 +1593,9 @@ impl WebRtcSession {
         }
         self.config.dtls_role = role;
         if let Some(engine) = self.openssl_dtls.as_mut() {
-            engine.set_role(role);
+            engine
+                .set_role(role)
+                .map_err(|_| WebRtcError::InvalidState)?;
         }
         assert_eq!(self.config.dtls_role, role);
         Ok(())

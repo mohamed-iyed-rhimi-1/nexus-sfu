@@ -34,6 +34,8 @@ nexus-bwe = { path = "crates/nexus-bwe" }
 nexus-api = { path = "crates/nexus-api" }
 # WebRTC transport and SDP
 nexus-webrtc = { path = "crates/nexus-webrtc" }
+# Data plane: shards, commands and events (Phase 1)
+nexus-dataplane = { path = "crates/nexus-dataplane" }
 tokio = { version = "1.44", features = ["full", "rt-multi-thread", "net", "sync", "time", "macros"] }
 tokio-util = { version = "0.7" }
 

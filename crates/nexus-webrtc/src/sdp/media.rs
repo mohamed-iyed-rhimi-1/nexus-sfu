@@ -337,6 +337,20 @@ pub struct SsrcGroup {
     pub ssrc_count: u8,
 }
 
+impl SsrcGroup {
+    /// Semantics (`FID`, `SIM`, …); empty if not UTF-8.
+    pub fn semantics_str(&self) -> &str {
+        let len = (self.semantics_len as usize).min(self.semantics.len());
+        std::str::from_utf8(&self.semantics[..len]).unwrap_or("")
+    }
+
+    /// The group's SSRCs, in order (the first is the primary for FID and the
+    /// lowest layer for SIM).
+    pub fn ssrc_list(&self) -> &[u32] {
+        &self.ssrcs[..(self.ssrc_count as usize).min(self.ssrcs.len())]
+    }
+}
+
 /// RID entry (RFC 8851).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rid {

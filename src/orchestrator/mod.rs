@@ -6,10 +6,15 @@
 
 pub mod candidates;
 pub mod connection;
+pub mod dtls;
 pub mod events;
+pub mod ids;
 pub mod negotiation;
 pub mod room;
+pub mod sdp_params;
 pub mod subscription;
+pub mod tracks;
+pub mod transports;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

@@ -76,8 +76,8 @@ These apply to every part; a part is not done until they hold.
 
 Each part is sized for one working session and ends at a green checkpoint.
 
-- **Add**, with the old path still live: 1.1 → 1.2a → 1.2b → 1.3 → 1.4 → 1.5a. 1.1 and 1.4
-  are independent of the rest and can move earlier or later.
+- **Add**, with the old path still live: 1.1 → 1.2a → 1.2b → 1.3 → 1.4 → 1.5a → 1.5b-prep.
+  1.1 and 1.4 are independent of the rest and can move earlier or later.
 - **Switch** (one commit): 1.5b.
 - **After the switch:** the deletion steps run in this order, because each one removes code
   the next one's targets still import (checked in the audit):
@@ -742,60 +742,164 @@ negotiator.rs, media.rs}`, `crates/nexus-webrtc/src/webrtc/session.rs` (compile 
 **Goal:** the new orchestrator building blocks as standalone, unit-tested modules, before the
 switch: nothing calls them yet.
 
-**Files:** `src/orchestrator/{transports.rs (new), tracks.rs (new), sdp_params.rs (new),
-ids.rs (new)}`, `crates/nexus-transport/src/dtls/openssl_backend.rs` (input guards).
+**Files:** `src/orchestrator/{ids.rs, dtls.rs, transports.rs, tracks.rs, sdp_params.rs}` (new),
+root `Cargo.toml` (`nexus-dataplane` dependency) and `Cargo.lock`,
+`crates/nexus-transport/src/dtls/{openssl_backend.rs, crypto.rs}` (input guards, MTU, profile
+conversion), `crates/nexus-webrtc/src/sdp/{attributes.rs, media.rs}` (read accessors only).
 
 **Change:**
-- `ids.rs`: counters for `SessionId`, `TrackId`, `SubscriptionId` (never 0). `TrackId`s come
-  from `WorkerPool::assign_track` (`pool.rs:3989`) today.
-- `transports.rs` (note §6.5): `Transports` = `HashMap<SessionId, TransportEntry>` with
-  `shard`, `IceParams` (16-char ufrag, 32-char password, random), `DtlsHandshake`, state,
-  `SsrcAllocator`, timestamps.
-- `DtlsHandshake` wraps `OpenSslDtlsEngine::with_certificate` and the pinned fingerprint,
-  with the logic of `check_dtls_completion` / `initialize_srtp` (`webrtc/session.rs:1477`,
-  `:1643`) without the copy into the pure-Rust `DtlsSession` (`:2305-2332`). Details the
-  note leaves out:
-  - **Role.** The SFU offers `actpass`; browsers answer `active`, which makes the SFU the
-    DTLS **server** (webrtc-rs answers `passive` in `dtls_survives_lost_first_flight`, which
-    makes it the client). A ClientHello can arrive before the answer is processed: a
-    ClientHello from the peer means the SFU is server. Server role: the engine is put in
-    accept state (`start_handshake`) before the first datagram, because `process` errors
-    without an active handshake (`openssl_backend.rs:495-505`). Client role: `start()` on
-    `AddressSelected` (note §6.1).
-  - **Fingerprint.** DTLS can complete before the answer: completion has a Pending state
-    until `set_remote_fingerprint`, then Match or Mismatch (as `check_dtls_completion`).
-  - **Output.** `process` and `handle_timeout` return one concatenated `Vec<u8>` of records
-    (the memory BIO appends). It is sent as one datagram, as today; the engine's MTU setting
-    is checked so a flight with the certificate fits one datagram, or the output is split
-    at record boundaries.
-  - **Input guards.** `process`/`feed` assert non-empty and ≤ 16,384 bytes: check the length
-    before calling, and remove the asserts.
-  - **Timeout.** Own handshake-timeout constant: the current one (`webrtc/mod.rs:70`,
-    `session.rs:103`) is deleted in C6.
-  - Returns `(profile, local, remote)` key material by role (client: inbound = server
-    key/salt), and `free_ssl()`.
-- `SsrcAllocator`: random `base`, strictly increasing offset, skips 0 and the peer's SSRCs
-  (bounded loop).
-- `tracks.rs`: `TrackRegistry` (TrackId → publisher session, shard, kind, codec, mid, ssrc,
-  ext ids, cname, content type).
-- `sdp_params.rs`: from a parsed answer, build `TrackSpec` for a publish m-line (primary
-  SSRC = first `a=ssrc` not a secondary in an `a=ssrc-group`, PT, `ExtIds` by URI, cname) and
-  `SubSpec` for a subscribe m-line (`PtMap` by codec name + clock rate, `ExtMap` publisher id
-  → URI → subscriber id, `mid`).
+- Root crate depends on `nexus-dataplane` (today only a workspace member, `Cargo.toml:2`).
+- `ids.rs`: `IdAllocator` with counters for `SessionId`, `TrackId`, `SubscriptionId` (start
+  at 1, never 0, asserted never to wrap). `TrackId`s come from `WorkerPool::assign_track`
+  (`pool.rs:3981`) today; the value stays the signaling `track_id` (note §4).
+- `dtls.rs`: `DtlsHandshake` wraps `OpenSslDtlsEngine::with_certificate` and the pinned
+  fingerprint, with the logic of `check_dtls_completion` / `initialize_srtp`
+  (`webrtc/session.rs:1480`, `:1646`) without the copy into the pure-Rust `DtlsSession`
+  (`:2298-2331`). Details the note leaves out:
+  - **Role, fixed lazily.** The SFU offers `actpass`; browsers answer `active` (SFU = DTLS
+    **server**), webrtc-rs answers `passive` in `dtls_survives_lost_first_flight` (SFU =
+    client). The engine's role cannot change once started (`set_role` asserts `!started`,
+    `openssl_backend.rs:440`), and a ClientHello can arrive before the answer is processed.
+    So the engine is created by whichever comes first: a ClientHello (role Server, engine
+    put in accept state, then fed) or the answer (`active` → Server, accept state at once;
+    `passive` → Client, started on the first `AddressSelected`). An answer that contradicts
+    a role already fixed by a ClientHello fails the handshake.
+  - **Fingerprint.** DTLS can complete before the answer: completion is Pending until the
+    fingerprint is pinned, then Match or Mismatch (as `check_dtls_completion`; no peer
+    fingerprint is Mismatch, an all-zero pinned value is an error, not an assert).
+  - **Output.** `process` and `handle_timeout` return one concatenated `Vec<u8>` (the
+    memory BIO appends), and no MTU is set: the BIO answers the MTU query with 0, so OpenSSL
+    fragments at its minimum and the old path sends the whole flight as one datagram. Now
+    `start_handshake` sets `DTLS_MTU` = 1,200 (`SslRef::set_mtu`, `NO_QUERY_MTU` on the
+    context) and `DtlsHandshake` splits the output at record boundaries into datagrams of
+    ≤ 1,200 bytes (one `SendDatagram` each in 1.5b).
+  - **Input guards.** `process` and `MemBio::feed` assert non-empty and ≤ 16,384 bytes
+    (`openssl_backend.rs:504-505`, `:81-82`); `set_role`/`start_handshake` assert
+    `!started`. `process` returns an error instead, the role/start asserts become errors,
+    and `DtlsHandshake` checks the length first.
+  - **Timeout.** Own constant `DTLS_HANDSHAKE_TIMEOUT` = 10 s from the first
+    `AddressSelected`. Today there are two: `webrtc/mod.rs:70` (10 s) and `session.rs:104`
+    (30 s, the one used); both go in C6. OpenSSL retransmits at 1, 2, 4 s fit.
+  - **Keys.** No export API: keys come from `engine.srtp_keys()` (`SrtpKeyMaterial`). New
+    `SrtpProfile` → `srtp::ProtectionProfile` conversion (none exists; `initialize_srtp`
+    matches by hand). `SrtpInstall` by role (server: local = server key‖salt, remote = client
+    key‖salt; client: the reverse) via `KeyMaterial::from_dtls_export`. All-zero keys are an
+    error. Beware `nexus_transport::dtls::KeyMaterial` (TLS record keys): use
+    `srtp::KeyMaterial`.
+  - `free_ssl()` drops the engine; the entry stays usable (later datagrams ignored).
+- `transports.rs` (note §6.5): `Transports` = `HashMap<SessionId, TransportEntry>` plus
+  participant ↔ session maps (replacing `register_transport` / `transport_to_participant`
+  in 1.5b). Entry: `shard`, `IceParams` (random 16-char ufrag, 32-char password from the
+  ice-char set), `DtlsHandshake`, state, `SsrcAllocator`, `created_at`,
+  `address_selected_at`. `sweep(now)` reports the ICE-connect timeout (30 s without an
+  address) and the DTLS timeout.
+- `SsrcAllocator`: random non-zero `base` (offset 0 is the session's `rtcp_ssrc` on the
+  shard, `session.rs:172`), offsets from 1 strictly increasing and `< 2^31`, skips 0 and the peer's
+  SSRCs (bounded loop, `None` when exhausted).
+- `tracks.rs`: `TrackRegistry` (TrackId → publisher, session, shard, kind, codec + name,
+  mid, ssrc, ext ids, cname, content type).
+- `sdp_params.rs` (pure, on `&MediaDescription`): `TrackSpec` for a publish m-line (primary
+  SSRC = first `a=ssrc` that is not a non-first member of an `a=ssrc-group`, an
+  `a=ssrc-group:SIM` is an error since v1 has no simulcast; PT and clock rate of the
+  offered codec; `ExtIds` by URI; cname = the SFU's `nexus-{publisher}` passed in, never
+  the publisher's own, note §6.5) and `SubSpec` for
+  a subscribe m-line (`PtMap` by codec name + clock rate, `ExtMap` publisher id → URI →
+  subscriber id, subscriber `mid`; inactive or rejected m-line → none). Extension ids > 14
+  are an error (left open by 1.4). The SDP types have no string accessors for extmap URI,
+  `a=ssrc` attribute/value or ssrc-group semantics: small ones are added in `nexus-webrtc`.
 
 **Tests:**
-- Handshake between a `DtlsHandshake` and a plain OpenSSL peer in both roles, including
-  ClientHello before the answer; keys picked by role match the peer's; fingerprint mismatch
+- Handshake between a `DtlsHandshake` and a plain OpenSSL peer (`OpenSslDtlsEngine::new`) in
+  both roles, including ClientHello before the answer and a ClientHello followed by a
+  `passive` answer (error); keys picked by role match the peer's; fingerprint mismatch
   fails; completion before the fingerprint waits and then succeeds; `free_ssl` leaves the
-  entry usable.
-- Empty, 1-byte, 16,385-byte and random datagrams into `DtlsHandshake::process`: error, no
-  panic.
+  entry usable; every datagram of the certificate flight is ≤ 1,200 bytes and the handshake
+  completes with datagrams fed one at a time; a lost first flight recovers through
+  `handle_timeout`.
+- Empty, 1-byte, 16,385-byte and random datagrams into `DtlsHandshake::process` in every
+  state and into `OpenSslDtlsEngine::process`: error or nothing, no panic; the record
+  splitter fuzzed.
 - `SsrcAllocator`: 10,000 allocations strictly increasing in offset, never 0 or a peer SSRC.
-- `sdp_params`: Chrome-shaped and Firefox-shaped answers (fixtures in the test) give the
-  expected specs; a declined extension maps to 0; an FID group's secondary SSRC is not the
-  track's SSRC; a remapped subscriber PT is found.
+- `sdp_params`: Chrome-, Firefox- and webrtc-rs-shaped answers (fixtures in the test) give
+  the expected specs; a declined extension maps to 0; id 15 is an error; an FID group's
+  secondary SSRC is not the track's SSRC; a remapped subscriber PT is found; a codec the
+  publisher does not send is an error.
 
-**Checkpoint:** workspace green, old path unchanged.
+**Code notes:**
+- Found while implementing (2026-09-27):
+  - **MTU measured.** Without an MTU OpenSSL cut records at its 256-byte minimum (the
+    certificate spread over records of ≤ 180 bytes); with `DTLS_MTU` the certificate is one
+    320-byte record. The whole server flight is ≈ 650 bytes, so the split rarely produces
+    more than one datagram today; it is the guarantee, not a fix for an observed failure.
+    `flights_are_cut_into_records_that_fit_the_mtu` fails without the MTU.
+  - `OpenSslDtlsEngine::set_role` returns `Result` (the old `WebRtcSession::set_dtls_role`
+    maps it to `InvalidState`); `start_handshake` twice and `process` on empty or
+    oversized input are errors. `SrtpKeyMaterial`, `DTLS_MTU`, `MAX_BIO_READ` exported from
+    `nexus_transport::dtls`; `SrtpProfile::protection_profile()` added.
+  - `DtlsHandshake` lives in its own `src/orchestrator/dtls.rs` (tests in `dtls_tests.rs`).
+    An invalid-length datagram is refused without a state change; any other error fails
+    the handshake for good and drops the OpenSSL state. Before the engine exists, only a
+    ClientHello starts it; other datagrams are ignored. `Progress::completed` is true once,
+    on the step that completes with a matching fingerprint.
+  - `sdp_params` also refuses two used extensions on one id (the shard would reject the
+    `Subscribe`). `TrackSpec` and `SubSpec` derive `PartialEq`/`Eq` (tests).
+  - **CNAME (review):** `TrackSpec::cname` is the SFU's `nexus-{publisher}` (note §6.5),
+    given by the caller; the publisher's own `a=ssrc … cname:` is not read. The same value
+    goes into subscriber offers and translated SDES, and one participant's CNAME is never
+    shown to another.
+  - **Review fixes (2026-09-27), before commit:**
+    - `free_ssl` acts only on a complete handshake (it was a `debug_assert`: in release, a
+      stray early `free_ssl` dropped the engine and a later ClientHello started a second
+      one, reporting `completed` twice). It returns whether it freed.
+    - `a=ssrc-group:SIM` on a publish m-line is `ParamsError::Simulcast` (was: first layer).
+    - `SsrcAllocator` redraws a zero base (`new(0)` asserts: the base is the RTCP SSRC).
+    - Tests: the peer's flights reach the SFU one record per datagram; lost server flight
+      with the SFU as server, recovered by the peer's ClientHello retransmission (no SFU
+      timer); fingerprint mismatch when the answer arrives after DTLS completed.
+  - Each new safeguard checked to fail with its fix disabled: role conflict, peer-SSRC
+    skip, length guard, FID secondary, fingerprint mismatch, MTU; after review also
+    `free_ssl` before completion, SIM refusal, zero-base redraw.
+
+**Checkpoint:** workspace green, old path unchanged (e2e 3/3; Linux container, the part
+touches DTLS I/O).
+
+---
+
+### 1.5b-prep Groundwork that keeps the old path green
+
+**Goal:** everything the switch needs that works on the old path too, so the switch commit
+only rewires. One commit.
+
+**Files:** `src/node.rs` (new), `src/sfu.rs`, `src/config/{mod.rs, loader.rs, tests.rs}`,
+`src/main.rs`, `config/*.toml`, `crates/nexus-webrtc/src/sdp/negotiator.rs`,
+`crates/nexus-loadtest/src/{client.rs, media.rs, track_stats.rs}`, `tests/e2e.rs`.
+
+**Change:**
+- `node.rs`: node id generation, `DistributedState`, SWIM and the gossip thread
+  (`sfu.rs:492-778`) and the client shutdown notice (`:2232`) move out of `Sfu`. `Sfu::new`
+  calls them until C1+C3, `server.rs` after the switch: no copy exists at any time.
+  `clock::now_ns` and `WorkerError` are not used there.
+- Config `[dataplane]` (note §14) with `#[serde(default)]`: `shards`, `busy_poll_rounds`,
+  `pool_buffers`, `consent_timeout_ms`, `rebind_silence_ms`, `cpu_affinity`,
+  `realtime_priority(_level)`. `to_dataplane_config` builds `DataplaneConfig` (bind address
+  and buffers from `[transport]`, `reserved_ports` = signaling, API and metrics ports,
+  `max_sessions` from `max_webrtc_sessions`) and validation calls its `validate`.
+  `--shards` (`main.rs:65-131`), `NEXUS_SHARDS` (`loader.rs:96`), the section in the four
+  `config/*.toml` (production: `busy_poll_rounds = 256`). Not used until the switch.
+- Negotiator: `ice_lite` option (`SessionDescription::ice_lite`, never set today); Track
+  m-line rtcp-fb passed in instead of hard-coded (`negotiator.rs:1121-1156`); the old path
+  passes today's set (test: its offer is unchanged).
+- Loadtest client (on the old path SSRCs and payloads pass through unchanged, so the checks
+  hold there too): one `stream_id` per client (`client.rs:640`, `:653`; no longer needed for
+the CNAME check, since the SFU writes `nexus-{publisher}` itself, but it makes the client
+announce one stream like a browser; optional); the senders of
+  `add_track` kept; payload marker (SSRC, frame counter) in the first 8 bytes of each frame
+  (`media.rs`), checked by the `on_track` reader, mismatches in `TrackStatsMap`; the SSRCs
+  of each SFU offer recorded per mid (`announced_ssrcs()`).
+- `two_party_audio_video` checks the marker. The SSRC comparison stays "published" until
+  the switch.
+
+**Checkpoint:** workspace green, e2e 3/3 on the old path, Linux container.
 
 ---
 
@@ -805,33 +909,58 @@ ids.rs (new)}`, `crates/nexus-transport/src/dtls/openssl_backend.rs` (input guar
 but still compiles.
 
 **Files:** `src/server.rs`, `src/main.rs`, `src/orchestrator/{mod.rs, negotiation.rs,
-subscription.rs, connection.rs, events.rs, candidates.rs}`, `src/config/*`,
-`crates/nexus-core/src/config.rs`, `config/*.toml`, `openssl_backend.rs` (`use_srtp` order),
-`tests/e2e.rs`, `tests/e2e/harness.rs`, `crates/nexus-loadtest/src/{client.rs, media.rs,
-track_stats.rs}`.
+subscription.rs, connection.rs, events.rs, candidates.rs}`, `openssl_backend.rs` (`use_srtp`
+order), `tests/e2e.rs`, `tests/e2e/harness.rs`. Config, `node.rs`, the negotiator options and
+the loadtest client changes land before, in 1.5b-prep.
 
 **Change** (the file-by-file tables of note §6.5, in full, plus):
-- `server.rs`: `Dataplane::start`; per-shard candidates via `candidates::resolve` (signature
-  `(&[IpAddr], SocketAddr) -> Result<Vec<SocketAddr>, String>`, unchanged). Moved out of
-  `Sfu::new` / `Sfu::shutdown` into `server.rs`: node id generation (`sfu.rs:491-540`, uses
-  `clock::now_ns` and `WorkerError`, both replaced), `DistributedState` (`:545`),
-  `shared_shutdown` (`:648`), `MetricsCollector::new(shards)` (`:653`), the broadcast
-  channel, SWIM and the gossip thread (`:667-721`), and the client shutdown notice
-  (`:2232`, `set_signaling_connections`) with its drain sleep. `start_api` gets the
-  collector and state from there. `ServerHandle.media_addr` → `media_addrs` (per shard);
+- `server.rs`: `to_dataplane_config` → `Dataplane::start`; per-shard candidates via
+  `candidates::resolve` (signature `(&[IpAddr], SocketAddr) -> Result<Vec<SocketAddr>,
+  String>`, unchanged). `node.rs` (1.5b-prep) for node id, `DistributedState`, gossip and the
+  shutdown notice with its drain sleep; `shared_shutdown` and `MetricsCollector::new(shards)`
+  created here. `start_api` gets the collector and state from there. `dataplane.shutdown()`
+  runs in `spawn_blocking`. `ServerHandle.media_addr` → `media_addrs` (per shard);
   `packet_loop` → the dataplane handle; `ServerHandle::is_finished()` (`main.rs:379`)
   reports whether the shards stopped. The ingress
   thread and `PacketSender` go.
 - `mod.rs`: constructor takes `DataplaneHandle`, `Vec<ShardInfo>`, placement; `select!` on
-  dataplane events; ICE/consent/cleanup intervals removed; 1 s sweep added (ICE-connect
-  timeout, note §6.4); `Unpublish` → `RemoveTrack` **and** the `DistributedState` entry
-  (today it only touches `ssrc_router`, `mod.rs:258-295`).
+  dataplane events; ICE/consent/cleanup intervals removed; 1 s sweep added (ICE-connect and
+  DTLS timeouts, `Transports::sweep`); `Unpublish` → `RemoveTrack` **and** the
+  `TrackRegistry` and `DistributedState` entries (today it only touches `ssrc_router`,
+  `mod.rs:259-299`). One helper pushes commands: `CommandQueueFull` → `Error` to the client
+  and the session closed (note §5.3), never dropped silently.
 - `negotiation.rs`: `create_transport` → `SessionId`, placement, `CreateSession`; offers
   with `a=ice-lite` (`SessionDescription::ice_lite`, never set today), fixed extmaps,
   publish rtcp-fb `nack pli` + `ccm fir`, subscription m-lines with the allocated out SSRC,
-  `stream_id`/`cname` `nexus-{publisher participant}`; `handle_answer` → `AddTrack` per
+  `stream_id`/`cname` `nexus-{publisher participant}` (the cname is `TrackSpec::cname`, the
+  same value the translated SDES carries); `handle_answer` → `AddTrack` per
   publish m-line and `Subscribe` per answered subscribe m-line (from `sdp_params`); remote
   candidates accepted and ignored; `cleanup_participant` → `CloseSession`.
+  - **Every offer goes through `create_ordered_offer`.** The first publish builds its offer
+    by hand today (`negotiation.rs:347-386`: no extmaps, no BUNDLE, no rtcp-fb, no
+    media-level ICE), so `mid` SSRC learning could not work on it. Codecs passed explicitly
+    (VP8, Opus): with `None` the Track m-lines offer the default list (VP9, H264, AV1
+    included) and a subscriber answering another codec gets no `PtMap` match.
+  - `MlineRole::Subscribe` carries `SubscriptionId`, out SSRC (allocated when the slot is
+    filled, at offer time) and whether it is on the shard. `handle_answer` pushes
+    `Subscribe` for every answered, active slot not yet on the shard, in increasing out-SSRC
+    offset (monotonic by construction, given the fresh-SSRC rule for a slot overtaken by a
+    higher offset below). This replaces `pending_mid_map`.
+  - DTLS role and fingerprint from the answer go to `DtlsHandshake::on_answer`; remote ICE
+    credentials are no longer read. A `sdp_params` error answers `Error` for that m-line.
+  - **Fingerprint:** only `sha-256`. An answer may carry several `a=fingerprint` lines
+    (RFC 8122); pick the sha-256 one, refuse an answer without one, and never truncate a
+    longer digest to 32 bytes. Check what the parser keeps when a level has several lines
+    (today one `Option<DtlsFingerprint>` per level) and fix it here if it keeps the wrong
+    one.
+  - **Setup:** `a=setup:active` or no `a=setup` → the SFU is server; `passive` → client;
+    `actpass` (not a valid answer) and `holdconn` are errors (as
+    `dtls_role_from_answer` does today, `negotiation.rs:616`).
+  - **Out SSRC of a late slot:** a subscribe slot whose out SSRC was allocated in an offer
+    but not yet registered on the shard, when a slot with a higher offset has been
+    registered since (the shard's high-water mark), gets a fresh SSRC on its next offer;
+    an SSRC below the high-water mark is never sent in a `Subscribe` (the shard would
+    refuse it as `OutSsrcNotMonotonic`).
   - **Local candidates stay trickled:** `start_ice_gathering` (`:652`) sends the session's
     shard candidates as `IceCandidate` messages plus end-of-candidates; `ice-options:trickle`
     stays in the offer. No connectivity checks are started.
@@ -839,39 +968,33 @@ track_stats.rs}`.
   - The old m-line cap constant from 1.4 goes; the limit is `MAX_MEDIA_SECTIONS` with an
     error to the client beyond it (R9).
   - Subscribe (Track) m-lines still offer `nack`, `nack pli`, `goog-remb`, `transport-cc`
-    (kept in 1.4 for the old path): decide the v1 set here (§12.4: no transport-cc or
-    REMB in v1; the shard ignores NACK from subscribers).
+    (kept in 1.4 for the old path). v1 set: `nack pli` and `ccm fir` only (§12.4: no
+    transport-cc or REMB in v1; the shard ignores NACK from subscribers).
 - `subscription.rs`: `Unsubscribe` commands; `handle_session_established` deleted (active
   on answer; called from `mod.rs:204`, `:332`); viewport / content type without data-plane
   effect. A `Subscribe` request with more than 10 ids is answered with `Error` instead of
   being silently cut to 10 (`subscription.rs:135`); the constant duplicated at
   `negotiation.rs:25` is removed.
-- `connection.rs`: `handle_event` for `DtlsDatagram`, `AddressSelected` (start the
-  handshake if the SFU is DTLS client), `PeerSrtpVerified` (`free_ssl`), `ConsentLost`;
-  `InstallSrtp` on completion; 200 ms tick keeps DTLS retransmission and the handshake
+- `connection.rs`: `handle_event` for `DtlsDatagram` (one `SendDatagram` per output
+  datagram), `AddressSelected` (start the handshake if the SFU is DTLS client; the first one
+  starts the DTLS timeout), `PeerSrtpVerified` (`free_ssl`), `ConsentLost`,
+  `CommandRejected` (logged; `UnknownSubscription` after `RemoveTrack` is expected);
+  `InstallSrtp` on completion with a matching fingerprint; 200 ms tick keeps DTLS retransmission and the handshake
   timeout. `DisconnectReason` (`events.rs:26`) gains `DtlsFailed`; `IceFailed`, never
   constructed today, is now used by the ICE-connect timeout.
-- Config `[dataplane]` (note §14) with `shards = 1`, `busy_poll_rounds`, `pool_buffers`,
-  `consent_timeout_ms`, `rebind_silence_ms`, `cpu_affinity`, `realtime_priority(_level)`.
-  The section gets `#[serde(default)]` (no section has it today, and
-  `test_shipped_configs_validate` loads every shipped file). `--shards` in the hand-written
-  CLI parser (`main.rs:66-120`), `NEXUS_SHARDS` in `config/loader.rs:96-107`. Port-range
-  validation (note §13.3) is new: no port-conflict check exists today. The old
-  `[worker]`/`[memory]` fields stay readable until C7 so the old code compiles.
 - `use_srtp`: `SRTP_AEAD_AES_128_GCM` first.
-- Loadtest client, for the tests:
-  - **One `stream_id` per client** for audio and video (today `loadtest-video-{rand}` and
-    `loadtest-audio-{rand}`, `client.rs:640`, `:653`; webrtc-rs uses the stream id as the
-    CNAME, so one publisher announces two CNAMEs and 1.6b's CNAME check could never pass).
-  - Payload marker (note §17.1): the publishing task (`client.rs:698`) reads its SSRCs from
-    `pc.get_senders()` (as `published_ssrcs` does, `:942-954`; `add_track`'s senders are
-    discarded at `:657`, `:662`) and `media.rs` writes (SSRC, frame counter) into the first
-    8 bytes of each frame. The subscriber's reader (`:438-448`) checks it; `TrackStatsMap`
-    records mismatches.
+- **Shard: DTLS only from the selected address.** `handle_dtls`
+  (`nexus-dataplane/src/shard/ingress.rs:209`) looks the source up in `by_addr`, which
+  holds every address that sent an authenticated binding request and the previous address
+  after a switch. It forwards `DtlsDatagram` only when the source is the session's
+  selected address (`session.addr`), else counts a drop; `SendDatagram` already goes to
+  that address. Test in `tests/shard.rs`: DTLS from a checked but unselected candidate
+  produces no event.
+- `ServerHandle` users: `main.rs:349`, `harness.rs:66`, `e2e.rs:150` use `media_addrs[0]`.
 - Tests (note §17.1): `two_party_audio_video` compares against the SSRCs each client's offer
-  announced for the peer's tracks (`tests/e2e.rs:61-67` already flags this) plus the
-  marker; `candidate_is_announced_address` uses `media_addrs[0]` (also `harness.rs:66`,
-  `main.rs:349`).
+  announced for the peer's tracks (`announced_ssrcs()`, 1.5b-prep; `tests/e2e.rs:61-67`
+  already flags this) plus the marker; `candidate_is_announced_address` uses
+  `media_addrs[0]`.
 
 **Code notes (audited 2026-09-26):**
 - Old-path references to replace. `SsrcRouter`/`WorkerPool`: `negotiation.rs` 12, 15,
@@ -879,9 +1002,10 @@ track_stats.rs}`.
   361, 429, 466, 481; `mod.rs` 22, 25, 53-65, 265; `server.rs` 126-178.
   `WebRtcTransport`/`TransportId`: `negotiation.rs` 21, 45-56, 85, 145-254, 325, 399-509,
   652, 729-829, 984, 1068-1099, 1236; `mod.rs` 27-30, 52-78; `connection.rs` throughout.
-- Functions deleted: `pending_mid_map` (`negotiation.rs:88`), `settled_established_transport`
-  (`:199`), `get_srtp_key_material` (`:219`), `take_pending_mid_map` (`:234`),
-  `selected_remote_addr` (`:242`).
+- Functions deleted (line numbers as of `474583a`): `pending_mid_map` (`negotiation.rs:92`),
+  `settled_established_transport` (`:203`), `get_srtp_key_material` (`:223`),
+  `take_pending_mid_map` (`:238`), `selected_remote_addr` (`:246`). `start_ice_gathering` is
+  at `:671`. The older line lists above drifted by ≈ 4 lines after 1.4: grep the names.
 - Payload marker: the VP8 payloader prepends a 1-byte descriptor and splits frames, so the
   marker is only in the first packet of a frame, after the descriptor; Opus samples (960
   bytes of PCM) are the payload as is. The marker's first byte becomes the VP8 payload's
@@ -1011,8 +1135,8 @@ stay under 30 s.
   Disconnected after 5 s without input, Failed after 30 s.
 - `register_default_interceptors` (`client.rs:193`) includes the sender and receiver report
   interceptors (reports every 1 s). webrtc-rs sends bare SRs without SDES; the SFU's
-  translated compound adds SDES from `TrackSpec::cname`. The CNAME check depends on the
-  one-stream-id change of 1.5b.
+  translated compound adds SDES from `TrackSpec::cname` (`nexus-{publisher}`); the check
+  compares it with the `a=ssrc … cname:` of the subscriber's offer.
 
 **Tests:** the three tests pass on macOS and Linux; `address_change_mid_call` is checked to
 fail with the rebinding rule disabled.
@@ -1126,8 +1250,10 @@ parts above already follow the corrected facts.
 | §16 | C1 alone; C5 before C6 | C1 and C3 must be one step; C6 before C5 |
 | §17.3 | webrtc-rs keepalive every 2 s | No keepalive while traffic flows; requests start ≈ 2 s after the rebind, then every 200 ms |
 | §17.4 | Client signaling handle becomes a command channel | A lock on the shared connection suffices; the task must forward confirmations |
-| §17.5 | Audio and video SRs carry the same CNAME | Only after the loadtest client uses one stream id per client (1.5b) |
+| §17.5 | Audio and video SRs carry the same CNAME | Holds because the SFU writes `nexus-{publisher}` for every track of a publisher (1.5a review), not the publisher's own CNAME |
 | §17.9 | Page needs no build step | `sdk/dist` is gitignored; token and secure context needed |
+| §6.1, §6.5 | The answer's `a=setup` fixes the DTLS role | A ClientHello can arrive first and fix it (engine role cannot change once started); a contradicting answer fails the handshake |
+| §6.3 | DTLS flights sent as they come | No MTU is set (the BIO reports 0): output is split at record boundaries into ≤ 1,200-byte datagrams |
 | §11.2 | The table lives in `nexus-dataplane`, shared with the negotiator | It lives in `nexus_media::rtp::extensions` (no dependency between the two crates); `nexus_dataplane::ext` re-exports it |
 
 ## Risks for this phase
@@ -1153,7 +1279,8 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.2b Shard core: extensions, RTCP, housekeeping, alloc test | Done | see git log (1.2) | `ext.rs` table + element iterator, full rewrite, `mid` SSRC learning, SR+SDES translation, PLI/FIR with throttle, housekeeping, `ShardStats`, event retention; `tests/alloc.rs` 0 allocations (GCM and CM) |
 | 1.3 Shard thread and I/O | Done | see git log (1.3) | `LinuxIo`/`PortableIo`, park/wake, shard thread, `DataplaneHandle`, `Dataplane::start`, `DataplaneConfig`, `Placement`/`SingleShard`, shard-wide DTLS cap; `tests/loopback.rs`; lost-wake-up fix; review fixes: oversized flood pacing, GRO refusal, concurrent shutdown, bytes sent, closed event channel |
 | 1.4 SDP groundwork, signaling limits, shared certificate | Done | see git log (1.4) | `media: Vec` (32), BUNDLE 544 B, 128 KB SDP and printer errors, two SDP parser panics fixed + proptests, `Mid::parse`, `rtcp_fbs`, `stream_id`/`cname` with one msid, extension table in `nexus-media`, WebSocket 256 KB + error reply + 1 MB cap, `DtlsCertificate` + `with_certificate`; old-path cap 8 |
-| 1.5a Control-plane pieces | Not started | | |
+| 1.5a Control-plane pieces | Done | see git log (1.5a) | `ids`, `dtls` (`DtlsHandshake`: lazy role, MTU split, keys by role), `transports` (`SsrcAllocator`, timeouts), `tracks`, `sdp_params`; engine input guards and `DTLS_MTU`; SDP accessors |
+| 1.5b-prep Node module, config, negotiator options, loadtest marker | Not started | | Old path green |
 | 1.5b Switch (one commit) | Not started | | Early browser check result goes here |
 | 1.7 Benches, memory budget, CI | Not started | | Before C2 |
 | C2 Old benches | Not started | | |
@@ -1340,3 +1467,34 @@ Add one line per working session: date, part, what was done, what is left.
   stricter parser refuses. macOS: fmt, clippy clean, 1,975 passed, e2e 3/3, SDP proptests
   at 5,000 cases clean; Linux arm64 (own target volume): clippy clean, 1,981 passed, e2e
   2/2. Committed. Next: 1.5a.
+- 2026-09-27: 1.5 planned against the code (three read-only audits: DTLS engine, orchestrator
+  and SDP, dataplane/config/e2e). §1.5a/§1.5b refined, new part 1.5b-prep (node module,
+  `[dataplane]` config, negotiator options, loadtest marker; old path stays green) so the
+  switch commit only rewires; two corrections added (DTLS role fixed by a ClientHello, no
+  MTU set). 1.5a implemented (uncommitted, for review): root crate depends on
+  `nexus-dataplane`; `src/orchestrator/{ids, dtls, transports, tracks, sdp_params}.rs` with
+  unit tests and proptests (random datagrams into every handshake state, record splitter);
+  OpenSSL engine input asserts turned into errors, `DTLS_MTU` = 1,200, SDP read accessors.
+  Each new safeguard checked to fail with its fix disabled. macOS: fmt, clippy clean,
+  2,008 passed, e2e (old path) 3/3; Linux arm64 container (own target volume
+  `nexus-dataplane-target`): fmt, clippy clean, 2,014 passed, 0 failed. Next: review and
+  commit 1.5a, then 1.5b-prep.
+- 2026-09-27, review fixes for 1.5a (uncommitted, for review): `free_ssl` only frees a
+  complete handshake (a stray early call could start a second engine and complete twice in
+  release); `TrackSpec::cname` is the SFU's `nexus-{publisher}` (note §6.5), the
+  publisher's own CNAME is not read (the "For 1.5b: CNAME" note replaced); a publish
+  m-line with `a=ssrc-group:SIM` is an error; `SsrcAllocator` redraws a zero base. New
+  tests: peer flights one record per datagram, lost server flight recovered by the
+  peer's ClientHello retransmission, fingerprint mismatch after completion, `free_ssl`
+  before completion. 1.5b gains: sha-256 fingerprint selection, `a=setup` rules, fresh
+  SSRC for a slot overtaken by a higher offset, shard DTLS only from the selected address
+  (today any `by_addr` entry). Each new safeguard checked to fail with its fix disabled.
+  macOS: fmt, clippy clean, 2,012 passed, e2e 3/3; Linux arm64 container (own target
+  volume `nexus-dataplane-target`): fmt, clippy clean, 2,018 passed, 0 failed, e2e 3/3.
+  Next: review, commit 1.5a, then 1.5b-prep.
+- 2026-09-27, verification of the 1.5a fixes: `free_ssl`, CNAME `nexus-{publisher}`, SIM
+  refusal, zero SSRC base and the four new DTLS tests confirmed in code and tests; stale
+  CNAME wording fixed in the design note (§6.5 table) and `tracks.rs`. Left for 1.5b:
+  `SsrcAllocator` does not check peer SSRCs against `base`, and `allocate` uses up offsets
+  when it returns `None`. macOS: fmt, clippy clean, 2,012 passed, e2e 3/3; Linux arm64
+  (own target volume): clippy clean, 2,018 passed, e2e 2/2. Committed. Next: 1.5b-prep.

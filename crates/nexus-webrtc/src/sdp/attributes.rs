@@ -532,6 +532,19 @@ pub struct SsrcInfo {
 }
 
 impl SsrcInfo {
+    /// Attribute name (`cname`, `msid`, …); empty if not UTF-8 (the parser only
+    /// stores UTF-8).
+    pub fn attribute_str(&self) -> &str {
+        let len = (self.attr_len as usize).min(self.attribute.len());
+        std::str::from_utf8(&self.attribute[..len]).unwrap_or("")
+    }
+
+    /// Attribute value (the cname, `stream track` for msid, …); empty if absent.
+    pub fn value_str(&self) -> &str {
+        let len = (self.value_len as usize).min(self.value.len());
+        std::str::from_utf8(&self.value[..len]).unwrap_or("")
+    }
+
     /// Parse from ssrc attribute value.
     ///
     /// Format: ssrc attribute:value
@@ -592,6 +605,14 @@ pub struct ExtMap {
     pub uri: [u8; 128],
     /// URI length.
     pub uri_len: u8,
+}
+
+impl ExtMap {
+    /// Extension URI; empty if not UTF-8 (the parser only stores UTF-8).
+    pub fn uri_str(&self) -> &str {
+        let len = (self.uri_len as usize).min(self.uri.len());
+        std::str::from_utf8(&self.uri[..len]).unwrap_or("")
+    }
 }
 
 /// Media direction.

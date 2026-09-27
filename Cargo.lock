@@ -2029,6 +2029,7 @@ dependencies = [
  "nexus-api",
  "nexus-bwe",
  "nexus-core",
+ "nexus-dataplane",
  "nexus-loadtest",
  "nexus-media",
  "nexus-metrics",
