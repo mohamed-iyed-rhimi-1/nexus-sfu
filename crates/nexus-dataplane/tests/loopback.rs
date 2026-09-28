@@ -483,3 +483,18 @@ fn shard_socket_has_gro_off() {
     let socket = nexus_dataplane::bind_shard_socket(config.bind_addr, &config).unwrap();
     assert!(!nexus_dataplane::udp_gro_enabled(socket.as_raw_fd()).unwrap());
 }
+
+/// A buffer size the kernel refuses (macOS: `ENOBUFS` above
+/// `kern.ipc.maxsockbuf`; Linux caps it silently) still gives a socket: the
+/// request is halved until accepted instead of failing the start.
+#[test]
+fn oversized_socket_buffers_fall_back() {
+    let config = DataplaneConfig {
+        recv_buffer_bytes: 1 << 30,
+        send_buffer_bytes: 1 << 30,
+        ..config("127.0.0.1:0")
+    };
+    let socket = nexus_dataplane::bind_shard_socket(config.bind_addr, &config)
+        .expect("socket with smaller buffers");
+    assert!(socket.local_addr().is_ok());
+}

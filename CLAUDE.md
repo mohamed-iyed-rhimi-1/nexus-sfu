@@ -82,7 +82,14 @@ cd sdk && npm run build
 On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto` and
 `protobuf-compiler` installed, the repo mounted, and named volumes for `target/` and the
 cargo registry. Many paths differ on Linux (io_uring, `recvmmsg`, core pinning,
-`panic = "abort"` in release), and CI is the only other Linux environment.
+`panic = "abort"` in release).
+
+`scripts/ci-local.sh` does this and runs the jobs of `ci.yml` locally. By default it runs
+the macOS job and Linux arm64 (Docker); `scripts/ci-local.sh all` adds Linux x86_64 and the
+`docker` job, both emulated as `linux/amd64` on Apple Silicon (slow), and only `all` covers
+every job. GitHub Actions does not run on this repository (account billing lock), so this
+script is the CI of record: put its summary (`target/ci-local/summary.txt`, which names the
+targets and whether the tree had changes) in the phase plan's session log.
 
 ### Docker
 

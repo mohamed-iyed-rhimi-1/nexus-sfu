@@ -6,6 +6,12 @@ on:
   push:
   pull_request:
 
+# A newer push to the same branch or PR cancels the older run, except on
+# main and tags, where every commit keeps its complete run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
   # Do not set RUSTFLAGS here. It replaces the target rustflags in
@@ -15,6 +21,7 @@ env:
 jobs:
   fmt:
     name: Format
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +33,7 @@ jobs:
 
   clippy:
     name: Clippy
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,10 +44,11 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y capnproto protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.arch }})
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +73,7 @@ jobs:
 
   bench-smoke:
     name: Bench smoke (${{ matrix.arch }})
+    timeout-minutes: 60
     needs: test
     strategy:
       fail-fast: false
@@ -83,16 +93,43 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y capnproto protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       # Runs every real-path benchmark once to check it still works (not a
-      # timing measurement: shared CI runners are too noisy for that).
-      - run: cargo bench --bench real_path -- --test
-      # Fails if an audio+video publisher's heap grows past the budget.
-      # Measured ~1.55 MB at v0.1.0; lower this as memory work lands.
-      - run: cargo bench --bench memory
+      # timing measurement: shared CI runners are too noisy for that). It
+      # also prints allocations per packet and drop counters per id.
+      - run: cargo bench --locked --bench real_path -- --test
+      # Fails if a participant publishing audio + video and subscribed to 10
+      # tracks holds more session state than the budget (design §3.11: data
+      # plane plus control plane; signaling is reported, not checked).
+      # Measured 16.9 KB in Phase 1.7 (1.55 MB at v0.1.0).
+      - run: cargo bench --locked --bench memory
         env:
-          NEXUS_MEM_BUDGET_KB: "1700"
+          NEXUS_MEM_BUDGET_KB: "25"
+
+  # macOS runs the portable shard I/O (`PortableIo`) and the code behind
+  # `cfg(not(target_os = "linux"))`, which the Linux jobs never compile.
+  macos:
+    name: Test (macOS arm64)
+    timeout-minutes: 60
+    runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.83.0"
+          components: clippy
+      - name: Install system dependencies
+        run: brew install capnp protobuf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The default open-file limit on macOS runners is 256; the e2e and
+      # loopback tests open many sockets. `ulimit` lasts one step's shell, so
+      # it is set in the same step as the tests.
+      - run: ulimit -n 4096 && cargo test --workspace --locked
 
   docker:
     name: Docker image
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

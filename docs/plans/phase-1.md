@@ -1,6 +1,6 @@
 # Phase 1 — New data plane, one shard
 
-**State: in progress** (1.1-1.4 done; plan written 2026-09-26, audited against the code the same day).
+**State: in progress** (1.1-1.5b done; plan written 2026-09-26, audited against the code the same day).
 
 **Design:** [`docs/design/dataplane-v1.md`](../design/dataplane-v1.md) (approved; §16 gives the
 parts and order, §17 the tests), within [`docs/dataplane-design.md`](../dataplane-design.md)
@@ -22,6 +22,12 @@ against `e825887`; line numbers drift, so prefer the symbol names.
 
 ## Exit criteria
 
+"In CI" below means **GitHub Actions, or while it is unavailable, a recorded
+`scripts/ci-local.sh all` run** (owner's decision, 2026-09-27: Actions has never run a job on
+this repository because of an account billing lock). The script runs the jobs of `ci.yml`
+on macOS (natively) and on Linux arm64 and x86_64 (Docker; x86_64 emulated on Apple Silicon).
+Its summary, with the commit it ran on, goes in the session log.
+
 1. **E2E on the new path**, in CI on Linux (x86_64 and arm64, both already in `ci.yml`) and
    macOS (new job, 1.7):
    - the Phase 0 tests (`two_party_audio_video`, `candidate_is_announced_address`,
@@ -36,6 +42,8 @@ against `e825887`; line numbers drift, so prefer the symbol names.
    (`crates/nexus-dataplane/tests/alloc.rs`, note §17.7).
 3. **Fixed memory per participant ≤ 25 KB** (design §3.11) for the "A+V publisher subscribed
    to 10 tracks" scenario, enforced in CI by the ported `benches/memory.rs` (note §17.8).
+   Session state only (data plane + control plane); the signaling connection is measured and
+   reported beside it, not in it (design §3.11, clarified 2026-09-28).
 4. **Manual Chrome and Firefox call** with AES-GCM offered first, recorded in this plan with
    browser versions and the negotiated cipher (note §17.9, all six steps).
 5. **Old path deleted:** `src/worker/`, `src/forward/`, the packet loop and `Sfu`,
@@ -57,7 +65,8 @@ These apply to every part; a part is not done until they hold.
   New direct dependencies use the version already in the lock file.
 - **Linux check:** a part that touches I/O, SRTP, benches or `cfg(target_os)` code is run in
   the Linux container (CLAUDE.md) before it is marked done. Linux-only code is otherwise
-  exercised only in CI.
+  exercised only in CI. From 1.7 on, `scripts/ci-local.sh` (macOS + Linux arm64 by default)
+  is that check; its summary goes in the session log.
 - **Network input never panics.** Every function a datagram reaches returns `None` or `Err`
   on bad input. `assert!` is only for the shard's own invariants. Where an existing function
   asserts on packet contents before its graceful check, the assert goes (the audit found
@@ -1101,7 +1110,8 @@ the loadtest client changes land before, in 1.5b-prep.
   The e2e marker check maps each received SSRC, through the offer's announced SSRC and its
   kind, to the one publisher SSRC its payload must name.
 - **`/metrics`:** nothing feeds `MetricsCollector`'s worker series after the switch; they
-  read zero until shard stats are exported in 1.7.
+  read zero until shard stats are exported in C7 (`WorkerPoolMetrics` → shard metrics, note
+  §5.4; the C7 row owns it, 1.7 does not).
 
 **Code notes (last fixes before the squash, 2026-09-27):**
 - `Join` while already in a room is refused (`ALREADY_IN_ROOM`): switching kept the old
@@ -1192,10 +1202,10 @@ session, C4 and C6 one, C5 and C7 one.
 
 | Step | After | Removed | Also |
 |------|-------|---------|------|
-| C2 | 1.7 | The old `real_path` and `memory` bench code, replaced by the ports from 1.7, so CI's bench smoke and memory budget never lose coverage; `benches/forwarding.rs` (measures `SsrcRouter`); `benches/packet_processing.rs` ported to the shard's classifier or deleted (it imports `quick_classify`/`PacketType` from `nexus-webrtc` `demux.rs`) | `Cargo.toml` `[[bench]]` entries |
+| C2 | 1.7 | (`real_path` and `memory` were rewritten in place by 1.7, so CI's bench smoke and memory budget never lose coverage.) `benches/forwarding.rs` (measures `SsrcRouter`); `benches/packet_processing.rs` ported to the shard's classifier or deleted (it imports `quick_classify`/`PacketType` from `nexus-webrtc` `demux.rs`) | `Cargo.toml` `[[bench]]` entries |
 | C1+C3 | C2 (the old benches use the worker and router) | `Sfu` and the packet loop (`src/sfu.rs`), `SRTCP_SENT_CACHE`, `tests/pps_pipeline.rs`, root `sim` feature, `src/spin.rs`, `src/clock.rs`, `DrainState`, `DropTracker`; `src/worker/`, `src/forward/`, `src/transport/`; `src/proto.rs` and the root `build.rs` prost step (the root crate `include!`s its output only in `proto.rs`) and `check_io_uring_feature` (root `build.rs:19,31`) with the root `io_uring` feature; `lib.rs` modules and re-exports (39, 47, 50, 52, 56, 59, 134-139, 161-190); `CoreSfuError::Worker` / `WorkerError` (`nexus-core/src/error.rs:52`, `:322`) and the root `src/error.rs:24,61,85` wrappers | Merged because `worker/pool.rs` uses `SpinLoop` (`:367`, `:786`), `clock::now_us` (`:2296`) and `sfu::forget_publisher_srtcp` (`:4038`): deleting `sfu.rs` alone does not build. Root deps removed if unused after the step, each checked by a build: `prost`, `prost-build`, `capnp`, `capnpc`, `crossbeam`, `dashmap`, `memmap2`, `core_affinity`, `once_cell`, and the already unused `sysinfo`, `getrandom`, `tokio-util`, `futures-util`, `tokio-tungstenite`, `hyper`, `tower`, `tower-http`, `axum`, `rustls`, `tokio-rustls`, `rustls-pemfile`, `http`. `protoc` stays required (`nexus-signal` compiles its own schemas); CLAUDE.md unchanged on that point |
 | C4 | C1+C3 (the worker imports `nexus-actor` migration types) | `crates/nexus-actor`, `crates/nexus-dst` (it also turns on `nexus-transport/sim` for the whole workspace), workspace entries, `config/mod.rs:157-181` limits (use the orchestrator's constants), `config/tests.rs:333-338`, `lib.rs:70-75`; the `nexus_actor_*` gauges (`nexus-metrics/src/prometheus.rs:228-242`), their test, `scripts/verify_metrics.sh:51` | `nexus_actor::MAX_ROOMS` is 1,000, the orchestrator's `MAX_ROOMS` 10,000 (`room.rs:13`): validation accepts more rooms after this step; tests updated to the new limit. `nexus-core/types.rs` and `production.toml` comments that mention actors |
-| C6 | C1+C3, C2 (`Sfu` and the old benches use `WebRtcTransport` and `test-hooks`) | `nexus-webrtc`: `webrtc/transport.rs`, `webrtc/session.rs`, `webrtc/demux.rs`, `webrtc/mod.rs` constants, the `test-hooks` feature and the root dev-dependency that enables it (`Cargo.toml:123`), `OpenSslDtlsEngine::new` (per-session certificate) | SDP stays |
+| C6 | C1+C3, C2 (`Sfu` and the old benches use `WebRtcTransport` and `test-hooks`) | `nexus-webrtc`: `webrtc/transport.rs`, `webrtc/session.rs`, `webrtc/demux.rs`, `webrtc/mod.rs` constants, the `test-hooks` feature and the root dev-dependency that enables it (`Cargo.toml:125`; no bench needs it after 1.7), `OpenSslDtlsEngine::new` (per-session certificate) | SDP stays |
 | C5 | C6 (`webrtc/session.rs:69-74` imports `DtlsSession`, `IceAgent`, `IceConfig` and more), C4 (`nexus-dst` uses the arena) | `nexus-transport`: `arena.rs`, `ring_buffer.rs`, `batch.rs`, `udp.rs`, `media_transport.rs`, `io_uring.rs`, `arena_proptest.rs`, `arena_refcount_proptest.rs`, the crate's `io_uring` and `sim` features; ICE `agent.rs`, `checklist.rs`, and `StunServer`; pure-Rust DTLS (`dtls/session.rs`, `handshake.rs`, `record.rs`, and the parts of `dtls/crypto.rs` nothing imports) | Keep `ice/stun/server.rs`'s `create_binding_request` and `generate_transaction_id` (used by `gather.rs` and the tests: move them if `server.rs` goes), `SrtpProfile` and `SrtpKeyMaterial` from `dtls/crypto.rs` (used by `openssl_backend.rs:37`), `gro.rs`, `gso.rs`, `socket_config.rs`, `stun/`, `candidate.rs`, `gather.rs` enumeration, `SrtpContext` (tests use it). `ring` stays (SRTP GCM) |
 | C7 | C4, C1+C3 | Config fields of note §14 (`[worker]`, `[memory]`, `actor.*`, `transport.batch_*`, `stun_servers`, `--workers`, `NEXUS_WORKER_COUNT`, `NEXUS_ARENA_SIZE_MB`), the arena ≥ 16 MB and workers ≤ 2 × CPU checks in `validate_cross_module` (`config/mod.rs:148-155`, `:183-196`), `config/*.toml`, README config and feature sections (lines 32-33, 65, 73, 84, 123-127, 142-143, 201), `nexus-metrics` `WorkerPoolMetrics` (`worker.rs:122`) → shard metrics (note §5.4) | `examples/basic_sfu.rs` (reads `memory.*`, `worker.*`, `batch_*`: rewrite or delete, or `--all-targets` breaks); e2e `harness.rs:56-58`; `deploy/docker/run.sh` unchanged for one shard (publishes `10000/udp`) |
 
@@ -1307,36 +1317,401 @@ fail with the rebinding rule disabled.
 
 ### 1.7 Benches, memory budget, CI
 
-**Goal:** the ported benches, the memory budget in CI, macOS in CI.
+**Goal:** the `real_path` and `memory` benches measure the new path, the 25 KB budget is
+enforced on the §3.11 scenario, and CI runs on macOS as well as Linux. Two sessions:
+**1.7a** (`real_path`, CI files) and **1.7b** (`memory`, budget). They are independent;
+1.7a first because C2 waits on both.
 
-**Files:** `benches/real_path.rs`, `benches/memory.rs`, `Cargo.toml`,
+**Files:** `benches/{real_path.rs, memory.rs, common/mod.rs}` (rewritten in place),
+`Cargo.toml` (`[[bench]]` unchanged), `src/orchestrator/mod.rs` (one hidden entry point),
+`crates/nexus-dataplane/src/handle.rs` (socket buffer fallback),
 `.github/workflows/{ci.yml, release.yml}`.
 
+**CI is unavailable:** GitHub Actions has **never run a job** on this repository. Every run in
+`gh run list`, `main` and all `phase-1` pushes included (latest 36327569855, 2026-09-27),
+stops in seconds with "The job was not started because your account is locked due to a
+billing issue". No existing job, the Linux arm64 one included, has ever been proven. Owner's
+decision (2026-09-27): do not wait for it. `scripts/ci-local.sh` runs the same jobs locally
+and stands in for CI in the exit criteria (see the note above them); `ci.yml` is kept in
+sync with it so real CI works once the lock is cleared.
+
+#### 1.7a `real_path` and CI
+
 **Change:**
-- `real_path`: same groups (`ingress`, `egress`, `srtp`) and ids
-  (`{gcm|cm_sha1_80}/{audio|video}`) and subscriber counts **1, 10, 100, 500**
-  (`real_path.rs:55`); ingress (socket buffer → decrypted and routed) and egress per
-  subscriber (copy + rewrite + encrypt + send) through `nexus-dataplane` on real loopback
-  sockets; prints allocations per packet (a counting allocator, which it lacks today). Keeps
-  a criterion harness: the CI smoke run passes `--test`. `LinuxIo` on Linux, `PortableIo`
-  on macOS; numbers are only compared within one platform.
-- `memory` (note §17.8): data plane through commands on `MemIo`; control plane through the
-  orchestrator managers with a fake signaling channel and the transport entry after
-  `free_ssl`; scenarios "A+V publisher, no subscriptions" and "+ subscribed to 10 tracks";
-  also the `Ssl` size during a handshake. `NEXUS_MEM_BUDGET_KB` checks **"+ subscribed to 10
-  tracks"** (the §3.11 scenario; today only the 0-subscription case is checked,
-  `memory.rs:382-390`). The budget uses the counting allocator only: malloc zone statistics
-  are process-wide (tokio threads add noise at a 25 KB scale) and `mallinfo2` misses mmap'd
-  chunks; they stay for the OpenSSL report.
-- CI: `NEXUS_MEM_BUDGET_KB: "25"` (was `"1700"`, `ci.yml:92`); bench smoke uses the ported
-  benches; a `macos-14` (arm64) job with the pinned 1.83.0 toolchain, `Swatinem/rust-cache`,
-  `brew install capnp protobuf`, running `cargo test --workspace` and clippy. `release.yml`
-  pins 1.83.0 (it uses `stable`, `release.yml:32`).
+- **Rewrite `benches/real_path.rs` in place** on `nexus-dataplane`. The old code cannot
+  survive C1+C3 (it imports `crossbeam`, `dashmap`, `MediaWorker`/`WorkerMessage`,
+  `SsrcRouter`, `PacketArena`, `WebRtcTransport` and the `test-hooks` method
+  `install_srtp_for_testing`, `real_path.rs:25-45`, `:169`), and its numbers are already
+  recorded in architecture.md Part 5. C2 then no longer touches `real_path`/`memory`.
+- Same groups and ids: `srtp` (`protect|unprotect/{gcm|cm_sha1_80}/{audio|video}`),
+  `ingress` (`{profile}/{media}`), `egress` (`{profile}/{media}/{1,10,100,500}`), same payload
+  sizes (100 / 1,100 B). The publisher's packets carry the extensions the shard now
+  rewrites (`mid` and audio level, as in `tests/alloc.rs`), not the old TWCC id 3.
+- **Setup** reuses the data-plane test helpers without a new crate feature:
+  `#[path = "../crates/nexus-dataplane/tests/support/mod.rs"] mod support;` (`Peer`,
+  `key`, `track_spec`, `sub_spec`, `rtp_with_ext`; all their crates are root
+  dependencies). They allocate, so they stay outside timed and counted regions.
+- **Shard on a real socket**, driven on the bench thread (no shard thread, so timing is the
+  work, not a wake-up): `Shard::new(config, PlatformIo::new(socket), events, now)` with the
+  socket from `bind_shard_socket` (GRO off on Linux, `LinuxIo::new` refuses it on). `now`
+  is advanced by the bench. `max_sessions` ≥ 501; `pool_buffers` ≥ 500 + `RECV_BATCH` (64);
+  the event `Vec` pre-sized and drained between iterations.
+- **`ingress`** (socket buffer → decrypted, parsed, routed; zero subscribers so no egress
+  is timed): the publisher's protected packet is sent in the untimed setup with
+  `BatchSize::PerIteration`, so each timed `iterate` receives exactly one datagram (with
+  `SmallInput` several setups run first and one `iterate` drains up to 64). Setup waits
+  until the datagram is in the shard's socket (review fix below); iterations that receive
+  other than one are counted and printed. **Not comparable with Part 5:** the old ingress
+  started from a slice (`WebRtcTransport::process_packet`, no `recv`); recorded as a new
+  baseline.
+- **`egress`**: one publisher, N subscriber sessions (one per sink; `MAX_SUBS_PER_SESSION`
+  limits per session, not per track), each connected and with SRTP installed through
+  commands. Timed: one publisher packet in, N rewritten + protected packets out through
+  `sendmmsg`/`send_to` (500 subscribers: mid-packet flushes at `SEND_BATCH` = 256).
+  `Throughput::Elements(N)` so the number is per subscriber, as before. Sinks drained by
+  `common::Sinks`; `raise_fd_limit()` (macOS soft limit 256). After each id print
+  `tx_datagrams`, `drop_send_failed`, `drop_srtp_auth` and `tx_full_flushes` from
+  `shard.stats()`, like the old `report()`; a run with send failures or auth drops is
+  reported, not silently averaged.
+- **Sequence wrap:** a full Criterion run sends ≫ 65,536 packets per stream. The shard
+  handles ROC (1.1), but the publisher peer's `SrtpContext` and the inbound replay window
+  must see increasing indices: keep one peer per id and never rewind its seq. `srtp`
+  group: `SrtpOutbound`/`SrtpInbound` (the shard's types, registered SSRC) instead of
+  `SrtpContext`; unprotect gets fresh ciphertext per batch as today (`:425-427`).
+- **Allocations per packet:** a counting `#[global_allocator]` with the thread-local gate of
+  `tests/alloc.rs` (counts calls; gate only around `Shard::iterate`). One untimed pass per
+  id before Criterion measures it: 1,000 packets, print allocations per packet. Not an
+  assert (`alloc.rs` is the gate, exit criterion 2); a non-zero value is printed with
+  `!!` like the old ring-decay warning.
+- `--test` smoke still works (Criterion's flag). Setup of the 500-subscriber rigs runs in
+  smoke mode too: keep it under ≈ 10 s.
+- `benches/common/mod.rs`: doc comment names `real_path` and `udp_floor` (still both users).
+- **Socket buffers on macOS** (`handle.rs:100`): the default 8 MiB `SO_RCVBUF`/`SO_SNDBUF`
+  (`nexus-core` `config.rs:137-138`, `DataplaneConfig` `config.rs:120-121`) is accepted on
+  Darwin 25 (`kern.ipc.maxsockbuf` = 8 MiB) but older XNU returns `ENOBUFS` above ≈ 7.1 MiB,
+  and `configure_socket_buffers` turns that into a hard `Err` (`socket_config.rs:99-125`):
+  every server test would fail on a `macos-14` (Darwin 23) runner. `bind_shard_socket`
+  halves the request on `ENOBUFS` (bounded: down to 256 KB) and `warn!`s the size it got;
+  any other error stays fatal. Design §3.12 already says "warn". Unit test with a size
+  above `maxsockbuf`.
+- **CI** (`ci.yml`):
+  - bench smoke unchanged in form (`cargo bench --bench real_path -- --test`,
+    `cargo bench --bench memory`), plus `--locked` on both and on clippy (`:39`; the
+    engineering rules say CI builds with `--locked`).
+  - `NEXUS_MEM_BUDGET_KB: "25"` (`:92`) **lands with 1.7b**, not before: today's bench
+    checks the 0-subscription malloc total (≈ 1.55 MB) and would fail.
+  - New job `macos` on `macos-14` (arm64): `dtolnay/rust-toolchain@master` with
+    `toolchain: "1.83.0"` and `components: clippy`; `HOMEBREW_NO_AUTO_UPDATE=1`, `brew
+    install capnp protobuf` (root `build.rs:48-66` and `nexus-signal/build.rs` need both
+    until C1+C3); `Swatinem/rust-cache@v2`; `cargo clippy --workspace --all-targets --locked
+    -- -D warnings`; `cargo test --workspace --locked` (a superset of note §16's `cargo
+    test --test e2e`; `alloc.rs` included). No bench smoke on macOS (`memory` and
+    `real_path` run there locally; `udp_floor` is Linux only).
+  - `timeout-minutes: 60` on every job (default 360) and a `concurrency` group per ref
+    with `cancel-in-progress`, so a burst of `phase-1` pushes does not queue.
+- `release.yml:32`: `dtolnay/rust-toolchain@master` with `toolchain: "1.83.0"` and
+  `targets:`. Today `@stable` installs stable and `rust-toolchain.toml` silently selects
+  1.83.0 anyway; the `targets:` go to the wrong toolchain (harmless only because each
+  target equals its host). `docker/build-push-action@v5` → `@v6` like `ci.yml`.
 
-**Tests:** the benches run locally on macOS and in the Linux container; numbers recorded in
-architecture.md Part 5 in 1.9 (Phase 1 baseline, one shard).
+**Code notes (planning audit 2026-09-27):**
+- The root crate already depends on `nexus-dataplane` (`Cargo.toml:38`); `PlatformIo` picks
+  `LinuxIo`/`PortableIo` (`shard/io.rs:28-32`); `impl EventSink for Vec<Event>`
+  (`command.rs:284`) grows without bound: pre-size and drain.
+- The shard's classifier is `pub(crate)` (`shard/ingress.rs:31`): C2 drops
+  `packet_processing.rs`'s demux groups (or makes `classify` public); not 1.7's concern.
+- Criterion 0.5.1; `[profile.bench]` inherits release (`codegen-units = 1`) with thin LTO,
+  so compile time dominates the smoke run. `scripts/build_and_test.sh:29` (`cargo bench
+  --no-run`) and the Dockerfile's `COPY benches/` need every `[[bench]]` to exist and build.
+- The CI release build (`ci.yml:62`, fat LTO) before the tests is the largest single cost
+  of the `test` job; left as is (it checks the shipped profile builds).
+- macOS runner timing: `loopback.rs` asserts wake ≤ 10 ms median / 100 ms max (`:294`),
+  shutdown ≤ 100 ms (`:310`), flood drain < 500 ms (`:399`); e2e DTLS < 3 s after a lost
+  flight (`e2e.rs:302`). All pass locally with wide margin; if one flakes on a 3-vCPU
+  runner, widen it for CI only with a comment, never skip it.
+- e2e needs a non-loopback IPv4 (`harness.rs:36-43`): macOS runners have `en0` with a
+  private address (expected fine, unverified until the first run). IPv6 loopback tests skip
+  if `::1` cannot bind (`loopback.rs:254-273`).
 
-**Checkpoint:** CI green on all jobs (**exit criteria 1 and 3**).
+**Tests:** `cargo bench --bench real_path -- --test` on macOS and in the Linux container; a
+full run on each, numbers kept in the session log (architecture.md Part 5 in 1.9); the
+`ENOBUFS` fallback unit test; `actionlint` (or a YAML parse) on both workflows.
+
+**Found while implementing 1.7a (2026-09-27):**
+- **Injected input.** Sink sockets belong to the drain threads, so subscribers cannot send
+  their STUN from them. `BenchIo` wraps `PlatformIo` and hands the shard datagrams from
+  memory first (any source address), then reads the socket. Setup STUN comes in that way,
+  as does the egress input, so egress measures no receive syscall but still decrypts the
+  publisher packet (at N = 1 that is part of the result). Ingress uses a real client socket.
+- **Split rigs.** Criterion's setup and routine closures both borrow mutably: the publisher
+  (ciphertext builder) and the shard are separate values.
+- `now` is fixed per rig: housekeeping never runs inside a timed call (it costs once per
+  second in production).
+- **The fallback is not reachable on this Mac.** Darwin 25 caps a 1 GiB request silently,
+  so the loopback test `oversized_socket_buffers_fall_back` passes with or without the fix.
+  The halving logic is a pure function (`fit_buffer_sizes`) with a fake setter that
+  refuses above 7,456,540 B (older XNU's limit): its tests fail with the `ENOBUFS` arm
+  disabled. Both sizes are halved (`configure_socket_buffers` does not say which one was
+  refused), down to 256 KB, never raised; other errors stay fatal.
+- The bench smoke (`-- --test`) takes ≈ 5 s after the build (2 min for the bench profile).
+
+**Review fixes for 1.7a (2026-09-27, from an instrumented review run):**
+- **Ingress timed empty and double receives.** Loopback delivery lags `send_to` (macOS: in
+  60-70% of timed iterations the datagram was not there yet, and the next iteration
+  received 2), so the first macOS ingress numbers averaged empty and double iterations.
+  Setup now waits until the shard's socket has the datagram: `peek_from` on a clone of the
+  shard socket (`try_clone`, the same socket), bounded by 100 ms. An always-on counter of
+  iterations with `received != 1` is printed per id and marked `!!` when non-zero (the
+  `debug_assert` never ran in the bench profile). After the fix: 0 on macOS and Linux;
+  macOS ingress medians 14-28% lower than the first run.
+- **Sink-side drops.** On Linux `sendmmsg` succeeds when a sink's receive buffer is full, so
+  `tx_datagrams` can overstate delivery (the review run read 63-88% at 1 and 10
+  subscribers). After each egress id the bench waits (≤ 500 ms, until the count stops
+  moving) and prints what the sinks read against `tx_datagrams`, marked `!!` below 99%.
+  Larger sink buffers would not help in the container (`net.core.rmem_max` = 208 KB there).
+  In this session's runs the sinks read ≥ 99.97% on every id (numbers below); the drop
+  rate evidently depends on load on the VM, which is what the check is for.
+- `report()` counts `drop_send_failed` as invalidating the result, like the SRTP and pool
+  drops.
+- **Relative to the kernel floor.** Phase 0's `udp_floor` number came from another session
+  and VM state; `udp_floor` is now run in the same session as `real_path`, and egress is
+  recorded relative to it (numbers below).
+- `fit_buffer_sizes` is a bounded `for` loop (`FIT_ROUNDS` = 14: from `i32::MAX`, 13
+  halvings reach the 256 KB floor and the 14th attempt ends it; a test counts the calls).
+- `ci.yml`: `cancel-in-progress` only off `main` and tags; the `macos` job raises the
+  open-file limit to 4,096 in the test step (`ulimit` lasts one step's shell; the runner
+  default is 256). `ci-local.sh` does the same. `release.yml` jobs have `timeout-minutes`.
+- **Numbers** (Criterion medians, after the review fixes below; the first run's macOS
+  ingress numbers averaged empty and double receives and are replaced; not comparable with
+  Part 5, see the bench header). `udp_floor` ran in the same container session as
+  `real_path`:
+
+  | | macOS arm64 (M2 Pro, `PortableIo`) | Linux arm64 container (6 vCPU, `LinuxIo`) |
+  |---|---|---|
+  | ingress gcm audio / video | 1.52 / 1.71 µs | 0.67 / 0.80 µs |
+  | ingress cm audio / video | 1.55 / 2.20 µs | 0.71 / 1.24 µs |
+  | egress gcm video, per subscriber at 1 / 10 / 100 / 500 | 7.61 / 7.98 / 7.34 / 7.51 µs | 2.14 / 1.30 / 1.07 / 0.94 µs |
+  | egress cm video, per subscriber at 1 / 10 / 100 / 500 | 8.57 / 8.34 / 7.74 / 7.88 µs | 3.15 / 1.74 / 1.52 / 1.35 µs |
+  | egress gcm audio, per subscriber at 100 | 7.05 µs | 0.75 µs |
+  | `udp_floor` `sendmmsg`, 1,200 B, per datagram, to 1 / 10 / 100 destinations | (Linux only) | 0.51 / 0.82 / 0.69 µs |
+  | **egress video ÷ floor** at 10 / 100 subscribers, gcm | | **1.58× / 1.55×** |
+  | **egress video ÷ floor** at 10 / 100 subscribers, cm | | **2.12× / 2.20×** |
+  | srtp protect gcm audio / video | 112 / 259 ns | 150 / 295 ns |
+  | srtp protect cm audio / video | 158 / 675 ns | 193 / 716 ns |
+
+  0 allocations per packet on every `ingress` and `egress` id on both platforms; every
+  ingress iteration received exactly one datagram; the sinks read ≥ 99.9% of what was sent
+  on every egress id (macOS 100%); no send failure, SRTP drop or rejected command. macOS
+  egress is one `send_to` syscall per datagram (design §3.12: correct, not fast). The
+  review run measured the floor at 1.57 µs per datagram in a busier VM: only ratios within
+  one session are meaningful. The old path at `062e668` (Part 5, Linux arm64, another
+  session): egress video at 100 subscribers 3.13 µs (GCM) / 2.19 µs (CM) per subscriber,
+  ingress video 3.78 / 2.47 µs from a slice.
+
+#### 1.7b `memory` and the 25 KB budget
+
+**Change:**
+- **Rewrite `benches/memory.rs` in place** (note §17.8). The old one builds
+  `WebRtcTransport`, `MediaWorker`, `PacketArena` and `OpenSslDtlsEngine::new` (removed in
+  C6), and checks only the 0-subscription case using **malloc totals**
+  (`created_malloc.unwrap_or(created_rust)`, `memory.rs:364`; assert at `:386`). Its
+  "+ subscribed to 10 A+V others" row was 20 subscriptions (`:376-378`); the §3.11 scenario
+  is 10 tracks (5 A+V pairs). Both are changes of method, stated in the report's header and
+  in architecture.md Part 5 (1.9).
+- **Scenario:** rooms of 6 participants; each publishes audio + video and subscribes to the
+  other 5 (10 tracks). This is exactly "A+V publisher subscribed to 10 tracks" per
+  participant, and the fan-out entries a subscription adds to the *publisher's* track are
+  shared evenly. Measure `R` = 10 rooms (60 participants) and divide: the slabs and id maps
+  double on demand (`slab.rs:28-35`, `shard/mod.rs:137-144`), so one participant's delta is
+  mostly resizing. Also measure the "no subscriptions" step (all published, nothing
+  subscribed) in the same run.
+- **One process, both planes, one thread, no tokio runtime:**
+  - Shard on `MemIo`, `max_sessions` 1,000, synthetic keys; `iterate` called by the bench.
+  - `SessionOrchestrator` (public constructor, `mod.rs:64`) with a `CommandSink` wrapping
+    `shard.command_queue()` (an `Arc<ArrayQueue<Command>>`), `SingleShard`,
+    `DtlsCertificate::generate()`, `DistributedState::new(DistributedStateConfig::new(1))`.
+  - The orchestrator's handlers are private (`dispatch_event` `:160`, `settle` `:130`). Add
+    one `#[doc(hidden)] pub fn handle(&mut self, event: OrchestratorEvent)` that runs
+    `dispatch_event` then `settle` (what `orchestrator_tests.rs:165` does), documented as
+    the bench and test entry. Driving the managers one by one would duplicate the private
+    glue in `SessionOrchestrator::handle_answer`.
+  - Fake signaling: `OrchestratorEvent::Connected` with an `mpsc::channel` sender per
+    participant (`orchestrator_tests.rs:173`); the bench drains every receiver after each
+    step (with `try_recv`, no runtime) so queued `Offer` SDP strings are not counted as
+    session state. Answers built by rewriting offers: copy `answer_for`
+    (`orchestrator_tests.rs:212`, ≈ 50 lines) into the bench.
+  - DTLS to "after `free_ssl`": `free_ssl` frees only a `Complete` handshake (`dtls.rs:292`),
+    so each participant runs a real handshake: a peer `OpenSslDtlsEngine::with_certificate`
+    (`openssl_backend.rs:361`); `Event::AddressSelected`, the peer's flights as
+    `Event::DtlsDatagram`, the SFU's flights taken from the `SendDatagram` commands in the
+    queue, then `Event::PeerSrtpVerified` (triggers `free_ssl`, `connection.rs:61-64`). The
+    shard sees the resulting `InstallSrtp`. Peer engines are dropped before the "after"
+    sample.
+- **What the window excludes** (built before the baseline sample): the shard (pool 2 MiB,
+  command queue, pre-sized `by_addr`, retention), the orchestrator and `DistributedState`
+  (global `Orswot` ≈ 500 KB), and the rooms (≈ 440 KB each, created first, empty). Reported
+  separately as "fixed per shard / per room".
+- **Measured with the counting allocator only** (live bytes, alloc − dealloc, per thread
+  gate around the bench's own calls as in `alloc.rs`, so nothing else in the process is
+  counted). Malloc zone statistics / `mallinfo2` stay for the OpenSSL lines only.
+- **Report** (per participant, KB, one decimal):
+  - "A+V publisher, no subscriptions" and "+ subscribed to 10 tracks" (Rust heap, delta/N),
+    each split into data plane and control plane (two gated counters: the bench tags which
+    plane it is calling). Command boxes are allocated by the orchestrator and freed by the
+    shard, so the split is by **who holds the memory at the end**: the per-plane figures
+    come from each plane's frees and allocations netted together, and only the total is
+    asserted. If the split misattributes, report the structural line as the split instead.
+  - A **structural line** next to them: `size_of` of `Session`, `SrtpInbound` +
+    `SrtpOutbound`, 2 × `PublishedTrack`, 10 × `Subscription`, and the inline entries of
+    the pre-sized control-plane maps (`sessions`, negotiation and subscription `states`,
+    capacity 1,024, `mod.rs:70`, `negotiation.rs:154`, `subscription.rs:55`), which an
+    allocation delta cannot see. Printed, not asserted.
+  - Transient peaks, reported: the parsed answer during `accept_answer` (≈ 18 KB per
+    `MediaDescription`, ≈ 216 KB for 12 m-lines, freed after), the DTLS engine's Rust
+    buffers during the handshake (`pending_output` + two `MemBio` buffers, 3 × 16 KB,
+    `openssl_backend.rs:78-80`, `:370`).
+  - `Ssl` during the handshake and after `free_ssl`: malloc delta per session (macOS
+    `malloc_zone_statistics`, Linux `mallinfo2`; "n/a" elsewhere), averaged over the 60.
+    Expected ≈ 0 after `free_ssl`; printed, not asserted (process-wide and noisy).
+- **Budget:** `NEXUS_MEM_BUDGET_KB` asserts "+ subscribed to 10 tracks" (data + control,
+  delta/N) ≤ budget. CI sets `"25"` in this step (`ci.yml:92`). The assert message names
+  the scenario and prints both planes.
+- **Expected** (audit estimate from struct layouts; only SRTP measured): data plane ≈ 11 KB
+  (SRTP 7.5 KB measured, `direction.rs:866-871`; session ≈ 0.7 KB; 2 tracks ≈ 0.8 KB; 10
+  subscriptions ≈ 1.3 KB; maps and fan-out ≈ 0.6 KB), control plane ≈ 3.5 KB
+  (`NegotiationState` m-line slots and mids ≈ 1.2 KB, `TransportEntry` ≈ 0.6 KB with the
+  engine slot inline, `TrackRegistry` 2 × 0.33 KB, subscriptions, `DistributedState`
+  track registers). **≈ 14.5 KB**, the note's §15 said ≈ 11 KB with SRTP at 4.6 KB. If the
+  measurement exceeds 25 KB, in this order: slim `ReplayProtection` (48 B × 64, ≈ 2 KB,
+  1.1 code notes), box the engine in `DtlsHandshake` (≈ 320 B), move the 256-byte CNAME
+  out of `TrackSpec` (4 copies per A+V publisher). Record the measured split either way.
+
+**Code notes (planning audit 2026-09-27):**
+- `NegotiationState` does **not** keep `SessionDescription`s (1.4's concern): the parsed
+  answer lives only in `accept_answer` (`negotiation.rs:341-370`). No boxing needed.
+- `Session`, `PublishedTrack`, `Subscription` have no size tests; the structural line gives
+  them visibility, a `size_of` assert is not added (layout changes in Phase 2-3).
+- `CRYPTO_set_mem_functions` would measure OpenSSL exactly but `openssl-sys` 0.9.111 does
+  not bind it; not worth a hand-written binding for a reported (not budgeted) number.
+- The note's §15 table is off on SRTP (4.6 KB estimated, 7.5 KB measured) and the total;
+  add a row to the corrections table.
+
+**Tests:** `cargo bench --bench memory` with `NEXUS_MEM_BUDGET_KB=25` passes on macOS and in
+the Linux container; checked to fail with the budget set to the measured value minus 1 KB,
+and with a 4 KB `Vec` leaked per `CreateSession` in a scratch change (proves the window
+sees data-plane state), then with one leaked per `Subscribe` handled in the orchestrator
+(control plane).
+
+**Found while implementing 1.7b (2026-09-27):**
+- **Two hidden entry points, not one:** `SessionOrchestrator::handle_signal(OrchestratorEvent)`
+  and `handle_dataplane(Event)` (each: dispatch, then `settle`, as `run` does). Data-plane
+  events need the orchestrator's private `plane`. The shard's `Session`,
+  `PublishedTrack`, `Subscription` live in private modules: `nexus_dataplane::sizes`
+  (`#[doc(hidden)]`) gives their `size_of` for the structural line.
+- **Attribution by allocating plane.** Instead of two gated counters, the bench's allocator
+  prefixes each block with a 16-byte header holding the tag in force when it was made
+  (data, control, other); `dealloc` subtracts from that tag. A plane's figure is what it
+  allocated and still holds, so command boxes (allocated by the orchestrator, freed by the
+  shard) and event payloads (the other way) net to zero wherever they are freed; the
+  split needed no correction. `realloc` is the trait default (allocate, copy, free).
+- **The bench's own copies counted as the control plane.** The first run read 17.7 KB of
+  control plane: the fake client kept the offer `String` (≈ 14 KB, allocated by the
+  orchestrator) for its ICE credentials. Found by recording the control-plane allocations
+  that survived one participant's subscribe (one of 14,140-14,200 B each time, the size
+  varying with id digits). Clients now keep their own copy.
+- Signaling channels are created and warmed up (96 messages, so tokio's blocks exist)
+  before the baseline; rooms are created before it by an admin participant that never
+  joins (≈ 440 KB each would swamp the per-participant figure).
+- **The SFU's DTLS engine starts at the publish answer** (the answer says `active`, the SFU
+  is server and starts at once), before the first datagram. Its size is measured as what
+  `free_ssl` frees; OpenSSL's as the malloc growth since the baseline that the Rust
+  counter does not explain (headers included on the Rust side; malloc rounding remains).
+- **LLVM removed the first control-plane leak.** `std::mem::forget(vec![..])` in
+  `handle_subscribe` changed nothing: the unused allocation was optimised away. With
+  `black_box` it showed. The data-plane leak did not need it; both checks are now
+  written with `black_box`.
+- **Results** (identical Rust numbers on macOS and Linux arm64):
+
+  | per participant | data plane | control plane | total |
+  |---|---|---|---|
+  | A+V publisher, no subscriptions | 9.3 KB | 2.8 KB | 12.2 KB |
+  | **+ subscribed to 10 tracks** (budget 25 KB) | **12.0 KB** | **3.8 KB** | **15.8 KB** |
+  | structural (`size_of`): session 664 B, SRTP in/out 7,856 B, 2 tracks × 384 B, 10 subscriptions × 120 B | 10.2 KB | 248 B in pre-sized maps; `TransportEntry` 528 B | |
+
+  - DTLS per session: engine Rust buffers 32.1 KB (freed by `free_ssl`); OpenSSL with
+    the handshake complete, before `free_ssl`: 151.6 KB (macOS) / 124.8 KB (Linux); after
+    `free_ssl`: 3.8 / 1.9 KB (malloc rounding and OpenSSL caches; not asserted).
+  - Transient: the control plane peaks 420 KB above its resting level while handling one
+    subscribe (12 m-lines: offer printing, answer parse), then returns.
+  - Fixed, before the baseline: data plane 8.9 MB (pool 2 MiB, command queue, pre-sized
+    `by_addr`, and 6 MB of the bench's `MemIo` capture), control plane 13.2 MB
+    (`DistributedState`'s pre-sized CRDTs and 10 rooms).
+  - Checks: `NEXUS_MEM_BUDGET_KB=14.8` fails with the per-plane split in the message; a
+    4 KB leak per `CreateSession` on the shard moves only the data-plane column (+4.0 KB),
+    one per `Subscribe` in the orchestrator only the control-plane column (+4.0 KB in the
+    subscribed row). The run asserts its own claims: 60 sessions, 120 tracks, 600
+    subscriptions on the shard, no refused command, no consent loss, 60 established
+    handshakes with the SFU as DTLS server.
+  - vs. the note's §15 estimate (≈ 11 KB): SRTP is 7.7 KB, not 4.6 KB (already in the
+    corrections table); the rest matches. 9.2 KB of headroom; none of the fallbacks
+    (slimmer `ReplayProtection`, boxed engine, CNAME out of `TrackSpec`) is needed.
+
+**Review fixes for 1.7 (2026-09-28; the review ran `ci-local.sh all`, x86_64 and `docker`
+included, and passed):**
+- **Signaling reported, not budgeted.** `benches/memory/signaling.rs` runs the real
+  `SignalingServer` on its own thread (every allocation there tagged `Signaling`) and real
+  `nexus-loadtest` clients on the bench thread; 50 connections each authenticate, receive a
+  15 KB offer and send a 15 KB answer, and stay open. Server side per connection: **≈ 49 KB
+  over WebSocket, ≈ 57 KB over TLS** (connection task, outbound channel, tungstenite
+  buffers, rustls state), three times the session state. Not in the budget (note §15;
+  design §3.11 now says so, revision 2026-09-28); worth a look after v1 (tungstenite's
+  buffers are sized for large messages).
+- **Allocator overhead line.** Live blocks per participant (23) and the malloc residual,
+  split into what OpenSSL still holds after `free_ssl` (2.8-3.8 KB) and the allocator's
+  rounding and per-block overhead (≈ 0.9-1.1 KB per participant). Printed, not checked.
+- **Fixed costs split:** shard 8.9 MB (incl. 6 MB of the bench's `MemIo` capture),
+  orchestrator 8.9 MB (`DistributedState`'s pre-sized CRDTs), **430 KB per room**
+  (`DistributedState::create_room`).
+- **Two runs, past the doubling point.** 10 rooms (60 sessions in a 64-slot slab) and 11
+  rooms (66 in 128). The data plane grows from 12.0 to 13.0 KB per participant in the 11-room
+  run; the checked figure is the larger run plus the control plane's entries in maps
+  pre-sized before the baseline (248 B, from `size_of`, invisible to the deltas):
+
+  | per participant | 10 rooms | 11 rooms |
+  |---|---|---|
+  | A+V publisher, no subscriptions | 12.2 KB | 13.2 KB |
+  | + subscribed to 10 tracks (data / control) | 15.8 KB (12.0 / 3.8) | 16.6 KB (13.0 / 3.6) |
+  | **checked: larger run + pre-sized entries** | | **16.9 KB ≤ 25 KB** |
+
+  `NEXUS_MEM_BUDGET_KB=16.8` fails with the split and the room count in the message.
+- `ci-local.sh`: the summary line says `clean` or how many paths are uncommitted or
+  untracked (`git status --porcelain`; untracked files are copied into the Linux jobs), and
+  which targets ran; `docker` builds `--platform linux/amd64` like the CI job (emulated on
+  Apple Silicon); `set -eo pipefail` inside the container. CLAUDE.md: only `all` covers
+  every job; the `docker` and x86_64 targets are emulated.
+
+**Checkpoint (1.7):** both benches run locally on macOS and in the Linux container (smoke
+and full); `scripts/ci-local.sh all` green (every `ci.yml` job, `bench-smoke` with
+`NEXUS_MEM_BUDGET_KB=25`, the `macos` job, Linux x86_64 emulated), its summary in the
+session log. **Exit criterion 3** is met then (the budget holds and `ci.yml` and the script
+enforce it). **Exit criterion 1** needs the 1.6 tests, then another `all` run.
+
+**`scripts/ci-local.sh`** (added 2026-09-27, after 1.7a):
+- Targets `macos`, `linux-arm64`, `linux-x86_64`, `docker`, `all`; default `macos
+  linux-arm64` on a Mac. Jobs run one after another (timing tests share the CPU) and go on
+  after a failure (`fail-fast: false`); the exit code is 1 if any step failed.
+- Linux jobs run in `nexus-ci:1.83.0-<arch>`, built on first use from
+  `rust:1.83.0-bookworm` with the packages `ci.yml` installs, on a copy of the working tree
+  (uncommitted changes included; `target/`, `node_modules/`, `.git` excluded). The target
+  directory is a named volume per architecture (`nexus-ci-target-<arch>`), the cargo
+  registry a shared one (`nexus-ci-cargo`).
+- The memory budget is read from `ci.yml` (`NEXUS_MEM_BUDGET_KB`), so the two cannot differ.
+- Logs per job and `summary.txt` in `target/ci-local/`; the summary's last line names the
+  commit, whether the tree had uncommitted changes, the budget, and PASS/FAIL.
+- Differences from Actions, by necessity: arm64 Linux runs in a VM on the Mac (Docker
+  Desktop), x86_64 under emulation (slow; a timing assert that fails only there is noted
+  and re-run, not ignored), macOS is Darwin 25 rather than `macos-14` (the `ENOBUFS` limit
+  of 1.7a cannot show up here).
 
 ---
 
@@ -1390,7 +1765,9 @@ pointing to the corrections below), this plan.
 - CLAUDE.md: "Current phase", "Architecture (today)", workspace structure (no `nexus-actor`,
   `nexus-dst`; new `nexus-dataplane`), commands (benches, e2e; no `--features sim`),
   `[dataplane]` config, the SDK token command.
-- Status table and session log complete; merge `phase-1` into `main`.
+- Status table and session log complete; a `scripts/ci-local.sh all` run green on the
+  commit to merge (or CI, if Actions works again), summary in the session log; merge
+  `phase-1` into `main`.
 
 **Checkpoint:** every exit criterion checked off in the Status table; merged.
 
@@ -1414,6 +1791,7 @@ parts above already follow the corrected facts.
 | §17.9 | Page needs no build step | `sdk/dist` is gitignored; token and secure context needed |
 | §6.1, §6.5 | The answer's `a=setup` fixes the DTLS role | A ClientHello can arrive first and fix it (engine role cannot change once started); a contradicting answer fails the handshake |
 | §6.3 | DTLS flights sent as they come | No MTU is set (the BIO reports 0): output is split at record boundaries into ≤ 1,200-byte datagrams |
+| §15 | SRTP ≈ 4.6 KB per participant, fixed total ≈ 11 KB | `SrtpInbound` + `SrtpOutbound` measure 7,728 B; audit estimate ≈ 14.5 KB in total (1.7b measures it); still under 25 KB |
 | §11.2 | The table lives in `nexus-dataplane`, shared with the negotiator | It lives in `nexus_media::rtp::extensions` (no dependency between the two crates); `nexus_dataplane::ext` re-exports it |
 
 ## Risks for this phase
@@ -1426,6 +1804,8 @@ The note's §19 risks stand; these are the ones the audit added.
 | A 32-m-line session hits signaling size limits | 1.4 raises the SDP and WebSocket limits and turns silent drops into errors; tested with 32 m-lines |
 | The manual browser check is blocked by HTTPS/token setup | 1.8 documents both setups; the SDK and token work can start before 1.5b |
 | Linux-only code (`LinuxIo`, pinning, GRO check) only runs in the container and CI | Container run is part of every I/O part's checkpoint |
+| **CI has never run** (GitHub account billing lock; every run fails before starting, 2026-09-27) | Owner's decision: `scripts/ci-local.sh` stands in for CI (exit criteria note). Residual: no real `macos-14` or x86_64 hardware, and nothing runs automatically on push, so a session that skips the script is not caught. When Actions works again, the first run may surface failures in jobs that have never run |
+| `macos-14` refuses 8 MiB socket buffers (`ENOBUFS` on older XNU) and every server test fails | 1.7a: `bind_shard_socket` halves on `ENOBUFS` and warns |
 | Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 (done: two parser panics fixed, fuzz proptests on the parser) |
 | **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3 (done): a shard-wide cap on `DtlsDatagram` events per second (`dtls_budget_per_sweep`, 1,024). 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
 | **Known limit, room authorization (v1 item).** Tokens carry no room claim: any authenticated user can join any room by id (sequential) and subscribe to its tracks. 1.5b confines subscriptions to the subscriber's own room and refuses a second `Join`, but not the first | Added to the v1 scope (`dataplane-design.md` §2, revision 2026-09-27); not in Phase 1 unless decided otherwise. Needs a room claim in the JWT (`nexus-api`), checks in `Create`/`Join`, and the dev token of 1.8 minting it |
@@ -1443,7 +1823,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.5a Control-plane pieces | Done | see git log (1.5a) | `ids`, `dtls` (`DtlsHandshake`: lazy role, MTU split, keys by role), `transports` (`SsrcAllocator`, timeouts), `tracks`, `sdp_params`; engine input guards and `DTLS_MTU`; SDP accessors |
 | 1.5b-prep Node module, config, negotiator options, loadtest marker | Done | see git log (1.5b-prep) | `node.rs`, `[dataplane]` config, `with_ice_lite` + Track rtcp-fb parameter (golden old-path offer), loadtest marker + announced SSRCs; moved in: sha-256 fingerprint choice, `SsrcAllocator` fixes, shard DTLS from the selected address only. Old path green (e2e 3/3) |
 | 1.5b Switch (one commit) | Done | see git log (1.5b) | New path live: e2e 3/3 (both DTLS roles, AES-GCM), SSRCs rewritten. Early browser check: Chrome 153 passes (GCM, ICE-lite, media both ways) after the stable-PT fix; Firefox deferred to 1.8 (owner's decision) |
-| 1.7 Benches, memory budget, CI | Not started | | Before C2 |
+| 1.7 Benches, memory budget, CI | Done | see git log (1.7) | 1.7a: `real_path` on the shard, 0 allocations per packet, `ENOBUFS` fallback, macOS CI job, `--locked`, timeouts, release pinned. 1.7b: `memory` on both planes, 16.9 KB per participant checked (session state), signaling ≈ 49/57 KB reported apart, budget 25 in `ci.yml`. Before C2. CI unavailable (billing lock): `scripts/ci-local.sh` stands in |
 | C2 Old benches | Not started | | |
 | C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Not started | | |
 | C4 `nexus-actor`, `nexus-dst` | Not started | | |
@@ -1455,7 +1835,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
 | 1.9 Documents, merge | Not started | | |
 
-Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ☐ 25 KB budget · 4 ☐ browsers · 5 ☐ old path
+Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ◐ 25 KB budget (16.9 KB checked, session state only; enforced by `ci.yml` and `ci-local.sh`; the review's `all` run passed before the 2026-09-28 fixes, one more after them) · 4 ☐ browsers · 5 ☐ old path
 deleted · 6 ☐ no panic on input · 7 ☐ documents.
 
 ### Session log
@@ -1727,3 +2107,104 @@ Add one line per working session: date, part, what was done, what is left.
   and unanswered subscribe m-lines are not released; room authorization has no phase yet.
   Squash-committed onto `phase-1`. Next: 1.7 (benches, memory budget, CI), then the
   deletions.
+- 2026-09-27: 1.7 planned against the code (three read-only audits: benches, data-plane and
+  orchestrator memory, CI). Split into 1.7a (`real_path` rewritten in place on a shard driven
+  on the bench thread over a real socket, one datagram per timed ingress iteration,
+  allocations per packet printed; CI `macos-14` job, `--locked`, timeouts, `release.yml`
+  pinned; `ENOBUFS` fallback for 8 MiB socket buffers on older macOS) and 1.7b (`memory`
+  rewritten: rooms of 6 all-to-all, 60 participants, counting allocator only, both planes on
+  one thread through a new hidden `SessionOrchestrator::handle`, real DTLS to `free_ssl`;
+  budget on "+ subscribed to 10 tracks"; estimate ≈ 14.5 KB). Found: **CI has never run a
+  job** (GitHub billing lock), the old budget used malloc totals and 20 subscriptions, the
+  1.5b note promising shard metrics in 1.7 (moved to C7, which owns it), note §15's SRTP
+  figure (corrections table). Next: 1.7a.
+- 2026-09-27: 1.7a implemented (uncommitted, for review). `benches/real_path.rs` rewritten
+  on `nexus-dataplane` (shard on the bench thread over a real loopback socket, `BenchIo`
+  for injected setup/egress input, one datagram per timed ingress call, allocation pass
+  per id, drop counters per id; `srtp` group on `SrtpOutbound`/`SrtpInbound`);
+  `bind_shard_socket` halves buffer sizes on `ENOBUFS` (`fit_buffer_sizes`, tests fail
+  with the fix disabled); CI: `macos` job (macos-14, clippy + tests), `--locked` on clippy
+  and benches, `timeout-minutes`, `concurrency`; `release.yml` on 1.83.0 and
+  build-push-action v6; actionlint clean. Billing lock set aside (owner's decision): CI
+  itself not run. macOS: fmt, clippy clean, 2,058 passed, 0 failed; Linux arm64 container
+  (repo copied in, target volume `nexus-dataplane-target`): fmt, clippy clean, 2,064
+  passed, 0 failed; bench smoke and full run on both (numbers in the 1.7a notes). Not run:
+  Linux x86_64. Next: 1.7b (`memory`, budget 25 in CI).
+- 2026-09-27: `scripts/ci-local.sh` added (owner's decision: GitHub Actions stays locked, the
+  script stands in for CI in the exit criteria; plan, CLAUDE.md updated). Review fixes for
+  1.7a (uncommitted, for review): ingress setup waits for loopback delivery (`peek_from` on
+  a clone of the shard socket) and counts iterations with `received != 1` (0 on both
+  platforms after the fix; macOS ingress medians 14-28% lower than the first run); egress
+  compares what the sinks read with `tx_datagrams` (≥ 99.9% in this session; the review
+  run's 63-88% did not reproduce, the check marks it when it happens); `drop_send_failed`
+  invalidates a result; `udp_floor` run in the same session, egress recorded relative to it
+  (gcm video 1.55× the floor at 100 subscribers, cm 2.20×); `fit_buffer_sizes` a bounded
+  `for` (14 rounds, tested); `cancel-in-progress` off `main`/tags only, `ulimit -n 4096` in
+  the macOS test step and in `ci-local.sh`, `timeout-minutes` on `release.yml` jobs.
+  `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           7s
+  macos          PASS  cargo test --workspace                          82s (2058 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                           6s
+  linux-arm64    PASS  release build                                   74s
+  linux-arm64    PASS  cargo test --workspace                         107s (2064 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           37s
+  linux-arm64    PASS  bench memory (budget 1700 KB)                    6s
+  ci-local 2026-09-27 17:13, 9481ebf + uncommitted changes, budget 1700 KB: PASS
+  ```
+  Own target volume (`nexus-ci-target-arm64`). Full `real_path` on both platforms and
+  `udp_floor` on Linux after that run (numbers in the 1.7a notes). Not run: `linux-x86_64`,
+  `docker`. Stopped for review; not committed. Next: 1.7b.
+- 2026-09-27: 1.7b implemented (uncommitted, for review). `benches/memory.rs` rewritten: 10
+  rooms of 6 (each participant A+V, subscribed to the other 10 tracks), a shard on `MemIo`
+  and the real `SessionOrchestrator` on the bench thread (commands into the shard queue,
+  events back through the new hidden `handle_signal`/`handle_dataplane`), a real DTLS
+  handshake per client up to `free_ssl`; allocator tagging each block with the plane that
+  made it. 15.8 KB per participant (data 12.0, control 3.8) on macOS and Linux;
+  `NEXUS_MEM_BUDGET_KB: "25"` in `ci.yml`. The first run's 17.7 KB control plane was the
+  bench holding offer strings (fixed). Budget and both leak checks fail as they should
+  (the control-plane leak needed `black_box`). `nexus_dataplane::sizes` added.
+  `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           8s
+  macos          PASS  cargo test --workspace                          84s (2058 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                           7s
+  linux-arm64    PASS  release build                                   68s
+  linux-arm64    PASS  cargo test --workspace                         116s (2064 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                          343s
+  linux-arm64    PASS  bench memory (budget 25 KB)                      6s
+  ci-local 2026-09-27 17:46, 9481ebf + uncommitted changes, budget 25 KB: PASS
+  ```
+  (`real_path` smoke 343 s: the bench profile rebuilt after the library changes.) Exit
+  criterion 3 holds on these targets; it is checked off after the `all` run. Not run: `linux-x86_64`, `docker` (the 1.7 checkpoint asks for `all`
+  before C2). Next: review 1.7a + 1.7b, commit, `ci-local.sh all`, then C2.
+- 2026-09-28: review fixes for 1.7 (uncommitted, for review). `memory`: signaling measured
+  apart (real `SignalingServer` on its own thread, 50 `nexus-loadtest` clients, 15 KB
+  offer/answer each: ≈ 49 KB per connection over WebSocket, ≈ 57 KB over TLS, not in the
+  budget; design §3.11 clarified, revision 2026-09-28); allocator overhead line (malloc
+  residual = OpenSSL after `free_ssl` 2.8-3.8 KB + allocator ≈ 1 KB per participant);
+  fixed costs split (shard, orchestrator, 430 KB per room); runs at 10 and 11 rooms (past
+  the 64-slot slab), the checked figure is the larger run plus the pre-sized control-plane
+  map entries (248 B): **16.9 KB** (fails at a 16.8 KB budget). `ci-local.sh`: untracked
+  files in the tree state, targets in the summary, `docker` for `linux/amd64`, `pipefail`
+  in the container. CLAUDE.md: only `all` covers every job. `ci-local.sh` (default
+  targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           7s
+  macos          PASS  cargo test --workspace                          91s (2058 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                           4s
+  linux-arm64    PASS  release build                                    1s
+  linux-arm64    PASS  cargo test --workspace                          74s (2064 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                            2s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     22s
+  ci-local 2026-09-28 07:26, 9481ebf (13 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Linux figures identical to macOS (16.9 KB checked; ws 49.2 KB, wss 56.8 KB). Not run after
+  these fixes: `linux-x86_64`, `docker` (the review's `all` run predates them). Stopped for
+  review; not committed.

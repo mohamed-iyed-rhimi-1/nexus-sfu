@@ -126,6 +126,22 @@ impl SessionOrchestrator {
         }
     }
 
+    /// One signaling event, then the closes it caused: what `run` does per event.
+    /// For benches and tests that drive the orchestrator without a runtime
+    /// (`benches/memory.rs`); the server uses `run`.
+    #[doc(hidden)]
+    pub fn handle_signal(&mut self, event: OrchestratorEvent) {
+        self.dispatch_event(event);
+        self.settle();
+    }
+
+    /// One data-plane event, then the closes it caused (see `handle_signal`).
+    #[doc(hidden)]
+    pub fn handle_dataplane(&mut self, event: Event) {
+        connection::handle_event(event, &mut self.plane);
+        self.settle();
+    }
+
     /// Close the participants whose sessions failed during the last step.
     fn settle(&mut self) {
         // Bounded: each round closes the participants recorded in the previous one;

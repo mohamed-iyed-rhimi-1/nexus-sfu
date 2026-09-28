@@ -333,6 +333,13 @@ Per participant publishing audio + video and subscribed to 10 others (5 A+V pair
 
 Shard-level fixed memory (buffer pool, queues) is configured and reported separately.
 
+The 25 KB budget is **session state only**: the data plane's per-session, per-track and
+per-subscription state and the control plane's (negotiation, subscriptions, transport entry
+after the `SSL` object is freed, track registry). The signaling connection (WebSocket task,
+outbound channel, tungstenite and TLS buffers) is signaling, not session state; it is
+measured and reported next to the budget, not in it (Phase 1.7: ≈ 49 KB per connection over
+WebSocket, ≈ 57 KB over TLS, after a 15 KB offer/answer exchange).
+
 ### 3.12 Platform
 
 - Linux: `recvmmsg`/`sendmmsg`, `SO_RCVBUF`/`SO_SNDBUF` checks (already warn), optional GSO
@@ -450,3 +457,4 @@ section updated at the end of every working session.
 | 2026-09-26 | Ship-first revision: the project has no deployments, so the old data plane is replaced directly instead of run beside the new one (D10), fixes to the old path stop (Phase 0 part 0.1d dropped; its bug is covered by a Phase 1 test), phases 4-6 become "after v1", and the six design notes become one (`dataplane-v1.md`) plus `loss-recovery.md`. v1 scope in §2; simulcast is after v1 unless decided otherwise. |
 | 2026-09-26 | `docs/design/dataplane-v1.md` approved. Its revisions applied: **R1** PLI/FIR forwarding and PLI on subscribe move to Phase 1 (D6, §5); **R2** ICE-lite, no consent-check timer (§3.9); **R3** command/event lists (§3.2); **R4** owner-local buffer refcounts (§3.3); **R5** SRTP ≈ 5 KB and track state 0.5 KB in the budget, total unchanged (§3.11); **R6** SR and PLI e2e tests in the Phase 1 exit; **R7** rebinding rule (§3.9); **R8** TWCC feedback toward publishers in v1, Phase 3 (§2, §3.8, §5); **R9** ≈ 15 A+V publishers per participant accepted for v1 (§2). |
 | 2026-09-27 | v1 scope (§2) gains **room authorization**, found in the Phase 1.5b review: JWTs carry no room claim, so any authenticated user can join any room whose id it guesses (ids are sequential) and subscribe to its tracks. Not assigned to a phase yet; it touches the token format (`nexus-api`), signaling (`Create`/`Join`) and the SDK/dev-token tooling (Phase 1.8). |
+| 2026-09-28 | §3.11 clarified, no decision changed: the 25 KB budget covers session state (data plane and control plane) only; the signaling connection is reported next to it (Phase 1.7 review). Measured in Phase 1.7: session state 16.9 KB per participant (the checked figure), signaling ≈ 49 KB per WebSocket connection (≈ 57 KB with TLS). |

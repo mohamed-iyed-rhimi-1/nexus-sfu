@@ -110,12 +110,61 @@ pub fn bind_shard_socket(addr: SocketAddr, config: &DataplaneConfig) -> io::Resu
     let send = size(config.send_buffer_bytes)?;
     let socket = UdpSocket::bind(addr)?;
     socket.set_nonblocking(true)?;
-    nexus_transport::socket_config::configure_socket_buffers(
-        socket.as_raw_fd(),
-        Some(recv),
-        Some(send),
-    )?;
+    set_buffer_sizes(&socket, recv, send)?;
     Ok(socket)
+}
+
+/// Smallest buffer size `set_buffer_sizes` falls back to.
+const MIN_FALLBACK_BUFFER: i32 = 256 * 1024;
+/// Most attempts in `fit_buffer_sizes`: halving `i32::MAX` reaches
+/// `MIN_FALLBACK_BUFFER` (2^18) after 13 rounds, and the attempt at the floor
+/// either succeeds or returns its error, so 14 attempts always end the loop.
+const FIT_ROUNDS: u32 = 14;
+
+/// Sets the socket buffer sizes. Linux caps a large request silently; older
+/// macOS kernels refuse one above `kern.ipc.maxsockbuf` with `ENOBUFS`
+/// (design §3.12: warn, do not fail), so the request is halved until it is
+/// accepted, down to `MIN_FALLBACK_BUFFER`. Any other error is returned.
+fn set_buffer_sizes(socket: &UdpSocket, recv: i32, send: i32) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let (r, s) = fit_buffer_sizes(recv, send, |r, s| {
+        nexus_transport::socket_config::configure_socket_buffers(fd, Some(r), Some(s)).map(|_| ())
+    })?;
+    if (r, s) != (recv, send) {
+        tracing::warn!(
+            requested_recv = recv,
+            requested_send = send,
+            recv = r,
+            send = s,
+            "socket buffer sizes refused by the kernel (ENOBUFS), using smaller ones"
+        );
+    }
+    Ok(())
+}
+
+/// Calls `set` with `(recv, send)`, halving both on `ENOBUFS` until it
+/// succeeds; returns the sizes set.
+fn fit_buffer_sizes(
+    recv: i32,
+    send: i32,
+    mut set: impl FnMut(i32, i32) -> io::Result<()>,
+) -> io::Result<(i32, i32)> {
+    assert!(recv > 0 && send > 0, "buffer sizes checked by the caller");
+    let (mut r, mut s) = (recv, send);
+    for _ in 0..FIT_ROUNDS {
+        match set(r, s) {
+            Ok(()) => {
+                debug_assert!(r <= recv && s <= send);
+                return Ok((r, s));
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) && r.max(s) > MIN_FALLBACK_BUFFER => {
+                r = (r / 2).max(MIN_FALLBACK_BUFFER.min(recv));
+                s = (s / 2).max(MIN_FALLBACK_BUFFER.min(send));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("{FIT_ROUNDS} halvings reach the floor from any i32 size")
 }
 
 /// Entry point of the data plane.
@@ -298,5 +347,59 @@ impl DataplaneHandle {
 impl Drop for DataplaneHandle {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refuse_above(limit: i32) -> impl FnMut(i32, i32) -> io::Result<()> {
+        move |r, s| {
+            if r.max(s) > limit {
+                Err(io::Error::from_raw_os_error(libc::ENOBUFS))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn buffer_sizes_halve_on_enobufs() {
+        let got = fit_buffer_sizes(8 << 20, 8 << 20, refuse_above(7_456_540)).unwrap();
+        assert_eq!(got, (4 << 20, 4 << 20));
+        assert_eq!(
+            fit_buffer_sizes(1 << 20, 1 << 20, refuse_above(8 << 20)).unwrap(),
+            (1 << 20, 1 << 20)
+        );
+    }
+
+    #[test]
+    fn buffer_sizes_stop_at_the_floor_and_keep_other_errors() {
+        let refused = fit_buffer_sizes(8 << 20, 8 << 20, refuse_above(1_000)).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::ENOBUFS));
+        // From the largest size the rounds are enough to reach the floor.
+        let mut calls = 0;
+        let refused = fit_buffer_sizes(i32::MAX, i32::MAX, |r, s| {
+            calls += 1;
+            refuse_above(1_000)(r, s)
+        })
+        .unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::ENOBUFS));
+        assert_eq!(calls, FIT_ROUNDS);
+        let mut calls = 0;
+        let other = fit_buffer_sizes(8 << 20, 8 << 20, |_, _| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap_err();
+        assert_eq!(other.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_small_size_is_never_raised() {
+        let got = fit_buffer_sizes(64 * 1024, 16 << 20, refuse_above(1 << 20)).unwrap();
+        assert_eq!(got, (64 * 1024, 1 << 20));
     }
 }

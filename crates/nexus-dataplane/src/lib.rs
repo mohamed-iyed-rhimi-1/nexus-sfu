@@ -56,3 +56,15 @@ pub use shard::io::{
 };
 pub use shard::stats::{ShardCounters, ShardStats, ShardStatsSnapshot};
 pub use shard::{IterationStats, Shard, ShardSnapshot};
+
+/// In-memory sizes of the shard's per-session, per-track and per-subscription
+/// entries, for the memory bench's structural report (`benches/memory.rs`).
+#[doc(hidden)]
+pub mod sizes {
+    /// One session slot.
+    pub const SESSION: usize = std::mem::size_of::<crate::session::Session>();
+    /// One published-track slot.
+    pub const PUBLISHED_TRACK: usize = std::mem::size_of::<crate::track::PublishedTrack>();
+    /// One subscription slot.
+    pub const SUBSCRIPTION: usize = std::mem::size_of::<crate::subscription::Subscription>();
+}
