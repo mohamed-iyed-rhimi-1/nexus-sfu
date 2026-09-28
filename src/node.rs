@@ -5,8 +5,8 @@
 //! gossip thread that keeps it in sync with other nodes, and the shutdown
 //! notice sent to signaling clients.
 //!
-//! `Sfu::new` starts a `Node` until the old path is deleted; after the switch
-//! to the new data plane `server::start` does.
+//! `server::start` starts the `Node`. The gossip thread runs only when
+//! `cluster.gossip_enabled` is set.
 
 use std::fmt;
 use std::net::SocketAddr;

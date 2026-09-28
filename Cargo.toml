@@ -7,7 +7,7 @@ name = "nexus-sfu"
 version = "0.1.0"
 edition = "2021"
 authors = ["Nexus Team"]
-description = "High-performance WebRTC SFU with batch forwarding and worker sharding"
+description = "High-performance WebRTC SFU with a sharded, allocation-free data plane"
 license = "AGPL-3.0-only"
 repository = "https://github.com/nexus/nexus-sfu"
 keywords = ["webrtc", "sfu", "real-time", "media"]
@@ -16,13 +16,13 @@ categories = ["multimedia", "network-programming"]
 [dependencies]
 # Core shared types and primitives
 nexus-core = { path = "crates/nexus-core" }
-# Media processing: RTP/RTCP parsing, codecs, simulcast
+# Media processing: RTP/RTCP parsing, header extensions
 nexus-media = { path = "crates/nexus-media" }
-# Transport layer: UDP, ICE, DTLS, SRTP, arena, ring buffer
+# Transport: SRTP, STUN, candidates, OpenSSL DTLS, socket setup
 nexus-transport = { path = "crates/nexus-transport" }
 # CRDT state management
 nexus-state = { path = "crates/nexus-state", features = ["serde"] }
-# QUIC signaling (required for QUIC-first signaling)
+# WebSocket signaling (its QUIC module is not started)
 nexus-signal = { path = "crates/nexus-signal" }
 # Metrics infrastructure
 nexus-metrics = { path = "crates/nexus-metrics" }

@@ -1,8 +1,9 @@
 # Data plane redesign
 
-**Status:** proposal, 2026-09-25. **Scope:** everything a media packet touches after the
-UDP socket, plus the ICE/DTLS pieces it depends on. The control plane (signaling,
-orchestrator, SDP, REST API) stays and is adapted, not rewritten.
+**Status:** accepted (2026-09-25; revisions in §8); Phase 1 implemented it for one shard.
+**Scope:** everything a media packet touches after the UDP socket, plus the ICE/DTLS pieces
+it depends on. The control plane (signaling, orchestrator, SDP, REST API) stays and is
+adapted, not rewritten.
 
 This document holds the **decisions, targets and phase boundaries**. It changes only by an
 entry in the revision log (§8). Everything else lives elsewhere:
@@ -73,7 +74,7 @@ first. v1 is the release that replaces the old data plane.
 | TWCC feedback toward publishers, so browsers set their publish bitrate (§3.8) | More than ≈ 15 audio + video publishers visible per participant |
 | Announced IP, consent, NAT rebinding (§3.9) | io_uring / AF_XDP evaluation (§3.12) |
 | End-to-end tests: two-party, multi-party, loss, late join, rejoin, unsubscribe/resubscribe, address change | Automated browser tests (Playwright) |
-| Room authorization: the token names the rooms its holder may create or join, and `Create`/`Join` check it (today tokens carry no room claim, so any authenticated user can join any room by id) | |
+| Room authorization: the token names the rooms its holder may create or join, and `Create`/`Join` check it (today tokens carry no room claim, so any authenticated user can join any room by id or by name). Delivered in Phase 1, part 1.9a, before the merge | |
 
 Without simulcast every subscriber receives the publisher's full-quality stream: fine for
 small meetings, poor for large rooms or weak connections. A session is limited to ≈ 30
@@ -230,8 +231,9 @@ iteration, not on a 1 ms timer.
   `aes-128-gcm`, HMAC-SHA1) and `ring` (GCM only) on 160-byte audio and 1,200-byte video,
   Linux arm64 and x86_64. The winner per profile sits behind the existing `SrtpCipher`
   interface, so the SRTP module and its RFC tests are kept.
-- **Profile order:** if AES-GCM is faster, offer `SRTP_AEAD_AES_128_GCM` first in DTLS
-  (`openssl_backend.rs:268-277`). Browsers support both.
+- **Profile order:** `SRTP_AEAD_AES_128_GCM` is offered first in DTLS, then
+  `SRTP_AES128_CM_SHA1_80` (`openssl_backend.rs`; since Phase 1.5b, revision 2026-09-28).
+  Browsers support both.
 
 ### 3.5 RTP rewrite and header extensions
 
@@ -346,7 +348,8 @@ per-subscription state and the control plane's (negotiation, subscriptions, tran
 after the `SSL` object is freed, track registry). The signaling connection (WebSocket task,
 outbound channel, tungstenite and TLS buffers) is signaling, not session state; it is
 measured and reported next to the budget, not in it (Phase 1.7: ≈ 49 KB per connection over
-WebSocket, ≈ 57 KB over TLS, after a 15 KB offer/answer exchange).
+WebSocket, ≈ 57 KB over TLS, after a 15 KB offer/answer exchange). Measured at the end of
+Phase 1: 17.5 KB of session state per participant (the checked figure).
 
 ### 3.12 Platform
 
@@ -373,7 +376,7 @@ WebSocket, ≈ 57 KB over TLS, after a 15 KB offer/answer exchange).
 | `src/orchestrator`, `nexus-signal` (WS), `nexus-api`, `nexus-metrics`, config | **Keep**, adapted to the command interface |
 | `src/worker/`, `src/forward/`, the packet loop in `src/sfu.rs`, `nexus-actor` | **Delete** in Phase 1, when the new path lands |
 | Dead code (architecture.md 2.3) | **Deleted** in Phase 0 (recoverable from git) |
-| `nexus-state` gossip thread | **Keep off by default** (`cluster.enabled`); it serves no media purpose today |
+| `nexus-state` gossip thread | **Keep off by default** (`cluster.gossip_enabled`); it serves no media purpose today |
 | `benches/real_path.rs`, `benches/memory.rs` | **Port** to the new API, keep the same scenarios so numbers stay comparable |
 | `tests/*/` (uncompiled) | **Delete**; coverage replaced by §6 |
 
@@ -467,3 +470,5 @@ section updated at the end of every working session.
 | 2026-09-27 | v1 scope (§2) gains **room authorization**, found in the Phase 1.5b review: JWTs carry no room claim, so any authenticated user can join any room whose id it guesses (ids are sequential) and subscribe to its tracks. Not assigned to a phase yet; it touches the token format (`nexus-api`), signaling (`Create`/`Join`) and the SDK/dev-token tooling (Phase 1.8). |
 | 2026-09-28 | §2 non-goals: clustering stated explicitly, found in the Phase 1 exit criterion 6 review. The gossip socket was bound on 0.0.0.0 by default, unauthenticated, and a datagram could abort the process. v1 starts no gossip unless `cluster.gossip_enabled` (default off, specific bind address); gossip must be authenticated before clustering ships. Its receive path is hardened (no panics on received data) either way. |
 | 2026-09-28 | §3.11 clarified, no decision changed: the 25 KB budget covers session state (data plane and control plane) only; the signaling connection is reported next to it (Phase 1.7 review). Measured in Phase 1.7: session state 16.9 KB per participant (the checked figure), signaling ≈ 49 KB per WebSocket connection (≈ 57 KB with TLS). |
+| 2026-09-28 | Phase 1 close (1.9), no decision changed. **D7 / §3.4 profile order:** `SRTP_AEAD_AES_128_GCM` has been offered first since Phase 1.5b, the condition of the 2026-09-26 (Linux) revision: the fixed GCM code passed browser checks with Chrome 153 (1.5b, 1.8); the Firefox check is Phase 1 exit criterion 4. **§3.11 measured figure:** 16.9 → 17.5 KB of session state per participant, because a room's participant set now grows at each join instead of being preallocated (≈ 440 KB per room before, 0 B for an empty room now); still under 25 KB. **§2 non-goals:** the tombstone recycling text (participant sets recycle their oldest removal records; safe on a single node only) was added with the 2026-09-28 clustering entry without being logged. **Protocol:** a `Published` message tells a publisher its track ids (Phase 1.8); no D/R change. §4: the gossip switch is `cluster.gossip_enabled`. |
+| 2026-09-28 | Owner's decisions at the Phase 1 close, from tests against a running release build. **Room authorization is fixed before v1, in Phase 1 (1.9a) before the merge:** a second user with their own valid token joined another user's room by its id (ids start at 1 and count up) and, through `Create` with the same name, got the same room. **Signaling memory is accepted for v1:** measured as SFU RSS growth, 19 KB per idle authenticated WebSocket connection and ≈ 37 KB after one 15 KB inbound message (1,000 connections: 36.4 KB each); with an outbound offer the bench's ≈ 49 KB. Session state (17.5 KB) plus signaling is ≈ 55-70 KB per participant, ≈ 0.6 GB for 10,000; shrinking WebSocket buffers after large messages is a post-v1 task. §3.11's 25 KB budget still covers session state only. |

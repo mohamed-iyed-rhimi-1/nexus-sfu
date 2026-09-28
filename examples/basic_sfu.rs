@@ -74,12 +74,8 @@ fn main() {
     println!();
 
     println!("=== Demo Complete ===");
-    println!("\nNote: Full packet processing requires implementing the remaining tasks:");
-    println!("  - Task 2: Packet Arena");
-    println!("  - Task 3: Ring Buffer");
-    println!("  - Task 5: RTP/RTCP Parser");
-    println!("  - Task 6: UDP Transport");
-    println!("  - etc.");
+    println!("\nRun the SFU itself with `cargo run -- --config config/development.toml`;");
+    println!("architecture.md describes the data path.");
 }
 
 /// Create a simple RTP packet for demonstration

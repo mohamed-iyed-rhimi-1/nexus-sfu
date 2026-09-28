@@ -177,9 +177,8 @@ STARTUP SEQUENCE:
     4. Gossip (only when cluster.gossip_enabled; off by default)
     5. Data plane (shards) initialization
     6. Signaling server initialization
-    7. Metrics server initialization
-    8. API server initialization
-    9. Shutdown signal handler registration
+    7. API server initialization (REST, /health, /ready, /metrics)
+    8. Shutdown signal handler registration
 "#,
         version = VERSION
     );

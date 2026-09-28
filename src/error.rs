@@ -8,7 +8,7 @@
 //! # Error Categories
 //!
 //! - **Hot Path Errors**: Return `Option` or `Result`, never panic
-//!   - Arena exhaustion → Return `None`, caller drops packet
+//!   - Buffer pool exhaustion → Return `None`, caller drops packet
 //!   - Parse failure → Log and drop packet
 //!   - Send failure → Increment counter, continue
 //!
@@ -326,11 +326,11 @@ mod tests {
         assert!(msg.contains("Stopped"));
 
         let err = SignalingError::HealthCheckFailed {
-            reason: "no active workers",
+            reason: "no shard running",
         };
         let msg = err.to_string();
         assert!(msg.contains("[E1015]"));
-        assert!(msg.contains("no active workers"));
+        assert!(msg.contains("no shard running"));
     }
 
     #[test]

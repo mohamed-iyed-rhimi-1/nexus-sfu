@@ -5,8 +5,9 @@
 Nexus SFU is a WebRTC Selective Forwarding Unit written in Rust. It forwards media packets
 between participants in real-time video/audio sessions.
 
-**Status:** v0.1.0 — incomplete. The data plane is being redesigned; performance and memory
-targets are not met yet.
+**Status:** v0.1.0 — incomplete. The new data plane runs with one shard (Phase 1): 0
+allocations per packet and ≤ 25 KB of session state per participant are met; throughput and
+multi-core targets are not measured yet (`architecture.md` Part 5). v1 is not released.
 **License:** AGPL-3.0-only (binary), Apache-2.0 (library crates)
 
 ## Start here
@@ -19,11 +20,12 @@ targets are not met yet.
 | `docs/design/*.md` | Detailed designs, written before the phase that needs them |
 | `docs/architecture-vision.md` | The original design, for reference only; much of it is not implemented or cannot work |
 
-**Current phase: 1** (`docs/plans/phase-1.md`, from the approved design note
-`docs/design/dataplane-v1.md`). Work on the `phase-1` branch; it merges into `main` (the
-trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
-soon (scope in `docs/dataplane-design.md` §2). The old data plane is deleted (the plan's
-deletion steps C1-C7).
+**Current phase: 1, closing** (`docs/plans/phase-1.md`, from the approved design note
+`docs/design/dataplane-v1.md`). All parts are done; step 1.9 (documents, merge) waits for the
+owner's Chrome + Firefox check (exit criterion 4), then `phase-1` is merged into `main` (the
+trunk). Work on the `phase-1` branch until then. Phase 0 is complete
+(`docs/plans/phase-0.md`). Next is Phase 2 (multiple shards; `docs/dataplane-design.md` §5).
+The goal is to ship v1 of the new data plane soon (scope in `docs/dataplane-design.md` §2).
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -41,7 +43,7 @@ never called. Check `architecture.md` Part 2, or trace from `src/main.rs`.
 - **Async runtime:** Tokio 1.44 (control plane only)
 - **HTTP:** Axum 0.7
 - **Signaling:** WebSocket + JSON (the only transport the SDK and loadtest use)
-- **Crypto:** OpenSSL (vendored) for DTLS; RustCrypto (aes, ctr, hmac, sha1, aes-gcm) for SRTP; rustls for TLS
+- **Crypto:** OpenSSL (vendored) for DTLS; SRTP AES-GCM on ring, AES-CM-HMAC-SHA1 on RustCrypto (aes, ctr, hmac, sha1); rustls for TLS
 - **Client SDK:** TypeScript 5.3.3, bundled with tsup (dual ESM/CJS)
 
 ## Build & Run
@@ -62,8 +64,8 @@ cargo run -- --config config/development.toml    # Development (needs certs/dev-
 ./target/release/nexus-sfu --config config/production.toml
 
 # Test
-cargo test --workspace                   # All tests, including tests/e2e.rs (~10 s)
-cargo test --test e2e                    # End-to-end: in-process SFU + webrtc-rs clients
+cargo test --workspace                   # All tests, including tests/e2e.rs
+cargo test --test e2e                    # End-to-end: in-process SFU + webrtc-rs clients (8 tests, ~50 s)
 cargo bench --bench real_path            # Real ingress/egress path cost
 cargo bench --bench srtp_backends        # SRTP protect/unprotect per backend (Phase 0.4)
 cargo bench --bench udp_floor            # Raw sendmmsg/recvmmsg cost, Linux only
@@ -74,7 +76,10 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # SDK (TypeScript)
-cd sdk && npm run build
+cd sdk && npm ci && npm run build && npm test
+
+# Dev token for the SDK and the browser page (examples/web/README.md)
+NEXUS_JWT_SECRET=<32+ chars> cargo run -p nexus-loadtest -- token --sub alice
 ```
 
 On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto`
@@ -107,8 +112,9 @@ See `architecture.md` for the full picture. The essentials:
 - **Control plane:** Tokio. WebSocket signaling → `SessionOrchestrator`
   (`src/orchestrator/`: room, negotiation, subscription, connection, plane) which runs the
   DTLS handshakes and sends commands to the shard. REST API on Axum with JWT.
-
-`architecture.md` still describes the old path in places; it is rewritten in Phase 1.9.
+- **State:** `nexus-state`'s `DistributedState` is the single-node room/track registry. SWIM
+  gossip is unauthenticated and off unless `cluster.gossip_enabled` (clustering is a v1
+  non-goal).
 
 ### Workspace Structure
 
@@ -125,10 +131,11 @@ crates/
   nexus-bwe/         GCC, REMB (not fed by the live path)
   nexus-api/         REST API with JWT
   nexus-metrics/     Prometheus metrics
-  nexus-state/       CRDTs, SWIM gossip
+  nexus-state/       CRDTs (single-node registry), SWIM gossip (off by default)
   nexus-loadtest/    Load generator with webrtc-rs clients; also the e2e tests' clients
                      (per-track receive stats, loss injection in lossy.rs)
 sdk/                 TypeScript client SDK
+examples/            basic_sfu.rs (prints the config), web/ (browser page on the SDK)
 tests/               e2e.rs (+ e2e/harness.rs)
 benches/             real_path, memory (+ memory/signaling.rs), srtp_backends, udp_floor
                      (trusted); packet_processing (RTCP parsing), crdt_sync
@@ -154,8 +161,9 @@ deploy/              Docker, Grafana dashboard
 
 ### Concurrency
 
-- **Never add locks or allocations to the packet forwarding hot path.** The current path
-  has both (see `architecture.md` 1.2); the redesign removes them. Do not add more.
+- **Never add locks or allocations to the packet forwarding hot path.** The shard has
+  neither (`architecture.md` 1.2); `crates/nexus-dataplane/tests/alloc.rs` checks 0
+  allocations per packet.
 - `parking_lot` mutexes only on control path
 
 ## Configuration
@@ -164,11 +172,15 @@ Config files in `config/` (TOML). Precedence: CLI args > env vars (`NEXUS_*`) > 
 
 - `config/development.toml` - one shard, small limits, DEBUG logging, no CPU affinity
 - `config/production.toml` - one shard with busy polling and CPU pinning; needs `NEXUS_JWT_SECRET` and TLS files at `/etc/nexus/tls/`
+- `config/loadtest.toml` - tuned for load testing
+
+`[dataplane]`: `shards` (must be 1 in Phase 1; `NEXUS_SHARDS`), `busy_poll_rounds` (idle
+iterations before a shard parks), `cpu_affinity`, `realtime_priority`. `[cluster]`:
+`gossip_enabled` (default false) needs a specific `gossip_bind_addr`, never 0.0.0.0.
 
 Unknown sections and unknown `[transport]` fields are errors (the old `[worker]`,
 `[memory]`, `[actor]`, `transport.batch_*`, `transport.stun_servers` were removed in Phase 1),
 as are the removed `NEXUS_WORKER_COUNT` and `NEXUS_ARENA_SIZE_MB`.
-- `config/loadtest.toml` - tuned for load testing
 
 If TLS paths are set but the files do not load, the SFU refuses to start.
 
@@ -200,5 +212,5 @@ If TLS paths are set but the files do not load, the SFU refuses to start.
 | 10000 / 10000 | UDP | Media (RTP/RTCP, STUN, DTLS) |
 | 8080 / 443 | TCP | WebSocket signaling (WSS when TLS is configured) |
 | 8443 / 443 | UDP | QUIC signaling (config only; not started) |
-| 8081 / 8081 | TCP | REST API, `/health`, `/ready` |
-| 9090 / 9090 | TCP | Prometheus metrics |
+| 8081 / 8081 | TCP | REST API, `/health`, `/ready`, Prometheus `/metrics` |
+| 9090 / 9090 | TCP | Reserved (`metrics.bind_addr`); nothing listens there |

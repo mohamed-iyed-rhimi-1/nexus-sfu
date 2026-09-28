@@ -6,7 +6,7 @@
 //! # Error Categories
 //!
 //! - **Hot Path Errors**: Return `Option` or `Result`, never panic
-//!   - Arena exhaustion → Return `None`, caller drops packet
+//!   - Buffer pool exhaustion → Return `None`, caller drops packet
 //!   - Parse failure → Log and drop packet
 //!   - Send failure → Increment counter, continue
 //!

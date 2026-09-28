@@ -1,6 +1,6 @@
 # Phase 1 — New data plane, one shard
 
-**State: in progress** (1.1-1.5b, 1.6a, 1.6b, 1.7, C1-C7 done; 1.8 code done; plan written 2026-09-26, audited against the code the same day).
+**State: in progress** (1.1-1.5b, 1.6a, 1.6b, 1.7, C1-C7, 1.8 code, "Before 1.9" done; 1.9 documents done, merge waiting for the owner's browser check (exit criterion 4); plan written 2026-09-26, audited against the code the same day).
 
 **Design:** [`docs/design/dataplane-v1.md`](../design/dataplane-v1.md) (approved; §16 gives the
 parts and order, §17 the tests), within [`docs/dataplane-design.md`](../dataplane-design.md)
@@ -1903,6 +1903,9 @@ included, and passed):**
   | **checked: larger run + pre-sized entries** | | **16.9 KB ≤ 25 KB** |
 
   `NEXUS_MEM_BUDGET_KB=16.8` fails with the split and the room count in the message.
+  **Later ("Before 1.9", Room memory):** rooms no longer preallocate their participant
+  sets (≈ 430-440 KB per room → ≈ 0.1 KB), and a set grows at each join, so the checked
+  figure is **17.5 KB** (re-measured in 1.9 at `fa8a6a9`: 17.3 KB at 11 rooms + 248 B).
 - `ci-local.sh`: the summary line says `clean` or how many paths are uncommitted or
   untracked (`git status --porcelain`; untracked files are copied into the Linux jobs), and
   which targets ran; `docker` builds `--platform linux/amd64` like the CI job (emulated on
@@ -2307,6 +2310,26 @@ pointing to the corrections below), this plan.
 
 **Checkpoint:** every exit criterion checked off in the Status table; merged.
 
+**Done (2026-09-28, documents):**
+- **Order (owner's decision):** the document work is committed now; the `ci-local.sh all`
+  run and the merge wait for the owner's §17.9 check (exit criterion 4). After the merge,
+  CLAUDE.md names Phase 2 as current, with its plan not written yet.
+- `architecture.md`: header, Parts 1-2 and 3 from the code (traced from `src/main.rs`); 2.2
+  marks the re-subscribe and SRTCP issues fixed and lists the open ones; Part 4 notes what
+  Phase 1 answered; Part 5 has the Phase 1 numbers (1.7a `real_path`, 1.1 SRTP, memory
+  re-measured at `fa8a6a9`: 17.5 KB, loopback, e2e) above the Phase 0 baseline.
+- Design: revision 2026-09-28 "Phase 1 close" (GCM offered first since 1.5b, 17.5 KB, the
+  tombstone text, `Published`); §3.4, §3.11, §4 (`cluster.gossip_enabled`) and the header
+  follow. `dataplane-v1.md` points to the corrections below.
+- **Decided here, not changed:** the always-zero `nexus_sfu_*` / `nexus_crdt_*` series are
+  documented (architecture.md 2.1), not removed (after v1). `docs/architecture-vision.md`
+  stays as a reference, as CLAUDE.md says. README performance targets are updated at
+  release (design §5); a line points to Part 5.
+- Old-path comments: `src/lib.rs` (crate comments, `tier::CURRENT`), `src/node.rs`,
+  `src/error.rs` and `nexus-core` (arena), root `Cargo.toml` (description, dependency
+  comments), `examples/basic_sfu.rs`. Left on purpose: provenance notes ("copied from
+  `src/worker/pool.rs`"), the refusal messages for removed config.
+
 ---
 
 ## Corrections to the design note
@@ -2344,7 +2367,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | `macos-14` refuses 8 MiB socket buffers (`ENOBUFS` on older XNU) and every server test fails | 1.7a: `bind_shard_socket` halves on `ENOBUFS` and warns |
 | Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 (done: two parser panics fixed, fuzz proptests on the parser) |
 | **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3 (done): a shard-wide cap on `DtlsDatagram` events per second (`dtls_budget_per_sweep`, 1,024). 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
-| **Known limit, room authorization (v1 item).** Tokens carry no room claim: any authenticated user can join any room by id (sequential) and subscribe to its tracks. 1.5b confines subscriptions to the subscriber's own room and refuses a second `Join`, but not the first | Added to the v1 scope (`dataplane-design.md` §2, revision 2026-09-27); not in Phase 1 unless decided otherwise. Needs a room claim in the JWT (`nexus-api`), checks in `Create`/`Join`, and the dev token of 1.8 minting it |
+| **Known limit, room authorization (v1 item).** Tokens carry no room claim: any authenticated user can join any room by id (sequential) and subscribe to its tracks. 1.5b confines subscriptions to the subscriber's own room and refuses a second `Join`, but not the first | Added to the v1 scope (`dataplane-design.md` §2, revision 2026-09-27). **Owner's decision 2026-09-28: fixed in Phase 1, part 1.9a, before the merge** (reproduced: a second token joined room 1 by id, and `Create` with the same name returned the same room). Needs a room claim in the JWT (`nexus-api`), checks in `Create`/`Join`, and the dev token of 1.8 minting it |
 | **Known limit, ICE-lite on-path injection.** STUN authenticates the request, not its source address (RFC 8445). An attacker on the path can drop a fresh nomination and send it from its own address before the original arrives, or replay one older than the last 16 transaction ids, and the session moves to it. Media stays SRTP-encrypted; the real peer is cut off until its next nomination | Inherent to ICE-lite; accepted for v1. 1.2 refuses repeated transaction ids and rate-limits switches. A full fix needs proof of liveness at the new address (e.g. consent from the SFU side) and comes after v1 |
 
 ## Status
@@ -2369,10 +2392,11 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.6a E2E: harness, ten clients, resubscribe | Done | see git log (1.6a) | Signaling task + events, `subscribe_confirmed`/`unsubscribe`, announced history + CNAME, inbound tap; `ten_clients` 9.7 s, suite 27.1 s; negative check fails on SRTCP index reuse |
 | 1.6b E2E: address change, SR, keyframes | Done | see git log (1.6b) | `LossRules::rebind`, `RtcpLog` (publisher PLI/FIR, subscriber SR/CNAME), three tests; resume 2.1-2.3 s, SR error ≤ 5.7 ms, burst → 1 PLI; negative check fails with the silence rule disabled. Review fixes (1.6a/1.6b checks, `ci-local.sh` lock, dashboard, scripts) |
 | 1.8 SDK, browser page, manual check | Code done (see git log (1.8)); owner's check pending | | `Published` to the publisher, `nexus-loadtest token`, SDK `createRoom`/`publish`/`unpublish`/`unsubscribe`/`leave`/`getStats`, ≤ 10 ids per request, `node:test` (20) in CI, `examples/web/`, review fixes (fenced error matching, refused-publish cleanup, refused publish m-lines released on the server). Chromium 153 pre-check passes steps 2, 3, 5 (GCM, ICE-lite, late join ≈ 0.2 s). Exit criterion 4 waits for the owner's Chrome + Firefox run on two machines |
-| SR flake, exit criterion 6 sweep | Done (uncommitted, for review) | | SR errors measured per SR (median ≤ 50 ms, max ≤ 200 ms). Sweep of every network input path: aborts fixed in the shard (duplicate nomination entries), signaling (`Create` name over 256 bytes, room-id wrap) and **gossip** (empty datagram, crafted updates, found in review). Gossip off unless a cluster is configured. Room limits (every room counted, per-creator cap, release, rooms no longer preallocate ≈ 440 KB). Proptests: authenticated STUN, random signaling, gossip bytes and messages. **Exit criterion 6 met** |
-| 1.9 Documents, merge | Not started | | |
+| SR flake, exit criterion 6 sweep | Done | `fa8a6a9` | SR errors measured per SR (median ≤ 50 ms, max ≤ 200 ms). Sweep of every network input path: aborts fixed in the shard (duplicate nomination entries), signaling (`Create` name over 256 bytes, room-id wrap) and **gossip** (empty datagram, crafted updates, found in review). Gossip off unless a cluster is configured. Room limits (every room counted, per-creator cap, release, rooms no longer preallocate ≈ 440 KB). Proptests: authenticated STUN, random signaling, gossip bytes and messages. **Exit criterion 6 met** |
+| 1.9a Room authorization | Not started | | Owner's decision 2026-09-28: before the merge. Room claim in the JWT; `Create`/`Join` check it; `nexus-loadtest token --room`; SDK/page pass it; e2e: a token for room A cannot join room B by id or by name |
+| 1.9 Documents, merge | Documents done; merge waits for 1.9a and exit criterion 4 | see git log (1.9) | `architecture.md` Parts 1-5 on the new path (Phase 1 numbers, Phase 0 kept as baseline), CLAUDE.md, README, design revision 2026-09-28 (GCM first, 17.5 KB, tombstones, `Published`), note in `dataplane-v1.md`, old-path comments in `src/lib.rs`, `node.rs`, `error.rs`, `Cargo.toml`, `basic_sfu.rs`. Left: owner's §17.9 table, `ci-local.sh all` on the merge commit, fast-forward `main` |
 
-Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☐ no panic on input · 7 ☐ documents.
+Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked at 1.7, 17.5 KB after the rooms change, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers (owner's Chrome + Firefox run, table in 1.8) · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☑ no panic on input (`fa8a6a9`) · 7 ☑ documents (1.9).
 
 ### Session log
 
@@ -3162,3 +3186,43 @@ Add one line per working session: date, part, what was done, what is left.
   in design §2 non-goals), rebind silence rule on the earliest stream, gossip log line
   confirmed. macOS: 1,461 passed, e2e 4/4, SDK 20 passed. **Exit criterion 6 met.**
   Committed and pushed. Left: the owner's §17.9 browser check (exit criterion 4), then 1.9.
+- 2026-09-28, 1.9 documents (uncommitted, for review): plan for 1.9 written and approved
+  (owner: documents now, merge after the §17.9 check; Phase 2 named next after the merge).
+  - `architecture.md` Parts 1-5 describe the new path, traced from `src/main.rs`; Phase 1
+    numbers in Part 5 above the Phase 0 baseline; memory re-measured at `fa8a6a9` (17.5 KB
+    checked, ws 49.3 / wss 56.9 KB).
+  - CLAUDE.md, README (feature list: SIMD parsing, simulcast and GCC are not on the live
+    path; testing section), design revision "Phase 1 close", `dataplane-v1.md` note, old-path
+    comments in code (`tier::CURRENT` and its test string, crate comments, `Cargo.toml`
+    description, `basic_sfu.rs`). Details under 1.9 "Done". Exit criteria 6 and 7 ☑.
+  - `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                          18s
+  macos          PASS  cargo test --workspace                         158s (1461 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            4s (20 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                5s
+  linux-arm64    PASS  clippy                                          20s
+  linux-arm64    PASS  release build                                  105s
+  linux-arm64    PASS  cargo test --workspace                         233s (1467 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           77s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     29s
+  ci-local 2026-09-28 17:34, fa8a6a9 (12 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit. Then the owner's §17.9 Chrome + Firefox run (table in 1.8, exit
+  criterion 4); then CLAUDE.md "Current phase: 2", design §5 Phase 1 "(done)",
+  `ci-local.sh all` on the commit to merge, `git merge --ff-only phase-1` into `main`.
+- 2026-09-28, review of the 1.9 documents: claims checked against the code (≈ 25 constants,
+  paths and thread names correct). Fixed here: REST routes (`GET /rooms`, `DELETE
+  /rooms/:id`) and REST room release in `architecture.md`, SRTP ≈ 7.9 KB (7,856 B, current
+  bench), loopback test path; CLAUDE.md port 9090 (reserved; `/metrics` is on 8081); README
+  `[room]`/`[bwe]` examples (not read) and the metrics location; `tier::metrics` latency and
+  memory targets (1 / 5 ms, 25 KB) and the `main.rs` startup list. The orchestrator's fixed
+  cost is 9.3 MB in the current bench (the 8.9 MB above was before the room changes).
+  **Owner's decisions** (tests against a running release build, design revision
+  2026-09-28): room authorization fixed before the merge (new part 1.9a: a second token
+  joined room 1 by id, and `Create` with the same name returned the same room); signaling
+  memory accepted for v1 (RSS: 19 KB per idle connection, ≈ 37 KB after a 15 KB message,
+  ≈ 49 KB with an outbound offer in the bench). Also seen: `Joined` lists other
+  participants with an empty name. Next: commit 1.9 documents, then 1.9a, the owner's
+  §17.9 check, `ci-local.sh all`, merge.

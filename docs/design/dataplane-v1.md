@@ -3,6 +3,11 @@
 **Status:** approved 2026-09-26 (with the owner's decisions R8 and R9). **Constraints:** [`docs/dataplane-design.md`](../dataplane-design.md)
 (D1-D10, §2 v1 scope, §3, §5). **Current code:** [`architecture.md`](../../architecture.md).
 
+**Implemented in Phase 1** ([`docs/plans/phase-1.md`](../plans/phase-1.md)). Facts in this note
+that the implementation found wrong are listed in that plan's
+[Corrections to the design note](../plans/phase-1.md#corrections-to-the-design-note); none
+changed a decision. The note is kept as written.
+
 This note is the design Phase 1 is planned from. It covers the shard, its interface to the
 control plane, session state, SRTP, ICE, buffers, RTP/RTCP rewriting, the interfaces Phase 2
 builds on, the order in which the old path is deleted, and how each Phase 1 exit criterion is

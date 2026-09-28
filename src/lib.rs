@@ -42,17 +42,17 @@ pub mod types;
 // through the crate paths (e.g., nexus_transport::srtp::SrtpInbound).
 
 // -----------------------------------------------------------------------------
-// nexus-transport: Low-level transport (UDP, SRTP, DTLS, ICE)
+// nexus-transport: SRTP, STUN, candidates, OpenSSL DTLS engine, socket setup
 // -----------------------------------------------------------------------------
 pub use nexus_transport;
 
 // -----------------------------------------------------------------------------
-// nexus-media: RTP/RTCP parsing, codecs, simulcast
+// nexus-media: RTP/RTCP parsing, header extensions (codecs, simulcast unused)
 // -----------------------------------------------------------------------------
 pub use nexus_media;
 
 // -----------------------------------------------------------------------------
-// nexus-state: Distributed state (CRDTs, SWIM protocol)
+// nexus-state: CRDT state (single node), SWIM gossip (off unless configured)
 // -----------------------------------------------------------------------------
 pub use nexus_state;
 pub use nexus_state::SwimProtocol;
@@ -61,7 +61,7 @@ pub use nexus_state::{
 };
 
 // -----------------------------------------------------------------------------
-// nexus-signal: QUIC signaling with WebSocket fallback
+// nexus-signal: WebSocket signaling (the QUIC module is not started)
 // -----------------------------------------------------------------------------
 pub use nexus_signal;
 pub use nexus_signal::{
@@ -70,7 +70,7 @@ pub use nexus_signal::{
 };
 
 // -----------------------------------------------------------------------------
-// nexus-bwe: Bandwidth estimation (GCC)
+// nexus-bwe: Bandwidth estimation (GCC; not on the live path)
 // -----------------------------------------------------------------------------
 pub use nexus_bwe;
 pub use nexus_bwe::{
@@ -85,7 +85,7 @@ pub use nexus_api;
 pub use nexus_api::{ApiServer, JwtValidator};
 
 // -----------------------------------------------------------------------------
-// nexus-webrtc: WebRTC transport and SDP parsing
+// nexus-webrtc: SDP parsing, printing and negotiation
 // -----------------------------------------------------------------------------
 pub use nexus_webrtc;
 
@@ -124,21 +124,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Performance tier information
 pub mod tier {
-    /// MVP: io_uring/kqueue with batch forwarding
-    pub const CURRENT: &str = "MVP - Batch Forwarding with Worker Sharding";
+    /// Phase 1: one data-plane shard (recvmmsg/sendmmsg on Linux)
+    pub const CURRENT: &str = "MVP - Phase 1 data plane, one shard";
 
     /// Expected performance metrics
     pub mod metrics {
         /// Packets per second per core (target)
         pub const PACKETS_PER_SEC_PER_CORE: u64 = 500_000;
-        /// Latency in milliseconds (P50 target)
-        pub const LATENCY_P50_MS: u64 = 20;
-        /// Latency in milliseconds (P99 target)
-        pub const LATENCY_P99_MS: u64 = 50;
+        /// Forwarding latency in milliseconds (P50 target, design §3)
+        pub const LATENCY_P50_MS: u64 = 1;
+        /// Forwarding latency in milliseconds (P99 target, design §3)
+        pub const LATENCY_P99_MS: u64 = 5;
         /// Maximum participants per room
         pub const MAX_PARTICIPANTS_PER_ROOM: u32 = 1000;
-        /// Memory per participant in bytes (target)
-        pub const MEMORY_PER_PARTICIPANT_BYTES: u64 = 500 * 1024;
+        /// Session state per participant in bytes (budget, checked by `benches/memory.rs`;
+        /// the signaling connection is extra)
+        pub const MEMORY_PER_PARTICIPANT_BYTES: u64 = 25 * 1024;
     }
 }
 
