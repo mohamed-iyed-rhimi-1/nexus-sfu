@@ -1901,6 +1901,7 @@ name = "nexus-metrics"
 version = "0.1.0"
 dependencies = [
  "nexus-core",
+ "nexus-dataplane",
  "parking_lot",
  "prometheus",
  "tokio",
@@ -1926,7 +1927,6 @@ dependencies = [
  "nexus-transport",
  "nexus-webrtc",
  "notify",
- "num_cpus",
  "openssl",
  "parking_lot",
  "proptest",

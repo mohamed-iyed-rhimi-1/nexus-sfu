@@ -3,39 +3,26 @@
 #
 # This configuration is optimized for local development with:
 # - All services bound to localhost (127.0.0.1)
-# - Minimal resource allocation (32MB arena, 50 participants, 10 rooms)
-# - Fixed 2 workers without CPU pinning or RT priority
+# - Small limits (50 participants, 10 rooms, 100 sessions)
+# - One shard, no CPU pinning or RT priority
 # - Debug logging enabled
 # - Relaxed BWE thresholds for local network testing
 # - Development JWT secret (minimum 32 characters)
 #
 # Distinct from:
-# - default.toml: Uses auto-detect workers, 64MB arena, 100 participants
-# - production.toml: Uses 1GB arena, 1000 participants, CPU pinning, RT priority
+# - default.toml: 100 participants, loopback addresses
+# - production.toml: 1000 participants, busy polling, CPU pinning
 # for this duration before terminating connections.
 drain_timeout_ms = 1                 # 0 seconds for dev (faster shutdown)
-
 
 [transport]
 media_bind_addr = "0.0.0.0:10000"
 signaling_bind_addr = "0.0.0.0:8080"
 recv_buffer_size_bytes = 4194304        # 4MB (minimal for dev)
 send_buffer_size_bytes = 4194304        # 4MB (minimal for dev)
-batch_size = 16                         # Smaller batches for dev
-batch_flush_interval_us = 2000          # 2ms (relaxed for dev)
 max_webrtc_sessions = 100               # Smaller limit for dev (must be <= 1000)
 tls_cert_path = "./certs/dev-cert.pem"    # Self-signed cert for local QUIC
 tls_key_path = "./certs/dev-key.pem"      # Self-signed key for local QUIC
-stun_servers = ["74.125.250.129:19302", "74.125.250.130:19302"]
-
-[memory]
-arena_size_mb = 32                      # 32MB (minimal for dev, per task spec)
-ring_buffer_size = 256                  # 256 packets per track (smaller for dev)
-
-[worker]
-num_workers = 2                         # Fixed 2 workers for dev (per task spec)
-cpu_affinity = false                    # No CPU pinning in dev (per task spec)
-realtime_priority = false               # No RT priority in dev (per task spec)
 
 [room]
 max_participants_per_room = 50          # 50 max participants (per task spec)
@@ -76,7 +63,7 @@ fanout = 1                              # Minimal fanout for single-node dev
 max_piggyback_updates = 8               # Smaller piggyback for dev
 
 [dataplane]
-# New data plane (not started until the switch in Phase 1.5b).
+# The data plane (nexus-dataplane): one thread and one media socket per shard.
 # Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
 shards = 1                              # Must be 1 in Phase 1
 busy_poll_rounds = 0                    # Park as soon as idle
@@ -90,14 +77,6 @@ realtime_priority_level = 80
 [cluster]
 # Single-node development mode
 node_id = 0
-
-[actor]
-max_track_actors = 80                   # 80 tracks (fits in 32MB arena with 256 ring buffer)
-max_participant_actors = 50             # 50 participants (matches room limit)
-max_room_actors = 10                    # 10 rooms (per task spec)
-message_queue_size = 512                # Smaller queues for dev
-migration_queue_size = 5                # Smaller migration queue
-supervision_restart_limit = 3
 
 [api]
 bind_addr = "127.0.0.1:8081"

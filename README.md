@@ -23,45 +23,47 @@ Most SFUs are written in Go or C++ and rely on garbage collection or manual memo
 
 - **No GC pauses** — Rust's ownership model gives deterministic latency
 - **No external state** — CRDTs replace Redis; nodes self-coordinate via gossip
-- **No god objects** — the packet loop does one thing (forward packets), the orchestrator does another (manage sessions)
+- **No god objects** — the data plane does one thing (forward packets), the orchestrator does another (manage sessions)
 
 The goal is an SFU that forwards 500K+ packets/sec/core in userspace with P99 latency under 5ms; see `architecture.md` for what is measured today.
 
 ## Features
 
-- **Zero-alloc hot path** — arena allocator with partitioned packet slots, SPSC lock-free channels
-- **Worker sharding** — consistent hashing distributes tracks across CPU cores
+- **Zero-alloc hot path** — the shard forwards with no heap allocation, lock or clock read per packet (checked in CI)
+- **Sharded data plane** — one thread and one socket per shard, `recvmmsg`/`sendmmsg`; one shard in Phase 1
 - **SIMD RTP parsing** — NEON (ARM) and SSE/AVX (x86) accelerated header parsing
 - **Simulcast** — layer selection with hysteresis to prevent oscillation
-- **Actor-per-track** — independent failure domains, cross-node migration
 - **CRDT state** — no Redis, no Postgres, self-coordinating cluster
 - **WebSocket signaling** — JSON messages, WSS with TLS
 - **GCC bandwidth estimation** — delay + loss based, with REMB and probing
-- **Deterministic simulation testing** — reproducible fault injection
 
 ## Architecture
 
 ```
-UDP recv → classify (1 byte) → RTP/RTCP (inline) → SRTP decrypt → SSRC route → worker forward
-                              → STUN/DTLS (channel) → ConnectionMonitor → orchestrator
+recvmmsg → classify → STUN (ICE-lite, answered in the shard)
+                    → DTLS → event → orchestrator (handshake) → SendDatagram command
+                    → SRTP/SRTCP → decrypt → route → rewrite (SSRC, seq, ts, PT, extensions)
+                                 → encrypt per subscriber → sendmmsg
 ```
 
-The packet loop runs on a pinned core with zero allocations. It receives packets, decrypts RTP/RTCP inline, and routes by SSRC to sharded workers. STUN/DTLS packets (< 1% of traffic) are channeled to the orchestrator.
+The data plane (`nexus-dataplane`) runs shards: one thread and one socket each, driven only by commands from the orchestrator and reporting events back. The shard answers STUN itself, decrypts and forwards media with zero allocations per packet, translates Sender Reports and forwards keyframe requests. DTLS datagrams go to the orchestrator, which runs the handshake and installs the SRTP keys.
 
-The orchestrator runs a `tokio::select!` loop with 4 modules:
+The orchestrator (`src/orchestrator/`) runs a `tokio::select!` loop over signaling messages, data-plane events and timers:
 
 | Module | Responsibility |
 |--------|---------------|
-| `RoomManager` | Room CRUD, join/leave, participant notifications |
-| `NegotiationManager` | Transport creation, SDP offer/answer, ICE gathering, track registration |
-| `SubscriptionManager` | Subscribe/unsubscribe, viewport filtering, media activation |
-| `ConnectionMonitor` | STUN/DTLS processing, ICE pacing, DTLS retransmit, consent checks |
+| `room` | Room CRUD, join/leave, participant notifications |
+| `negotiation` | SDP offer/answer (the SFU always offers), track registration |
+| `subscription` | Subscribe/unsubscribe, viewport filtering |
+| `connection`, `dtls` | DTLS handshakes on the shard's DTLS datagrams, consent and timeouts |
+| `plane` | Commands to the shards, sessions, SSRC allocation |
 
 ### Workspace Crates
 
 | Crate | Purpose |
 |-------|---------|
 | `nexus-core` | Shared types, config, error definitions |
+| `nexus-dataplane` | The data plane: shards, commands and events, SRTP in/out, rewrite, fan-out, socket I/O |
 | `nexus-transport` | SRTP, STUN, candidates, the OpenSSL DTLS engine, socket setup |
 | `nexus-media` | RTP/RTCP parsing (SIMD), codec detection (H264/VP8/VP9/AV1/Opus), simulcast |
 | `nexus-webrtc` | SDP parsing, printing and offer/answer negotiation |
@@ -69,7 +71,7 @@ The orchestrator runs a `tokio::select!` loop with 4 modules:
 | `nexus-bwe` | GCC bandwidth estimation (delay + loss), REMB, probing, speaker detection |
 | `nexus-signal` | WebSocket signaling (a QUIC module exists but is not started) |
 | `nexus-api` | REST API with JWT auth |
-| `nexus-metrics` | Prometheus metrics, per-worker stats, tracing |
+| `nexus-metrics` | Prometheus metrics (per-shard stats), tracing |
 | `nexus-loadtest` | Load testing framework with headless WebRTC clients |
 
 ## Quick Start
@@ -116,11 +118,10 @@ announced_ips = ["203.0.113.7"]       # ICE host candidates; see below
 [room]
 max_participants_per_room = 1000
 
-[memory]
-arena_size_mb = 64
-
-[worker]
-num_workers = 0  # 0 = auto-detect CPU cores
+[dataplane]
+shards = 1              # one thread and one media port per shard (1 in Phase 1)
+busy_poll_rounds = 0    # idle iterations before a shard parks (256 in production)
+cpu_affinity = false    # pin shard i to core i
 
 [bwe]
 initial_bandwidth_bps = 1_000_000
@@ -135,8 +136,7 @@ Precedence: command-line arguments > environment variables > config file > defau
 | `NEXUS_ANNOUNCED_IPS` | `transport.announced_ips`, comma-separated |
 | `NEXUS_JWT_SECRET` | `security.jwt_secret` and `api.jwt_secret` (at least 32 characters) |
 | `NEXUS_TLS_CERT_PATH`, `NEXUS_TLS_KEY_PATH` | Signaling TLS certificate and key (PEM) |
-| `NEXUS_WORKER_COUNT` | `worker.num_workers` |
-| `NEXUS_ARENA_SIZE_MB` | `memory.arena_size_mb` |
+| `NEXUS_SHARDS` | `dataplane.shards` |
 | `NEXUS_LOG_LEVEL` | `logging.level` |
 | `NEXUS_METRICS_ADDR` | `metrics.bind_addr` |
 
@@ -191,7 +191,7 @@ sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 echo -e "net.core.rmem_max=16777216\nnet.core.wmem_max=16777216" | sudo tee /etc/sysctl.d/99-nexus-sfu.conf
 ```
 
-Worker threads are pinned to CPU cores when `worker.cpu_affinity = true` (production config) and left to the scheduler when it is `false`.
+Shard threads are pinned to CPU cores when `dataplane.cpu_affinity = true` (production config) and left to the scheduler when it is `false`.
 
 ### Monitoring
 
@@ -205,7 +205,7 @@ Nexus exports Prometheus metrics on the configured metrics endpoint. A Grafana d
 | P50 forwarding latency | < 1ms |
 | P99 forwarding latency | < 5ms |
 | Packets/sec/core (userspace) | 500K+ |
-| Memory per participant | < 100KB |
+| Memory per participant (session state) | ≤ 25 KB (checked in CI) |
 
 ## Contributing
 

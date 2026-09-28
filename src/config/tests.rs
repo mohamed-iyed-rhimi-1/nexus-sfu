@@ -17,14 +17,13 @@ fn test_development_config_loads() {
     config.validate().expect("development.toml should validate");
 
     // Verify key development settings per task spec
-    assert_eq!(config.memory.arena_size_mb, 32, "arena should be 32MB");
-    assert_eq!(config.worker.num_workers, 2, "should have 2 workers");
+    assert_eq!(config.dataplane.shards, 1, "one shard");
     assert!(
-        !config.worker.cpu_affinity,
+        !config.dataplane.cpu_affinity,
         "cpu_affinity should be disabled"
     );
     assert!(
-        !config.worker.realtime_priority,
+        !config.dataplane.realtime_priority,
         "realtime_priority should be disabled"
     );
     assert_eq!(
@@ -53,12 +52,15 @@ fn test_production_config_loads() {
     // So we skip validation here, just verify it parses
 
     // Verify key production settings
-    assert_eq!(config.memory.arena_size_mb, 1024, "arena should be 1GB");
-    assert_eq!(config.worker.num_workers, 0, "should auto-detect workers");
-    assert!(config.worker.cpu_affinity, "cpu_affinity should be enabled");
+    assert_eq!(config.dataplane.shards, 1, "one shard in Phase 1");
+    assert_eq!(config.dataplane.busy_poll_rounds, 256, "busy polling");
     assert!(
-        config.worker.realtime_priority,
-        "realtime_priority should be enabled"
+        config.dataplane.cpu_affinity,
+        "cpu_affinity should be enabled"
+    );
+    assert!(
+        !config.dataplane.realtime_priority,
+        "SCHED_FIFO stays off with busy polling"
     );
     assert_eq!(
         config.room.max_participants_per_room, 1000,
@@ -69,13 +71,6 @@ fn test_production_config_loads() {
         LogLevel::Info,
         "logging should be info"
     );
-}
-
-#[test]
-fn test_cross_module_validation_arena_size() {
-    let mut config = NexusConfig::default();
-    config.memory.arena_size_mb = 1; // Too small (minimum is 16MB)
-    assert!(config.validate().is_err());
 }
 
 // Note: Environment variable tests are combined into a single test to avoid
@@ -141,6 +136,15 @@ fn test_env_var_overrides() {
     env::set_var("NEXUS_SHARDS", "2");
     let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
     assert!(config.validate().is_err(), "Phase 1 runs one shard");
+    env::remove_var("NEXUS_SHARDS");
+
+    // Test 6: the old data plane's variables are refused, not ignored
+    for name in ["NEXUS_WORKER_COUNT", "NEXUS_ARENA_SIZE_MB"] {
+        env::set_var(name, "4");
+        let err = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap_err();
+        assert!(err.to_string().contains(name), "{err}");
+        env::remove_var(name);
+    }
 
     // Cleanup
     env::remove_var("NEXUS_SHARDS");
@@ -165,18 +169,18 @@ fn test_hot_reload_logging_level() {
 }
 
 #[test]
-fn test_hot_reload_ignores_memory_config() {
+fn test_hot_reload_ignores_dataplane_config() {
     let mut config = NexusConfig::default();
-    let original_arena_size = config.memory.arena_size_mb;
+    let original = config.dataplane.pool_buffers;
     let new_config = NexusConfig {
-        memory: MemoryConfig {
-            arena_size_mb: 2048,
+        dataplane: DataplaneSettings {
+            pool_buffers: original * 2,
             ..Default::default()
         },
         ..Default::default()
     };
     config.reload_control_plane(&new_config);
-    assert_eq!(config.memory.arena_size_mb, original_arena_size);
+    assert_eq!(config.dataplane.pool_buffers, original);
 }
 
 // Transport validation tests
@@ -190,37 +194,9 @@ fn test_transport_validation_zero_buffer() {
 }
 
 #[test]
-fn test_transport_validation_non_power_of_two_batch() {
-    let config = TransportConfig {
-        batch_size: 33, // Not power of 2
-        ..Default::default()
-    };
-    assert!(config.validate().is_err());
-}
-
-#[test]
 fn test_transport_validation_buffer_too_large() {
     let config = TransportConfig {
         recv_buffer_size_bytes: 2 * 1024 * 1024 * 1024, // 2GB
-        ..Default::default()
-    };
-    assert!(config.validate().is_err());
-}
-
-// Memory validation tests
-#[test]
-fn test_memory_validation_non_power_of_two() {
-    let config = MemoryConfig {
-        ring_buffer_size: 1000, // Not power of 2
-        ..Default::default()
-    };
-    assert!(config.validate().is_err());
-}
-
-#[test]
-fn test_memory_validation_zero_arena() {
-    let config = MemoryConfig {
-        arena_size_mb: 0,
         ..Default::default()
     };
     assert!(config.validate().is_err());
@@ -265,25 +241,6 @@ fn test_bwe_validation_invalid_decrease_factor() {
     assert!(config.validate().is_err());
 }
 
-// Actor validation tests
-#[test]
-fn test_actor_validation_non_power_of_two_queue() {
-    let config = ActorConfig {
-        message_queue_size: 1000, // Not power of 2
-        ..Default::default()
-    };
-    assert!(config.validate().is_err());
-}
-
-#[test]
-fn test_actor_validation_too_many_tracks() {
-    let config = ActorConfig {
-        max_track_actors: 2_000_000,
-        ..Default::default()
-    };
-    assert!(config.validate().is_err());
-}
-
 // Metrics validation tests
 #[test]
 fn test_metrics_validation_invalid_addr() {
@@ -314,41 +271,50 @@ fn test_transport_builder() {
     assert_eq!(config.send_buffer_size_bytes, 16_777_216);
 }
 
-#[test]
-fn test_memory_builder() {
-    let config = MemoryConfig::default()
-        .with_arena_size_mb(1024)
-        .with_ring_buffer_size(2048);
-
-    assert_eq!(config.arena_size_mb, 1024);
-    assert_eq!(config.ring_buffer_size, 2048);
-}
-
 // Removed: test_env_override_after_file_load - combined into test_env_var_overrides above
 
 #[test]
 fn test_hot_reload_validates_before_applying() {
     // This test verifies that invalid configs are rejected during hot-reload
     // The actual hot-reload validation is tested in the watcher module
-    let mut config = NexusConfig::default();
-    config.memory.arena_size_mb = 0; // Invalid
+    let config = NexusConfig {
+        drain_timeout_ms: 0, // Invalid
+        ..Default::default()
+    };
 
     // Validation should fail
     assert!(config.validate().is_err());
 }
 
+/// The old data plane's sections and `[transport]` fields are refused, not
+/// silently ignored (Phase 1 C7).
 #[test]
-fn test_actor_limits_beyond_the_orchestrators_capacity_are_rejected() {
-    use crate::orchestrator::room::MAX_ROOMS;
-    let mut config = NexusConfig::default();
-    config.actor.max_room_actors = MAX_ROOMS as u32 + 1;
-    let err = config.validate().unwrap_err();
-    assert!(err.to_string().contains("actor.max_room_actors"), "{err}");
-
-    // 10,000 rooms: more than nexus-actor's 1,000, now accepted.
-    let mut config = NexusConfig::default();
-    config.actor.max_room_actors = MAX_ROOMS as u32;
-    assert!(config.validate().is_ok());
+fn test_removed_sections_and_fields_are_refused() {
+    let base = toml::to_string(&NexusConfig::default()).unwrap();
+    assert!(toml::from_str::<NexusConfig>(&base).is_ok());
+    for section in [
+        "[worker]\nnum_workers = 2\n",
+        "[memory]\narena_size_mb = 32\n",
+        "[actor]\nmax_room_actors = 10\n",
+    ] {
+        let text = format!("{base}\n{section}");
+        let err = toml::from_str::<NexusConfig>(&text)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{section}: {err}");
+    }
+    for field in [
+        "batch_size = 32",
+        "batch_flush_interval_us = 1000",
+        "stun_servers = []",
+    ] {
+        let text = base.replacen("[transport]\n", &format!("[transport]\n{field}\n"), 1);
+        assert_ne!(text, base, "the default config has a [transport] section");
+        let err = toml::from_str::<NexusConfig>(&text)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{field}: {err}");
+    }
 }
 
 #[test]

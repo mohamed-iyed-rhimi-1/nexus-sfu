@@ -53,9 +53,6 @@ pub fn test_config() -> NexusConfig {
     config.security.jwt_secret = JWT_SECRET.to_string();
     config.api.jwt_secret = JWT_SECRET.to_string();
     config.api.enabled = false;
-    config.worker.num_workers = 1;
-    config.worker.cpu_affinity = false;
-    config.memory.arena_size_mb = 16;
     config.drain_timeout_ms = 50;
     config.cluster.node_id = 1;
     config.dataplane.shards = 1;

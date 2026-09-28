@@ -32,11 +32,10 @@ echo "$OUTPUT" | grep -q "nexus_sfu_forwarding_latency_seconds_sum" && echo "   
 echo "$OUTPUT" | grep -q "nexus_sfu_forwarding_latency_seconds_count" && echo "   ✅ Latency count present"
 echo ""
 
-# Test 5: Verify worker metrics
-echo "5️⃣  Verifying worker metrics..."
-echo "$OUTPUT" | grep -q "nexus_worker_cpu_usage_percent{worker_id=" && echo "   ✅ Worker CPU metrics present"
-echo "$OUTPUT" | grep -q "nexus_worker_packet_queue_depth{worker_id=" && echo "   ✅ Worker queue metrics present"
-echo "$OUTPUT" | grep -q "nexus_worker_packets_processed_total{worker_id=" && echo "   ✅ Worker packet counters present"
+# Test 5: Verify shard metrics (the example installs a fixed stats source)
+echo "5️⃣  Verifying shard metrics..."
+echo "$OUTPUT" | grep -q 'nexus_shard_rx_datagrams_total{shard="0"}' && echo "   ✅ Shard counters present"
+echo "$OUTPUT" | grep -q 'nexus_shard_sessions{shard="0"}' && echo "   ✅ Shard gauges present"
 echo ""
 
 # Test 6: Verify CRDT metrics
@@ -69,7 +68,7 @@ echo "✅ All verification checks passed!"
 echo ""
 echo "📊 Metrics Summary:"
 echo "   • SFU metrics: 9 (including latency histogram)"
-echo "   • Worker metrics: 6 per worker (with labels)"
+echo "   • Shard metrics: every ShardCounters field plus 4 gauges, per shard"
 echo "   • CRDT metrics: 8 (including state sync latency)"
 echo "   • Actor metrics: 8"
 echo "   • Total: $METRIC_COUNT metrics exported"

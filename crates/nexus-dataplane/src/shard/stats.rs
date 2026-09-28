@@ -12,6 +12,16 @@ macro_rules! counters {
             $($(#[$doc])* pub $name: u64,)*
         }
 
+        impl ShardCounters {
+            /// The counters' names, in declaration order (for exporters).
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($name),)*];
+
+            /// The counters' values, in the order of `NAMES`.
+            pub fn values(&self) -> [u64; Self::NAMES.len()] {
+                [$(self.$name,)*]
+            }
+        }
+
         /// Published counters and gauges, written once per second.
         #[derive(Debug, Default)]
         pub struct ShardStats {
@@ -192,5 +202,34 @@ mod tests {
         };
         stats.publish(&counters, gauges);
         assert_eq!(stats.load(), ShardStatsSnapshot { counters, gauges });
+    }
+
+    #[test]
+    fn names_and_values_line_up() {
+        let counters = ShardCounters {
+            rx_datagrams: 3,
+            rebinds: 7,
+            ..Default::default()
+        };
+        let values = counters.values();
+        assert_eq!(values.len(), ShardCounters::NAMES.len());
+        let value = |name: &str| {
+            let i = ShardCounters::NAMES
+                .iter()
+                .position(|n| *n == name)
+                .unwrap();
+            values[i]
+        };
+        assert_eq!(value("rx_datagrams"), 3);
+        assert_eq!(value("rebinds"), 7);
+        assert_eq!(value("tx_datagrams"), 0);
+        // Prometheus names: lowercase ASCII and underscores only, all distinct.
+        let mut names = ShardCounters::NAMES.to_vec();
+        assert!(names
+            .iter()
+            .all(|n| n.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ShardCounters::NAMES.len());
     }
 }

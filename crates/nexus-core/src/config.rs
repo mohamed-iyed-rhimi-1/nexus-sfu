@@ -86,11 +86,12 @@ impl std::error::Error for ConfigError {}
 // TransportConfig
 // -----------------------------------------------------------------------
 
-/// Transport configuration for network I/O and packet processing.
-///
-/// Controls UDP socket buffer sizes, batch sending parameters,
-/// and bind addresses for media and signaling traffic.
+/// Transport configuration: media and signaling addresses, socket buffer sizes,
+/// the session limit, signaling TLS and the announced addresses. Unknown fields are
+/// an error (the old data plane's `batch_size`, `batch_flush_interval_us` and
+/// `stun_servers` were removed in Phase 1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     /// Address for media (RTP/RTCP) UDP traffic
     pub media_bind_addr: SocketAddr,
@@ -100,10 +101,6 @@ pub struct TransportConfig {
     pub recv_buffer_size_bytes: u32,
     /// UDP send buffer size in bytes (kernel SO_SNDBUF)
     pub send_buffer_size_bytes: u32,
-    /// Max packets per sendmmsg batch (must be power of 2)
-    pub batch_size: u32,
-    /// Flush interval for batch sender in microseconds
-    pub batch_flush_interval_us: u32,
     /// Maximum concurrent WebRTC sessions
     pub max_webrtc_sessions: u32,
     /// TLS certificate path for WSS (PEM format). Empty = plain WS.
@@ -112,9 +109,6 @@ pub struct TransportConfig {
     /// TLS private key path for WSS (PEM format). Empty = plain WS.
     #[serde(default)]
     pub tls_key_path: String,
-    /// STUN server addresses for server-reflexive candidate gathering.
-    #[serde(default)]
-    pub stun_servers: Vec<String>,
     /// Addresses advertised as ICE host candidates, with the bound media port.
     /// Empty: the bind IP if it is specific, otherwise the host's interfaces.
     /// A server behind NAT or in a container needs its public address here.
@@ -136,12 +130,9 @@ impl Default for TransportConfig {
                 .expect("default signaling addr is valid"),
             recv_buffer_size_bytes: 8_388_608, // 8 MB
             send_buffer_size_bytes: 8_388_608, // 8 MB
-            batch_size: 32,
-            batch_flush_interval_us: 1000, // 1 ms
             max_webrtc_sessions: 10_000,
             tls_cert_path: String::new(),
             tls_key_path: String::new(),
-            stun_servers: Vec::new(),
             announced_ips: Vec::new(),
         }
     }
@@ -158,12 +149,6 @@ impl Validate for TransportConfig {
         if self.send_buffer_size_bytes == 0 {
             errors.push("transport.send_buffer_size_bytes must be > 0".to_string());
         }
-        if self.batch_size == 0 {
-            errors.push("transport.batch_size must be > 0".to_string());
-        }
-        if self.batch_flush_interval_us == 0 {
-            errors.push("transport.batch_flush_interval_us must be > 0".to_string());
-        }
 
         // Negative-space assertions (upper bounds)
         const MAX_BUFFER_BYTES: u32 = 1_073_741_824; // 1 GB
@@ -172,14 +157,6 @@ impl Validate for TransportConfig {
         }
         if self.send_buffer_size_bytes > MAX_BUFFER_BYTES {
             errors.push("transport.send_buffer_size_bytes must be <= 1 GB".to_string());
-        }
-
-        // Batch size must be power of 2 for efficient modulo
-        if self.batch_size > 0 && !self.batch_size.is_power_of_two() {
-            errors.push("transport.batch_size must be power of 2".to_string());
-        }
-        if self.batch_size > 64 {
-            errors.push("transport.batch_size must be <= 64".to_string());
         }
 
         // WebRTC session bounds
@@ -241,134 +218,6 @@ impl TransportConfig {
         self.recv_buffer_size_bytes = size_bytes;
         self.send_buffer_size_bytes = size_bytes;
         self
-    }
-}
-
-// -----------------------------------------------------------------------
-// MemoryConfig
-// -----------------------------------------------------------------------
-
-/// Memory configuration for pre-allocated pools.
-///
-/// Controls the packet arena size and per-track ring buffer
-/// capacity. Both are allocated at startup and never grow.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct MemoryConfig {
-    /// Packet arena size in megabytes (pre-allocated at startup)
-    pub arena_size_mb: u32,
-    /// Ring buffer capacity per track (must be power of 2)
-    pub ring_buffer_size: u32,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            arena_size_mb: 64,
-            ring_buffer_size: 1024,
-        }
-    }
-}
-
-impl Validate for MemoryConfig {
-    fn validate(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if self.arena_size_mb == 0 {
-            errors.push("memory.arena_size_mb must be > 0".to_string());
-        }
-        if self.arena_size_mb > 4096 {
-            errors.push("memory.arena_size_mb must be <= 4096 (4 GB)".to_string());
-        }
-        if self.ring_buffer_size == 0 {
-            errors.push("memory.ring_buffer_size must be > 0".to_string());
-        }
-        if self.ring_buffer_size > 0 && !self.ring_buffer_size.is_power_of_two() {
-            errors.push("memory.ring_buffer_size must be power of 2".to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-}
-
-impl MemoryConfig {
-    /// Set the arena size in megabytes.
-    pub fn with_arena_size_mb(mut self, size_mb: u32) -> Self {
-        self.arena_size_mb = size_mb;
-        self
-    }
-
-    /// Set the ring buffer size per track.
-    pub fn with_ring_buffer_size(mut self, size: u32) -> Self {
-        self.ring_buffer_size = size;
-        self
-    }
-}
-
-// -----------------------------------------------------------------------
-// WorkerConfig
-// -----------------------------------------------------------------------
-
-/// Default SCHED_FIFO priority level (1-99, higher = more priority).
-fn default_realtime_priority_level() -> u32 {
-    80
-}
-
-/// Worker configuration for CPU-pinned threads.
-///
-/// Controls the number of media worker threads, CPU affinity,
-/// and real-time scheduling priority. `num_workers == 0` means
-/// auto-detect from available CPU cores.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct WorkerConfig {
-    /// Number of worker threads (0 = auto-detect from CPU count)
-    pub num_workers: u32,
-    /// Pin each worker to a dedicated CPU core
-    pub cpu_affinity: bool,
-    /// Request real-time scheduling priority (requires CAP_SYS_NICE)
-    pub realtime_priority: bool,
-    /// SCHED_FIFO priority level (1-99, default 80).
-    /// Only used when realtime_priority is true.
-    #[serde(default = "default_realtime_priority_level")]
-    pub realtime_priority_level: u32,
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            num_workers: 0,
-            cpu_affinity: false,
-            realtime_priority: false,
-            realtime_priority_level: default_realtime_priority_level(),
-        }
-    }
-}
-
-impl Validate for WorkerConfig {
-    fn validate(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // num_workers == 0 means auto-detect, which is valid.
-        // Upper bound is checked in cross-module validation
-        // because it depends on the CPU count at runtime.
-
-        // Validate realtime_priority_level when realtime_priority is enabled
-        if self.realtime_priority && !(1..=99).contains(&self.realtime_priority_level) {
-            errors.push(
-                "worker.realtime_priority_level must be in \
-                 range 1..=99 when realtime_priority is true"
-                    .to_string(),
-            );
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -639,68 +488,6 @@ impl Validate for SecurityConfig {
 }
 
 // -----------------------------------------------------------------------
-// ActorConfig
-// -----------------------------------------------------------------------
-
-/// Actor system configuration.
-///
-/// Controls the maximum number of each actor type and their
-/// message queue sizes. All limits are fixed at startup.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ActorConfig {
-    /// Maximum track actors in the system
-    pub max_track_actors: u32,
-    /// Maximum participant actors in the system
-    pub max_participant_actors: u32,
-    /// Maximum room actors in the system
-    pub max_room_actors: u32,
-    /// Per-actor message queue capacity (must be power of 2)
-    pub message_queue_size: u32,
-    /// Queue size for actor migration messages
-    pub migration_queue_size: u32,
-    /// Max restarts before an actor is permanently stopped
-    pub supervision_restart_limit: u32,
-}
-
-impl Default for ActorConfig {
-    fn default() -> Self {
-        Self {
-            max_track_actors: 10_000,
-            max_participant_actors: 1_000,
-            max_room_actors: 100,
-            message_queue_size: 1024,
-            migration_queue_size: 10,
-            supervision_restart_limit: 3,
-        }
-    }
-}
-
-impl Validate for ActorConfig {
-    fn validate(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if self.max_track_actors == 0 {
-            errors.push("actor.max_track_actors must be > 0".to_string());
-        }
-        if self.max_track_actors > 1_000_000 {
-            errors.push("actor.max_track_actors must be <= 1000000".to_string());
-        }
-        if self.message_queue_size == 0 {
-            errors.push("actor.message_queue_size must be > 0".to_string());
-        }
-        if self.message_queue_size > 0 && !self.message_queue_size.is_power_of_two() {
-            errors.push("actor.message_queue_size must be power of 2".to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
 // MetricsConfig
 // -----------------------------------------------------------------------
 
@@ -755,25 +542,6 @@ impl Validate for MetricsConfig {
 }
 
 // -----------------------------------------------------------------------
-// Compile-time assertions for defaults
-// -----------------------------------------------------------------------
-
-const _: () = {
-    // Verify ActorConfig defaults are sane at compile time.
-    const DEFAULT_ACTOR: ActorConfig = ActorConfig {
-        max_track_actors: 10_000,
-        max_participant_actors: 1_000,
-        max_room_actors: 100,
-        message_queue_size: 1024,
-        migration_queue_size: 10,
-        supervision_restart_limit: 3,
-    };
-    assert!(DEFAULT_ACTOR.max_track_actors > 0);
-    assert!(DEFAULT_ACTOR.max_track_actors <= 1_000_000);
-    assert!(DEFAULT_ACTOR.message_queue_size.is_power_of_two());
-};
-
-// -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
 
@@ -824,48 +592,6 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("recv_buffer")));
-    }
-
-    #[test]
-    fn test_invalid_transport_batch_not_power_of_two() {
-        let cfg = TransportConfig {
-            batch_size: 3,
-            ..Default::default()
-        };
-        let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("power of 2")));
-    }
-
-    #[test]
-    fn test_valid_memory_config() {
-        let cfg = MemoryConfig::default();
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_invalid_memory_zero_arena() {
-        let cfg = MemoryConfig {
-            arena_size_mb: 0,
-            ..Default::default()
-        };
-        let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("arena_size_mb")));
-    }
-
-    #[test]
-    fn test_invalid_memory_ring_not_power_of_two() {
-        let cfg = MemoryConfig {
-            ring_buffer_size: 1000,
-            ..Default::default()
-        };
-        let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("power of 2")));
-    }
-
-    #[test]
-    fn test_valid_worker_config() {
-        let cfg = WorkerConfig::default();
-        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -940,22 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_actor_config() {
-        let cfg = ActorConfig::default();
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_invalid_actor_queue_not_power_of_two() {
-        let cfg = ActorConfig {
-            message_queue_size: 100,
-            ..Default::default()
-        };
-        let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("power of 2")));
-    }
-
-    #[test]
     fn test_valid_metrics_config() {
         let cfg = MetricsConfig::default();
         assert!(cfg.validate().is_ok());
@@ -1002,11 +712,10 @@ mod tests {
         let cfg = TransportConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
         let decoded: TransportConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg.batch_size, decoded.batch_size);
         assert_eq!(cfg.recv_buffer_size_bytes, decoded.recv_buffer_size_bytes);
         assert_eq!(cfg.tls_cert_path, decoded.tls_cert_path);
         assert_eq!(cfg.tls_key_path, decoded.tls_key_path);
-        assert_eq!(cfg.stun_servers, decoded.stun_servers);
+        assert_eq!(cfg.announced_ips, decoded.announced_ips);
     }
 
     #[test]
@@ -1025,16 +734,14 @@ mod tests {
         let cfg = TransportConfig {
             recv_buffer_size_bytes: 0,
             send_buffer_size_bytes: 0,
-            batch_size: 3,
-            batch_flush_interval_us: 0,
             max_webrtc_sessions: 0,
             ..Default::default()
         };
         let errs = cfg.validate().unwrap_err();
-        // At least 5 distinct errors expected
+        // At least 3 distinct errors expected
         assert!(
-            errs.len() >= 5,
-            "expected >= 5 errors, got {}: {:?}",
+            errs.len() >= 3,
+            "expected >= 3 errors, got {}: {:?}",
             errs.len(),
             errs
         );

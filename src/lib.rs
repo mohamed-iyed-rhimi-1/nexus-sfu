@@ -105,18 +105,8 @@ pub use nexus_media::rtp::RtpHeader;
 // Application modules: config, error, tracing, types
 // -----------------------------------------------------------------------------
 pub use config::{
-    ActorConfig,
-    ApiConfig,
-    BweConfig,
-    ConfigError,
-    LoggingConfig,
-    MemoryConfig,
-    MetricsConfig,
-    NexusConfig,
-    RoomConfig,
-    SecurityConfig,
-    TransportConfig, // Application-level transport config (distinct from UdpTransportConfig)
-    WorkerConfig,
+    ApiConfig, BweConfig, ConfigError, DataplaneSettings, LoggingConfig, MetricsConfig,
+    NexusConfig, RoomConfig, SecurityConfig, TransportConfig,
 };
 pub use error::{
     signaling_error_codes, ApiError, ParseError, RoomError, RtcpError, RtpError, SfuError,

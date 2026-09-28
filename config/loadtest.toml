@@ -8,21 +8,9 @@ media_bind_addr = "0.0.0.0:10000"
 signaling_bind_addr = "0.0.0.0:8080"
 recv_buffer_size_bytes = 16777216       # 16MB
 send_buffer_size_bytes = 16777216       # 16MB
-batch_size = 64
-batch_flush_interval_us = 1000          # 1ms
 max_webrtc_sessions = 200
 tls_cert_path = ""                      # Empty = plain WS (no TLS)
 tls_key_path = ""
-stun_servers = []
-
-[memory]
-arena_size_mb = 128                     # 128MB for 100 viewers
-ring_buffer_size = 512
-
-[worker]
-num_workers = 1
-cpu_affinity = false
-realtime_priority = false
 
 [room]
 max_participants_per_room = 150         # 1 publisher + 100 viewers + headroom
@@ -62,7 +50,7 @@ fanout = 1
 max_piggyback_updates = 8
 
 [dataplane]
-# New data plane (not started until the switch in Phase 1.5b).
+# The data plane (nexus-dataplane): one thread and one media socket per shard.
 # Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
 shards = 1                              # Must be 1 in Phase 1
 busy_poll_rounds = 0                    # Park as soon as idle
@@ -75,14 +63,6 @@ realtime_priority_level = 80
 
 [cluster]
 node_id = 0
-
-[actor]
-max_track_actors = 400                  # 2 tracks × 101 participants + headroom
-max_participant_actors = 150
-max_room_actors = 10
-message_queue_size = 2048
-migration_queue_size = 5
-supervision_restart_limit = 3
 
 [api]
 bind_addr = "127.0.0.1:8081"

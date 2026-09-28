@@ -3,8 +3,8 @@
 use nexus_metrics::MetricsCollector;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create metrics collector with 4 workers
-    let collector = MetricsCollector::new(4)?;
+    // Create a metrics collector for one data-plane shard
+    let collector = MetricsCollector::new(1)?;
 
     // Record some SFU metrics
     collector.sfu.record_packet_received(1500);
@@ -13,10 +13,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     collector.sfu.set_active_participants(5);
     collector.sfu.set_active_rooms(2);
 
-    // Record worker metrics
-    collector.workers.worker(0).set_cpu_usage_percent(45.5);
-    collector.workers.worker(0).set_packet_queue_depth(100);
-    collector.workers.worker(0).record_packet_processed();
+    // Shard stats come from the data plane: the server installs a source that
+    // reads each shard's published snapshot (here, a fixed one).
+    collector.shards.set_source(Box::new(|_| {
+        let mut stats = nexus_dataplane::ShardStatsSnapshot::default();
+        stats.counters.rx_datagrams = 1_000;
+        stats.gauges.sessions = 5;
+        stats
+    }));
 
     // Record CRDT metrics
     collector.crdt.record_gossip_sent();
@@ -37,10 +41,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("P50 latency: {:.2}ms", collector.sfu.p50_latency_ms());
     println!("P99 latency: {:.2}ms", collector.sfu.p99_latency_ms());
-    println!(
-        "Total packets processed: {}",
-        collector.workers.total_packets_processed()
-    );
 
     Ok(())
 }

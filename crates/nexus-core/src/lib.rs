@@ -30,6 +30,6 @@ pub use error::{
 // The full NexusConfig aggregator stays in the root crate
 // because it depends on crate-specific configs (GossipConfig, etc.).
 pub use config::{
-    ActorConfig, BweConfig, ConfigError, LogLevel, LoggingConfig, MemoryConfig, MetricsConfig,
-    RoomConfig, SecurityConfig, TransportConfig, Validate, WorkerConfig, MAX_ANNOUNCED_IPS,
+    BweConfig, ConfigError, LogLevel, LoggingConfig, MetricsConfig, RoomConfig, SecurityConfig,
+    TransportConfig, Validate, MAX_ANNOUNCED_IPS,
 };

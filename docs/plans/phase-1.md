@@ -1285,6 +1285,38 @@ Dockerfile's `liburing-dev`. The grep check of the code notes below: what remain
 comment (1.9). Crate docs (`lib.rs`, `ice`, `dtls`), CLAUDE.md and README describe what is
 left.
 
+**C7 done (2026-09-28):**
+- **Config (note §14):** `MemoryConfig`, `WorkerConfig`, `ActorConfig` and their sections,
+  `transport.batch_size`, `batch_flush_interval_us`, `stun_servers` (the `[transport]` one;
+  `[ice_servers]` stays), `--workers`, `NEXUS_WORKER_COUNT`, `NEXUS_ARENA_SIZE_MB`, and
+  `validate_cross_module` (all three of its checks were about removed sections) removed,
+  with their tests; the four TOMLs, the e2e harness, `examples/basic_sfu.rs` (prints the
+  `[dataplane]` settings), `main.rs`'s startup summary. Root dependency `num_cpus` dropped.
+- **Fail fast, not silent:** `NexusConfig` and `TransportConfig` are
+  `#[serde(deny_unknown_fields)]`, so a file that still has `[worker]`, `[memory]`,
+  `[actor]` or the removed `[transport]` fields fails to load instead of loading with those
+  settings ignored (the ones that still apply are under `[dataplane]`); the two removed
+  environment variables are an error naming their replacement. Tests for both, checked to
+  fail without the fix. Unknown **CLI** arguments were already ignored before (the parser
+  has no error path): `--workers` is now one of them; noted, not changed here.
+- **Metrics (note §5.4):** `WorkerPoolMetrics` and the six `nexus_worker_*` series replaced
+  by shard metrics: `nexus_shard_<counter>_total{shard}` for every `ShardCounters` field
+  (the stats macro now exposes `NAMES` and `values()`) and `nexus_shard_{sessions, tracks,
+  subscriptions, rx_pps}{shard}`. `nexus-metrics` depends on `nexus-dataplane`;
+  `MetricsCollector::new(shards)`; the server installs a stats source
+  (`ShardMetrics::set_source`, reading `DataplaneHandle::stats`) and `/metrics` reads it
+  at render time: no copy task, freshness = the shard's once-per-second publish. Tests: the
+  names/values order, the collector's per-shard export, and a real one-shard data plane
+  whose `drop_unclassified` shows up in `/metrics` output. `verify_metrics.sh` and the
+  Grafana dashboard (Worker CPU → Shard Datagrams) follow. **Still zero:** the
+  `nexus_sfu_*` and `nexus_crdt_*` series (nothing feeds `SfuMetrics`/`CrdtMetrics` since
+  the old path; the Grafana panels on them read zero). Not in C7's scope; left for 1.9 or
+  later (open item).
+- README: features, architecture paragraph and orchestrator modules, crate table
+  (`nexus-dataplane` row), config example (`[dataplane]`), env table (`NEXUS_SHARDS`), CPU
+  pinning, memory target (≤ 25 KB session state). CLAUDE.md: config files and the
+  refusal rules. `config/*.toml` `[dataplane]` comments no longer say "not started".
+
 **Code notes (audited 2026-09-26):** `tests/pps_pipeline.rs` is `#![cfg(feature = "sim")]`,
 not in CI: delete, don't port. After C5, `grep -rn "arena\|io_uring\|MediaTransport" crates
 src` must be empty outside comments updated in 1.9. Before each step, `grep -rn` the removed
@@ -1905,14 +1937,13 @@ The note's §19 risks stand; these are the ones the audit added.
 | C4 `nexus-actor`, `nexus-dst` | Done | see git log (C4) | Both crates, `ActorMetrics` and the `nexus_actor_*` series gone; `[actor]` checked against the orchestrator's limits until C7 |
 | C6 `WebRtcTransport`, session, demux | Done | see git log (C6) | `nexus-webrtc` is SDP only (≈ 5,800 lines gone); `OpenSslDtlsEngine::new` removed |
 | C5 Replaced `nexus-transport` modules | Done | see git log (C5) | Arena, ring buffer, UDP/io_uring/batch transports, ICE agent, `StunServer`, pure-Rust DTLS, `ArenaError` gone; `nexus-transport` is SRTP, STUN, candidates, OpenSSL DTLS, socket setup |
-| C7 Config, README, example | Not started | | |
+| C7 Config, README, example | Done | see git log (C7) | Old config sections/fields/env vars removed and refused (fail fast); shard stats on `/metrics`; README, example, TOMLs, dashboard |
 | 1.6a E2E: harness, ten clients, resubscribe | Not started | | |
 | 1.6b E2E: address change, SR, keyframes | Not started | | |
 | 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
 | 1.9 Documents, merge | Not started | | |
 
-Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☐ old path
-deleted · 6 ☐ no panic on input · 7 ☐ documents.
+Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☐ no panic on input · 7 ☐ documents.
 
 ### Session log
 
@@ -2408,3 +2439,26 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 08:38, 3d914bc (33 uncommitted or untracked paths), targets: macos linux-arm64 docker, budget 25 KB: PASS
   ```
   Next: review and commit C5, then C7 (config, README, example; shard metrics export).
+- 2026-09-28: C5 committed (`cf105a8`). C7 implemented (uncommitted, for review): the old
+  `[worker]`/`[memory]`/`[actor]` config, `transport.batch_*`/`stun_servers`,
+  `--workers` and the two environment variables removed, and refused when still present
+  (`deny_unknown_fields`, env error); shard stats on `/metrics` (`nexus_shard_*{shard}`,
+  read at render time from `DataplaneHandle::stats`), `WorkerPoolMetrics` gone; README,
+  example, TOMLs, dashboard, `verify_metrics.sh`, CLAUDE.md. Tests 1,417 → 1,405: 17 tests
+  of removed config types and worker metrics, 5 new (stats names, shard source, per-shard
+  export, server `/metrics` on a real shard, config refusals). **Exit criterion 5 met**
+  (every deletion step done). Open: `nexus_sfu_*`/`nexus_crdt_*` series read zero.
+  `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                0s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                         102s (1405 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                2s
+  linux-arm64    PASS  clippy                                          13s
+  linux-arm64    PASS  release build                                   60s
+  linux-arm64    PASS  cargo test --workspace                         141s (1411 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           35s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     20s
+  ci-local 2026-09-28 08:55, cf105a8 (29 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit C7. Left in Phase 1: 1.6a, 1.6b (e2e), 1.8 (SDK, browsers), 1.9.

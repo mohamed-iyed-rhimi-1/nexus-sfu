@@ -92,12 +92,16 @@
       },
       {
         "id": 5,
-        "title": "Worker CPU Usage",
+        "title": "Shard Datagrams",
         "type": "graph",
         "targets": [
           {
-            "expr": "nexus_worker_cpu_usage_percent / 100",
-            "legendFormat": "Worker {{worker_id}}"
+            "expr": "rate(nexus_shard_rx_datagrams_total[1m])",
+            "legendFormat": "rx shard {{shard}}"
+          },
+          {
+            "expr": "rate(nexus_shard_tx_datagrams_total[1m])",
+            "legendFormat": "tx shard {{shard}}"
           }
         ],
         "yaxes": [

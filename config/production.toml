@@ -2,14 +2,12 @@
 # TigerStyle: Optimized for performance and reliability
 #
 # Configuration Sections (per architecture document Section 12):
-# - transport: Network I/O and packet processing
-# - memory: Pre-allocated pools (arena, ring buffers)
-# - worker: CPU-pinned media worker threads
+# - transport: Media and signaling addresses, socket buffers, TLS, announced IPs
+# - dataplane: Shards (busy polling, CPU pinning, packet buffers, timeouts)
 # - room: Room limits and timeouts
 # - bwe: Bandwidth estimation (GCC algorithm)
 # - quic: QUIC signaling (unused: not started, WebSocket only)
 # - gossip: SWIM gossip protocol for cluster state sync
-# - actor: Actor system limits and supervision
 # - metrics: Prometheus metrics endpoint
 # - security: JWT authentication
 # - logging: Structured logging configuration
@@ -29,21 +27,9 @@ media_bind_addr = "0.0.0.0:10000"
 signaling_bind_addr = "0.0.0.0:443"
 recv_buffer_size_bytes = 16777216       # 16MB
 send_buffer_size_bytes = 16777216       # 16MB
-batch_size = 64                         # Larger batches for throughput
-batch_flush_interval_us = 1000          # 1ms
 max_webrtc_sessions = 10000             # Max concurrent WebRTC sessions
 tls_cert_path = "/etc/nexus/tls/cert.pem"
 tls_key_path = "/etc/nexus/tls/key.pem"
-stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
-
-[memory]
-arena_size_mb = 1024                    # 1GB pre-allocated
-ring_buffer_size = 2048                 # 2048 packets per track
-
-[worker]
-num_workers = 0                         # Auto-detect (one per core)
-cpu_affinity = true                     # Pin workers to cores
-realtime_priority = true                # Use SCHED_FIFO (requires CAP_SYS_NICE)
 
 [room]
 max_participants_per_room = 1000
@@ -94,7 +80,7 @@ max_piggyback_updates = 16
 seed_peers = []
 
 [dataplane]
-# New data plane (not started until the switch in Phase 1.5b).
+# The data plane (nexus-dataplane): one thread and one media socket per shard.
 # Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
 shards = 1                              # Must be 1 in Phase 1
 busy_poll_rounds = 256                  # Spin before parking (lower latency, more CPU)
@@ -111,14 +97,6 @@ realtime_priority_level = 80
 # Unique node ID. Set to 0 for auto-generation from hostname+pid+time.
 # In production multi-node clusters, set explicitly per node or use HOSTNAME env var.
 node_id = 0
-
-[actor]
-max_track_actors = 1000000              # 1M tracks
-max_participant_actors = 10000          # Not read (section removed in Phase 1 C7); <= the orchestrator's session table
-max_room_actors = 1000                  # Not read; <= the orchestrator's MAX_ROOMS (10,000)
-message_queue_size = 4096               # Larger queues
-migration_queue_size = 10
-supervision_restart_limit = 3
 
 [metrics]
 bind_addr = "0.0.0.0:9090"

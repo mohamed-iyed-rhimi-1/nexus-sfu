@@ -48,8 +48,6 @@ struct Args {
     media_addr: Option<SocketAddr>,
     /// Signaling (WebSocket) bind address override.
     signal_addr: Option<SocketAddr>,
-    /// Number of worker threads override.
-    num_workers: Option<u32>,
     /// Number of data-plane shards override.
     shards: Option<u16>,
     /// Log level override.
@@ -70,7 +68,6 @@ impl Args {
             config_path: None,
             media_addr: None,
             signal_addr: None,
-            num_workers: None,
             shards: None,
             log_level: None,
             log_file: None,
@@ -103,12 +100,6 @@ impl Args {
                     i += 1;
                     if i < args.len() {
                         result.signal_addr = args[i].parse().ok();
-                    }
-                }
-                "--workers" => {
-                    i += 1;
-                    if i < args.len() {
-                        result.num_workers = args[i].parse().ok();
                     }
                 }
                 "--shards" => {
@@ -159,7 +150,6 @@ OPTIONS:
     -c, --config <PATH>     Path to TOML configuration file
     --media-addr <ADDR>     Media (RTP/RTCP) bind address [default: 0.0.0.0:10000]
     --signal-addr <ADDR>    Signaling (WebSocket) bind address [default: 0.0.0.0:8080]
-    --workers <NUM>         Number of worker threads [default: auto-detect]
     --shards <NUM>          Number of data-plane shards [default: 1]
     --log-level <LEVEL>     Log level: trace, debug, info, warn, error [default: info]
     --log-file <PATH>       Optional log file path for file output
@@ -174,8 +164,8 @@ EXAMPLES:
     # Run with specific bind addresses
     nexus-sfu --media-addr 0.0.0.0:10000 --signal-addr 0.0.0.0:8080
 
-    # Run with 4 worker threads and debug logging
-    nexus-sfu --workers 4 --log-level debug
+    # Run with debug logging
+    nexus-sfu --log-level debug
 
     # Run with file logging
     nexus-sfu --log-file /var/log/nexus-sfu.log
@@ -237,9 +227,6 @@ fn load_config(args: &Args) -> Result<NexusConfig, String> {
     }
     if let Some(addr) = args.signal_addr {
         config.transport.signaling_bind_addr = addr;
-    }
-    if let Some(workers) = args.num_workers {
-        config.worker.num_workers = workers;
     }
     if let Some(shards) = args.shards {
         config.dataplane.shards = shards;
@@ -305,7 +292,7 @@ async fn main() -> ExitCode {
     }
 
     info!("Starting Nexus SFU v{}", VERSION);
-    info!("Startup sequence: config → tracing → distributed state → gossip → worker pool → signaling → metrics → API");
+    info!("Startup sequence: config → tracing → distributed state → gossip → data plane → signaling → metrics → API");
 
     // Log configuration summary
     info!("Configuration loaded:");
@@ -314,8 +301,7 @@ async fn main() -> ExitCode {
         "  Signaling address: {}",
         config.transport.signaling_bind_addr
     );
-    info!("  Workers: {} (0 = auto)", config.worker.num_workers);
-    info!("  Arena size: {}MB", config.memory.arena_size_mb);
+    info!("  Shards: {}", config.dataplane.shards);
     info!("  Drain timeout: {}ms", config.drain_timeout_ms);
 
     // ========================================================================

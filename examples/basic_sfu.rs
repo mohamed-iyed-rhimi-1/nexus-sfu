@@ -31,16 +31,14 @@ fn main() {
         "Signaling bind address: {}",
         config.transport.signaling_bind_addr
     );
-    println!("Arena size: {} MB", config.memory.arena_size_mb);
+    println!("Data-plane shards: {}", config.dataplane.shards);
     println!(
-        "Ring buffer size: {} packets",
-        config.memory.ring_buffer_size
+        "Packet buffers per shard: {}",
+        config.dataplane.pool_buffers
     );
-    println!("Workers: {} (0 = auto-detect)", config.worker.num_workers);
-    println!("Batch size: {} packets", config.transport.batch_size);
     println!(
-        "Batch flush interval: {} μs",
-        config.transport.batch_flush_interval_us
+        "Consent timeout: {} ms",
+        config.dataplane.consent_timeout_ms
     );
     println!(
         "Max participants per room: {}",

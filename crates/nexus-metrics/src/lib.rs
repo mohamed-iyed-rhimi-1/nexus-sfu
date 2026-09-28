@@ -13,14 +13,14 @@
 mod crdt;
 mod prometheus;
 mod sfu;
+mod shard;
 mod tracing_metrics;
-mod worker;
 
 pub use crdt::CrdtMetrics;
 pub use prometheus::PrometheusExporter;
 pub use sfu::SfuMetrics;
+pub use shard::{ShardMetrics, ShardStatsSource};
 pub use tracing_metrics::{TracingMetrics, TracingMetricsSnapshot};
-pub use worker::{WorkerMetrics, WorkerPoolMetrics};
 
 use std::sync::Arc;
 
@@ -29,29 +29,30 @@ use std::sync::Arc;
 /// Aggregates all subsystem metrics for Prometheus export.
 pub struct MetricsCollector {
     pub sfu: Arc<SfuMetrics>,
-    pub workers: Arc<WorkerPoolMetrics>,
+    /// Data-plane shards (design note §5.4).
+    pub shards: Arc<ShardMetrics>,
     pub crdt: Arc<CrdtMetrics>,
     pub tracing: Arc<TracingMetrics>,
     exporter: Arc<PrometheusExporter>,
 }
 
 impl MetricsCollector {
-    /// Create new metrics collector
+    /// A collector for `shards` data-plane shards.
     ///
     /// # Assertions
-    /// - num_workers > 0
-    pub fn new(num_workers: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(num_workers > 0, "num_workers must be > 0");
+    /// - shards > 0
+    pub fn new(shards: u32) -> Result<Self, Box<dyn std::error::Error>> {
+        assert!(shards > 0, "shards must be > 0");
 
         let sfu = Arc::new(SfuMetrics::new());
-        let workers = Arc::new(WorkerPoolMetrics::new(num_workers));
+        let shards = Arc::new(ShardMetrics::new(shards as usize));
         let crdt = Arc::new(CrdtMetrics::new());
         let tracing = Arc::new(TracingMetrics::new());
         let exporter = Arc::new(PrometheusExporter::new()?);
 
         Ok(Self {
             sfu,
-            workers,
+            shards,
             crdt,
             tracing,
             exporter,
@@ -61,7 +62,7 @@ impl MetricsCollector {
     /// Export metrics in Prometheus text format
     pub fn export_prometheus(&self) -> Result<String, Box<dyn std::error::Error>> {
         // Update Prometheus metrics from internal collectors
-        self.exporter.update(&self.sfu, &self.workers, &self.crdt);
+        self.exporter.update(&self.sfu, &self.shards, &self.crdt);
 
         self.exporter.render()
     }

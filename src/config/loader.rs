@@ -3,6 +3,12 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+/// Environment variables of the old data plane, and what replaces them.
+const REMOVED_ENV_VARS: [(&str, &str); 2] = [
+    ("NEXUS_WORKER_COUNT", "NEXUS_SHARDS (dataplane.shards)"),
+    ("NEXUS_ARENA_SIZE_MB", "dataplane.pool_buffers"),
+];
+
 pub struct ConfigLoader;
 
 impl ConfigLoader {
@@ -64,9 +70,7 @@ impl ConfigLoader {
     ///   both empty for this variable to fill)
     /// - `NEXUS_TLS_CERT_PATH`: TLS certificate path (quic.cert_path, requires nexus-signal)
     /// - `NEXUS_TLS_KEY_PATH`: TLS key path (quic.key_path, requires nexus-signal)
-    /// - `NEXUS_WORKER_COUNT`: Number of worker threads (worker.num_workers)
     /// - `NEXUS_SHARDS`: Number of data-plane shards (dataplane.shards)
-    /// - `NEXUS_ARENA_SIZE_MB`: Packet arena size in MB (memory.arena_size_mb)
     /// - `NEXUS_LOG_LEVEL`: Log level (logging.level)
     /// - `NEXUS_METRICS_ADDR`: Metrics bind address (metrics.bind_addr)
     /// - `NEXUS_ANNOUNCED_IPS`: comma-separated IPs advertised as ICE host
@@ -94,22 +98,20 @@ impl ConfigLoader {
         }
 
         // Numeric overrides with validation
-        if let Ok(workers) = env::var("NEXUS_WORKER_COUNT") {
-            config.worker.num_workers = workers
-                .parse()
-                .map_err(|_| ConfigError::invalid("NEXUS_WORKER_COUNT", "must be u32"))?;
+        // Variables of the old data plane: an error, not silently ignored.
+        for (name, instead) in REMOVED_ENV_VARS {
+            if env::var_os(name).is_some() {
+                return Err(ConfigError::invalid(
+                    name,
+                    &format!("removed with the old data plane; use {instead}"),
+                ));
+            }
         }
 
         if let Ok(shards) = env::var("NEXUS_SHARDS") {
             config.dataplane.shards = shards
                 .parse()
                 .map_err(|_| ConfigError::invalid("NEXUS_SHARDS", "must be u16"))?;
-        }
-
-        if let Ok(arena_mb) = env::var("NEXUS_ARENA_SIZE_MB") {
-            config.memory.arena_size_mb = arena_mb
-                .parse()
-                .map_err(|_| ConfigError::invalid("NEXUS_ARENA_SIZE_MB", "must be u32"))?;
         }
 
         // Log level override

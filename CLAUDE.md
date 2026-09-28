@@ -23,8 +23,7 @@ targets are not met yet.
 `docs/design/dataplane-v1.md`). Work on the `phase-1` branch; it merges into `main` (the
 trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
 soon (scope in `docs/dataplane-design.md` §2). The old data plane is deleted (the plan's
-deletion steps C1-C6); what remains of it is configuration (`[worker]`, `[memory]`,
-`[actor]`), removed in C7.
+deletion steps C1-C7).
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -163,8 +162,12 @@ deploy/              Docker, Grafana dashboard
 
 Config files in `config/` (TOML). Precedence: CLI args > env vars (`NEXUS_*`) > config file > defaults.
 
-- `config/development.toml` - 2 workers, small arena, DEBUG logging, no CPU affinity
-- `config/production.toml` - auto workers, 1 GB arena, CPU pinning; needs `NEXUS_JWT_SECRET` and TLS files at `/etc/nexus/tls/`
+- `config/development.toml` - one shard, small limits, DEBUG logging, no CPU affinity
+- `config/production.toml` - one shard with busy polling and CPU pinning; needs `NEXUS_JWT_SECRET` and TLS files at `/etc/nexus/tls/`
+
+Unknown sections and unknown `[transport]` fields are errors (the old `[worker]`,
+`[memory]`, `[actor]`, `transport.batch_*`, `transport.stun_servers` were removed in Phase 1),
+as are the removed `NEXUS_WORKER_COUNT` and `NEXUS_ARENA_SIZE_MB`.
 - `config/loadtest.toml` - tuned for load testing
 
 If TLS paths are set but the files do not load, the SFU refuses to start.

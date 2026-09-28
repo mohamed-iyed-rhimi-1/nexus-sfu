@@ -9,6 +9,8 @@ prometheus = { version = "0.13", default-features = false }
 
 # Shared types
 nexus-core = { path = "../nexus-core" }
+# Shard stats (exported per shard, design note §5.4)
+nexus-dataplane = { path = "../nexus-dataplane" }
 
 # Async runtime for HTTP server
 tokio = { version = "1.35", features = ["sync", "time"] }

@@ -7,7 +7,9 @@ use prometheus::{
     Registry, TextEncoder,
 };
 
-use crate::{CrdtMetrics, SfuMetrics, WorkerPoolMetrics};
+use nexus_dataplane::ShardCounters;
+
+use crate::{CrdtMetrics, SfuMetrics, ShardMetrics};
 
 /// Prometheus metrics registry
 pub struct PrometheusExporter {
@@ -24,13 +26,13 @@ pub struct PrometheusExporter {
     sfu_active_participants: Gauge,
     sfu_active_rooms: Gauge,
 
-    // Worker metrics (per-worker with labels)
-    worker_cpu_usage: IntGaugeVec,
-    worker_packet_queue_depth: IntGaugeVec,
-    worker_track_count: IntGaugeVec,
-    worker_packets_processed: IntCounterVec,
-    worker_migrations_sent: IntCounterVec,
-    worker_migrations_received: IntCounterVec,
+    // Shard metrics (label `shard`): one counter per `ShardCounters` field, in the
+    // order of `ShardCounters::NAMES`, and the four gauges.
+    shard_counters: Vec<IntCounterVec>,
+    shard_sessions: IntGaugeVec,
+    shard_tracks: IntGaugeVec,
+    shard_subscriptions: IntGaugeVec,
+    shard_rx_pps: IntGaugeVec,
 
     // CRDT metrics
     crdt_gossip_sent: Counter,
@@ -109,57 +111,28 @@ impl PrometheusExporter {
         ))?;
         registry.register(Box::new(sfu_active_rooms.clone()))?;
 
-        // Worker metrics
-        let worker_cpu_usage = IntGaugeVec::new(
-            opts!(
-                "nexus_worker_cpu_usage_percent",
-                "Worker CPU usage percentage"
-            ),
-            &["worker_id"],
-        )?;
-        registry.register(Box::new(worker_cpu_usage.clone()))?;
-
-        let worker_packet_queue_depth = IntGaugeVec::new(
-            opts!(
-                "nexus_worker_packet_queue_depth",
-                "Worker packet queue depth"
-            ),
-            &["worker_id"],
-        )?;
-        registry.register(Box::new(worker_packet_queue_depth.clone()))?;
-
-        let worker_track_count = IntGaugeVec::new(
-            opts!("nexus_worker_track_count", "Worker track count"),
-            &["worker_id"],
-        )?;
-        registry.register(Box::new(worker_track_count.clone()))?;
-
-        let worker_packets_processed = IntCounterVec::new(
-            opts!(
-                "nexus_worker_packets_processed_total",
-                "Worker packets processed"
-            ),
-            &["worker_id"],
-        )?;
-        registry.register(Box::new(worker_packets_processed.clone()))?;
-
-        let worker_migrations_sent = IntCounterVec::new(
-            opts!(
-                "nexus_worker_migrations_sent_total",
-                "Worker migrations sent"
-            ),
-            &["worker_id"],
-        )?;
-        registry.register(Box::new(worker_migrations_sent.clone()))?;
-
-        let worker_migrations_received = IntCounterVec::new(
-            opts!(
-                "nexus_worker_migrations_received_total",
-                "Worker migrations received"
-            ),
-            &["worker_id"],
-        )?;
-        registry.register(Box::new(worker_migrations_received.clone()))?;
+        // Shard metrics
+        let mut shard_counters = Vec::with_capacity(ShardCounters::NAMES.len());
+        for name in ShardCounters::NAMES {
+            let counter = IntCounterVec::new(
+                opts!(
+                    format!("nexus_shard_{name}_total"),
+                    format!("Shard counter `{name}` (nexus-dataplane ShardCounters)")
+                ),
+                &["shard"],
+            )?;
+            registry.register(Box::new(counter.clone()))?;
+            shard_counters.push(counter);
+        }
+        let shard_gauge = |name: &str, help: &str| -> Result<IntGaugeVec, prometheus::Error> {
+            let gauge = IntGaugeVec::new(opts!(format!("nexus_shard_{name}"), help), &["shard"])?;
+            registry.register(Box::new(gauge.clone()))?;
+            Ok(gauge)
+        };
+        let shard_sessions = shard_gauge("sessions", "Sessions on the shard")?;
+        let shard_tracks = shard_gauge("tracks", "Published tracks on the shard")?;
+        let shard_subscriptions = shard_gauge("subscriptions", "Subscriptions on the shard")?;
+        let shard_rx_pps = shard_gauge("rx_pps", "Datagrams received per second")?;
 
         // CRDT metrics
         let crdt_gossip_sent = Counter::with_opts(Opts::new(
@@ -224,12 +197,11 @@ impl PrometheusExporter {
             sfu_active_tracks,
             sfu_active_participants,
             sfu_active_rooms,
-            worker_cpu_usage,
-            worker_packet_queue_depth,
-            worker_track_count,
-            worker_packets_processed,
-            worker_migrations_sent,
-            worker_migrations_received,
+            shard_counters,
+            shard_sessions,
+            shard_tracks,
+            shard_subscriptions,
+            shard_rx_pps,
             crdt_gossip_sent,
             crdt_gossip_received,
             crdt_state_syncs,
@@ -242,7 +214,7 @@ impl PrometheusExporter {
     }
 
     /// Update metrics from collectors
-    pub fn update(&self, sfu: &SfuMetrics, workers: &WorkerPoolMetrics, crdt: &CrdtMetrics) {
+    pub fn update(&self, sfu: &SfuMetrics, shards: &ShardMetrics, crdt: &CrdtMetrics) {
         // Update SFU metrics
         self.sfu_packets_received.reset();
         self.sfu_packets_received
@@ -283,50 +255,7 @@ impl PrometheusExporter {
             .set(sfu.active_participants() as f64);
         self.sfu_active_rooms.set(sfu.active_rooms() as f64);
 
-        // Update worker metrics
-        for worker in workers.workers() {
-            let worker_id_str = worker.worker_id().to_string();
-
-            // CPU usage (scaled to integer percentage * 100)
-            let cpu_scaled = (worker.cpu_usage_percent() * 100.0) as i64;
-            self.worker_cpu_usage
-                .with_label_values(&[&worker_id_str])
-                .set(cpu_scaled);
-
-            // Queue depth
-            self.worker_packet_queue_depth
-                .with_label_values(&[&worker_id_str])
-                .set(worker.packet_queue_depth() as i64);
-
-            // Track count
-            self.worker_track_count
-                .with_label_values(&[&worker_id_str])
-                .set(worker.track_count() as i64);
-
-            // Packets processed (reset and set)
-            self.worker_packets_processed
-                .with_label_values(&[&worker_id_str])
-                .reset();
-            self.worker_packets_processed
-                .with_label_values(&[&worker_id_str])
-                .inc_by(worker.packets_processed_total());
-
-            // Migrations sent
-            self.worker_migrations_sent
-                .with_label_values(&[&worker_id_str])
-                .reset();
-            self.worker_migrations_sent
-                .with_label_values(&[&worker_id_str])
-                .inc_by(worker.migrations_sent());
-
-            // Migrations received
-            self.worker_migrations_received
-                .with_label_values(&[&worker_id_str])
-                .reset();
-            self.worker_migrations_received
-                .with_label_values(&[&worker_id_str])
-                .inc_by(worker.migrations_received());
-        }
+        self.update_shards(shards);
 
         // Update CRDT metrics
         self.crdt_gossip_sent.reset();
@@ -364,6 +293,36 @@ impl PrometheusExporter {
         self.crdt_conflicts.reset();
         self.crdt_conflicts
             .inc_by(crdt.crdt_conflicts_total() as f64);
+    }
+
+    /// Copies each shard's latest published stats (nothing before the server
+    /// installed the stats source).
+    fn update_shards(&self, shards: &ShardMetrics) {
+        for index in 0..shards.shards() {
+            let Some(stats) = shards.snapshot(index) else {
+                return;
+            };
+            let label = index.to_string();
+            let labels = [label.as_str()];
+            let values = stats.counters.values();
+            debug_assert_eq!(values.len(), self.shard_counters.len());
+            for (counter, value) in self.shard_counters.iter().zip(values) {
+                let child = counter.with_label_values(&labels);
+                child.reset();
+                child.inc_by(value);
+            }
+            let gauges = [
+                (&self.shard_sessions, stats.gauges.sessions),
+                (&self.shard_tracks, stats.gauges.tracks),
+                (&self.shard_subscriptions, stats.gauges.subscriptions),
+                (&self.shard_rx_pps, stats.gauges.rx_pps),
+            ];
+            for (gauge, value) in gauges {
+                gauge
+                    .with_label_values(&labels)
+                    .set(i64::try_from(value).unwrap_or(i64::MAX));
+            }
+        }
     }
 
     /// Render metrics in Prometheus text format

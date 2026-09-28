@@ -13,21 +13,9 @@ media_bind_addr = "127.0.0.1:10000"
 signaling_bind_addr = "127.0.0.1:8080"
 recv_buffer_size_bytes = 8388608        # 8MB (smaller for dev)
 send_buffer_size_bytes = 8388608        # 8MB
-batch_size = 32                         # Smaller batches for dev
-batch_flush_interval_us = 1000          # 1ms
 max_webrtc_sessions = 1000              # Smaller limit for dev
 tls_cert_path = ""                        # Empty = plain WS for development
 tls_key_path = ""                         # Empty = plain WS for development
-stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
-
-[memory]
-arena_size_mb = 64                      # 64MB (smaller for dev)
-ring_buffer_size = 1024                 # 1024 packets per track
-
-[worker]
-num_workers = 0                         # Auto-detect
-cpu_affinity = false                    # Don't pin in dev
-realtime_priority = false               # Don't use RT priority in dev
 
 [room]
 max_participants_per_room = 100         # Smaller limit for dev
@@ -71,14 +59,6 @@ max_piggyback_updates = 16
 # Empty in dev (single node mode)
 seed_peers = []
 
-[actor]
-max_track_actors = 10000
-max_participant_actors = 1000
-max_room_actors = 100
-message_queue_size = 1024
-migration_queue_size = 10
-supervision_restart_limit = 3
-
 [metrics]
 bind_addr = "127.0.0.1:9090"
 collection_interval_ms = 1000
@@ -95,7 +75,7 @@ include_timestamps = true
 include_thread_ids = true
 
 [dataplane]
-# New data plane (not started until the switch in Phase 1.5b).
+# The data plane (nexus-dataplane): one thread and one media socket per shard.
 # Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
 shards = 1                              # Must be 1 in Phase 1
 busy_poll_rounds = 0                    # Park as soon as idle

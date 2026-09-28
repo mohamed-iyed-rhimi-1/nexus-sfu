@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nexus_dataplane::{Dataplane, DataplaneHandle, SingleShard};
+use nexus_dataplane::{Dataplane, DataplaneHandle, ShardId, SingleShard};
 use nexus_metrics::MetricsCollector;
 use nexus_state::DistributedState;
 use nexus_transport::dtls::DtlsCertificate;
@@ -155,6 +155,9 @@ pub async fn start(config: NexusConfig) -> Result<ServerHandle, String> {
     let (dataplane, shards) =
         Dataplane::start(dataplane_config).map_err(|e| format!("data plane: {e}"))?;
     let dataplane = Arc::new(dataplane);
+    if let Some(metrics) = &metrics {
+        export_shard_stats(metrics, &dataplane);
+    }
     let media_addrs: Vec<SocketAddr> = shards.iter().map(|s| s.local_addr).collect();
     let shard_candidates = shards
         .iter()
@@ -242,6 +245,17 @@ fn metrics_collector(shards: u16) -> Option<Arc<MetricsCollector>> {
             None
         }
     }
+}
+
+/// `/metrics` reads each shard's published stats from the data plane (note §5.4).
+fn export_shard_stats(metrics: &MetricsCollector, dataplane: &Arc<DataplaneHandle>) {
+    assert_eq!(metrics.shards.shards(), dataplane.shard_count());
+    let dataplane = Arc::clone(dataplane);
+    let installed = metrics.shards.set_source(Box::new(move |index| {
+        let shard = u8::try_from(index).expect("shard index fits the ShardId range");
+        dataplane.stats(ShardId::new(shard))
+    }));
+    assert!(installed, "the stats source is installed once");
 }
 
 fn signaling_config(config: &NexusConfig) -> SignalingConfig {
@@ -357,5 +371,33 @@ mod tests {
         assert!(!readiness.get(), "/ready reports the stopped data plane");
         shutdown.store(true, Ordering::Release);
         task.await.unwrap();
+    }
+
+    /// `/metrics` shows the shard's own counters, as published (every second).
+    #[test]
+    fn metrics_export_the_shards_stats() {
+        let config = nexus_dataplane::DataplaneConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        };
+        let (dataplane, shards) = Dataplane::start(config).unwrap();
+        let dataplane = Arc::new(dataplane);
+        let metrics = metrics_collector(1).expect("collector");
+        export_shard_stats(&metrics, &dataplane);
+        // A datagram the shard cannot classify: counted in `drop_unclassified`.
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.send_to(&[0xFF; 8], shards[0].local_addr).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let wanted = "nexus_shard_drop_unclassified_total{shard=\"0\"} 1";
+        loop {
+            let output = metrics.export_prometheus().unwrap();
+            if output.contains(wanted) {
+                assert!(output.contains("nexus_shard_rx_datagrams_total{shard=\"0\"} 1"));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{output}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        dataplane.shutdown();
     }
 }

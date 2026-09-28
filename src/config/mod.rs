@@ -19,8 +19,8 @@ pub use watcher::ConfigWatcher;
 
 // Import config structs from nexus-core (single source of truth)
 pub use nexus_core::config::{
-    ActorConfig, BweConfig, LogLevel, LoggingConfig, MemoryConfig, MetricsConfig, RoomConfig,
-    SecurityConfig, TransportConfig, Validate, WorkerConfig,
+    BweConfig, LogLevel, LoggingConfig, MetricsConfig, RoomConfig, SecurityConfig, TransportConfig,
+    Validate,
 };
 
 use serde::{Deserialize, Serialize};
@@ -48,17 +48,20 @@ impl ClusterConfig {
     }
 }
 
-/// Root configuration aggregator
+/// Root configuration aggregator.
+///
+/// Unknown top-level sections are an error: a file that still has the old data
+/// plane's `[worker]`, `[memory]` or `[actor]` (removed in Phase 1; their settings
+/// that still apply are under `[dataplane]`) fails at startup instead of loading
+/// with those settings silently ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NexusConfig {
     pub transport: TransportConfig,
-    pub memory: MemoryConfig,
-    pub worker: WorkerConfig,
     pub room: RoomConfig,
     pub bwe: BweConfig,
     pub quic: QuicConfig,
     pub gossip: GossipConfig,
-    pub actor: ActorConfig,
     pub metrics: MetricsConfig,
     pub api: ApiConfig,
     pub security: SecurityConfig,
@@ -108,15 +111,12 @@ impl NexusConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate each module using nexus-core's Validate trait
         validate_core_config("transport", self.transport.validate())?;
-        validate_core_config("memory", self.memory.validate())?;
-        validate_core_config("worker", self.worker.validate())?;
         validate_core_config("room", self.room.validate())?;
         validate_core_config("bwe", self.bwe.validate())?;
         self.quic
             .validate()
             .map_err(|e| ConfigError::invalid("quic", &e))?;
         self.gossip.validate()?;
-        validate_core_config("actor", self.actor.validate())?;
         validate_core_config("metrics", self.metrics.validate())?;
         self.api.validate()?;
         validate_core_config("security", self.security.validate())?;
@@ -137,65 +137,6 @@ impl NexusConfig {
             ));
         }
 
-        // Cross-module validation
-        self.validate_cross_module()?;
-
-        Ok(())
-    }
-
-    /// Validate relationships between modules
-    fn validate_cross_module(&self) -> Result<(), ConfigError> {
-        // Arena size validation: The arena is a shared pool for concurrent packets,
-        // not a dedicated buffer per track. A reasonable minimum is based on:
-        // - Expected concurrent active tracks (not max_track_actors)
-        // - Typical packet rate and processing latency
-        // For development/testing, we use a much smaller threshold.
-        // Production configs should size arena based on actual load.
-        let min_arena_mb = 16u64; // Minimum 16MB for basic operation
-
-        if (self.memory.arena_size_mb as u64) < min_arena_mb {
-            return Err(ConfigError::invalid(
-                "memory.arena_size_mb",
-                &format!("must be >= {} MB for basic operation", min_arena_mb),
-            ));
-        }
-
-        // `[actor]` limits: nothing reads them since the actor system went (the
-        // section goes in Phase 1 C7); until then they must fit the
-        // orchestrator's own capacity.
-        let actor_limits = [
-            (
-                "actor.max_room_actors",
-                self.actor.max_room_actors as usize,
-                crate::orchestrator::room::MAX_ROOMS,
-            ),
-            (
-                "actor.max_participant_actors",
-                self.actor.max_participant_actors as usize,
-                crate::orchestrator::transports::MAX_TRANSPORTS,
-            ),
-        ];
-        for (field, value, max) in actor_limits {
-            if value > max {
-                return Err(ConfigError::invalid(field, &format!("must be <= {}", max)));
-            }
-        }
-
-        // Worker count should not exceed 2x CPU cores
-        let cpu_count = num_cpus::get() as u32;
-        let worker_count = if self.worker.num_workers == 0 {
-            cpu_count
-        } else {
-            self.worker.num_workers
-        };
-
-        if worker_count > cpu_count * 2 {
-            return Err(ConfigError::invalid(
-                "worker.num_workers",
-                &format!("should not exceed 2x CPU cores ({})", cpu_count * 2),
-            ));
-        }
-
         Ok(())
     }
 
@@ -207,7 +148,7 @@ impl NexusConfig {
         self.room.empty_room_timeout_ms = new_config.room.empty_room_timeout_ms;
         self.bwe = new_config.bwe;
 
-        // NOT safe to reload: memory, workers, transport (require restart)
+        // NOT safe to reload: transport, dataplane (require restart)
         // These are ignored during hot-reload
     }
 }
@@ -216,13 +157,10 @@ impl Default for NexusConfig {
     fn default() -> Self {
         Self {
             transport: TransportConfig::default(),
-            memory: MemoryConfig::default(),
-            worker: WorkerConfig::default(),
             room: RoomConfig::default(),
             bwe: BweConfig::default(),
             quic: QuicConfig::default(),
             gossip: GossipConfig::default(),
-            actor: ActorConfig::default(),
             metrics: MetricsConfig::default(),
             api: ApiConfig::default(),
             security: SecurityConfig::default(),
