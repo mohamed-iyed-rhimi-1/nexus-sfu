@@ -7,7 +7,7 @@ use prometheus::{
     Registry, TextEncoder,
 };
 
-use crate::{ActorMetrics, CrdtMetrics, SfuMetrics, WorkerPoolMetrics};
+use crate::{CrdtMetrics, SfuMetrics, WorkerPoolMetrics};
 
 /// Prometheus metrics registry
 pub struct PrometheusExporter {
@@ -41,16 +41,6 @@ pub struct PrometheusExporter {
     crdt_peer_failures: Counter,
     crdt_merges: Counter,
     crdt_conflicts: Counter,
-
-    // Actor metrics
-    actor_rooms: Gauge,
-    actor_participants: Gauge,
-    actor_tracks: Gauge,
-    actor_message_queue_depth: Gauge,
-    actor_messages_processed: Counter,
-    actor_messages_dropped: Counter,
-    actor_restarts: Counter,
-    actor_failures: Counter,
 }
 
 impl PrometheusExporter {
@@ -223,47 +213,6 @@ impl PrometheusExporter {
         ))?;
         registry.register(Box::new(crdt_conflicts.clone()))?;
 
-        // Actor metrics
-        let actor_rooms =
-            Gauge::with_opts(Opts::new("nexus_actor_rooms", "Number of room actors"))?;
-        registry.register(Box::new(actor_rooms.clone()))?;
-
-        let actor_participants = Gauge::with_opts(Opts::new(
-            "nexus_actor_participants",
-            "Number of participant actors",
-        ))?;
-        registry.register(Box::new(actor_participants.clone()))?;
-
-        let actor_tracks =
-            Gauge::with_opts(Opts::new("nexus_actor_tracks", "Number of track actors"))?;
-        registry.register(Box::new(actor_tracks.clone()))?;
-
-        let actor_message_queue_depth = Gauge::with_opts(Opts::new(
-            "nexus_actor_message_queue_depth",
-            "Total message queue depth",
-        ))?;
-        registry.register(Box::new(actor_message_queue_depth.clone()))?;
-
-        let actor_messages_processed = Counter::with_opts(Opts::new(
-            "nexus_actor_messages_processed_total",
-            "Messages processed",
-        ))?;
-        registry.register(Box::new(actor_messages_processed.clone()))?;
-
-        let actor_messages_dropped = Counter::with_opts(Opts::new(
-            "nexus_actor_messages_dropped_total",
-            "Messages dropped",
-        ))?;
-        registry.register(Box::new(actor_messages_dropped.clone()))?;
-
-        let actor_restarts =
-            Counter::with_opts(Opts::new("nexus_actor_restarts_total", "Actor restarts"))?;
-        registry.register(Box::new(actor_restarts.clone()))?;
-
-        let actor_failures =
-            Counter::with_opts(Opts::new("nexus_actor_failures_total", "Actor failures"))?;
-        registry.register(Box::new(actor_failures.clone()))?;
-
         Ok(Self {
             registry,
             sfu_packets_received,
@@ -289,25 +238,11 @@ impl PrometheusExporter {
             crdt_peer_failures,
             crdt_merges,
             crdt_conflicts,
-            actor_rooms,
-            actor_participants,
-            actor_tracks,
-            actor_message_queue_depth,
-            actor_messages_processed,
-            actor_messages_dropped,
-            actor_restarts,
-            actor_failures,
         })
     }
 
     /// Update metrics from collectors
-    pub fn update(
-        &self,
-        sfu: &SfuMetrics,
-        workers: &WorkerPoolMetrics,
-        crdt: &CrdtMetrics,
-        actors: &ActorMetrics,
-    ) {
+    pub fn update(&self, sfu: &SfuMetrics, workers: &WorkerPoolMetrics, crdt: &CrdtMetrics) {
         // Update SFU metrics
         self.sfu_packets_received.reset();
         self.sfu_packets_received
@@ -429,30 +364,6 @@ impl PrometheusExporter {
         self.crdt_conflicts.reset();
         self.crdt_conflicts
             .inc_by(crdt.crdt_conflicts_total() as f64);
-
-        // Update actor metrics
-        self.actor_rooms.set(actors.room_actors() as f64);
-        self.actor_participants
-            .set(actors.participant_actors() as f64);
-        self.actor_tracks.set(actors.track_actors() as f64);
-        self.actor_message_queue_depth
-            .set(actors.message_queue_depth() as f64);
-
-        self.actor_messages_processed.reset();
-        self.actor_messages_processed
-            .inc_by(actors.messages_processed_total() as f64);
-
-        self.actor_messages_dropped.reset();
-        self.actor_messages_dropped
-            .inc_by(actors.messages_dropped_total() as f64);
-
-        self.actor_restarts.reset();
-        self.actor_restarts
-            .inc_by(actors.actor_restarts_total() as f64);
-
-        self.actor_failures.reset();
-        self.actor_failures
-            .inc_by(actors.actor_failures_total() as f64);
     }
 
     /// Render metrics in Prometheus text format

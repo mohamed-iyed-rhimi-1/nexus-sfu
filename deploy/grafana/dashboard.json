@@ -122,36 +122,6 @@
             "legendFormat": "Received"
           }
         ]
-      },
-      {
-        "id": 7,
-        "title": "Actor Counts",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "nexus_actor_rooms",
-            "legendFormat": "Rooms"
-          },
-          {
-            "expr": "nexus_actor_participants",
-            "legendFormat": "Participants"
-          },
-          {
-            "expr": "nexus_actor_tracks",
-            "legendFormat": "Tracks"
-          }
-        ]
-      },
-      {
-        "id": 8,
-        "title": "Actor Message Queue Depth",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "nexus_actor_message_queue_depth",
-            "legendFormat": "Queue Depth"
-          }
-        ]
       }
     ]
   }

@@ -1,4 +1,4 @@
-use nexus_metrics::{ActorMetrics, CrdtMetrics, MetricsCollector, SfuMetrics, WorkerPoolMetrics};
+use nexus_metrics::{CrdtMetrics, MetricsCollector, SfuMetrics, WorkerPoolMetrics};
 
 #[test]
 fn test_sfu_metrics_packet_recording() {
@@ -56,17 +56,6 @@ fn test_crdt_metrics_gossip() {
 }
 
 #[test]
-fn test_actor_metrics_counts() {
-    let metrics = ActorMetrics::new();
-
-    metrics.set_room_actors(5);
-    metrics.set_participant_actors(20);
-    metrics.set_track_actors(100);
-
-    assert_eq!(metrics.total_actors(), 125);
-}
-
-#[test]
 fn test_metrics_collector_creation() {
     let collector = MetricsCollector::new(4).expect("Failed to create collector");
 
@@ -74,7 +63,6 @@ fn test_metrics_collector_creation() {
     assert_eq!(collector.sfu.packets_received_total(), 0);
     assert_eq!(collector.workers.workers().len(), 4);
     assert_eq!(collector.crdt.active_peers(), 0);
-    assert_eq!(collector.actors.total_actors(), 0);
 }
 
 #[test]
@@ -85,7 +73,6 @@ fn test_prometheus_export() {
     collector.sfu.record_packet_received(1500);
     collector.sfu.set_active_tracks(10);
     collector.crdt.set_active_peers(3);
-    collector.actors.set_room_actors(2);
 
     // Export to Prometheus format
     let output = collector.export_prometheus().expect("Failed to export");
@@ -94,7 +81,7 @@ fn test_prometheus_export() {
     assert!(output.contains("nexus_sfu_packets_received_total"));
     assert!(output.contains("nexus_sfu_active_tracks"));
     assert!(output.contains("nexus_crdt_active_peers"));
-    assert!(output.contains("nexus_actor_rooms"));
+    assert!(!output.contains("nexus_actor_"), "actor metrics are gone");
 }
 
 #[test]

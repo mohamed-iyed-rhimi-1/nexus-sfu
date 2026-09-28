@@ -160,25 +160,19 @@ impl NexusConfig {
             ));
         }
 
-        // Actor limits must fit the actor system's compiled capacity
-        // (nexus-actor asserts these). The actor runtime is no longer started,
-        // but the limits stay validated until the worker pool is replaced.
-        // Track capacity is derived as participants * 10.
+        // `[actor]` limits: nothing reads them since the actor system went (the
+        // section goes in Phase 1 C7); until then they must fit the
+        // orchestrator's own capacity.
         let actor_limits = [
             (
                 "actor.max_room_actors",
                 self.actor.max_room_actors as usize,
-                nexus_actor::MAX_ROOMS,
+                crate::orchestrator::room::MAX_ROOMS,
             ),
             (
                 "actor.max_participant_actors",
                 self.actor.max_participant_actors as usize,
-                nexus_actor::MAX_PARTICIPANTS,
-            ),
-            (
-                "actor.max_participant_actors (x10 tracks)",
-                self.actor.max_participant_actors as usize * 10,
-                nexus_actor::MAX_TRACKS.min(nexus_actor::MAX_REGISTRY_SIZE),
+                crate::orchestrator::transports::MAX_TRANSPORTS,
             ),
         ];
         for (field, value, max) in actor_limits {

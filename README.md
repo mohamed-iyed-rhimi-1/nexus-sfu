@@ -66,12 +66,10 @@ The orchestrator runs a `tokio::select!` loop with 4 modules:
 | `nexus-media` | RTP/RTCP parsing (SIMD), codec detection (H264/VP8/VP9/AV1/Opus), simulcast |
 | `nexus-webrtc` | WebRTC session state machine, SDP negotiation, packet demux |
 | `nexus-state` | CRDTs (Orswot, LWWReg, GCounter), SWIM gossip, distributed state |
-| `nexus-actor` | Actor-per-track model with migration, supervision, registry |
 | `nexus-bwe` | GCC bandwidth estimation (delay + loss), REMB, probing, speaker detection |
 | `nexus-signal` | WebSocket signaling (a QUIC module exists but is not started) |
 | `nexus-api` | REST API with JWT auth |
 | `nexus-metrics` | Prometheus metrics, per-worker stats, tracing |
-| `nexus-dst` | Deterministic simulation testing with fault injection |
 | `nexus-loadtest` | Load testing framework with headless WebRTC clients |
 
 ## Quick Start
@@ -157,9 +155,6 @@ address clients can reach.
 ```bash
 # Unit + integration tests
 cargo test --workspace
-
-# Deterministic simulation (reproducible, with fault injection)
-cargo run -p nexus-dst -- run scenarios/basic.toml
 
 # Load test
 cargo run -p nexus-loadtest -- webinar --viewers 100 --sfu-url ws://localhost:8080

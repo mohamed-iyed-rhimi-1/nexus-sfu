@@ -46,12 +46,6 @@ echo "$OUTPUT" | grep -q "nexus_crdt_state_sync_latency_seconds_bucket" && echo 
 echo "$OUTPUT" | grep -q "nexus_crdt_active_peers" && echo "   ✅ Peer metrics present"
 echo ""
 
-# Test 7: Verify actor metrics
-echo "7️⃣  Verifying actor metrics..."
-echo "$OUTPUT" | grep -q "nexus_actor_rooms" && echo "   ✅ Actor count metrics present"
-echo "$OUTPUT" | grep -q "nexus_actor_messages_processed_total" && echo "   ✅ Actor message metrics present"
-echo ""
-
 # Test 8: Validate Grafana dashboard JSON
 echo "8️⃣  Validating Grafana dashboard..."
 if command -v jq &> /dev/null; then

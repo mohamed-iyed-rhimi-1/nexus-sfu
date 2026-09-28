@@ -338,15 +338,16 @@ fn test_hot_reload_validates_before_applying() {
 }
 
 #[test]
-fn test_actor_limits_beyond_compiled_capacity_are_rejected() {
-    // Previously accepted, then aborted at startup in ActorManager::new.
+fn test_actor_limits_beyond_the_orchestrators_capacity_are_rejected() {
+    use crate::orchestrator::room::MAX_ROOMS;
     let mut config = NexusConfig::default();
-    config.actor.max_room_actors = nexus_actor::MAX_ROOMS as u32 + 1;
+    config.actor.max_room_actors = MAX_ROOMS as u32 + 1;
     let err = config.validate().unwrap_err();
     assert!(err.to_string().contains("actor.max_room_actors"), "{err}");
 
+    // 10,000 rooms: more than nexus-actor's 1,000, now accepted.
     let mut config = NexusConfig::default();
-    config.actor.max_room_actors = nexus_actor::MAX_ROOMS as u32;
+    config.actor.max_room_actors = MAX_ROOMS as u32;
     assert!(config.validate().is_ok());
 }
 

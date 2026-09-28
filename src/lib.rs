@@ -42,16 +42,6 @@ pub mod types;
 // through the re-export modules above (e.g., nexus_transport::ice::IceAgent).
 
 // -----------------------------------------------------------------------------
-// nexus-actor: Actor system for room/participant/track management
-// -----------------------------------------------------------------------------
-pub use nexus_actor;
-pub use nexus_actor::{
-    ActorHealth, ActorManager, ActorRegistry, ActorState, ActorSupervisor,
-    MediaKind as ActorMediaKind, PacketSlot as ActorPacketSlot, ParticipantActor, RestartPolicy,
-    RoomActor, TrackActor, TrackActorMessage, TrackActorResponse, WorkerId as ActorWorkerId,
-};
-
-// -----------------------------------------------------------------------------
 // nexus-transport: Low-level transport (UDP, SRTP, DTLS, ICE)
 // -----------------------------------------------------------------------------
 pub use nexus_transport;

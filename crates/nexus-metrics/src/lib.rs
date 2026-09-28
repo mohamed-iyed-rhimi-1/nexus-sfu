@@ -10,14 +10,12 @@
 
 #![deny(warnings)]
 
-mod actor;
 mod crdt;
 mod prometheus;
 mod sfu;
 mod tracing_metrics;
 mod worker;
 
-pub use actor::ActorMetrics;
 pub use crdt::CrdtMetrics;
 pub use prometheus::PrometheusExporter;
 pub use sfu::SfuMetrics;
@@ -33,7 +31,6 @@ pub struct MetricsCollector {
     pub sfu: Arc<SfuMetrics>,
     pub workers: Arc<WorkerPoolMetrics>,
     pub crdt: Arc<CrdtMetrics>,
-    pub actors: Arc<ActorMetrics>,
     pub tracing: Arc<TracingMetrics>,
     exporter: Arc<PrometheusExporter>,
 }
@@ -49,7 +46,6 @@ impl MetricsCollector {
         let sfu = Arc::new(SfuMetrics::new());
         let workers = Arc::new(WorkerPoolMetrics::new(num_workers));
         let crdt = Arc::new(CrdtMetrics::new());
-        let actors = Arc::new(ActorMetrics::new());
         let tracing = Arc::new(TracingMetrics::new());
         let exporter = Arc::new(PrometheusExporter::new()?);
 
@@ -57,7 +53,6 @@ impl MetricsCollector {
             sfu,
             workers,
             crdt,
-            actors,
             tracing,
             exporter,
         })
@@ -66,8 +61,7 @@ impl MetricsCollector {
     /// Export metrics in Prometheus text format
     pub fn export_prometheus(&self) -> Result<String, Box<dyn std::error::Error>> {
         // Update Prometheus metrics from internal collectors
-        self.exporter
-            .update(&self.sfu, &self.workers, &self.crdt, &self.actors);
+        self.exporter.update(&self.sfu, &self.workers, &self.crdt);
 
         self.exporter.render()
     }

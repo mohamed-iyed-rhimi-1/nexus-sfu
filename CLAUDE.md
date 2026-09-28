@@ -24,7 +24,7 @@ targets are not met yet.
 trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
 soon (scope in `docs/dataplane-design.md` §2). The old data plane is being deleted (the
 plan's deletion steps); do not fix bugs in what is left of it (`nexus-webrtc`'s transport and
-session, the replaced `nexus-transport` modules, `nexus-actor`, `nexus-dst`).
+session, the replaced `nexus-transport` modules).
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -127,8 +127,6 @@ crates/
   nexus-api/         REST API with JWT
   nexus-metrics/     Prometheus metrics
   nexus-state/       CRDTs, SWIM gossip
-  nexus-actor/       Actor system; only config limits and migration types are used
-  nexus-dst/         Deterministic simulation; does not exercise the server
   nexus-loadtest/    Load generator with webrtc-rs clients; also the e2e tests' clients
                      (per-track receive stats, loss injection in lossy.rs)
 sdk/                 TypeScript client SDK

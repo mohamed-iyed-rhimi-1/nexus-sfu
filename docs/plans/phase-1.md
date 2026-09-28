@@ -1240,6 +1240,20 @@ CLAUDE.md/README list only `capnp`. The Dockerfile no longer copies `build.rs` a
 CLAUDE.md: the "Architecture (today)" data-plane line, the workspace layout and the
 "do not fix" list describe the tree as it is now (`architecture.md` waits for 1.9).
 
+**C4 done (2026-09-28):** `crates/nexus-actor` and `crates/nexus-dst` deleted with their
+workspace entries and the root dependency; `lib.rs`'s `nexus_actor` re-exports removed.
+`[actor]` validation now checks the orchestrator's limits (`room::MAX_ROOMS`, now `pub`,
+10,000; `transports::MAX_TRANSPORTS`) instead of `nexus_actor`'s (1,000 rooms); the
+"× 10 tracks" check went with the registry. Nothing reads `[actor]` (C7 removes the
+section). The config test now asserts 10,000 rooms accepted and 10,001 refused.
+`nexus-metrics`: `ActorMetrics` (nothing fed it) and the eight `nexus_actor_*` series
+removed with their test and example lines; the collector test asserts none is exported;
+`scripts/verify_metrics.sh` step 7 and the two Grafana panels (Actor Counts, Actor Message
+Queue Depth) removed. Comments: `production.toml` `[actor]`, `nexus-core` `types.rs`.
+README crate table and the `nexus-dst` command, CLAUDE.md layout. `Cargo.lock`: the two
+crates only. With `nexus-dst` gone nothing turns on `nexus-transport/sim`: its sim-gated
+code is no longer built by the workspace (deleted in C5).
+
 **Code notes (audited 2026-09-26):** `tests/pps_pipeline.rs` is `#![cfg(feature = "sim")]`,
 not in CI: delete, don't port. After C5, `grep -rn "arena\|io_uring\|MediaTransport" crates
 src` must be empty outside comments updated in 1.9. Before each step, `grep -rn` the removed
@@ -1857,7 +1871,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.7 Benches, memory budget, CI | Done | see git log (1.7) | 1.7a: `real_path` on the shard, 0 allocations per packet, `ENOBUFS` fallback, macOS CI job, `--locked`, timeouts, release pinned. 1.7b: `memory` on both planes, 16.9 KB per participant checked (session state), signaling ≈ 49/57 KB reported apart, budget 25 in `ci.yml`. Before C2. CI unavailable (billing lock): `scripts/ci-local.sh` stands in |
 | C2 Old benches | Done | see git log (C2) | `forwarding.rs` deleted; `packet_processing.rs` keeps RTCP parsing, demux groups dropped; root `test-hooks` dev-dependency removed (from C6) |
 | C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Done | see git log (C1+C3) | ≈ 7,100 lines of old path + `sfu.rs` (2,284) gone; 20 root dependencies, `build.rs`, `proto/`, `protoc` no longer needed |
-| C4 `nexus-actor`, `nexus-dst` | Not started | | |
+| C4 `nexus-actor`, `nexus-dst` | Done | see git log (C4) | Both crates, `ActorMetrics` and the `nexus_actor_*` series gone; `[actor]` checked against the orchestrator's limits until C7 |
 | C6 `WebRtcTransport`, session, demux | Not started | | Before C5 |
 | C5 Replaced `nexus-transport` modules | Not started | | |
 | C7 Config, README, example | Not started | | |
@@ -2303,3 +2317,22 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 08:08, 7e7b689 (31 uncommitted or untracked paths), targets: docker, budget 25 KB: PASS
   ```
   Next: review and commit C1+C3, then C4 (`nexus-actor`, `nexus-dst`).
+- 2026-09-28: C1+C3 committed (`372cbcd`). C4 implemented (uncommitted, for review):
+  `nexus-actor`, `nexus-dst`, `ActorMetrics` and the `nexus_actor_*` series removed;
+  `[actor]` validated against the orchestrator's limits. Tests 1,976 → 1,683 on macOS:
+  the two crates held 291 test items (176 + 115), plus the `ActorMetrics` test and
+  `nexus-transport` code built only with `sim` (which `nexus-dst` turned on).
+  `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                          13s
+  macos          PASS  cargo test --workspace                          95s (1683 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                          16s
+  linux-arm64    PASS  release build                                   63s
+  linux-arm64    PASS  cargo test --workspace                         136s (1689 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           44s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     20s
+  ci-local 2026-09-28 08:18, 372cbcd (49 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit C4, then C6 (before C5).

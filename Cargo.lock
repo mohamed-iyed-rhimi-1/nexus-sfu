@@ -1836,19 +1836,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-actor"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "crossbeam",
- "crossbeam-channel",
- "nexus-core",
- "nexus-state",
- "parking_lot",
- "proptest",
-]
-
-[[package]]
 name = "nexus-api"
 version = "0.1.0"
 dependencies = [
@@ -1907,25 +1894,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-dst"
-version = "0.1.0"
-dependencies = [
- "clap",
- "nexus-actor",
- "nexus-bwe",
- "nexus-core",
- "nexus-media",
- "nexus-state",
- "nexus-transport",
- "proptest",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
 name = "nexus-loadtest"
 version = "0.1.0"
 dependencies = [
@@ -1978,7 +1946,6 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "libc",
- "nexus-actor",
  "nexus-api",
  "nexus-bwe",
  "nexus-core",

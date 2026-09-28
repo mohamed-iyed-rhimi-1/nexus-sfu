@@ -23,12 +23,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     collector.crdt.record_gossip_received();
     collector.crdt.set_active_peers(3);
 
-    // Record actor metrics
-    collector.actors.set_room_actors(2);
-    collector.actors.set_participant_actors(5);
-    collector.actors.set_track_actors(10);
-    collector.actors.record_message_processed();
-
     // Export to Prometheus format
     let prometheus_output = collector.export_prometheus()?;
 
@@ -43,7 +37,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("P50 latency: {:.2}ms", collector.sfu.p50_latency_ms());
     println!("P99 latency: {:.2}ms", collector.sfu.p99_latency_ms());
-    println!("Total actors: {}", collector.actors.total_actors());
     println!(
         "Total packets processed: {}",
         collector.workers.total_packets_processed()

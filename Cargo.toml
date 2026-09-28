@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-dataplane", "crates/nexus-state", "crates/nexus-actor", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-dst", "crates/nexus-loadtest"]
+members = [".", "crates/nexus-core", "crates/nexus-media", "crates/nexus-transport", "crates/nexus-dataplane", "crates/nexus-state", "crates/nexus-signal", "crates/nexus-metrics", "crates/nexus-bwe", "crates/nexus-api", "crates/nexus-webrtc", "crates/nexus-loadtest"]
 resolver = "2"
 
 [package]
@@ -22,8 +22,6 @@ nexus-media = { path = "crates/nexus-media" }
 nexus-transport = { path = "crates/nexus-transport" }
 # CRDT state management
 nexus-state = { path = "crates/nexus-state", features = ["serde"] }
-# Actor system for tracks
-nexus-actor = { path = "crates/nexus-actor" }
 # QUIC signaling (required for QUIC-first signaling)
 nexus-signal = { path = "crates/nexus-signal" }
 # Metrics infrastructure

@@ -9,14 +9,12 @@ use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a media track.
 /// Tracks represent individual audio or video streams
-/// from participants. Using u64 for consistency with
-/// nexus-actor crate's actor addressing.
+/// from participants. u64, as in the signaling protocol.
 pub type TrackId = u64;
 
 /// Unique identifier for a participant in a room.
 /// Each participant can publish multiple tracks and
-/// subscribe to others. Using u64 for consistency with
-/// nexus-actor crate's actor addressing.
+/// subscribe to others. u64, as in the signaling protocol.
 pub type ParticipantId = u64;
 
 /// Unique identifier for a room.
@@ -93,8 +91,7 @@ mod tests {
     #[test]
     fn test_type_sizes() {
         // Verify explicit sizing matches expectations.
-        // TrackId and ParticipantId are u64 for
-        // nexus-actor compatibility.
+        // TrackId and ParticipantId are u64, as in the signaling protocol.
         assert_eq!(std::mem::size_of::<TrackId>(), 8);
         assert_eq!(std::mem::size_of::<ParticipantId>(), 8);
         assert_eq!(std::mem::size_of::<RoomId>(), 4);

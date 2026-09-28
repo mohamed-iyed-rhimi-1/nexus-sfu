@@ -10,7 +10,8 @@ use nexus_state::DistributedState;
 
 use super::ParticipantHandle;
 
-const MAX_ROOMS: usize = 10_000;
+/// Most rooms the orchestrator holds.
+pub const MAX_ROOMS: usize = 10_000;
 const MAX_PARTICIPANTS_PER_ROOM: u32 = 1_000;
 
 pub struct RoomManager {
