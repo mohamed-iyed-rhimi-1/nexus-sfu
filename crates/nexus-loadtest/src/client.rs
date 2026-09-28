@@ -429,6 +429,7 @@ impl HeadlessClient {
         let first_frame_received = Arc::clone(&self.first_frame_received);
         let track_stats = self.track_stats.clone();
         let rtcp = self.rtcp.clone();
+        let media = self.track_stats.clone();
 
         peer_connection.on_track(Box::new(move |track, receiver, _transceiver| {
             let rx_packets = Arc::clone(&rx_packets);
@@ -437,10 +438,11 @@ impl HeadlessClient {
             let track_stats = track_stats.clone();
             // Sender reports and SDES from the SFU, per receiver (one track each).
             let rtcp = rtcp.clone();
+            let media = media.clone();
             tokio::spawn(async move {
                 loop {
                     match receiver.read_rtcp().await {
-                        Ok((packets, _)) => rtcp.record(&packets),
+                        Ok((packets, _)) => rtcp.record_with_media(&packets, Some(&media)),
                         Err(e) => {
                             tracing::debug!("receiver RTCP reader stops: {e}");
                             break;

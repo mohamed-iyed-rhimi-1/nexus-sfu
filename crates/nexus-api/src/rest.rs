@@ -503,22 +503,22 @@ async fn create_room_handler(
         });
     }
 
-    let room_id = state
-        .next_room_id
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-    // Create room in distributed state if available (for orchestrator synchronization)
-    if let Some(ref distributed_state) = state.distributed_state {
-        if let Err(e) =
-            distributed_state.create_room(room_id, request.name.clone(), request.max_participants)
-        {
-            warn!("Failed to create room in distributed state: {:?}", e);
-            return Err(ApiError::Internal(format!(
-                "Failed to create room in distributed state: {:?}",
-                e
-            )));
-        }
-    }
+    // With distributed state, the id comes from its allocator, which the
+    // orchestrator's `Create` also uses: the two never take the same id.
+    let room_id = match state.distributed_state {
+        Some(ref distributed_state) => distributed_state
+            .create_room_auto(request.name.clone(), request.max_participants)
+            .map_err(|e| {
+                warn!("Failed to create room in distributed state: {:?}", e);
+                ApiError::Internal(format!(
+                    "Failed to create room in distributed state: {:?}",
+                    e
+                ))
+            })?,
+        None => state
+            .next_room_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    };
 
     let room = RoomResponse {
         id: room_id,
@@ -601,6 +601,36 @@ mod tests {
 
     fn test_secret() -> String {
         "this-is-a-test-secret-with-32-chars!".to_string()
+    }
+
+    /// REST and the orchestrator share one room-id allocator: a REST create after
+    /// the orchestrator created rooms gets the next free id, not a 500.
+    #[tokio::test]
+    async fn test_rest_create_after_orchestrator_rooms() {
+        let distributed = Arc::new(DistributedState::new(
+            nexus_state::DistributedStateConfig::new(1),
+        ));
+        // The orchestrator's `Create` path
+        assert_eq!(distributed.create_room_auto(String::new(), 10).unwrap(), 1);
+        assert_eq!(distributed.create_room_auto("a".into(), 10).unwrap(), 2);
+        let state = Arc::new(AppState::with_distributed_state(
+            &test_secret(),
+            None,
+            distributed.clone(),
+        ));
+        let request = CreateRoomRequest {
+            name: "rest".into(),
+            max_participants: 10,
+        };
+        let created = create_room_handler(State(state.clone()), Json(request)).await;
+        assert!(created.is_ok());
+        let rooms = state.rooms.read().await;
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id, 3);
+        assert_eq!(distributed.get_room(3).unwrap().name(), "rest");
+        assert_eq!(distributed.get_room(1).unwrap().name(), "", "untouched");
+        // And the orchestrator's next room follows
+        assert_eq!(distributed.create_room_auto(String::new(), 10).unwrap(), 4);
     }
 
     #[test]

@@ -36,6 +36,9 @@ pub struct TrackRxStats {
     pub first_timestamp: u32,
     /// Last RTP timestamp received.
     pub last_timestamp: u32,
+    /// When the packet carrying `last_timestamp` arrived (wall clock). Reordered
+    /// and duplicate packets do not move it, so the pair is one packet's.
+    pub last_timestamp_wall: SystemTime,
     /// Times the RTP timestamp went backwards between consecutive
     /// in-order packets.
     pub timestamp_regressions: u64,
@@ -72,6 +75,7 @@ impl TrackRxStats {
             recent: 1,
             first_timestamp: timestamp,
             last_timestamp: timestamp,
+            last_timestamp_wall: SystemTime::now(),
             timestamp_regressions: 0,
             first_arrival: now,
             last_arrival: now,
@@ -132,6 +136,7 @@ impl TrackRxStats {
                 self.timestamp_regressions += 1;
             }
             self.last_timestamp = timestamp;
+            self.last_timestamp_wall = self.last_arrival_wall;
         } else {
             let age = highest - ext;
             let bit = if age < 128 { 1u128 << age } else { 0 };
@@ -143,6 +148,13 @@ impl TrackRxStats {
             }
         }
     }
+}
+
+/// One received RTP packet's timestamp and arrival time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LastPacket {
+    pub rtp_timestamp: u32,
+    pub arrival: SystemTime,
 }
 
 /// Shared per-track stats of one client, filled by its RTP reader tasks.
@@ -172,6 +184,15 @@ impl TrackStatsMap {
         if let Some(stats) = map.get_mut(&ssrc) {
             stats.record_marker(marker_ssrc, frame);
         }
+    }
+
+    /// The newest in-order packet on `ssrc`: its RTP timestamp and arrival.
+    pub fn last_packet(&self, ssrc: u32) -> Option<LastPacket> {
+        let map = self.inner.lock().expect("track stats lock");
+        map.get(&ssrc).map(|t| LastPacket {
+            rtp_timestamp: t.last_timestamp,
+            arrival: t.last_timestamp_wall,
+        })
     }
 
     /// Snapshot of every track, sorted by SSRC.

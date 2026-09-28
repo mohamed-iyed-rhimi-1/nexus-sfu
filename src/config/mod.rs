@@ -39,12 +39,34 @@ pub struct ClusterConfig {
     /// Range: 1..=u64::MAX (0 triggers auto-generation).
     #[serde(default)]
     pub node_id: u64,
+    /// Start SWIM gossip with other nodes. Off by default: v1 is single-node,
+    /// and gossip is unauthenticated (any sender can spoof membership, rooms and
+    /// tracks), so it must not listen unless a cluster is deliberately configured.
+    #[serde(default)]
+    pub gossip_enabled: bool,
+    /// Address the gossip socket binds when `gossip_enabled`. Required then, and a
+    /// specific interface address (not 0.0.0.0 or ::); port 0 lets the OS choose.
+    #[serde(default)]
+    pub gossip_bind_addr: Option<std::net::SocketAddr>,
 }
 
 impl ClusterConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // node_id == 0 is valid (triggers auto-generation)
-        Ok(())
+        if !self.gossip_enabled {
+            return Ok(());
+        }
+        match self.gossip_bind_addr {
+            None => Err(ConfigError::invalid(
+                "cluster",
+                "gossip_enabled needs gossip_bind_addr (an interface address)",
+            )),
+            Some(addr) if addr.ip().is_unspecified() => Err(ConfigError::invalid(
+                "cluster",
+                "gossip_bind_addr must be a specific address, not 0.0.0.0 or ::",
+            )),
+            Some(_) => Ok(()),
+        }
     }
 }
 
@@ -123,6 +145,12 @@ impl NexusConfig {
         validate_core_config("logging", self.logging.validate())?;
         self.ice_servers.validate()?;
         self.cluster.validate()?;
+        if !self.cluster.gossip_enabled && !self.gossip.seed_peers.is_empty() {
+            return Err(ConfigError::invalid(
+                "gossip",
+                "seed_peers are set but cluster.gossip_enabled is false",
+            ));
+        }
         self.validate_dataplane()?;
 
         // Validate drain_timeout_ms

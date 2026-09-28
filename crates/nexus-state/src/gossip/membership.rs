@@ -99,10 +99,17 @@ impl MembershipList {
 
     /// Increment and return the local incarnation number.
     ///
-    /// Used when refuting suspicion about self.
+    /// Used when refuting suspicion about self. Saturates at `u64::MAX`: a
+    /// peer can push the local incarnation there (see `mark_alive`).
     #[inline]
     pub fn increment_incarnation(&self) -> u64 {
-        self.incarnation.fetch_add(1, Ordering::Relaxed) + 1
+        let previous = self
+            .incarnation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or_else(|current| current);
+        previous.saturating_add(1)
     }
 
     /// Add a new peer to the membership list.
@@ -354,7 +361,8 @@ impl MembershipList {
                 if current > incarnation {
                     break;
                 }
-                let new_inc = incarnation + 1;
+                // Network-supplied incarnation: saturate, never overflow
+                let new_inc = incarnation.saturating_add(1);
                 if self
                     .incarnation
                     .compare_exchange(current, new_inc, Ordering::Relaxed, Ordering::Relaxed)
@@ -801,6 +809,16 @@ mod tests {
 
         let peer = list.find_peer(2).unwrap();
         assert_eq!(peer.state(), PeerState::Dead);
+    }
+
+    #[test]
+    fn test_incarnation_saturates() {
+        // A peer can claim any incarnation for us: saturate, never overflow
+        let mut list = MembershipList::new(1);
+        list.mark_alive(1, u64::MAX).unwrap();
+        assert_eq!(list.local_incarnation(), u64::MAX);
+        assert_eq!(list.increment_incarnation(), u64::MAX);
+        assert_eq!(list.local_incarnation(), u64::MAX);
     }
 
     #[test]

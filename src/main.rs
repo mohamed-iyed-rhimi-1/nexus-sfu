@@ -7,8 +7,8 @@
 //! The SFU follows a specific initialization order per the architecture document:
 //! 1. Configuration loading and validation
 //! 2. Tracing/logging initialization
-//! 3. `nexus_sfu::server::start`: SFU (distributed state, gossip, worker
-//!    pool, media socket), signaling, orchestrator, API, packet loop
+//! 3. `nexus_sfu::server::start`: distributed state (gossip only when
+//!    `cluster.gossip_enabled`), data plane shards, signaling, orchestrator, API
 //! 4. Wait for SIGTERM / SIGINT, then graceful shutdown
 //!
 //! # Usage
@@ -174,8 +174,8 @@ STARTUP SEQUENCE:
     1. Configuration loading and validation
     2. Tracing/logging initialization
     3. Distributed state initialization
-    4. Gossip protocol initialization
-    5. Worker pool initialization
+    4. Gossip (only when cluster.gossip_enabled; off by default)
+    5. Data plane (shards) initialization
     6. Signaling server initialization
     7. Metrics server initialization
     8. API server initialization
@@ -292,7 +292,12 @@ async fn main() -> ExitCode {
     }
 
     info!("Starting Nexus SFU v{}", VERSION);
-    info!("Startup sequence: config → tracing → distributed state → gossip → data plane → signaling → metrics → API");
+    let gossip = if config.cluster.gossip_enabled {
+        "gossip"
+    } else {
+        "no gossip (single node)"
+    };
+    info!("Startup sequence: config → tracing → distributed state → {gossip} → data plane → signaling → metrics → API");
 
     // Log configuration summary
     info!("Configuration loaded:");

@@ -11,6 +11,8 @@ use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndicat
 use webrtc::rtcp::sender_report::SenderReport;
 use webrtc::rtcp::source_description::{SdesType, SourceDescription};
 
+use crate::track_stats::{LastPacket, TrackStatsMap};
+
 /// Most entries of each kind kept.
 pub const MAX_ENTRIES: usize = 4096;
 
@@ -32,6 +34,9 @@ pub struct SenderReportRx {
     pub rtp_time: u32,
     pub packet_count: u32,
     pub at: SystemTime,
+    /// The last media packet received on `ssrc` when the report arrived, if the
+    /// reader was given the receive stats (`record_with_media`).
+    pub last_packet: Option<LastPacket>,
 }
 
 #[derive(Debug, Default)]
@@ -52,7 +57,24 @@ pub struct RtcpLog {
 impl RtcpLog {
     /// Record what matters in one compound packet read from a sender or receiver.
     pub fn record(&self, packets: &[Box<dyn Packet + Send + Sync>]) {
+        self.record_with_media(packets, None);
+    }
+
+    /// As `record`; each sender report also gets the last media packet `media`
+    /// holds for its SSRC at this moment, so its error can be measured against
+    /// the packet that was current when it arrived.
+    pub fn record_with_media(
+        &self,
+        packets: &[Box<dyn Packet + Send + Sync>],
+        media: Option<&TrackStatsMap>,
+    ) {
         let (now, wall) = (Instant::now(), SystemTime::now());
+        // Before taking the log lock: the two locks are never held together.
+        let last: Vec<(u32, Option<LastPacket>)> = packets
+            .iter()
+            .filter_map(|p| p.as_any().downcast_ref::<SenderReport>())
+            .map(|sr| (sr.ssrc, media.and_then(|m| m.last_packet(sr.ssrc))))
+            .collect();
         let mut inner = self.inner.lock().expect("rtcp log lock");
         for packet in packets {
             let any = packet.as_any();
@@ -69,6 +91,10 @@ impl RtcpLog {
                     rtp_time: sr.rtp_time,
                     packet_count: sr.packet_count,
                     at: wall,
+                    last_packet: last
+                        .iter()
+                        .find(|(ssrc, _)| *ssrc == sr.ssrc)
+                        .and_then(|(_, p)| *p),
                 });
             } else if let Some(sdes) = any.downcast_ref::<SourceDescription>() {
                 for chunk in &sdes.chunks {
@@ -208,6 +234,30 @@ mod tests {
         );
         assert_eq!(log.cnames(), vec![(7, "nexus-1".to_string())]);
         assert_eq!(log.overflow(), 0);
+    }
+
+    #[test]
+    fn sender_reports_carry_the_last_packet_when_given_media() {
+        let media = TrackStatsMap::default();
+        media.record(7, "video", "video/VP8", 10, 9_000);
+        media.record(7, "video", "video/VP8", 12, 15_000);
+        media.record(7, "video", "video/VP8", 11, 12_000); // reordered: not the last
+        let log = RtcpLog::default();
+        let sr = |ssrc| -> Vec<Box<dyn Packet + Send + Sync>> {
+            vec![Box::new(SenderReport {
+                ssrc,
+                ..Default::default()
+            })]
+        };
+        log.record_with_media(&sr(7), Some(&media));
+        log.record_with_media(&sr(8), Some(&media));
+        log.record(&sr(7));
+        let reports = log.sender_reports();
+        let last = reports[0].last_packet.expect("media on 7");
+        assert_eq!(last.rtp_timestamp, 15_000);
+        assert!(last.arrival <= reports[0].at);
+        assert_eq!(reports[1].last_packet, None, "no media on 8");
+        assert_eq!(reports[2].last_packet, None, "record: no media given");
     }
 
     #[test]

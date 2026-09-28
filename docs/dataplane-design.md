@@ -84,6 +84,14 @@ publishers; accepted for v1.
 
 - Multi-node media relay, recording, XDP/eBPF forwarding, QUIC signaling. They stay out of
   the binary until they have their own design; code is kept in git history, not in the tree.
+- Clustering. v1 is single-node. The SWIM gossip in `nexus-state` is **unauthenticated**:
+  any host that can reach its UDP port can spoof membership, rooms, participants and tracks.
+  It is off unless `cluster.gossip_enabled` is set (then bound to a configured interface,
+  never 0.0.0.0), and must gain authentication (at least a shared-key MAC per datagram)
+  before clustering ships. Room participant sets also recycle their oldest removal
+  records (tombstones) so a room survives unlimited join/leave churn; that is only safe on a
+  single node. With gossip, a late add from another node could resurrect a removed
+  participant, so clustering needs a different compaction (e.g. causal-stability based).
 - TURN server, TCP media candidates.
 - SVC (VP9/AV1 layer dropping); a later extension of §3.7.
 
@@ -457,4 +465,5 @@ section updated at the end of every working session.
 | 2026-09-26 | Ship-first revision: the project has no deployments, so the old data plane is replaced directly instead of run beside the new one (D10), fixes to the old path stop (Phase 0 part 0.1d dropped; its bug is covered by a Phase 1 test), phases 4-6 become "after v1", and the six design notes become one (`dataplane-v1.md`) plus `loss-recovery.md`. v1 scope in §2; simulcast is after v1 unless decided otherwise. |
 | 2026-09-26 | `docs/design/dataplane-v1.md` approved. Its revisions applied: **R1** PLI/FIR forwarding and PLI on subscribe move to Phase 1 (D6, §5); **R2** ICE-lite, no consent-check timer (§3.9); **R3** command/event lists (§3.2); **R4** owner-local buffer refcounts (§3.3); **R5** SRTP ≈ 5 KB and track state 0.5 KB in the budget, total unchanged (§3.11); **R6** SR and PLI e2e tests in the Phase 1 exit; **R7** rebinding rule (§3.9); **R8** TWCC feedback toward publishers in v1, Phase 3 (§2, §3.8, §5); **R9** ≈ 15 A+V publishers per participant accepted for v1 (§2). |
 | 2026-09-27 | v1 scope (§2) gains **room authorization**, found in the Phase 1.5b review: JWTs carry no room claim, so any authenticated user can join any room whose id it guesses (ids are sequential) and subscribe to its tracks. Not assigned to a phase yet; it touches the token format (`nexus-api`), signaling (`Create`/`Join`) and the SDK/dev-token tooling (Phase 1.8). |
+| 2026-09-28 | §2 non-goals: clustering stated explicitly, found in the Phase 1 exit criterion 6 review. The gossip socket was bound on 0.0.0.0 by default, unauthenticated, and a datagram could abort the process. v1 starts no gossip unless `cluster.gossip_enabled` (default off, specific bind address); gossip must be authenticated before clustering ships. Its receive path is hardened (no panics on received data) either way. |
 | 2026-09-28 | §3.11 clarified, no decision changed: the 25 KB budget covers session state (data plane and control plane) only; the signaling connection is reported next to it (Phase 1.7 review). Measured in Phase 1.7: session state 16.9 KB per participant (the checked figure), signaling ≈ 49 KB per WebSocket connection (≈ 57 KB with TLS). |

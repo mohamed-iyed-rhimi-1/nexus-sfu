@@ -447,7 +447,8 @@ struct Rig {
     shard: Shard<MemIo, Vec<Event>>,
     orchestrator: SessionOrchestrator,
     clients: Vec<Client>,
-    admin_rx: mpsc::Receiver<SignalMessage>,
+    /// One per room, kept open: a room nobody joined is released with its creator.
+    room_admins: Vec<mpsc::Receiver<SignalMessage>>,
     peer_certificate: DtlsCertificate,
     peer_fingerprint: String,
     /// Scratch for the shard's events (pre-sized, bench-owned).
@@ -486,19 +487,11 @@ impl Rig {
         });
         let peer_certificate = DtlsCertificate::generate().expect("peer certificate");
         let peer_fingerprint = fingerprint_hex(peer_certificate.fingerprint());
-        let (admin_tx, admin_rx) = mpsc::channel(1_024);
-        let event = OrchestratorEvent::Connected {
-            participant_id: ADMIN,
-            outbound_tx: admin_tx,
-            claims: None,
-        };
-        let mut orchestrator = orchestrator;
-        tagged(Tag::Control, || orchestrator.handle_signal(event));
         Self {
             shard,
             orchestrator,
             clients: (0..rooms * ROOM_SIZE).map(Client::new).collect(),
-            admin_rx,
+            room_admins: Vec::new(),
             peer_certificate,
             peer_fingerprint,
             events: Vec::with_capacity(4_096),
@@ -506,16 +499,29 @@ impl Rig {
         }
     }
 
-    /// The rooms, created by a participant that never joins one.
+    /// The rooms, each created by its own admin connection that never joins one
+    /// (a connection may create `MAX_ROOMS_PER_CREATOR` rooms). The admins'
+    /// connections are scaffolding, untagged; the `Create` is counted as before.
     fn create_rooms(&mut self) {
         let rooms = self.clients.len() / ROOM_SIZE;
         for room in 1..=rooms as u64 {
+            let admin = ADMIN + room;
+            let (admin_tx, admin_rx) = mpsc::channel(16);
+            self.orchestrator
+                .handle_signal(OrchestratorEvent::Connected {
+                    participant_id: admin,
+                    outbound_tx: admin_tx,
+                    claims: None,
+                });
             let event = OrchestratorEvent::Message {
-                participant_id: ADMIN,
+                participant_id: admin,
                 message: SignalMessage::Create { room_name: None },
             };
             tagged(Tag::Control, || self.orchestrator.handle_signal(event));
-            match self.admin_rx.try_recv() {
+            let mut admin_rx = admin_rx;
+            let created = admin_rx.try_recv();
+            self.room_admins.push(admin_rx);
+            match created {
                 Ok(SignalMessage::Created { room_id, .. }) => assert_eq!(room_id, room),
                 other => panic!("room {room} not created: {other:?}"),
             }

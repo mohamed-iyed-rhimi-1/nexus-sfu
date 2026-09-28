@@ -122,6 +122,9 @@ pub struct Session {
     pub last_switch: Option<Instant>,
     /// A nomination refused by the switch interval, applied once it passed.
     pub pending_nomination: Option<SocketAddr>,
+    /// In the shard's `pending_switches` (listed at most once, which bounds the
+    /// list by `max_sessions`). Cleared when the entry is removed.
+    pub switch_listed: bool,
     /// An `AddressSelected` the event sink refused; retried by the sweep.
     pub unreported_switch: Option<SelectReason>,
     /// Transaction ids of recent authenticated binding requests (ring).
@@ -156,6 +159,7 @@ impl Session {
             dtls_budget: DTLS_BUDGET_PER_SWEEP,
             last_switch: None,
             pending_nomination: None,
+            switch_listed: false,
             unreported_switch: None,
             recent_transactions: [[0; 12]; RECENT_TRANSACTIONS],
             recent_len: 0,

@@ -48,7 +48,7 @@ cert_path = "./certs/dev-cert.pem"
 key_path = "./certs/dev-key.pem"
 
 [gossip]
-# SWIM gossip protocol configuration
+# SWIM gossip protocol configuration (used only when cluster.gossip_enabled)
 probe_interval_ms = 1000
 ping_timeout_ms = 500
 suspect_timeout_ms = 5000
@@ -90,6 +90,12 @@ realtime_priority_level = 80
 # Unique node ID. Set to 0 for auto-generation from hostname+pid+time.
 # In production, set explicitly or derive from HOSTNAME.
 node_id = 0
+# Gossip (SWIM) with other nodes: off by default. v1 is single-node, and gossip is
+# unauthenticated (any sender can spoof membership, rooms and tracks), so enable it
+# only on a trusted network, bound to a specific interface (not 0.0.0.0).
+# gossip_enabled = true
+# gossip_bind_addr = "10.0.0.5:7946"
+gossip_enabled = false
 
 # ============================================================================
 # ICE Server Configuration

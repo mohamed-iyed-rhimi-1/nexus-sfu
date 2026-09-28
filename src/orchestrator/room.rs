@@ -13,19 +13,26 @@ use super::ParticipantHandle;
 /// Most rooms the orchestrator holds.
 pub const MAX_ROOMS: usize = 10_000;
 const MAX_PARTICIPANTS_PER_ROOM: u32 = 1_000;
+/// Longest participant name accepted in `Join` (it is copied to every peer).
+pub const MAX_PARTICIPANT_NAME_LEN: usize = 256;
+/// Rooms one connection may have created and not yet released.
+pub const MAX_ROOMS_PER_CREATOR: usize = 4;
 
 pub struct RoomManager {
     room_names: HashMap<String, u32>,
-    next_room_id: u32,
     distributed_state: Arc<DistributedState>,
+    /// Rooms each participant created. A room still empty when its creator
+    /// leaves or disconnects is released; a joined room is released by its last
+    /// member leaving. So no room outlives both its creator and its members.
+    created: HashMap<u64, Vec<u32>>,
 }
 
 impl RoomManager {
     pub fn new(distributed_state: Arc<DistributedState>) -> Self {
         Self {
             room_names: HashMap::with_capacity(256),
-            next_room_id: 1,
             distributed_state,
+            created: HashMap::new(),
         }
     }
 
@@ -54,29 +61,11 @@ impl RoomManager {
             }
         }
 
-        if self.room_names.len() >= MAX_ROOMS {
-            send_error(
-                sessions,
-                participant_id,
-                "ROOM_LIMIT",
-                "Maximum rooms reached",
-            );
+        let Some(room_id) = self.new_room(participant_id, room_name.as_deref(), sessions) else {
             return;
-        }
-
-        let room_id = self.next_room_id;
-        self.next_room_id += 1;
-
+        };
         if let Some(ref name) = room_name {
             self.room_names.insert(name.clone(), room_id);
-        }
-
-        if let Err(e) = self.distributed_state.create_room(
-            room_id,
-            room_name.clone().unwrap_or_default(),
-            MAX_PARTICIPANTS_PER_ROOM,
-        ) {
-            warn!("Failed to create room in CRDT: {:?}", e);
         }
 
         send_to(
@@ -89,6 +78,75 @@ impl RoomManager {
         );
 
         info!("Room {} created by participant {}", room_id, participant_id);
+    }
+
+    /// Creates a room in the shared state and returns its id, or sends the error.
+    /// Network input: the name's length and the id counter are checked here, not
+    /// asserted downstream (exit criterion 6).
+    fn new_room(
+        &mut self,
+        participant_id: u64,
+        name: Option<&str>,
+        sessions: &HashMap<u64, ParticipantHandle>,
+    ) -> Option<u32> {
+        if name.is_some_and(|n| n.len() > nexus_state::MAX_ROOM_NAME_LEN) {
+            let message = format!(
+                "Room name longer than {} bytes",
+                nexus_state::MAX_ROOM_NAME_LEN
+            );
+            send_error(sessions, participant_id, "INVALID_INPUT", &message);
+            return None;
+        }
+        // Every room counts, named or not, however it was created (REST too)
+        if self.distributed_state.room_count() >= MAX_ROOMS {
+            send_error(
+                sessions,
+                participant_id,
+                "ROOM_LIMIT",
+                "Maximum rooms reached",
+            );
+            return None;
+        }
+        let state = &self.distributed_state;
+        let mine = self.created.entry(participant_id).or_default();
+        mine.retain(|&room| state.room_exists(room));
+        if mine.len() >= MAX_ROOMS_PER_CREATOR {
+            let message = format!("At most {MAX_ROOMS_PER_CREATOR} rooms created per connection");
+            send_error(sessions, participant_id, "ROOM_LIMIT", &message);
+            return None;
+        }
+        let room_id = match self.allocate_room(name) {
+            Ok(id) => id,
+            Err(reason) => {
+                send_error(sessions, participant_id, "ROOM_LIMIT", reason);
+                return None;
+            }
+        };
+        let mine = self.created.entry(participant_id).or_default();
+        assert!(mine.len() < MAX_ROOMS_PER_CREATOR);
+        mine.push(room_id);
+        debug_assert!(room_id != 0);
+        Some(room_id)
+    }
+
+    /// Creates the room under the next free id of the shared allocator
+    /// (`DistributedState::create_room_auto`, also used by the REST API).
+    fn allocate_room(&mut self, name: Option<&str>) -> Result<u32, &'static str> {
+        let name = name.unwrap_or_default().to_string();
+        match self
+            .distributed_state
+            .create_room_auto(name, MAX_PARTICIPANTS_PER_ROOM)
+        {
+            Ok(room_id) => {
+                assert!(room_id != 0);
+                Ok(room_id)
+            }
+            Err(nexus_state::CrdtError::Overflow) => Err("Room ids exhausted"),
+            Err(e) => {
+                warn!("Failed to create room in CRDT: {:?}", e);
+                Err("Room not created")
+            }
+        }
     }
 
     pub fn handle_join(
@@ -108,6 +166,22 @@ impl RoomManager {
             return;
         }
 
+        if participant_name.len() > MAX_PARTICIPANT_NAME_LEN {
+            let message = format!("Name longer than {MAX_PARTICIPANT_NAME_LEN} bytes");
+            send_error(sessions, participant_id, "INVALID_INPUT", &message);
+            return;
+        }
+        // Room ids are u32: a larger id names no room (it must not wrap to one)
+        let Ok(room_id_u32) = u32::try_from(room_id) else {
+            send_error(
+                sessions,
+                participant_id,
+                "ROOM_NOT_FOUND",
+                "Room does not exist",
+            );
+            return;
+        };
+
         // One room per participant: switching would keep the old room's membership,
         // tracks and subscriptions. Leave (which ends the session) first.
         if sessions
@@ -122,8 +196,6 @@ impl RoomManager {
             );
             return;
         }
-
-        let room_id_u32 = room_id as u32;
 
         if !self.distributed_state.room_exists(room_id_u32) {
             send_error(
@@ -239,6 +311,7 @@ impl RoomManager {
             return;
         }
         self.cleanup_participant_room(participant_id, sessions);
+        self.release_created_rooms(participant_id);
     }
 
     pub fn handle_disconnected(
@@ -250,6 +323,25 @@ impl RoomManager {
             return;
         }
         self.cleanup_participant_room(participant_id, sessions);
+        self.release_created_rooms(participant_id);
+    }
+
+    /// The rooms `participant_id` created that nobody is in are removed (after
+    /// its own membership was cleaned up).
+    fn release_created_rooms(&mut self, participant_id: u64) {
+        let Some(rooms) = self.created.remove(&participant_id) else {
+            return;
+        };
+        assert!(rooms.len() <= MAX_ROOMS_PER_CREATOR);
+        for room in rooms {
+            if self.distributed_state.room_exists(room)
+                && self.distributed_state.participant_count(room) == 0
+            {
+                self.distributed_state.remove_room(room);
+                self.room_names.retain(|_, &mut v| v != room);
+                debug!("Room {} released: empty when its creator left", room);
+            }
+        }
     }
 
     /// Clean up room membership and notify peers.

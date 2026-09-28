@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! start(config)
-//!  ├─ Node                node id, distributed state, gossip thread
+//!  ├─ Node                node id, distributed state, gossip thread (clusters only)
 //!  ├─ Dataplane           one socket and one thread per shard (nexus-dataplane)
 //!  ├─ SignalingServer     WebSocket listener (bound before anything runs)
 //!  ├─ SessionOrchestrator tokio task: signaling + data-plane events → commands

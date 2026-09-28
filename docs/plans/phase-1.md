@@ -2092,6 +2092,202 @@ anything that failed.
 
 ---
 
+### Before 1.9: SR test flake, exit criterion 6 sweep
+
+**SR test flake (`sender_report_translation`).**
+- **What happened:** the test compared the last SR with the track's last packet read at
+  the end of the test, up to about 1 s of extrapolation. That packet's arrival time was
+  also taken from any packet, while its RTP timestamp came only from in-order packets.
+  One run in five (the run right after the Docker jobs) measured 28.9 ms against 20 ms.
+- **Change:**
+  - The loadtest's `RtcpLog::record_with_media` stores the receiver's last in-order
+    packet (`LastPacket`: timestamp and that packet's arrival) with each SR when the SR
+    arrives.
+  - The test measures every SR after media arrived (at least 3 per track) and asserts
+    the median error ≤ 50 ms and every SR ≤ 200 ms.
+- **Measured:** 2-3 ms per SR.
+- **Negative check:** a 100 ms offset in the shard's SR translation fails the test
+  (median 105.5 ms).
+
+**Exit criterion 6: no reachable panic on network input (2026-09-28).**
+- **Method:** each input path traced from the socket or WebSocket to every `unwrap`,
+  `expect`, `assert!`, index, slice, split and time-arithmetic site. Release builds
+  (`panic = "abort"`, no overflow checks) are what counts.
+- **Coverage:** the data plane end to end, STUN and DTLS, and SDP plus the signaling
+  JSON and orchestrator. Each finding was then checked against the code, with a test
+  that fails without the fix.
+
+| Path | Checked | Result |
+|------|---------|--------|
+| Shard receive and classify (`io/linux.rs`, `portable.rs`, `ingress.rs`) | Batch and pool bounds, truncation, `classify` | Safe |
+| STUN in the shard (`ice.rs` scan, `integrity.rs`, `write_success`) | Header, attribute walk (≤ 32), USERNAME/ufrag split, MI/FINGERPRINT offsets, response size | Safe |
+| ICE-lite address selection (`select_address`, `apply_pending_switches`) | Nomination, throttle, rebind, replay | **Fixed**: see below |
+| SRTP/SRTCP in and out (`nexus-transport/src/srtp`: `direction`, `index`, `replay`, `crypto` GCM and CM) | Length and tag checks before splits, ROC and index limits, replay window shifts | Safe |
+| RTP parse, rewrite, extensions (`nexus-media` `RtpHeader::parse`, `rewrite.rs`, `ext.rs`) | CSRC, extension and padding bounds, one- and two-byte elements, output room | Safe |
+| RTCP (`demux_compound`, SR/PLI/FIR parse, `shard/rtcp.rs` translation, keyframe requests) | Compound walk (≤ 16), fixed lengths, `FixedVec` caps | Safe |
+| DTLS to the control plane (`handle_dtls`, `orchestrator/dtls.rs`, `openssl_backend.rs`, `srtp_keys.rs`) | Budgets, empty and oversized input guards, record split, role and ClientHello, fingerprint (SHA-256, 32 bytes), keying export, verify callback (`\|_, _\| true`) | Safe |
+| WebSocket and auth (`nexus-signal/websocket/server.rs`, `nexus-api/auth.rs`) | 1 MB frame and 256 KB message caps, rate limit, auth frame, JWT decode | Safe |
+| Orchestrator messages (`mod.rs`, `room.rs`, `negotiation.rs`, `subscription.rs`, `plane.rs`, `sdp_params.rs`) | Each client message; `claim_mline`'s assert against the limit checks, expects after state lookups, `answer.media[index]` after `mids_match`, id casts | **Fixed**: `Create`/`Join`, see below |
+| SDP answer (`nexus-webrtc` parser, `Mid::parse`, `track_spec`, `extract_fingerprint`) | Byte-based line types, `min`-bounded copies, `parts[i]` behind length checks, hex decode, UTF-8 accessors | Safe |
+| REST (`nexus-api/rest.rs`) | Name length, participant range, `Bearer` slice | Safe. The room-id wrap after 2^32 POSTs now gets an error from `create_room` |
+| **SWIM gossip** (`nexus-state/src/gossip/`: `transport`, `types`, `protocol`, `membership`; `DistributedState` apply paths; CRDT merges). Missed by the first sweep, found in review | Receive size, every decoder, piggyback counts, sender-supplied actor ids and incarnations, updates applied to the state | **Fixed**: see "Gossip" below. It is also no longer started on a single node |
+
+**Fixes:**
+- **Duplicate nomination entries aborted the shard.**
+  - Cause: a nomination from the current address cleared `pending_nomination` but left
+    the session in `pending_switches`, and the next throttled nomination listed it
+    again. Batches ending on the new address kept the copies until
+    `assert!(len < capacity)` aborted the process.
+  - Who could trigger it: any peer with the session's ICE credentials, in about
+    `2 × max_sessions` requests within 100 ms.
+  - Fix: `Session::switch_listed`, so a session is listed at most once.
+  - Tests: `alternating_throttled_nominations_list_the_session_once`, and
+    `authenticated_stun_sequences_never_panic` (a proptest of signed requests with random
+    source addresses, including one shared address, nomination, replays, timing and
+    batching). Both fail without the fix; the proptest found the abort on its own once
+    requests could share a batch.
+- **`Create` with a room name over 256 bytes aborted the process, in one message.**
+  - Cause: `RoomMetadata::new` asserts on the length.
+  - Fix: `handle_create` refuses the name with `INVALID_INPUT`, and
+    `DistributedState::create_room` returns `InvalidState` for a room id of 0, an
+    over-long name or out-of-range `max_participants`, instead of asserting.
+- **The room-id counter overflowed.**
+  - Cause: `next_room_id += 1` panicked in debug builds and wrapped to 0 in release,
+    where `create_room` asserted.
+  - Fix: `checked_add`. The last id is never handed out, and the counter advances only
+    when the room was created.
+  - Also changed: a failed create now sends an error instead of `Created` for a room
+    that does not exist.
+- **`Join` checks (not panics, fixed in passing):**
+  - `participant_name` over 256 bytes gets `INVALID_INPUT`. It was copied to every
+    peer, so it was a memory amplification.
+  - A `room_id` above `u32::MAX` gets `ROOM_NOT_FOUND`; it used to wrap onto another
+    room.
+- **Tests for these:**
+  - `create_and_join_refuse_input_that_used_to_panic`;
+  - `test_create_room_refuses_invalid_input` (`nexus-state`);
+  - `random_signaling_never_panics`: a 128-case proptest over random and well-formed
+    messages from three participants, with answers to the latest offer, declined
+    m-lines, disconnects and reconnects. It reaches registered tracks, subscriptions,
+    `NOT_OWNER`, `TOO_MANY_TRACKS` and `INVALID_ANSWER`. Negative check: without the
+    name checks it finds the `Create` abort.
+
+**Gossip (second review of the sweep).**
+- **What was wrong:** `Node::start` always opened the SWIM socket on `0.0.0.0:0`, with no
+  authentication. Several received datagrams aborted the process:
+  - an empty datagram (`transport.rs` `assert!(size > 0)`);
+  - updates with zero or out-of-range ids (asserts in the `types.rs` decoders and in
+    `DistributedState` add/remove participant, track and subscription);
+  - an `LWWReg` timestamp of 0;
+  - a ping-req naming this node;
+  - a full membership whose anti-entropy snapshot exceeded the datagram size;
+  - an incarnation at `u64::MAX` (overflow).
+- **Received data no longer panics:**
+  - An empty datagram is dropped and counted. A datagram longer than the receive
+    buffer (`MAX_MESSAGE_SIZE`) is truncated by the kernel, and the truncated bytes are
+    decoded like any other input, safely.
+  - Decoders return `None` and apply paths return errors.
+  - The receive loop drops and counts bad datagrams (`SwimProtocol::handle_datagram`,
+    `messages_dropped`).
+  - Snapshots are capped at 38 members.
+  - Incarnations saturate.
+  - The subscription-update decoder now reads the layout the encoder writes (it never
+    matched, so a legitimate update decoded to track 0).
+  - Asserts on local invariants stay.
+- **Tests:** `crates/nexus-state/tests/gossip_robustness.rs` (14 tests: an empty and an
+  oversized datagram, each crafted update, framing, actor ranges, messages about the local
+  node, and proptests over random bytes, 2,000 cases, and over structured messages, 3,000
+  cases), plus unit tests in `types.rs`, `transport.rs`, `membership.rs` and
+  `distributed_state.rs`. Each fix was checked by reverting it: the matching test panics
+  at the original site.
+- **Gossip is off unless a cluster is configured.** `cluster.gossip_enabled` defaults to
+  false: the node creates its state and opens no gossip socket.
+  - When on, `cluster.gossip_bind_addr` is required and may not be 0.0.0.0 or `::`.
+  - `gossip.seed_peers` without `gossip_enabled` is a config error.
+  - The config files document both keys.
+  - Tests: `single_node_opens_no_gossip_socket`, `gossip_config_is_validated`.
+- **Gossip is unauthenticated** (spoofed membership, rooms, participants and tracks;
+  ping-req reflection). `dataplane-design.md` §2 non-goals and its revision log say it
+  must be authenticated before clustering ships.
+- **Found and not fixed** (gossip is off in v1):
+  - applied updates are re-broadcast as local operations and can echo between nodes;
+  - one datagram per probe interval means junk can starve real pings;
+  - `drain_relay_events` has no caller, so the relay queue fills.
+
+**Room exhaustion (second review).**
+- **Every room counts against `MAX_ROOMS`.** The check uses `DistributedState::room_count`,
+  named or not, REST-created too. Test: `unnamed_rooms_count_against_the_room_cap`.
+- **Per-connection limit:** a connection may hold `MAX_ROOMS_PER_CREATOR` (4) rooms it
+  created.
+- **Release:** a room still empty when its creator leaves or disconnects is released. A
+  joined room is released by its last member, as before. Test:
+  `created_rooms_are_limited_and_released_with_their_creator`.
+- **Room memory:**
+  - The participant `Orswot` no longer preallocates 10,000 entries and 5,000 tombstones
+    (≈ 440 KB per room, computed from the layout).
+  - Entries and tombstones grow on demand up to their caps (control path, at join and
+    leave).
+  - A room's set is capped at the room's participant limit (`Orswot::with_capacity`).
+  - Measured with a counting allocator: an empty room adds 0 B of heap beyond the state's
+    preallocated maps; 10 participants add 512 B. 10,000 empty rooms now fit in a unit
+    test.
+- **`create_room` refuses an existing id** (`DuplicateElement`) instead of replacing its
+  metadata and participant set.
+- **One room-id allocator (third review).** REST kept its own counter from 1, so after
+  the orchestrator had created rooms, REST creates got a 500 (`DuplicateElement`).
+  - `DistributedState::create_room_auto` hands out the next free id under the rooms lock:
+    taken ids are skipped, ids are never reused, and the last id is never handed out, so
+    there is no wrap to 0.
+  - The orchestrator's `Create` and REST (whenever it has the state) both use it. The
+    orchestrator's own counter is gone.
+  - Tests: `test_rest_create_after_orchestrator_rooms` (`nexus-api`),
+    `test_create_room_auto_skips_taken_ids_and_never_wraps`,
+    `test_create_room_keeps_an_existing_room`, `create_skips_a_room_id_taken_elsewhere`,
+    `test_orswot_grows_on_demand_up_to_its_capacity`.
+- **Tombstones recycle (third review).**
+  - Before: a participant set kept up to `MAX_TOMBSTONES` (5,000) and never cleared
+    them. After 5,000 leaves in one room's lifetime, `remove_participant` failed with
+    `TombstoneOverflow`: the leaver stayed as a ghost and the room never emptied.
+  - Now: tombstones are a ring of twice the set's element limit (at most 5,000), and the
+    oldest is overwritten when it is full, so a remove never fails for lack of room.
+  - Cost, only with gossip: a remove older than the ring can be undone by a stale remote
+    add of that element. On a single node, local adds always carry newer clocks.
+  - Tests: `test_orswot_tombstones_recycle_oldest_first`,
+    `test_join_leave_churn_never_leaves_ghosts` (6,000 cycles in `DistributedState`),
+    `join_leave_churn_keeps_the_room_usable` (6,000 participants through the
+    orchestrator).
+  - Negative check: when a full ring fails the remove, as before, the orchestrator test
+    ends with 1,000 ghosts in the room.
+
+**`address_change_mid_call` window (found while running this change).**
+- **What happened:** the test failed twice inside a full `cargo test --workspace` run,
+  once on Linux arm64 and once on macOS. Both times one stream to A had 31 of 75
+  sequence numbers missing in the window after the rebind.
+- **Not reproduced:** 0 failures in 19 runs alone or of the whole e2e binary.
+- **Likely cause:** the window was measured from the moment the *sum* of a direction's
+  streams moved again. A stream that resumed later (the sparse audio stream, under load)
+  could have its outage gap counted as loss.
+- **Change:** `wait_for_resume` tracks each stream and returns the earliest and the
+  latest resume. The silence rule (≥ `rebind_silence` − 200 ms) is checked on the
+  earliest stream of each direction (now both directions); `REBIND_RESUME_MAX` is checked
+  on the latest. The window starts after the latest. This removes the bias but does not
+  prove the cause. If the failure recurs, it is loss after resumption and needs a closer
+  look.
+
+**Known issues, not panics, not fixed (after v1 or 1.9 decides):**
+- **Rooms from REST are never released** (only the orchestrator tracks creators).
+- **Connections can hold slots before authenticating.** The TLS accept and WebSocket
+  upgrade have no timeout, so 10,000 half-open connections block signaling. The
+  connection-limit check is racy.
+- **`Disconnected` can be lost.** It goes to the orchestrator with `try_send`, so a full
+  queue leaks that participant's state.
+- **`MemBio` grows without a limit** if OpenSSL stops reading after an alert. The shard's
+  DTLS budget limits the rate.
+- **Fuzzing gaps that remain:**
+  - structured STUN attribute layouts (random bytes rarely pass the header check);
+  - the SRTP profiles other than GCM-128 in the shard proptests;
+  - no `cargo-fuzz` targets.
+
 ### 1.9 Documents and merge
 
 **Files:** `architecture.md`, `CLAUDE.md`, `README.md`, `docs/dataplane-design.md` (revision
@@ -2173,6 +2369,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.6a E2E: harness, ten clients, resubscribe | Done | see git log (1.6a) | Signaling task + events, `subscribe_confirmed`/`unsubscribe`, announced history + CNAME, inbound tap; `ten_clients` 9.7 s, suite 27.1 s; negative check fails on SRTCP index reuse |
 | 1.6b E2E: address change, SR, keyframes | Done | see git log (1.6b) | `LossRules::rebind`, `RtcpLog` (publisher PLI/FIR, subscriber SR/CNAME), three tests; resume 2.1-2.3 s, SR error ≤ 5.7 ms, burst → 1 PLI; negative check fails with the silence rule disabled. Review fixes (1.6a/1.6b checks, `ci-local.sh` lock, dashboard, scripts) |
 | 1.8 SDK, browser page, manual check | Code done (see git log (1.8)); owner's check pending | | `Published` to the publisher, `nexus-loadtest token`, SDK `createRoom`/`publish`/`unpublish`/`unsubscribe`/`leave`/`getStats`, ≤ 10 ids per request, `node:test` (20) in CI, `examples/web/`, review fixes (fenced error matching, refused-publish cleanup, refused publish m-lines released on the server). Chromium 153 pre-check passes steps 2, 3, 5 (GCM, ICE-lite, late join ≈ 0.2 s). Exit criterion 4 waits for the owner's Chrome + Firefox run on two machines |
+| SR flake, exit criterion 6 sweep | Done (uncommitted, for review) | | SR errors measured per SR (median ≤ 50 ms, max ≤ 200 ms). Sweep of every network input path: aborts fixed in the shard (duplicate nomination entries), signaling (`Create` name over 256 bytes, room-id wrap) and **gossip** (empty datagram, crafted updates, found in review). Gossip off unless a cluster is configured. Room limits (every room counted, per-creator cap, release, rooms no longer preallocate ≈ 440 KB). Proptests: authenticated STUN, random signaling, gossip bytes and messages. **Exit criterion 6 met** |
 | 1.9 Documents, merge | Not started | | |
 
 Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☐ no panic on input · 7 ☐ documents.
@@ -2863,3 +3060,105 @@ Add one line per working session: date, part, what was done, what is left.
   Fix before 1.9: record the last packet when each SR arrives, assert the median error
   ≤ 50 ms and every SR ≤ 200 ms. Code committed; the owner's §17.9 check (exit criterion 4)
   is still pending. Next: SR test fix and exit criterion 6 sweep, owner's check, then 1.9.
+- 2026-09-28, before 1.9 (uncommitted, for review): SR flake fixed and exit criterion 6
+  swept (section "Before 1.9").
+  - **SR test:** each SR is paired with the last in-order packet received when it
+    arrived; the test asserts median ≤ 50 ms and every SR ≤ 200 ms. Measured 2-5 ms,
+    also in the two e2e runs right after the Docker jobs (8/8 each). Negative check: a
+    100 ms translation offset fails.
+  - **Sweep:** every path network input reaches. Two reachable aborts fixed:
+    - duplicate `pending_switches` entries from alternating nominations (`switch_listed`);
+    - `Create` with a room name over 256 bytes (checked in the orchestrator, and
+      `create_room` returns errors instead of asserting).
+  - Also fixed: the room-id counter overflow, the `Join` name cap and `room_id` above
+    u32.
+  - New tests: two regressions, a `nexus-state` test, and two proptests (authenticated
+    STUN sequences, random signaling). Each fails without its fix.
+  - Known non-panic issues are listed in that section. **Exit criterion 6 met.**
+  - Tests 1,422 → 1,428 (macOS). `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                0s
+  macos          PASS  clippy                                          19s
+  macos          PASS  cargo test --workspace                         164s (1428 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            5s (20 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                4s
+  linux-arm64    PASS  clippy                                          17s
+  linux-arm64    PASS  release build                                   87s
+  linux-arm64    PASS  cargo test --workspace                         236s (1434 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           60s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     26s
+  ci-local 2026-09-28 14:48, 5888a11 (15 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit. Then the owner's §17.9 browser run (exit criterion 4), then
+  1.9.
+- 2026-09-28, second review of the exit criterion 6 sweep (uncommitted, for review): the
+  first sweep missed the SWIM gossip socket (details under "Before 1.9").
+  - **Gossip receive path hardened:**
+    - an empty datagram is dropped; an oversized one is truncated by the kernel and
+      its bytes decoded safely; every decoder returns `None` or an error;
+    - apply paths in `DistributedState` return errors;
+    - snapshots are capped and incarnations saturate;
+    - the subscription decoder now matches its encoder.
+    - Tests: `gossip_robustness.rs` (14 tests, including proptests over random and
+      structured bytes). Each fix was checked by reverting it.
+  - **Gossip off unless a cluster is configured:** `cluster.gossip_enabled`, default off,
+    with a specific `gossip_bind_addr`. Design doc §2 non-goals and revision log record
+    that gossip is unauthenticated and must be authenticated before clustering.
+  - **Rooms:**
+    - every room counts against `MAX_ROOMS`;
+    - 4 rooms per creating connection, released with their creator if still empty;
+    - participant sets grow on demand, capped at the room's limit (≈ 440 KB → 0 B heap
+      for an empty room, measured);
+    - `create_room` refuses an existing id.
+  - The memory bench creates rooms from one admin connection per room. The checked figure
+    is 17.5 KB, up from 16.9 KB: a room's participant set now grows at join and is counted
+    per participant.
+  - `address_change_mid_call`: the window now starts after every stream resumed (two
+    failures under full-suite load; cause not proven, see the section).
+  - Tests 1,428 → 1,456 (macOS). **Exit criterion 6 met.**
+  - `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           4s
+  macos          PASS  cargo test --workspace                         135s (1456 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            4s (20 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                4s
+  linux-arm64    PASS  clippy                                          10s
+  linux-arm64    PASS  release build                                    1s
+  linux-arm64    PASS  cargo test --workspace                         163s (1462 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                            2s
+  linux-arm64    PASS  bench memory (budget 25 KB)                      6s
+  ci-local 2026-09-28 16:21, 5888a11 (30 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit. Then the owner's §17.9 browser run (exit criterion 4), then
+  1.9.
+- 2026-09-28, third review before 1.9 (uncommitted, for review):
+  - one room-id allocator for REST and the orchestrator (`create_room_auto`);
+  - participant-set tombstones recycle (6,000 join/leave cycles pass; a ghost-per-leave
+    before);
+  - `address_change_mid_call` checks the silence rule on the earliest stream of both
+    directions and the resume bound on the latest;
+  - the plan's wording on oversized gossip datagrams (truncated by the kernel, decoded
+    safely);
+  - the startup log line and doc comments say gossip runs only in a cluster.
+  Tests 1,456 → 1,461 (macOS). `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                         155s (1461 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            4s (20 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                4s
+  linux-arm64    PASS  clippy                                          22s
+  linux-arm64    PASS  release build                                   88s
+  linux-arm64    PASS  cargo test --workspace                         273s (1467 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           61s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     27s
+  ci-local 2026-09-28 16:50, 5888a11 (33 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit "before 1.9". Then the owner's §17.9 browser run (exit
+  criterion 4), then 1.9.
+- 2026-09-28, verification of the third review before 1.9: one room-id allocator (atomic,
+  capped, never 0), tombstone recycling (correct on one node; unsafe with gossip, now also
+  in design §2 non-goals), rebind silence rule on the earliest stream, gossip log line
+  confirmed. macOS: 1,461 passed, e2e 4/4, SDK 20 passed. **Exit criterion 6 met.**
+  Committed and pushed. Left: the owner's §17.9 browser check (exit criterion 4), then 1.9.

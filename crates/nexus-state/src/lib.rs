@@ -142,7 +142,7 @@ pub mod types;
 pub use crdt::{GCounter, LWWReg, Orswot};
 pub use distributed_state::{
     DistributedState, DistributedStateConfig, RoomMetadata, RoomRegistry,
-    MAX_PARTICIPANTS_PER_ROOM, MAX_ROOMS, MAX_SUBSCRIPTIONS, MAX_TRACKS,
+    MAX_PARTICIPANTS_PER_ROOM, MAX_ROOMS, MAX_ROOM_NAME_LEN, MAX_SUBSCRIPTIONS, MAX_TRACKS,
 };
 pub use error::{CrdtError, CrdtResult, GossipError};
 pub use gossip::SwimProtocol;

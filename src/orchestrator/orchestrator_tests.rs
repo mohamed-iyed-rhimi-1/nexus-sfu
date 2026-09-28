@@ -17,6 +17,7 @@ use nexus_dataplane::{
 };
 use nexus_state::DistributedStateConfig;
 use parking_lot::Mutex;
+use proptest::prelude::*;
 
 use super::plane::CommandSink;
 use super::*;
@@ -605,6 +606,368 @@ fn mline_directions(sdp: &str) -> Vec<(String, &'static str)> {
             (mid.to_string(), dir)
         })
         .collect()
+}
+
+/// Room and participant input that reached asserts downstream (exit criterion 6):
+/// an over-long room name, the end of the room id space, an over-long participant
+/// name, a room id above u32 (it wrapped onto another room).
+#[tokio::test]
+async fn create_and_join_refuse_input_that_used_to_panic() {
+    let mut h = Harness::new();
+    let rx = connect(&mut h.orchestrator, 1);
+    h.clients.insert(1, rx);
+    let long = "a".repeat(nexus_state::MAX_ROOM_NAME_LEN + 1);
+    h.send(
+        1,
+        SignalMessage::Create {
+            room_name: Some(long),
+        },
+    );
+    assert_eq!(h.errors(1), ["INVALID_INPUT"]);
+    let longest = "é".repeat(nexus_state::MAX_ROOM_NAME_LEN / 2);
+    h.send(
+        1,
+        SignalMessage::Create {
+            room_name: Some(longest),
+        },
+    );
+    let created = h.drain(1);
+    assert!(matches!(
+        created[..],
+        [SignalMessage::Created { room_id: 1, .. }]
+    ));
+
+    // The last id is never handed out: no wrap to 0
+    h.orchestrator.plane.state.set_next_room_id(u32::MAX - 1);
+    h.send(1, SignalMessage::Create { room_name: None });
+    let created = h.drain(1);
+    let max = u64::from(u32::MAX - 1);
+    assert!(matches!(created[..], [SignalMessage::Created { room_id, .. }] if room_id == max));
+    h.send(1, SignalMessage::Create { room_name: None });
+    assert_eq!(h.errors(1), ["ROOM_LIMIT"]);
+
+    let name = "n".repeat(room::MAX_PARTICIPANT_NAME_LEN + 1);
+    h.send(
+        1,
+        SignalMessage::Join {
+            room_id: 1,
+            participant_name: name,
+        },
+    );
+    assert_eq!(h.errors(1), ["INVALID_INPUT"]);
+    h.send(
+        1,
+        SignalMessage::Join {
+            room_id: (1u64 << 32) + 1,
+            participant_name: "p1".into(),
+        },
+    );
+    assert_eq!(h.errors(1), ["ROOM_NOT_FOUND"], "not room 1");
+    h.send(
+        1,
+        SignalMessage::Join {
+            room_id: 1,
+            participant_name: "p1".into(),
+        },
+    );
+    assert!(h.errors(1).is_empty());
+}
+
+/// Room creation is bounded per connection, and a room nobody joined is released
+/// when its creator leaves or disconnects; a room with members is not.
+#[tokio::test]
+async fn created_rooms_are_limited_and_released_with_their_creator() {
+    let mut h = Harness::new();
+    for pid in [1, 2] {
+        let rx = connect(&mut h.orchestrator, pid);
+        h.clients.insert(pid, rx);
+    }
+    let state = h.orchestrator.plane.state.clone();
+    for _ in 0..room::MAX_ROOMS_PER_CREATOR {
+        h.send(1, SignalMessage::Create { room_name: None });
+    }
+    let created: Vec<u64> = h
+        .drain(1)
+        .into_iter()
+        .filter_map(|m| match m {
+            SignalMessage::Created { room_id, .. } => Some(room_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(created.len(), room::MAX_ROOMS_PER_CREATOR);
+    h.send(
+        1,
+        SignalMessage::Create {
+            room_name: Some("one more".into()),
+        },
+    );
+    assert_eq!(h.errors(1), ["ROOM_LIMIT"]);
+    // A known name is not a new room: allowed
+    h.send(
+        2,
+        SignalMessage::Create {
+            room_name: Some("shared".into()),
+        },
+    );
+    h.send(
+        1,
+        SignalMessage::Create {
+            room_name: Some("shared".into()),
+        },
+    );
+    assert!(h.errors(1).is_empty());
+    assert_eq!(state.room_count(), room::MAX_ROOMS_PER_CREATOR + 1);
+
+    // Participant 2 joins one of 1's rooms; 1 disconnects: the empty ones go
+    let joined = created[0];
+    h.send(
+        2,
+        SignalMessage::Join {
+            room_id: joined,
+            participant_name: "p2".into(),
+        },
+    );
+    h.drain(2);
+    h.orchestrator
+        .dispatch_event(OrchestratorEvent::Disconnected { participant_id: 1 });
+    h.orchestrator.settle();
+    assert!(
+        state.room_exists(joined as u32),
+        "a room with a member stays"
+    );
+    for room in &created[1..] {
+        assert!(
+            !state.room_exists(*room as u32),
+            "empty room {room} released"
+        );
+    }
+    assert!(
+        state.room_exists(1 + room::MAX_ROOMS_PER_CREATOR as u32),
+        "2's room stays"
+    );
+    // The last member leaving releases the joined room as before
+    h.send(2, SignalMessage::Leave);
+    assert!(!state.room_exists(joined as u32));
+}
+
+/// A room id the REST API created first is skipped, not overwritten.
+#[tokio::test]
+async fn create_skips_a_room_id_taken_elsewhere() {
+    let mut h = Harness::new();
+    let rx = connect(&mut h.orchestrator, 1);
+    h.clients.insert(1, rx);
+    let state = h.orchestrator.plane.state.clone();
+    state.create_room(1, "rest".into(), 10).unwrap();
+    state.add_participant(1, 99).unwrap();
+    h.send(1, SignalMessage::Create { room_name: None });
+    let created = h.drain(1);
+    assert!(matches!(
+        created[..],
+        [SignalMessage::Created { room_id: 2, .. }]
+    ));
+    assert_eq!(state.get_room(1).unwrap().name(), "rest");
+    assert_eq!(state.participant_count(1), 1);
+}
+
+/// Every room counts against `MAX_ROOMS`, named or not and however created. With
+/// participant sets that grow on join, 10,000 empty rooms are cheap to hold.
+#[tokio::test]
+async fn unnamed_rooms_count_against_the_room_cap() {
+    let mut h = Harness::new();
+    let rx = connect(&mut h.orchestrator, 1);
+    h.clients.insert(1, rx);
+    let state = h.orchestrator.plane.state.clone();
+    for id in 1..=room::MAX_ROOMS as u32 {
+        state.create_room(id, String::new(), 10).unwrap();
+    }
+    h.send(1, SignalMessage::Create { room_name: None });
+    assert_eq!(h.errors(1), ["ROOM_LIMIT"]);
+    h.send(
+        1,
+        SignalMessage::Create {
+            room_name: Some("named".into()),
+        },
+    );
+    assert_eq!(h.errors(1), ["ROOM_LIMIT"]);
+    assert_eq!(state.room_count(), room::MAX_ROOMS);
+}
+
+/// 6,000 participants join and leave one room (more than the participant set's
+/// tombstones): every leave takes effect and the room stays usable.
+#[tokio::test]
+async fn join_leave_churn_keeps_the_room_usable() {
+    let mut h = Harness::new();
+    h.join(1);
+    let state = h.orchestrator.plane.state.clone();
+    for pid in 2..6_002u64 {
+        let rx = connect(&mut h.orchestrator, pid);
+        h.clients.insert(pid, rx);
+        h.join_room(pid, 1);
+        h.send(pid, SignalMessage::Leave);
+        h.orchestrator
+            .dispatch_event(OrchestratorEvent::Disconnected {
+                participant_id: pid,
+            });
+        h.orchestrator.settle();
+        h.clients.remove(&pid);
+        h.drain(1);
+    }
+    assert_eq!(state.participant_count(1), 1, "only participant 1 is left");
+    h.join(6_002);
+    assert_eq!(state.participant_count(1), 2);
+}
+
+/// One step of the signaling fuzzer.
+#[derive(Clone, Debug)]
+enum Step {
+    /// A message from participant 1, 2 or 3.
+    Send(u64, SignalMessage),
+    /// A well-formed answer to the participant's latest offer.
+    AnswerLatest(u64, u32, bool),
+    Disconnect(u64),
+    Reconnect(u64),
+    /// Join the fuzz room (id 1).
+    JoinRoom(u64),
+    /// A well-formed Publish of these kinds (true: video).
+    PublishKinds(u64, Vec<bool>),
+    /// Subscribe to up to this many tracks seen in TrackPublished/Joined.
+    SubscribeSeen(u64, usize),
+}
+
+fn fuzz_string() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-z]{0,8}",
+        ".{0,40}",
+        (250..300usize).prop_map(|n| "x".repeat(n)),
+        Just("audio".to_string()),
+        Just("video".to_string()),
+    ]
+}
+
+fn fuzz_ids() -> impl Strategy<Value = Vec<u64>> {
+    prop::collection::vec(prop_oneof![0..12u64, any::<u64>()], 0..14)
+}
+
+fn fuzz_message() -> impl Strategy<Value = SignalMessage> {
+    prop_oneof![
+        prop::option::of(fuzz_string()).prop_map(|room_name| SignalMessage::Create { room_name }),
+        (prop_oneof![0..4u64, any::<u64>()], fuzz_string()).prop_map(
+            |(room_id, participant_name)| SignalMessage::Join {
+                room_id,
+                participant_name
+            }
+        ),
+        Just(SignalMessage::Leave),
+        (
+            prop::collection::vec(fuzz_string(), 0..4),
+            prop::collection::vec(fuzz_string(), 0..4)
+        )
+            .prop_map(|(kinds, contents)| SignalMessage::Publish { kinds, contents }),
+        fuzz_ids().prop_map(|track_ids| SignalMessage::Unpublish { track_ids }),
+        fuzz_ids().prop_map(|track_ids| SignalMessage::Subscribe { track_ids }),
+        fuzz_ids().prop_map(|track_ids| SignalMessage::Unsubscribe { track_ids }),
+        fuzz_string().prop_map(|sdp| SignalMessage::Answer { sdp }),
+        (
+            fuzz_string(),
+            prop::option::of(fuzz_string()),
+            prop::option::of(any::<u32>())
+        )
+            .prop_map(|(candidate, sdp_mid, sdp_mline_index)| {
+                SignalMessage::IceCandidate {
+                    candidate,
+                    sdp_mid,
+                    sdp_mline_index,
+                }
+            }),
+        (0..12u64, fuzz_string())
+            .prop_map(|(track_id, content)| SignalMessage::SetContent { track_id, content }),
+        (fuzz_ids(), fuzz_ids())
+            .prop_map(|(visible, pinned)| SignalMessage::Viewport { visible, pinned }),
+        Just(SignalMessage::Ping),
+        Just(SignalMessage::EndOfCandidates),
+        fuzz_string().prop_map(|sdp| SignalMessage::Offer {
+            sdp,
+            tracks: Vec::new()
+        }),
+    ]
+}
+
+fn fuzz_step() -> impl Strategy<Value = Step> {
+    let pid = 1..=3u64;
+    prop_oneof![
+        6 => (pid.clone(), fuzz_message()).prop_map(|(p, m)| Step::Send(p, m)),
+        3 => (pid.clone(), 1_000..60_000u32, any::<bool>()).prop_map(|(p, s, d)| Step::AnswerLatest(p, s, d)),
+        1 => pid.clone().prop_map(Step::Disconnect),
+        1 => pid.clone().prop_map(Step::Reconnect),
+        3 => pid.clone().prop_map(Step::JoinRoom),
+        3 => (pid.clone(), prop::collection::vec(any::<bool>(), 1..3)).prop_map(|(p, k)| Step::PublishKinds(p, k)),
+        3 => (pid, 1..12usize).prop_map(|(p, n)| Step::SubscribeSeen(p, n)),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+    /// Random signaling from three participants, well-formed and not, in any
+    /// order, including well-formed answers (declined m-lines, colliding SSRCs):
+    /// the orchestrator never panics (exit criterion 6).
+    #[test]
+    fn random_signaling_never_panics(steps in prop::collection::vec(fuzz_step(), 1..60)) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+        let mut h = Harness::new();
+        let mut offers: HashMap<u64, String> = HashMap::new();
+        let mut seen: Vec<u64> = Vec::new();
+        for pid in 1..=3u64 {
+            let rx = connect(&mut h.orchestrator, pid);
+            h.clients.insert(pid, rx);
+        }
+        h.send(1, SignalMessage::Create { room_name: Some("fuzz".into()) });
+        for step in steps {
+            match step {
+                Step::Send(pid, message) => h.send(pid, message),
+                Step::AnswerLatest(pid, ssrc_base, decline) => {
+                    if let Some(offer) = offers.get(&pid) {
+                        let declined: Vec<&str> = if decline { vec!["0"] } else { Vec::new() };
+                        let sdp = answer_for(offer, ssrc_base, &declined);
+                        h.send(pid, SignalMessage::Answer { sdp });
+                    }
+                }
+                Step::Disconnect(pid) => {
+                    h.orchestrator.dispatch_event(OrchestratorEvent::Disconnected { participant_id: pid });
+                    h.orchestrator.settle();
+                }
+                Step::Reconnect(pid) => {
+                    let rx = connect(&mut h.orchestrator, pid);
+                    h.clients.insert(pid, rx);
+                    offers.remove(&pid);
+                }
+                Step::JoinRoom(pid) => h.send(pid, SignalMessage::Join { room_id: 1, participant_name: format!("p{pid}") }),
+                Step::PublishKinds(pid, video) => {
+                    let kinds: Vec<&str> = video.iter().map(|&v| if v { "video" } else { "audio" }).collect();
+                    h.send(pid, publish_msg(&kinds));
+                }
+                Step::SubscribeSeen(pid, n) => {
+                    let track_ids: Vec<u64> = seen.iter().rev().take(n).copied().collect();
+                    h.send(pid, SignalMessage::Subscribe { track_ids });
+                }
+            }
+            for pid in 1..=3u64 {
+                for message in h.drain(pid) {
+                    match message {
+                        SignalMessage::Offer { sdp, .. } => {
+                            offers.insert(pid, sdp);
+                        }
+                        SignalMessage::TrackPublished { track_id, .. } => seen.push(track_id),
+                        SignalMessage::Joined { tracks, .. } => {
+                            seen.extend(tracks.iter().map(|t| t.track_id));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The PT of each m-line's first `a=rtpmap`, by mid.

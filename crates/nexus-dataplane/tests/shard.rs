@@ -1435,6 +1435,61 @@ fn throttled_nomination_is_applied_when_the_interval_passes() {
     assert_eq!(shard.snapshot().sessions, 0);
 }
 
+/// Nominations alternating between a new address and the current one inside the
+/// switch interval list the session once. Each cancel used to leave its entry, and
+/// the next throttled nomination added another, until the list's capacity assert
+/// aborted the process (exit criterion 6).
+#[test]
+fn alternating_throttled_nominations_list_the_session_once() {
+    let t0 = Instant::now();
+    let config = nexus_dataplane::ShardConfig {
+        pool_buffers: 512,
+        max_sessions: 2,
+        ..Default::default()
+    };
+    let io = nexus_dataplane::MemIo::new();
+    let mut shard: TestShard = nexus_dataplane::Shard::new(config, io, Vec::new(), t0).unwrap();
+    let peer = Peer::new(1, "192.0.2.1:1000", GCM);
+    command(&mut shard, peer.create());
+    run(&mut shard, t0);
+    let current: SocketAddr = "192.0.2.1:1000".parse().unwrap();
+    let other: SocketAddr = "192.0.2.1:2000".parse().unwrap();
+    shard
+        .io_mut()
+        .push_inbound(current, peer.binding_request(true));
+    run(&mut shard, t0);
+    assert_eq!(shard.session_addr(peer.id), Some(current));
+
+    // Pairs within the interval, ending each batch on `other` so the nomination
+    // stays pending across batches (the case that piled up entries)
+    for round in 0..100u64 {
+        for _ in 0..2 {
+            shard
+                .io_mut()
+                .push_inbound(current, peer.binding_request(true));
+            shard
+                .io_mut()
+                .push_inbound(other, peer.binding_request(true));
+        }
+        run(&mut shard, at(t0, round * 9 / 10)); // 0..89 ms
+    }
+    assert_eq!(shard.session_addr(peer.id), Some(current));
+    assert_eq!(shard.counters().switch_throttled, 200);
+
+    // The pending nomination of `other` is applied once due, once
+    run(&mut shard, at(t0, 100));
+    run(&mut shard, at(t0, 150));
+    assert_eq!(shard.session_addr(peer.id), Some(other));
+    let selected = events(&mut shard)
+        .into_iter()
+        .filter(|e| matches!(e, Event::AddressSelected { .. }))
+        .count();
+    assert_eq!(
+        selected, 2,
+        "the first selection and the one pending switch"
+    );
+}
+
 #[test]
 fn replayed_nomination_does_not_move_the_session() {
     let now = Instant::now();
@@ -1588,6 +1643,80 @@ proptest! {
             .iter()
             .all(|e| matches!(e, Event::DtlsDatagram { .. }));
         prop_assert!(only_dtls);
+    }
+}
+
+/// One step of the STUN fuzzer: which peer sends, from which of four addresses
+/// (index 3 is shared by both peers), nominated or not, a replay of that peer's
+/// previous request or a fresh one, and how many ms pass before the shard runs
+/// (none: the request joins the next batch).
+fn stun_step() -> impl Strategy<Value = (usize, usize, bool, bool, Option<u64>)> {
+    (
+        0..2usize,
+        0..4usize,
+        any::<bool>(),
+        any::<bool>(),
+        prop::option::of(0..60u64),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// Authenticated binding requests in random order, sources, nominations,
+    /// replays and timing (switch throttle, rebind silence, address stealing):
+    /// no panic, each session keeps an address one of its requests came from,
+    /// and only `AddressSelected` events come out (exit criterion 6).
+    #[test]
+    fn authenticated_stun_sequences_never_panic(steps in prop::collection::vec(stun_step(), 1..200)) {
+        let t0 = Instant::now();
+        let config = nexus_dataplane::ShardConfig {
+            pool_buffers: 512,
+            max_sessions: 2,
+            ..Default::default()
+        };
+        let io = nexus_dataplane::MemIo::new();
+        let mut shard: TestShard = nexus_dataplane::Shard::new(config, io, Vec::new(), t0).unwrap();
+        let peers = [
+            Peer::new(1, "192.0.2.1:1000", GCM),
+            Peer::new(2, "192.0.2.2:1000", GCM),
+        ];
+        for peer in &peers {
+            command(&mut shard, peer.create());
+        }
+        run(&mut shard, t0);
+        let addr = |peer: usize, i: usize| -> SocketAddr {
+            if i == 3 {
+                "198.51.100.9:4000".parse().unwrap()
+            } else {
+                format!("192.0.2.{}:{}", peer + 1, 1000 + i).parse().unwrap()
+            }
+        };
+        let mut last: [Option<Vec<u8>>; 2] = [None, None];
+        let mut ms = 0;
+        for (peer, source, nominated, replay, dt) in steps {
+            let bytes = match (&last[peer], replay) {
+                (Some(previous), true) => previous.clone(),
+                _ => peers[peer].binding_request(nominated),
+            };
+            last[peer] = Some(bytes.clone());
+            shard.io_mut().push_inbound(addr(peer, source), bytes);
+            if let Some(dt) = dt {
+                ms += dt;
+                run(&mut shard, at(t0, ms));
+            }
+        }
+        run(&mut shard, at(t0, ms + 1_000));
+        prop_assert_eq!(shard.snapshot().sessions, 2);
+        for (n, peer) in peers.iter().enumerate() {
+            if let Some(selected) = shard.session_addr(peer.id) {
+                prop_assert!((0..4).any(|i| addr(n, i) == selected), "{selected}");
+            }
+        }
+        let only_selected = events(&mut shard)
+            .iter()
+            .all(|e| matches!(e, Event::AddressSelected { .. }));
+        prop_assert!(only_selected);
     }
 }
 

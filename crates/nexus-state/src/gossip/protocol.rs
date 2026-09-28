@@ -32,7 +32,8 @@ use super::config::GossipConfig;
 use super::membership::MembershipList;
 use super::transport::GossipTransport;
 use super::types::{
-    GossipMessage, PeerInfo, PeerState, StateUpdate, MAX_PEERS, MAX_PIGGYBACK_UPDATES,
+    GossipMessage, PeerInfo, PeerState, StateUpdate, MAX_MESSAGE_SIZE, MAX_PEERS,
+    MAX_PIGGYBACK_UPDATES, MAX_SNAPSHOT_MEMBERS,
 };
 use crate::distributed_state::DistributedState;
 use crate::error::GossipError;
@@ -95,6 +96,8 @@ pub struct ProtocolStats {
     pub state_updates_sent: AtomicU64,
     /// Total state updates received
     pub state_updates_received: AtomicU64,
+    /// Received datagrams dropped as malformed or invalid
+    pub messages_dropped: AtomicU64,
 }
 
 impl ProtocolStats {
@@ -113,6 +116,7 @@ impl ProtocolStats {
             peers_marked_dead: self.peers_marked_dead.load(Ordering::Relaxed),
             state_updates_sent: self.state_updates_sent.load(Ordering::Relaxed),
             state_updates_received: self.state_updates_received.load(Ordering::Relaxed),
+            messages_dropped: self.messages_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -125,6 +129,7 @@ impl ProtocolStats {
         self.peers_marked_dead.store(0, Ordering::Relaxed);
         self.state_updates_sent.store(0, Ordering::Relaxed);
         self.state_updates_received.store(0, Ordering::Relaxed);
+        self.messages_dropped.store(0, Ordering::Relaxed);
     }
 }
 
@@ -138,6 +143,7 @@ pub struct ProtocolStatsSnapshot {
     pub peers_marked_dead: u64,
     pub state_updates_sent: u64,
     pub state_updates_received: u64,
+    pub messages_dropped: u64,
 }
 
 /// SWIM protocol coordinator.
@@ -444,13 +450,14 @@ impl SwimProtocol {
             return Ok(()); // No peers to sync with
         };
 
-        // Build membership snapshot (bounded by MAX_PEERS)
+        // Build membership snapshot, bounded so the message fits the MTU
+        // (peers are added by received pings, so the list can be full)
         let all_peers = self.membership.get_all_peers();
         let mut members: Vec<(ActorId, u64, u8)> =
-            Vec::with_capacity(all_peers.len().min(MAX_PEERS));
+            Vec::with_capacity(all_peers.len().min(MAX_SNAPSHOT_MEMBERS));
 
         for (i, p) in all_peers.into_iter().enumerate() {
-            if i >= MAX_PEERS {
+            if i >= MAX_SNAPSHOT_MEMBERS {
                 break;
             }
             let state_byte = match p.state() {
@@ -584,7 +591,10 @@ impl SwimProtocol {
         target_addr: SocketAddr,
         requester_addr: SocketAddr,
     ) -> Result<(), GossipError> {
-        assert!(target != self.local_actor, "cannot ping-req self");
+        // Network input: a ping-req about ourselves is dropped, not asserted
+        if target == self.local_actor {
+            return Err(self.drop_message("ping-req targets the local actor"));
+        }
 
         // Send ping to target on behalf of requester
         let incarnation = self.membership.local_incarnation();
@@ -686,8 +696,8 @@ impl SwimProtocol {
 
         // Merge membership information (bounded by MAX_PEERS)
         for (actor_id, inc, state) in members.into_iter().take(MAX_PEERS) {
-            if actor_id == self.local_actor {
-                continue; // Skip self
+            if actor_id == self.local_actor || actor_id >= MAX_ACTORS as u64 {
+                continue; // Skip self and invalid ids
             }
 
             // Convert state byte to PeerState
@@ -893,12 +903,10 @@ impl SwimProtocol {
     /// # TigerStyle Compliance
     /// - ≤70 lines
     /// - ≥2 assertions
-    fn process_state_updates(&mut self, updates: Vec<StateUpdate>) {
-        // Precondition: updates bounded by protocol limit
-        assert!(
-            updates.len() <= MAX_PIGGYBACK_UPDATES,
-            "too many piggyback updates"
-        );
+    fn process_state_updates(&mut self, mut updates: Vec<StateUpdate>) {
+        // The decoder bounds received updates; stay bounded for any caller
+        updates.truncate(MAX_PIGGYBACK_UPDATES);
+        assert!(updates.len() <= MAX_PIGGYBACK_UPDATES);
 
         // Track statistics
         self.stats
@@ -1033,11 +1041,20 @@ impl SwimProtocol {
     /// Handle an incoming message.
     ///
     /// Dispatches to the appropriate handler based on message type.
+    ///
+    /// # Errors
+    /// `GossipError::InvalidMessage` (counted in `messages_dropped`) when an
+    /// actor id in the message is out of range or a ping-req targets us.
     pub fn handle_message(
         &mut self,
         msg: GossipMessage,
         source: SocketAddr,
     ) -> Result<(), GossipError> {
+        // Messages can be built by callers too: check what the decoder checks
+        if !actor_ids_in_range(&msg) {
+            return Err(self.drop_message("actor id out of range"));
+        }
+
         match msg {
             GossipMessage::Ping {
                 from,
@@ -1077,18 +1094,49 @@ impl SwimProtocol {
         }
     }
 
+    /// Decode and handle one received datagram.
+    ///
+    /// This is the whole receive path after the socket: `data` is untrusted.
+    /// Malformed or invalid datagrams are dropped and counted in
+    /// `messages_dropped`; nothing here panics on network input.
+    ///
+    /// # Errors
+    /// `GossipError::InvalidMessage` if the datagram was dropped, or the
+    /// handler's error (e.g. a failed send of the response).
+    pub fn handle_datagram(&mut self, data: &[u8], source: SocketAddr) -> Result<(), GossipError> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(self.drop_message("datagram exceeds MAX_MESSAGE_SIZE"));
+        }
+        match GossipMessage::decode(data) {
+            Ok(msg) => self.handle_message(msg, source),
+            Err(reason) => Err(self.drop_message(reason)),
+        }
+    }
+
+    /// Count a dropped message and build its error.
+    fn drop_message(&self, reason: &'static str) -> GossipError {
+        self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+        GossipError::InvalidMessage {
+            reason: reason.to_string(),
+        }
+    }
+
     /// Run one iteration of the receive loop.
     ///
-    /// Attempts to receive and process incoming messages (non-blocking).
+    /// Attempts to receive and process one incoming datagram (non-blocking).
+    /// Invalid datagrams are dropped and counted (`messages_dropped`), not
+    /// returned as errors, so a flood of junk cannot flood the caller's log.
     pub fn recv_loop_iteration(&mut self) -> Result<(), GossipError> {
-        // Try to receive with short timeout (non-blocking)
-        if let Some((msg, source)) = self.transport.try_recv() {
-            self.handle_message(msg, source)?;
-        } else {
-            // No message available - not an error
-        }
+        let mut buffer = [0u8; MAX_MESSAGE_SIZE];
+        let Some((len, source)) = self.transport.recv_raw(&mut buffer) else {
+            return Ok(()); // No message available - not an error
+        };
+        assert!(len > 0 && len <= MAX_MESSAGE_SIZE);
 
-        Ok(())
+        match self.handle_datagram(&buffer[..len], source) {
+            Err(GossipError::InvalidMessage { .. }) => Ok(()),
+            result => result,
+        }
     }
 
     /// Run the protocol for a specified duration.
@@ -1113,6 +1161,22 @@ impl SwimProtocol {
         }
 
         Ok(())
+    }
+}
+
+/// Whether every actor id in `msg` is below `MAX_ACTORS` (the decoder's check,
+/// repeated for messages built by callers of `handle_message`).
+fn actor_ids_in_range(msg: &GossipMessage) -> bool {
+    let valid = |id: ActorId| id < MAX_ACTORS as u64;
+    match msg {
+        GossipMessage::Ping { from, .. }
+        | GossipMessage::Ack { from, .. }
+        | GossipMessage::StateSnapshot { from, .. } => valid(*from),
+        GossipMessage::PingReq { from, target, .. } => valid(*from) && valid(*target),
+        GossipMessage::Suspect { actor_id, .. }
+        | GossipMessage::Alive { actor_id, .. }
+        | GossipMessage::Dead { actor_id } => valid(*actor_id),
+        GossipMessage::ForwardedAck { target, .. } => valid(*target),
     }
 }
 

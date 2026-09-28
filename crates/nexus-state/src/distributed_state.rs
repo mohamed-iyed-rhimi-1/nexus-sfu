@@ -373,6 +373,9 @@ pub struct DistributedState {
     /// When set, state changes are sent through this channel to be
     /// piggybacked on gossip messages.
     broadcast_tx: RwLock<Option<std::sync::mpsc::Sender<StateUpdate>>>,
+    /// Next id `create_room_auto` tries; advanced under the rooms lock, never
+    /// reused. The one allocator for the orchestrator and the REST API.
+    next_room_id: std::sync::atomic::AtomicU32,
 }
 
 impl DistributedState {
@@ -413,6 +416,7 @@ impl DistributedState {
             subscriptions: RwLock::new(subscriptions),
             config,
             broadcast_tx: RwLock::new(None),
+            next_room_id: std::sync::atomic::AtomicU32::new(1),
         }
     }
 
@@ -475,57 +479,114 @@ impl DistributedState {
     ///
     /// `Ok(())` on success, or `CrdtError::CapacityExhausted` if room limit reached.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `room_id == 0`, `name.is_empty()`, or `max_participants == 0`.
+    /// Returns `InvalidState` if `room_id == 0`, the name is longer than
+    /// `MAX_ROOM_NAME_LEN`, or `max_participants` is 0 or above
+    /// `MAX_PARTICIPANTS_PER_ROOM`: callers pass client input, which must not
+    /// reach the asserts of `RoomMetadata::new`. Returns `DuplicateElement` if
+    /// the room exists: it is never replaced.
     pub fn create_room(
         &self,
         room_id: RoomId,
         name: String,
         max_participants: u32,
     ) -> Result<(), CrdtError> {
-        assert!(room_id != 0, "room_id must be non-zero");
-        assert!(max_participants > 0, "max_participants must be positive");
-
-        // Get current timestamp from clock
-        let timestamp = {
-            let mut clock = self.clock.write().unwrap();
-            clock.increment(self.local_actor)
-        };
-
-        let created_at_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
-        let metadata = RoomMetadata::new(room_id, name, max_participants, created_at_ns);
-
-        // Acquire write locks
+        if room_id == 0 {
+            return Err(CrdtError::InvalidState {
+                reason: "room id 0",
+            });
+        }
+        check_room_input(&name, max_participants)?;
+        let metadata = new_room_metadata(room_id, name, max_participants);
+        let timestamp = self.tick();
         let mut rooms = self.rooms.write().unwrap();
         let mut participants = self.participants.write().unwrap();
-
-        // Check capacity
+        // An existing room keeps its metadata and members
+        if rooms.contains_key(&room_id) {
+            return Err(CrdtError::DuplicateElement);
+        }
         if rooms.len() >= self.config.max_rooms {
             return Err(CrdtError::CapacityExhausted {
                 capacity: self.config.max_rooms as u32,
             });
         }
+        self.insert_room(&mut rooms, &mut participants, metadata, timestamp);
+        Ok(())
+    }
 
-        // Create LWWReg for room metadata
+    /// Creates a room under the next free id and returns it: the allocator the
+    /// orchestrator and the REST API share, so neither takes the other's id. Ids
+    /// are never reused (existing ones are skipped) and 0 is never handed out.
+    ///
+    /// # Errors
+    /// As `create_room` (bad input, `CapacityExhausted`), and `Overflow` once the
+    /// id space is used up.
+    pub fn create_room_auto(
+        &self,
+        name: String,
+        max_participants: u32,
+    ) -> Result<RoomId, CrdtError> {
+        use std::sync::atomic::Ordering;
+        check_room_input(&name, max_participants)?;
+        let timestamp = self.tick();
+        let mut rooms = self.rooms.write().unwrap();
+        let mut participants = self.participants.write().unwrap();
+        if rooms.len() >= self.config.max_rooms {
+            return Err(CrdtError::CapacityExhausted {
+                capacity: self.config.max_rooms as u32,
+            });
+        }
+        // Bounded: at most `rooms.len()` < max_rooms ids are taken
+        for _ in 0..=self.config.max_rooms {
+            let room_id = self.next_room_id.load(Ordering::Relaxed);
+            // The last id is not handed out, so the counter never wraps to 0
+            let next = room_id.checked_add(1).ok_or(CrdtError::Overflow)?;
+            self.next_room_id.store(next, Ordering::Relaxed);
+            assert!(room_id != 0);
+            if !rooms.contains_key(&room_id) {
+                let metadata = new_room_metadata(room_id, name, max_participants);
+                self.insert_room(&mut rooms, &mut participants, metadata, timestamp);
+                return Ok(room_id);
+            }
+        }
+        Err(CrdtError::CapacityExhausted {
+            capacity: self.config.max_rooms as u32,
+        })
+    }
+
+    /// The next id `create_room_auto` tries (tests: the end of the id space).
+    #[doc(hidden)]
+    pub fn set_next_room_id(&self, room_id: RoomId) {
+        assert!(room_id != 0);
+        let _rooms = self.rooms.write().unwrap();
+        self.next_room_id
+            .store(room_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A new local clock value. Taken before the room locks: the clock is never
+    /// locked while they are held.
+    fn tick(&self) -> u64 {
+        self.clock.write().unwrap().increment(self.local_actor)
+    }
+
+    /// Inserts a checked room with an empty participant set, capped at the room's
+    /// limit (it grows on join). Callers hold both write locks.
+    fn insert_room(
+        &self,
+        rooms: &mut HashMap<RoomId, RoomRegistry>,
+        participants: &mut HashMap<RoomId, Orswot<ParticipantId>>,
+        metadata: RoomMetadata,
+        timestamp: u64,
+    ) {
+        let room_id = metadata.room_id();
+        let max_participants = metadata.max_participants() as usize;
+        assert!(!rooms.contains_key(&room_id) && rooms.len() < self.config.max_rooms);
         let mut reg = LWWReg::new(RoomMetadata::default(), self.local_actor);
         reg.set(metadata, timestamp, self.local_actor);
-
-        // Insert room
         rooms.insert(room_id, reg);
-
-        // Create empty participant set for this room
-        participants.insert(room_id, Orswot::new());
-
-        // Postcondition: room exists
-        debug_assert!(rooms.contains_key(&room_id));
-        debug_assert!(participants.contains_key(&room_id));
-
-        Ok(())
+        participants.insert(room_id, Orswot::with_capacity(max_participants));
+        debug_assert!(rooms.contains_key(&room_id) && participants.contains_key(&room_id));
     }
 
     /// Gets room metadata.
@@ -599,17 +660,14 @@ impl DistributedState {
     /// `Ok(Dot)` with the operation's dot on success, or an error if:
     /// - Room doesn't exist
     /// - Room is at capacity
-    ///
-    /// # Panics
-    ///
-    /// Panics if `room_id == 0` or `participant_id == 0`.
+    /// - `room_id == 0` or `participant_id == 0` (`InvalidState`: gossip
+    ///   updates reach this with ids from the network)
     pub fn add_participant(
         &self,
         room_id: RoomId,
         participant_id: ParticipantId,
     ) -> Result<Dot, CrdtError> {
-        assert!(room_id != 0, "room_id must be non-zero");
-        assert!(participant_id != 0, "participant_id must be non-zero");
+        check_participant_ids(room_id, participant_id)?;
 
         // Generate dot
         let clock_value = {
@@ -663,18 +721,14 @@ impl DistributedState {
     ///
     /// # Returns
     ///
-    /// `Ok(Dot)` with the operation's dot on success, or error if room doesn't exist.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `room_id == 0` or `participant_id == 0`.
+    /// `Ok(Dot)` with the operation's dot on success, or error if room doesn't
+    /// exist, or `InvalidState` if `room_id == 0` or `participant_id == 0`.
     pub fn remove_participant(
         &self,
         room_id: RoomId,
         participant_id: ParticipantId,
     ) -> Result<Dot, CrdtError> {
-        assert!(room_id != 0, "room_id must be non-zero");
-        assert!(participant_id != 0, "participant_id must be non-zero");
+        check_participant_ids(room_id, participant_id)?;
 
         // Generate dot
         let clock_value = {
@@ -780,13 +834,10 @@ impl DistributedState {
     ///
     /// # Returns
     ///
-    /// `Ok(timestamp)` for the operation on success, or error if capacity exceeded.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `track_id == 0`.
+    /// `Ok(timestamp)` for the operation on success, or error if capacity
+    /// exceeded, or `InvalidState` if `track_id == 0`.
     pub fn add_track(&self, track_id: TrackId, info: TrackInfo) -> Result<u64, CrdtError> {
-        assert!(track_id != 0, "track_id must be non-zero");
+        check_track_id(track_id)?;
 
         // Generate timestamp
         let timestamp = {
@@ -830,13 +881,10 @@ impl DistributedState {
     ///
     /// # Returns
     ///
-    /// `Ok(timestamp)` on success, or error if track doesn't exist.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `track_id == 0`.
+    /// `Ok(timestamp)` on success, or error if track doesn't exist, or
+    /// `InvalidState` if `track_id == 0`.
     pub fn update_track(&self, track_id: TrackId, info: TrackInfo) -> Result<u64, CrdtError> {
-        assert!(track_id != 0, "track_id must be non-zero");
+        check_track_id(track_id)?;
 
         // Generate timestamp
         let timestamp = {
@@ -913,18 +961,14 @@ impl DistributedState {
     ///
     /// # Returns
     ///
-    /// `Ok(Dot)` with the operation's dot on success, or error if capacity exceeded.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `track_id == 0` or `participant_id == 0`.
+    /// `Ok(Dot)` with the operation's dot on success, or error if capacity
+    /// exceeded, or `InvalidState` if `track_id == 0` or `participant_id == 0`.
     pub fn add_subscription(
         &self,
         track_id: TrackId,
         participant_id: ParticipantId,
     ) -> Result<Dot, CrdtError> {
-        assert!(track_id != 0, "track_id must be non-zero");
-        assert!(participant_id != 0, "participant_id must be non-zero");
+        check_subscription_ids(track_id, participant_id)?;
 
         // Generate dot
         let clock_value = {
@@ -965,18 +1009,14 @@ impl DistributedState {
     ///
     /// # Returns
     ///
-    /// `Ok(Dot)` with the operation's dot on success.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `track_id == 0` or `participant_id == 0`.
+    /// `Ok(Dot)` with the operation's dot on success, or `InvalidState` if
+    /// `track_id == 0` or `participant_id == 0`.
     pub fn remove_subscription(
         &self,
         track_id: TrackId,
         participant_id: ParticipantId,
     ) -> Result<Dot, CrdtError> {
-        assert!(track_id != 0, "track_id must be non-zero");
-        assert!(participant_id != 0, "participant_id must be non-zero");
+        check_subscription_ids(track_id, participant_id)?;
 
         // Generate dot
         let clock_value = {
@@ -1156,8 +1196,16 @@ impl DistributedState {
     /// `Ok(())` on successful merge, or error if merge failed.
     // Deltas arrive owned from the gossip decoder; taking a reference would
     // only force clones of the payloads stored below.
+    ///
+    /// # Errors
+    ///
+    /// The update comes from the network: zero ids, an invalid dot, a zero
+    /// timestamp or an out-of-range actor return an error instead of reaching
+    /// the CRDT preconditions (see `check_delta`).
     #[allow(clippy::needless_pass_by_value)]
     pub fn merge_delta(&self, update: StateUpdate) -> Result<(), CrdtError> {
+        check_delta(&update)?;
+
         match update {
             StateUpdate::ParticipantAdded {
                 room_id,
@@ -1209,7 +1257,14 @@ impl DistributedState {
             } => {
                 let mut tracks = self.tracks.write().unwrap();
 
-                // Get or create register
+                // A new track counts against the capacity like add_track
+                if !tracks.contains_key(&track_id) && tracks.len() >= self.config.max_tracks {
+                    return Err(CrdtError::CapacityExhausted {
+                        capacity: self.config.max_tracks as u32,
+                    });
+                }
+
+                // Get or create register (check_delta: timestamp > 0, actor in range)
                 let reg = tracks
                     .entry(track_id)
                     .or_insert_with(|| LWWReg::new(TrackInfo::default(), actor));
@@ -1226,6 +1281,14 @@ impl DistributedState {
                 dot,
             } => {
                 let mut subscriptions = self.subscriptions.write().unwrap();
+
+                if subscriptions.len() as usize >= self.config.max_subscriptions
+                    && !subscriptions.contains(&(track_id, participant_id))
+                {
+                    return Err(CrdtError::CapacityExhausted {
+                        capacity: self.config.max_subscriptions as u32,
+                    });
+                }
 
                 // Try to add - ignore result as idempotence is handled by CRDT
                 match subscriptions.add((track_id, participant_id), dot) {
@@ -1261,14 +1324,17 @@ impl DistributedState {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or the first error encountered.
+    /// `Ok(())` on success, or the first error encountered;
+    /// `CapacityExhausted` (nothing merged) if the batch is larger than
+    /// `MAX_PIGGYBACK_UPDATES`.
     pub fn merge_deltas(&self, updates: Vec<StateUpdate>) -> Result<(), CrdtError> {
         use crate::gossip::types::MAX_PIGGYBACK_UPDATES;
 
-        assert!(
-            updates.len() <= MAX_PIGGYBACK_UPDATES,
-            "too many updates in batch"
-        );
+        if updates.len() > MAX_PIGGYBACK_UPDATES {
+            return Err(CrdtError::CapacityExhausted {
+                capacity: MAX_PIGGYBACK_UPDATES as u32,
+            });
+        }
 
         for update in updates {
             self.merge_delta(update)?;
@@ -1438,8 +1504,136 @@ impl DistributedState {
 }
 
 // =============================================================================
+// Input Checks (ids reach these from clients and from gossip datagrams)
+// =============================================================================
+
+/// `InvalidState` unless both ids are non-zero.
+fn check_participant_ids(room_id: RoomId, participant_id: ParticipantId) -> Result<(), CrdtError> {
+    if room_id == 0 {
+        return Err(CrdtError::InvalidState {
+            reason: "room id 0",
+        });
+    }
+    if participant_id == 0 {
+        return Err(CrdtError::InvalidState {
+            reason: "participant id 0",
+        });
+    }
+    Ok(())
+}
+
+/// `InvalidState` unless the track id is non-zero.
+fn check_track_id(track_id: TrackId) -> Result<(), CrdtError> {
+    if track_id == 0 {
+        return Err(CrdtError::InvalidState {
+            reason: "track id 0",
+        });
+    }
+    Ok(())
+}
+
+/// `InvalidState` unless both ids are non-zero.
+fn check_subscription_ids(
+    track_id: TrackId,
+    participant_id: ParticipantId,
+) -> Result<(), CrdtError> {
+    check_track_id(track_id)?;
+    if participant_id == 0 {
+        return Err(CrdtError::InvalidState {
+            reason: "participant id 0",
+        });
+    }
+    Ok(())
+}
+
+/// `InvalidDot` unless the dot satisfies `Dot::new`'s invariants.
+fn check_dot(dot: Dot) -> Result<(), CrdtError> {
+    if dot.actor_id() >= MAX_ACTORS as u64 || dot.clock() == 0 {
+        return Err(CrdtError::InvalidDot {
+            actor_id: dot.actor_id(),
+            clock: dot.clock(),
+        });
+    }
+    Ok(())
+}
+
+/// Check a remote delta before it reaches the CRDT preconditions
+/// (`LWWReg::new`/`set`: actor in range, timestamp > 0; non-zero ids).
+fn check_delta(update: &StateUpdate) -> Result<(), CrdtError> {
+    match *update {
+        StateUpdate::ParticipantAdded {
+            room_id,
+            participant_id,
+            dot,
+        }
+        | StateUpdate::ParticipantRemoved {
+            room_id,
+            participant_id,
+            dot,
+        } => {
+            check_participant_ids(room_id, participant_id)?;
+            check_dot(dot)
+        }
+        StateUpdate::TrackUpdated {
+            track_id,
+            timestamp,
+            actor,
+            ..
+        } => {
+            check_track_id(track_id)?;
+            if timestamp == 0 {
+                return Err(CrdtError::InvalidTimestamp { timestamp });
+            }
+            if actor >= MAX_ACTORS as u64 {
+                return Err(CrdtError::InvalidActorId { actor_id: actor });
+            }
+            Ok(())
+        }
+        StateUpdate::SubscriptionAdded {
+            track_id,
+            participant_id,
+            dot,
+        }
+        | StateUpdate::SubscriptionRemoved {
+            track_id,
+            participant_id,
+            dot,
+        } => {
+            check_subscription_ids(track_id, participant_id)?;
+            check_dot(dot)
+        }
+        StateUpdate::RelaySubscribe { .. } | StateUpdate::RelayUnsubscribe { .. } => Ok(()),
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
+
+/// Metadata for a new room, stamped with the wall clock.
+fn new_room_metadata(room_id: RoomId, name: String, max_participants: u32) -> RoomMetadata {
+    let created_at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    RoomMetadata::new(room_id, name, max_participants, created_at_ns)
+}
+
+/// A room's name and participant limit, as `RoomMetadata::new` requires them:
+/// client input must be refused here, not reach its asserts.
+fn check_room_input(name: &str, max_participants: u32) -> Result<(), CrdtError> {
+    if name.len() > MAX_ROOM_NAME_LEN {
+        return Err(CrdtError::InvalidState {
+            reason: "room name too long",
+        });
+    }
+    if max_participants == 0 || max_participants > MAX_PARTICIPANTS_PER_ROOM {
+        return Err(CrdtError::InvalidState {
+            reason: "max_participants out of range",
+        });
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1481,6 +1675,205 @@ mod tests {
     #[should_panic(expected = "room_id must be non-zero")]
     fn test_room_metadata_invalid_room_id() {
         RoomMetadata::new(0, "Test".to_string(), 100, 1_234_567_890);
+    }
+
+    #[test]
+    fn test_merge_delta_rejects_invalid_remote_input() {
+        // Deltas come from gossip datagrams: errors, never CRDT asserts
+        let state = DistributedState::new(DistributedStateConfig::with_limits(1, 4, 2, 4));
+        state.create_room(1, "a".into(), 10).unwrap();
+        let dot = Dot::new(2, 1);
+        let info = TrackInfo::default();
+        let bad = [
+            StateUpdate::ParticipantAdded {
+                room_id: 0,
+                participant_id: 5,
+                dot,
+            },
+            StateUpdate::ParticipantAdded {
+                room_id: 1,
+                participant_id: 0,
+                dot,
+            },
+            StateUpdate::ParticipantAdded {
+                room_id: 1,
+                participant_id: 5,
+                dot: Dot::new_unchecked(MAX_ACTORS as u64, 1),
+            },
+            StateUpdate::ParticipantRemoved {
+                room_id: 1,
+                participant_id: 5,
+                dot: Dot::new_unchecked(2, 0),
+            },
+            StateUpdate::TrackUpdated {
+                track_id: 0,
+                info,
+                timestamp: 1,
+                actor: 2,
+            },
+            StateUpdate::TrackUpdated {
+                track_id: 9,
+                info,
+                timestamp: 0,
+                actor: 2,
+            },
+            StateUpdate::TrackUpdated {
+                track_id: 9,
+                info,
+                timestamp: 1,
+                actor: MAX_ACTORS as u64,
+            },
+            StateUpdate::SubscriptionAdded {
+                track_id: 0,
+                participant_id: 5,
+                dot,
+            },
+            StateUpdate::SubscriptionRemoved {
+                track_id: 9,
+                participant_id: 0,
+                dot,
+            },
+        ];
+        for update in bad {
+            assert!(state.merge_delta(update).is_err());
+        }
+        assert_eq!(state.participant_count(1), 0);
+        assert_eq!(state.track_count(), 0);
+        assert_eq!(state.subscription_count(), 0);
+
+        // Remote tracks respect max_tracks (2 here)
+        for track_id in 1..=2 {
+            let update = StateUpdate::TrackUpdated {
+                track_id,
+                info,
+                timestamp: 1,
+                actor: 2,
+            };
+            state.merge_delta(update).unwrap();
+        }
+        let third = StateUpdate::TrackUpdated {
+            track_id: 3,
+            info,
+            timestamp: 1,
+            actor: 2,
+        };
+        assert!(matches!(
+            state.merge_delta(third),
+            Err(CrdtError::CapacityExhausted { .. })
+        ));
+        // A batch above MAX_PIGGYBACK_UPDATES is an error, not an assert
+        let batch = vec![
+            StateUpdate::RelaySubscribe {
+                track_id: 1,
+                requester_node: 1
+            };
+            17
+        ];
+        assert!(state.merge_deltas(batch).is_err());
+    }
+
+    #[test]
+    fn test_local_ops_refuse_zero_ids() {
+        // Gossip-applied updates call these with ids from the network
+        let state = DistributedState::new(DistributedStateConfig::new(1));
+        state.create_room(1, "a".into(), 10).unwrap();
+        let invalid = |r: Result<Dot, CrdtError>| matches!(r, Err(CrdtError::InvalidState { .. }));
+        assert!(invalid(state.add_participant(0, 5)));
+        assert!(invalid(state.add_participant(1, 0)));
+        assert!(invalid(state.remove_participant(0, 5)));
+        assert!(invalid(state.remove_participant(1, 0)));
+        assert!(invalid(state.add_subscription(0, 5)));
+        assert!(invalid(state.add_subscription(9, 0)));
+        assert!(invalid(state.remove_subscription(0, 5)));
+        assert!(invalid(state.remove_subscription(9, 0)));
+        let info = TrackInfo::default();
+        assert!(state.add_track(0, info).is_err());
+        assert!(state.update_track(0, info).is_err());
+        assert_eq!(state.participant_count(1), 0);
+        assert_eq!(state.track_count(), 0);
+        assert_eq!(state.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_create_room_refuses_invalid_input() {
+        // Client input reaches create_room: errors, not RoomMetadata's asserts
+        let state = DistributedState::new(DistributedStateConfig::new(1));
+        let invalid = |r: Result<(), CrdtError>| matches!(r, Err(CrdtError::InvalidState { .. }));
+        assert!(invalid(state.create_room(0, "a".into(), 10)));
+        assert!(invalid(state.create_room(
+            1,
+            "a".repeat(MAX_ROOM_NAME_LEN + 1),
+            10
+        )));
+        assert!(invalid(state.create_room(1, "a".into(), 0)));
+        assert!(invalid(state.create_room(
+            1,
+            "a".into(),
+            MAX_PARTICIPANTS_PER_ROOM + 1
+        )));
+        assert!(!state.room_exists(1));
+        state
+            .create_room(1, "a".repeat(MAX_ROOM_NAME_LEN), 10)
+            .unwrap();
+        assert!(state.room_exists(1));
+    }
+
+    #[test]
+    fn test_create_room_keeps_an_existing_room() {
+        let state = DistributedState::new(DistributedStateConfig::new(1));
+        state.create_room(1, "first".into(), 2).unwrap();
+        state.add_participant(1, 7).unwrap();
+        let again = state.create_room(1, "second".into(), 100);
+        assert!(matches!(again, Err(CrdtError::DuplicateElement)));
+        assert_eq!(state.get_room(1).unwrap().name(), "first");
+        assert_eq!(state.participant_count(1), 1, "members kept");
+        // The participant set is capped at the room's limit
+        state.add_participant(1, 8).unwrap();
+        assert!(state.add_participant(1, 9).is_err());
+    }
+
+    #[test]
+    fn test_create_room_auto_skips_taken_ids_and_never_wraps() {
+        let state = DistributedState::new(DistributedStateConfig::new(1));
+        state.create_room(2, "taken".into(), 10).unwrap();
+        assert_eq!(state.create_room_auto("a".into(), 10).unwrap(), 1);
+        assert_eq!(
+            state.create_room_auto("b".into(), 10).unwrap(),
+            3,
+            "2 skipped"
+        );
+        assert_eq!(state.get_room(2).unwrap().name(), "taken");
+        assert!(state
+            .create_room_auto("x".repeat(MAX_ROOM_NAME_LEN + 1), 10)
+            .is_err());
+        // The last id is never handed out: no wrap to 0
+        state.set_next_room_id(u32::MAX - 1);
+        assert_eq!(
+            state.create_room_auto(String::new(), 10).unwrap(),
+            u32::MAX - 1
+        );
+        assert!(matches!(
+            state.create_room_auto(String::new(), 10),
+            Err(CrdtError::Overflow)
+        ));
+        assert!(!state.room_exists(0));
+    }
+
+    /// Tombstones are recycled: 6,000 joins and leaves in one room (more than
+    /// `MAX_TOMBSTONES`) all succeed, no leaver stays behind, and the room empties.
+    #[test]
+    fn test_join_leave_churn_never_leaves_ghosts() {
+        let state = DistributedState::new(DistributedStateConfig::new(1));
+        state.create_room(1, "churn".into(), 1_000).unwrap();
+        state.add_participant(1, 1).unwrap();
+        for p in 2..6_002u64 {
+            state.add_participant(1, p).unwrap();
+            state.remove_participant(1, p).unwrap();
+            assert!(!state.participant_exists(1, p), "participant {p} left");
+        }
+        assert_eq!(state.participant_count(1), 1);
+        state.remove_participant(1, 1).unwrap();
+        assert_eq!(state.participant_count(1), 0, "the room empties");
     }
 
     #[test]

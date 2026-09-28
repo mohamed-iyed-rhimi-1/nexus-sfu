@@ -673,7 +673,7 @@ async fn address_change_mid_call() {
     let rebinds = shard_stats(&server).counters.rebinds;
     let rebound_at = Instant::now();
     let new_addr = a_rules.rebind().await.expect("rebinds");
-    let (a_resumed, b_resumed) = tokio::join!(
+    let ((a_first, a_resumed), (b_first, b_resumed)) = tokio::join!(
         wait_for_resume(&a, &a_streams, rebound_at),
         wait_for_resume(&b, &b_streams, rebound_at)
     );
@@ -691,12 +691,17 @@ async fn address_change_mid_call() {
         "A -> B resumed after {b_resumed:?}"
     );
     // A's media from the new port is dropped until the old address has been
-    // silent for rebind_silence: an earlier resume means the rule was skipped.
+    // silent for rebind_silence: any stream resuming earlier means the rule was
+    // skipped. Checked on the earliest stream of each direction.
     let silence = Duration::from_millis(test_config().dataplane.rebind_silence_ms.into());
     let earliest = silence.saturating_sub(Duration::from_millis(200));
     assert!(
-        b_resumed >= earliest,
-        "A -> B resumed after {b_resumed:?}, before {earliest:?}"
+        b_first >= earliest,
+        "A -> B: a stream resumed after {b_first:?}, before {earliest:?}"
+    );
+    assert!(
+        a_first >= earliest,
+        "B -> A: a stream resumed after {a_first:?}, before {earliest:?}"
     );
 
     let (a_before, b_before) = (a.track_stats(), b.track_stats());
@@ -730,30 +735,55 @@ async fn address_change_mid_call() {
     server.shutdown().await.expect("clean shutdown");
 }
 
-/// How long after `since` packets on `ssrcs` started arriving again, after
-/// having stopped for at least 500 ms.
-async fn wait_for_resume(client: &HeadlessClient, ssrcs: &[u32], since: Instant) -> Duration {
+/// How long after `since` packets on each of `ssrcs` started arriving again,
+/// each after having stopped for at least 500 ms: (earliest, latest) stream.
+/// The earliest is the one the silence rule bounds from below; the latest ends
+/// the outage (a window measured from an earlier stream would count a later
+/// stream's outage gap as loss).
+async fn wait_for_resume(
+    client: &HeadlessClient,
+    ssrcs: &[u32],
+    since: Instant,
+) -> (Duration, Duration) {
     const GAP: Duration = Duration::from_millis(500);
-    let count = || -> u64 {
+    assert!(!ssrcs.is_empty() && ssrcs.len() <= 8);
+    let count = |ssrc: u32| -> u64 {
         let stats = client.track_stats();
-        let on = |t: &&TrackRxStats| ssrcs.contains(&t.ssrc);
-        stats.iter().filter(on).map(|t| t.packets).sum()
+        stats
+            .iter()
+            .find(|t| t.ssrc == ssrc)
+            .map_or(0, |t| t.packets)
     };
+    // Per stream: packets last seen, when they last changed, stalled, resumed at
+    let mut streams: Vec<(u32, u64, Instant, bool, Option<Duration>)> = ssrcs
+        .iter()
+        .map(|&s| (s, count(s), since, false, None))
+        .collect();
     let deadline = since + Duration::from_secs(10);
-    let (mut last, mut changed_at, mut stalled) = (count(), since, false);
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let now = count();
-        if now == last {
-            stalled |= changed_at.elapsed() >= GAP;
-            continue;
+        for (ssrc, last, changed_at, stalled, resumed) in streams.iter_mut() {
+            let now = count(*ssrc);
+            if resumed.is_some() {
+                continue;
+            }
+            if now == *last {
+                *stalled |= changed_at.elapsed() >= GAP;
+                continue;
+            }
+            if *stalled {
+                *resumed = Some(since.elapsed());
+            }
+            (*last, *changed_at) = (now, Instant::now());
         }
-        if stalled {
-            return since.elapsed();
+        if streams.iter().all(|s| s.4.is_some()) {
+            let resumed = || streams.iter().filter_map(|s| s.4);
+            let (first, last) = (resumed().min().unwrap(), resumed().max().unwrap());
+            assert!(first <= last);
+            return (first, last);
         }
-        (last, changed_at) = (now, Instant::now());
     }
-    panic!("media on {ssrcs:x?} did not stop and resume within 10 s (stalled: {stalled})");
+    panic!("media on {ssrcs:x?} did not stop and resume within 10 s: {streams:?}");
 }
 
 /// Over one window: each of `ssrcs` received ≥ 10 packets/s with ≤ 1 % of its
@@ -777,9 +807,13 @@ fn check_window(who: &str, before: &[TrackRxStats], after: &[TrackRxStats], ssrc
     }
 }
 
-/// Most error between a sender report's RTP timestamp and the media's,
-/// extrapolated to the report's NTP time (note §17.5).
-const SR_TOLERANCE_MS: f64 = 20.0;
+/// Error between a sender report's RTP timestamp and the media's, extrapolated
+/// from the last packet received when the report arrived to the report's NTP
+/// time (note §17.5): the median over a track's reports, and the most for any
+/// one. The single-report bound absorbs scheduling delay on loaded runners; a
+/// translation bug is off by far more (a wrong clock or offset: seconds).
+const SR_MEDIAN_TOLERANCE_MS: f64 = 50.0;
+const SR_MAX_TOLERANCE_MS: f64 = 200.0;
 
 /// A publishes audio + video (webrtc-rs sends SRs every second), B subscribes.
 /// B receives translated SRs on the SSRCs it receives the media on, with RTP
@@ -801,18 +835,18 @@ async fn sender_report_translation() {
     let ssrcs = ssrcs_of(&offered);
     wait_for_media(&b, &ssrcs, 1, STEP_TIMEOUT).await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(8);
     let log = b.rtcp_log();
     let reports_on = |ssrc: u32| {
         log.sender_reports()
             .iter()
-            .filter(|r| r.ssrc == ssrc)
+            .filter(|r| r.ssrc == ssrc && r.last_packet.is_some())
             .count()
     };
-    while ssrcs.iter().any(|s| reports_on(*s) < 2) {
+    while ssrcs.iter().any(|s| reports_on(*s) < 3) {
         assert!(
             Instant::now() < deadline,
-            "fewer than 2 SRs per track in 5 s: {:?}",
+            "fewer than 3 SRs after media per track in 8 s: {:?}",
             log.sender_reports()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -837,24 +871,41 @@ async fn sender_report_translation() {
         );
     }
 
-    let stats = b.track_stats();
     for m in &offered {
         let clock = if m.kind == "video" {
             90_000.0
         } else {
             48_000.0
         };
-        let track = stats.iter().find(|t| t.ssrc == m.ssrc).expect("media");
         let reports = log.sender_reports();
-        let sr = reports.iter().rev().find(|r| r.ssrc == m.ssrc).unwrap();
-        let error_ms = sr_error_ms(sr, track, clock);
+        let mut errors: Vec<f64> = reports
+            .iter()
+            .filter(|r| r.ssrc == m.ssrc)
+            .filter_map(|sr| Some(sr_error_ms(sr, &sr.last_packet?, clock)))
+            .collect();
+        assert!(
+            errors.len() >= 2,
+            "{}: {} SRs after media",
+            m.kind,
+            errors.len()
+        );
+        errors.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+        let median = errors[errors.len() / 2].abs();
+        let worst = errors.last().unwrap().abs();
         eprintln!(
-            "sender_report_translation: {} SR off by {error_ms:.1} ms",
+            "sender_report_translation: {} SR error over {} reports: median {median:.1} ms, \
+             worst {worst:.1} ms",
+            m.kind,
+            errors.len()
+        );
+        assert!(
+            median <= SR_MEDIAN_TOLERANCE_MS,
+            "{}: median {median} ms: {errors:?}",
             m.kind
         );
         assert!(
-            error_ms.abs() <= SR_TOLERANCE_MS,
-            "{}: {error_ms} ms: {sr:?}",
+            worst <= SR_MAX_TOLERANCE_MS,
+            "{}: worst {worst} ms: {errors:?}",
             m.kind
         );
     }
@@ -885,15 +936,15 @@ async fn sender_report_translation() {
 /// `clock` Hz from that packet's arrival to the SR's NTP time, in ms.
 fn sr_error_ms(
     sr: &nexus_loadtest::rtcp_log::SenderReportRx,
-    track: &TrackRxStats,
+    last: &nexus_loadtest::LastPacket,
     clock: f64,
 ) -> f64 {
     let sr_time = ntp_to_system_time(sr.ntp_time);
-    let elapsed = match sr_time.duration_since(track.last_arrival_wall) {
+    let elapsed = match sr_time.duration_since(last.arrival) {
         Ok(d) => d.as_secs_f64(),
         Err(e) => -e.duration().as_secs_f64(),
     };
-    let ticks = sr.rtp_time.wrapping_sub(track.last_timestamp) as i32 as f64;
+    let ticks = sr.rtp_time.wrapping_sub(last.rtp_timestamp) as i32 as f64;
     (ticks - elapsed * clock) / clock * 1000.0
 }
 

@@ -124,9 +124,15 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             self.counters.switch_throttled += 1;
             // A refused nomination is applied once the interval passed (a
             // rebind is simply retried by the peer's next request).
-            if nominated && session.pending_nomination.replace(from).is_none() {
-                assert!(self.pending_switches.len() < self.pending_switches.capacity());
-                self.pending_switches.push(idx);
+            // Listed once per session even when a nomination of the current
+            // address cleared `pending_nomination` while the entry stayed listed.
+            if nominated {
+                session.pending_nomination = Some(from);
+                if !session.switch_listed {
+                    assert!(self.pending_switches.len() < self.pending_switches.capacity());
+                    session.switch_listed = true;
+                    self.pending_switches.push(idx);
+                }
             }
             return;
         }
@@ -149,6 +155,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
                 continue;
             }
             self.pending_switches.swap_remove(i);
+            session.switch_listed = false;
             if let Some(addr) = self.sessions.get_mut(idx).pending_nomination.take() {
                 self.switch_to(idx, addr, SelectReason::Nominated, now);
             }

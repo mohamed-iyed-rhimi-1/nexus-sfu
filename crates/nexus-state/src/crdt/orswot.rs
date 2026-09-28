@@ -13,12 +13,15 @@
 //! - **Idempotent**: `merge(A, A) = A`
 //!
 //! # Memory Model
-//! Pre-allocated fixed-size arrays for elements and tombstones.
-//! Zero allocation after initialization.
+//! Elements and tombstones live in vectors that grow on demand up to fixed caps
+//! (control-path allocation on add/remove, never on a packet path). An empty set
+//! allocates nothing: a room's participant set costs what its members use, not
+//! its capacity (≈ 440 KB each when the arrays were preallocated).
 //!
 //! # Capacity
-//! - Maximum elements: `MAX_ELEMENTS` (10,000)
-//! - Maximum tombstones: `MAX_TOMBSTONES` (5,000)
+//! - Maximum elements: `MAX_ELEMENTS` (10,000), or less (`with_capacity`)
+//! - Tombstones: the latest `2 × max elements` (at most `MAX_TOMBSTONES`, 5,000),
+//!   recycled oldest first
 //!
 //! # Example
 //! ```
@@ -76,12 +79,19 @@ impl<T: Copy> Default for Entry<T> {
 /// not for hot path operations. Use `iter()` or `write_elements_to()` for
 /// zero-allocation element access.
 pub struct Orswot<T: Copy + Eq + Hash> {
-    /// Pre-allocated array of elements with their dots (heap-allocated once at init)
-    entries: Box<[Entry<T>; MAX_ELEMENTS]>,
+    /// Element slots with their dots; a removed element leaves a free slot that
+    /// the next add reuses. Grows to at most `max_elements` slots.
+    entries: Vec<Entry<T>>,
+    /// Most elements this set holds (≤ `MAX_ELEMENTS`)
+    max_elements: usize,
     /// Number of active elements
     count: AtomicU32,
-    /// Pre-allocated tombstone array (heap-allocated once at init)
-    tombstones: Box<[Option<Dot>; MAX_TOMBSTONES]>,
+    /// Tombstone slots, a ring of at most `max_tombstones` (see `add_tombstone`).
+    tombstones: Vec<Option<Dot>>,
+    /// Tombstones kept: twice the element limit, at most `MAX_TOMBSTONES`
+    max_tombstones: usize,
+    /// The ring slot the next tombstone overwrites once it is full
+    next_tombstone: usize,
     /// Number of tombstones
     tombstone_count: AtomicU32,
 }
@@ -99,11 +109,8 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     /// - `self.len() == 0`
     /// - `self.is_empty() == true`
     ///
-    /// # Complexity
-    /// O(MAX_ELEMENTS + MAX_TOMBSTONES) time for initialization
-    ///
     /// # Memory
-    /// One-time heap allocation at creation. Zero allocation after init.
+    /// Allocates nothing until the first add; see `with_capacity`.
     ///
     /// # Example
     /// ```
@@ -114,11 +121,23 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     /// assert_eq!(set.len(), 0);
     /// ```
     pub fn new() -> Self {
-        // One-time heap allocation at creation
+        Self::with_capacity(MAX_ELEMENTS)
+    }
+
+    /// An empty set holding at most `max_elements` elements (1..=`MAX_ELEMENTS`),
+    /// e.g. a room's participant limit.
+    pub fn with_capacity(max_elements: usize) -> Self {
+        assert!(
+            max_elements > 0 && max_elements <= MAX_ELEMENTS,
+            "max_elements must be in 1..=MAX_ELEMENTS"
+        );
         let result = Self {
-            entries: Box::new([Entry::default(); MAX_ELEMENTS]),
+            entries: Vec::new(),
+            max_elements,
             count: AtomicU32::new(0),
-            tombstones: Box::new([None; MAX_TOMBSTONES]),
+            tombstones: Vec::new(),
+            max_tombstones: (2 * max_elements).min(MAX_TOMBSTONES),
+            next_tombstone: 0,
             tombstone_count: AtomicU32::new(0),
         };
 
@@ -177,7 +196,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
         }
 
         // Check if element already exists
-        for i in 0..MAX_ELEMENTS {
+        for i in 0..self.entries.len() {
             if let Some(ref existing) = self.entries[i].element {
                 if *existing == element {
                     // Element exists - check if we should update the dot
@@ -196,34 +215,31 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
 
         // Element doesn't exist - find empty slot
         let current_count = self.count.load(Ordering::Acquire);
-        if current_count >= MAX_ELEMENTS as u32 {
+        if current_count >= self.max_elements as u32 {
             return Err(CrdtError::CapacityExhausted {
-                capacity: MAX_ELEMENTS as u32,
+                capacity: self.max_elements as u32,
             });
         }
 
-        // Find first empty slot (bounded loop)
-        for i in 0..MAX_ELEMENTS {
-            if self.entries[i].element.is_none() {
-                self.entries[i] = Entry {
-                    element: Some(element),
-                    dot,
-                };
-                self.count.fetch_add(1, Ordering::Release);
-
-                // Postcondition: element is now in set
-                debug_assert!(
-                    self.contains(&element),
-                    "Postcondition: element must be in set after add"
-                );
-                return Ok(true);
-            }
+        // A free slot, else a new one (count < max_elements, so slots < max or one is free)
+        let entry = Entry {
+            element: Some(element),
+            dot,
+        };
+        if let Some(i) = self.entries.iter().position(|e| e.element.is_none()) {
+            self.entries[i] = entry;
+        } else {
+            assert!(self.entries.len() < self.max_elements);
+            self.entries.push(entry);
         }
+        self.count.fetch_add(1, Ordering::Release);
 
-        // Should not reach here if count < MAX_ELEMENTS
-        Err(CrdtError::CapacityExhausted {
-            capacity: MAX_ELEMENTS as u32,
-        })
+        // Postcondition: element is now in set
+        debug_assert!(
+            self.contains(&element),
+            "Postcondition: element must be in set after add"
+        );
+        Ok(true)
     }
 
     /// Removes an element from the set
@@ -260,7 +276,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
         }
 
         // Find the element
-        for i in 0..MAX_ELEMENTS {
+        for i in 0..self.entries.len() {
             if let Some(ref existing) = self.entries[i].element {
                 if existing == element {
                     let entry_dot = self.entries[i].dot;
@@ -314,7 +330,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     /// ```
     #[inline]
     pub fn contains(&self, element: &T) -> bool {
-        for i in 0..MAX_ELEMENTS {
+        for i in 0..self.entries.len() {
             if let Some(ref existing) = self.entries[i].element {
                 if existing == element {
                     return true;
@@ -379,7 +395,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     /// ```
     pub fn merge(&mut self, other: &Orswot<T>) -> CrdtResult<()> {
         // First, merge tombstones and remove affected elements
-        for i in 0..MAX_TOMBSTONES {
+        for i in 0..other.tombstones.len() {
             if let Some(tombstone_dot) = other.tombstones[i] {
                 // Add tombstone if not already present
                 if !self.has_tombstone(&tombstone_dot) {
@@ -392,7 +408,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
         }
 
         // Then, merge elements - propagate errors immediately
-        for i in 0..MAX_ELEMENTS {
+        for i in 0..other.entries.len() {
             if let Some(element) = other.entries[i].element {
                 let dot = other.entries[i].dot;
 
@@ -449,9 +465,9 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     /// The number of elements written (may be less than set length if buffer is too small)
     pub fn write_elements_to(&self, buffer: &mut [(T, Dot)]) -> u32 {
         let mut written = 0u32;
-        let max_write = buffer.len().min(MAX_ELEMENTS);
+        let max_write = buffer.len().min(self.entries.len());
 
-        for i in 0..MAX_ELEMENTS {
+        for i in 0..self.entries.len() {
             if written as usize >= max_write {
                 break;
             }
@@ -473,9 +489,9 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
     /// The number of tombstones written
     pub fn write_tombstones_to(&self, buffer: &mut [Dot]) -> u32 {
         let mut written = 0u32;
-        let max_write = buffer.len().min(MAX_TOMBSTONES);
+        let max_write = buffer.len().min(self.tombstones.len());
 
-        for i in 0..MAX_TOMBSTONES {
+        for i in 0..self.tombstones.len() {
             if written as usize >= max_write {
                 break;
             }
@@ -497,32 +513,25 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
             return Ok(());
         }
 
-        let current_count = self.tombstone_count.load(Ordering::Acquire);
-        if current_count >= MAX_TOMBSTONES as u32 {
-            return Err(CrdtError::TombstoneOverflow {
-                count: current_count,
-                max: MAX_TOMBSTONES as u32,
-            });
+        // A ring: once full, the oldest tombstone is recycled. A remove never
+        // fails for lack of room (a participant who leaves is gone, and a room
+        // with churn still empties). The cost, only with gossip: a remove older
+        // than the ring can be undone by a stale remote add of that element.
+        if self.tombstones.len() < self.max_tombstones {
+            self.tombstones.push(Some(dot));
+            self.tombstone_count.fetch_add(1, Ordering::Release);
+        } else {
+            assert!(self.next_tombstone < self.max_tombstones);
+            self.tombstones[self.next_tombstone] = Some(dot);
+            self.next_tombstone = (self.next_tombstone + 1) % self.max_tombstones;
         }
-
-        // Find empty slot
-        for i in 0..MAX_TOMBSTONES {
-            if self.tombstones[i].is_none() {
-                self.tombstones[i] = Some(dot);
-                self.tombstone_count.fetch_add(1, Ordering::Release);
-                return Ok(());
-            }
-        }
-
-        Err(CrdtError::TombstoneOverflow {
-            count: current_count,
-            max: MAX_TOMBSTONES as u32,
-        })
+        debug_assert!(self.tombstones.len() <= self.max_tombstones);
+        Ok(())
     }
 
     /// Checks if a dot is tombstoned
     fn is_tombstoned(&self, dot: &Dot) -> bool {
-        for i in 0..MAX_TOMBSTONES {
+        for i in 0..self.tombstones.len() {
             if let Some(tombstone) = self.tombstones[i] {
                 // A dot is tombstoned if there's a tombstone with:
                 // - Same actor and clock >= dot's clock
@@ -536,7 +545,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
 
     /// Checks if a specific dot is in the tombstone array
     fn has_tombstone(&self, dot: &Dot) -> bool {
-        for i in 0..MAX_TOMBSTONES {
+        for i in 0..self.tombstones.len() {
             if let Some(tombstone) = self.tombstones[i] {
                 if tombstone == *dot {
                     return true;
@@ -548,7 +557,7 @@ impl<T: Copy + Eq + Hash> Orswot<T> {
 
     /// Removes an element by its dot
     fn remove_by_dot(&mut self, dot: &Dot) {
-        for i in 0..MAX_ELEMENTS {
+        for i in 0..self.entries.len() {
             if self.entries[i].element.is_some() && self.entries[i].dot == *dot {
                 self.entries[i].element = None;
                 self.count.fetch_sub(1, Ordering::Release);
@@ -886,17 +895,58 @@ mod tests {
         assert!(snap.contains(&2));
     }
 
+    #[test]
+    fn test_orswot_grows_on_demand_up_to_its_capacity() {
+        let mut set: Orswot<u64> = Orswot::with_capacity(3);
+        assert_eq!(set.entries.capacity(), 0, "an empty set allocates nothing");
+        for i in 1..=3u64 {
+            assert!(set.add(i, Dot::new(1, i)).unwrap());
+        }
+        assert!(matches!(
+            set.add(4, Dot::new(1, 4)),
+            Err(CrdtError::CapacityExhausted { capacity: 3 })
+        ));
+        // A removed element frees its slot for the next add
+        assert!(set.remove(&2, Dot::new(1, 5)).unwrap());
+        assert!(set.add(4, Dot::new(1, 6)).unwrap());
+        assert_eq!(set.entries.len(), 3, "slot reused, no growth");
+        assert!(set.contains(&4) && !set.contains(&2));
+        assert_eq!(set.tombstone_count(), 1);
+    }
+
+    #[test]
+    fn test_orswot_tombstones_recycle_oldest_first() {
+        // Capacity 2: at most 4 tombstones, then the oldest is overwritten
+        let mut set: Orswot<u64> = Orswot::with_capacity(2);
+        let mut clock = 0;
+        for element in 0..10u64 {
+            clock += 1;
+            set.add(element, Dot::new(1, clock)).unwrap();
+            clock += 1;
+            assert!(
+                set.remove(&element, Dot::new(1, clock)).unwrap(),
+                "remove {element}"
+            );
+            assert!(!set.contains(&element));
+        }
+        assert_eq!(set.tombstone_count(), 4);
+        assert_eq!(set.tombstones.len(), 4);
+        // The newest tombstones are kept: the last removed element's add dot
+        assert!(set.is_tombstoned(&Dot::new(1, 19)));
+        assert!(set.is_empty());
+    }
+
     impl<T: Copy + Eq + Hash> Orswot<T> {
         /// Creates a clone suitable for merging (for tests only)
         #[cfg(test)]
         fn clone_for_merge(&self) -> Self {
-            let mut other = Self::new();
-            for i in 0..MAX_ELEMENTS {
+            let mut other = Self::with_capacity(self.max_elements);
+            for i in 0..self.entries.len() {
                 if let Some(element) = self.entries[i].element {
                     let _ = other.add(element, self.entries[i].dot);
                 }
             }
-            for i in 0..MAX_TOMBSTONES {
+            for i in 0..self.tombstones.len() {
                 if let Some(dot) = self.tombstones[i] {
                     let _ = other.add_tombstone(dot);
                 }

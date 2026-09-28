@@ -59,4 +59,4 @@ pub use prometheus::{PrometheusServer, PrometheusState};
 pub use report::{ReportGenerator, TargetValidation, TestReport};
 pub use runner::TestRunner;
 pub use signal_task::{RemoteTrack, SignalEvent};
-pub use track_stats::{TrackRxStats, TrackStatsMap};
+pub use track_stats::{LastPacket, TrackRxStats, TrackStatsMap};

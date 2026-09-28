@@ -329,7 +329,7 @@ fn test_message_with_max_piggyback() {
         let dot = Dot::new(1, (i + 1) as u64);
         piggyback.push(StateUpdate::ParticipantAdded {
             room_id: 1,
-            participant_id: i as u64,
+            participant_id: i as u64 + 1, // 0 is not a valid participant id
             dot,
         });
     }

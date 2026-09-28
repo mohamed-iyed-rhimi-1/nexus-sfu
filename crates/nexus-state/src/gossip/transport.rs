@@ -453,7 +453,14 @@ impl GossipTransport {
     pub fn recv(&mut self) -> Result<(GossipMessage, SocketAddr), GossipError> {
         match self.socket.recv_from(&mut self.recv_buffer) {
             Ok((size, source)) => {
-                assert!(size > 0, "received message must not be empty");
+                // Anyone can send a zero-length datagram: an error, not an assert
+                if size == 0 {
+                    self.stats.record_recv_error();
+                    return Err(GossipError::InvalidMessage {
+                        reason: "empty datagram".to_string(),
+                    });
+                }
+                debug_assert!(size <= MAX_MESSAGE_SIZE);
 
                 self.stats.record_recv(size as u64);
 
@@ -470,6 +477,34 @@ impl GossipTransport {
                     self.stats.record_recv_error();
                 }
                 Err(GossipError::Transport(e))
+            }
+        }
+    }
+
+    /// Receive one raw datagram into `buf` (non-blocking), without decoding.
+    ///
+    /// Returns `Some((len, source))` with `len > 0`, or `None` when nothing is
+    /// queued, the datagram is empty, or the socket reports an error (counted in
+    /// `recv_errors`). A datagram longer than `buf` is truncated by the kernel.
+    pub fn recv_raw(&mut self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        assert!(!buf.is_empty(), "receive buffer must not be empty");
+
+        match self.socket.recv_from(buf) {
+            Ok((0, _)) => {
+                self.stats.record_recv_error();
+                None
+            }
+            Ok((size, source)) => {
+                // Postcondition: the kernel wrote within the buffer
+                debug_assert!(size <= buf.len());
+                self.stats.record_recv(size as u64);
+                Some((size, source))
+            }
+            Err(e) => {
+                if e.kind() != ErrorKind::WouldBlock {
+                    self.stats.record_recv_error();
+                }
+                None
             }
         }
     }
@@ -585,6 +620,23 @@ mod tests {
 
         let (received, _) = transport2.recv_timeout(100).unwrap();
         assert_eq!(received, msg);
+    }
+
+    #[test]
+    fn test_recv_empty_datagram_is_an_error() {
+        let mut transport = GossipTransport::new(localhost_addr()).unwrap();
+        let sender = UdpSocket::bind(localhost_addr()).unwrap();
+        sender.send_to(&[], transport.local_addr()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let result = transport.recv_timeout(100);
+        assert!(matches!(result, Err(GossipError::InvalidMessage { .. })));
+        assert_eq!(transport.stats().snapshot().recv_errors, 1);
+
+        sender.send_to(&[], transport.local_addr()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut buffer = [0u8; MAX_MESSAGE_SIZE];
+        assert!(transport.recv_raw(&mut buffer).is_none());
+        assert_eq!(transport.stats().snapshot().recv_errors, 2);
     }
 
     #[test]

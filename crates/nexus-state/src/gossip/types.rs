@@ -444,54 +444,55 @@ pub enum StateUpdate {
 /// Maximum size of a single StateUpdate when encoded
 const MAX_STATE_UPDATE_SIZE: usize = 64;
 
+/// Largest encoded StateUpdate (TrackUpdated: 1 + 8 + 18 + 8 + 8 bytes).
+const MAX_ENCODED_UPDATE_LEN: usize = 43;
+
+/// Size of one member entry in a StateSnapshot (actor_id + incarnation + state).
+const SNAPSHOT_MEMBER_SIZE: usize = 17;
+
+/// Maximum members in one StateSnapshot, so that a snapshot with a full
+/// update list still fits in `MAX_MESSAGE_SIZE`: header (1 + 8 + 8), two
+/// counts (2 + 2), and `MAX_PIGGYBACK_UPDATES` length-prefixed updates.
+pub const MAX_SNAPSHOT_MEMBERS: usize =
+    (MAX_MESSAGE_SIZE - (1 + 8 + 8 + 2 + 2) - MAX_PIGGYBACK_UPDATES * (2 + MAX_ENCODED_UPDATE_LEN))
+        / SNAPSHOT_MEMBER_SIZE;
+
+const _: () = {
+    assert!(MAX_ENCODED_UPDATE_LEN <= MAX_STATE_UPDATE_SIZE);
+    assert!(MAX_SNAPSHOT_MEMBERS > 0, "a snapshot must carry members");
+    assert!(MAX_SNAPSHOT_MEMBERS <= MAX_PEERS);
+};
+
+/// Read a big-endian u64 at `offset`; `None` if `data` is too short.
+#[inline]
+fn read_u64_at(data: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let bytes: [u8; 8] = data.get(offset..end)?.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
 // =============================================================================
 // StateUpdate Decode Helpers (TigerStyle: ≤70 lines per function)
 // =============================================================================
 
 /// Decode a Dot from bytes at the given offset.
 ///
-/// # TigerStyle Compliance
-/// - ≤70 lines
-/// - ≥2 assertions
+/// Returns `None` if the bytes are short, the actor is out of range, or the
+/// clock is 0: the bytes come from the network.
 #[inline]
 fn decode_dot_at(data: &[u8], offset: usize) -> Option<Dot> {
-    // Precondition: data must have enough bytes
-    assert!(
-        data.len() >= offset + 16,
-        "insufficient data for Dot decode"
-    );
+    let actor_id = read_u64_at(data, offset)?;
+    let clock = read_u64_at(data, offset.checked_add(8)?)?;
 
-    let actor_id = u64::from_be_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ]);
-    let clock = u64::from_be_bytes([
-        data[offset + 8],
-        data[offset + 9],
-        data[offset + 10],
-        data[offset + 11],
-        data[offset + 12],
-        data[offset + 13],
-        data[offset + 14],
-        data[offset + 15],
-    ]);
-
-    // Validate actor_id range
     if actor_id >= MAX_ACTORS as u64 {
         return None;
     }
-    // Validate clock is positive
     if clock == 0 {
         return None;
     }
 
-    // Postcondition: dot must be valid
+    // Postcondition: the dot satisfies Dot::new's invariants
+    debug_assert!(actor_id < MAX_ACTORS as u64 && clock > 0);
     Some(Dot::new_unchecked(actor_id, clock))
 }
 
@@ -513,8 +514,10 @@ fn decode_participant_update(data: &[u8], is_add: bool) -> Option<(StateUpdate, 
     ]);
     let dot = decode_dot_at(data, 13)?;
 
-    // Postcondition: IDs must be reasonable
-    assert!(room_id <= u32::MAX / 2, "room_id overflow protection");
+    // Network input: zero or out-of-range ids are dropped, not asserted
+    if room_id == 0 || room_id > u32::MAX / 2 || participant_id == 0 {
+        return None;
+    }
 
     let update = if is_add {
         StateUpdate::ParticipantAdded {
@@ -535,38 +538,38 @@ fn decode_participant_update(data: &[u8], is_add: bool) -> Option<(StateUpdate, 
 
 /// Decode subscription update (Added or Removed) from bytes.
 ///
-/// # TigerStyle Compliance
-/// - ≤70 lines
-/// - ≥2 assertions
+/// Wire format (as written by `StateUpdate::encode`):
+/// [type:u8][track_id:u64][participant_id:u64][dot actor:u64][dot clock:u64] = 33 bytes.
 #[inline]
 fn decode_subscription_update(data: &[u8], is_add: bool) -> Option<(StateUpdate, usize)> {
-    // Precondition: data must have minimum length
-    if data.len() < 25 {
+    if data.len() < 33 {
         return None;
     }
 
-    let track_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-    let participant_id = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
-    let dot = decode_dot_at(data, 9)?;
+    let track_id = read_u64_at(data, 1)?;
+    let participant_id = read_u64_at(data, 9)?;
+    let dot = decode_dot_at(data, 17)?;
 
-    // Postcondition: IDs must be reasonable
-    assert!(track_id <= u32::MAX / 2, "track_id overflow protection");
+    // Network input: zero or out-of-range ids are dropped, not asserted
+    if track_id == 0 || track_id > u64::MAX / 2 || participant_id == 0 {
+        return None;
+    }
 
     let update = if is_add {
         StateUpdate::SubscriptionAdded {
-            track_id: track_id.into(),
-            participant_id: participant_id.into(),
+            track_id,
+            participant_id,
             dot,
         }
     } else {
         StateUpdate::SubscriptionRemoved {
-            track_id: track_id.into(),
-            participant_id: participant_id.into(),
+            track_id,
+            participant_id,
             dot,
         }
     };
 
-    Some((update, 25))
+    Some((update, 33))
 }
 
 /// Decode relay subscribe/unsubscribe from bytes.
@@ -582,8 +585,10 @@ fn decode_relay_update(data: &[u8], is_subscribe: bool) -> Option<(StateUpdate, 
     let requester_node = u64::from_be_bytes([
         data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
     ]);
-    assert!(track_id > 0, "track_id must be non-zero");
-    assert!(requester_node > 0, "requester_node must be non-zero");
+    // Network input: zero ids are dropped, not asserted
+    if track_id == 0 || requester_node == 0 {
+        return None;
+    }
 
     let update = if is_subscribe {
         StateUpdate::RelaySubscribe {
@@ -642,13 +647,14 @@ fn decode_track_update(data: &[u8]) -> Option<(StateUpdate, usize)> {
         data[offset + 15],
     ]);
 
-    // Validate actor range
+    // Network input: out-of-range values are dropped, not asserted.
+    // A zero timestamp would reach LWWReg::set's precondition.
     if actor >= MAX_ACTORS as u64 {
         return None;
     }
-
-    // Postcondition: track_id must be reasonable
-    assert!(track_id <= u64::MAX / 2, "track_id overflow protection");
+    if track_id == 0 || track_id > u64::MAX / 2 || timestamp == 0 {
+        return None;
+    }
 
     Some((
         StateUpdate::TrackUpdated {
@@ -997,12 +1003,12 @@ impl GossipMessage {
                 buffer.extend_from_slice(&from.to_be_bytes());
                 buffer.extend_from_slice(&incarnation.to_be_bytes());
 
-                // Encode member count (bounded by MAX_PEERS)
-                let member_count = members.len().min(MAX_PEERS);
+                // Encode member count (bounded so the message fits the MTU)
+                let member_count = members.len().min(MAX_SNAPSHOT_MEMBERS);
                 buffer.extend_from_slice(&(member_count as u16).to_be_bytes());
 
                 for (i, (actor_id, inc, state)) in members.iter().enumerate() {
-                    if i >= MAX_PEERS {
+                    if i >= MAX_SNAPSHOT_MEMBERS {
                         break;
                     }
                     buffer.extend_from_slice(&actor_id.to_be_bytes());
@@ -1098,9 +1104,10 @@ impl GossipMessage {
                 return Err("piggyback update truncated");
             }
 
-            let (update, _) = StateUpdate::decode(&data[offset..offset + update_len])
-                .ok_or("invalid piggyback update")?;
-            piggyback.push(update);
+            // An invalid update is skipped; the framing above stays strict
+            if let Some((update, _)) = StateUpdate::decode(&data[offset..offset + update_len]) {
+                piggyback.push(update);
+            }
             offset += update_len;
         }
 
@@ -1148,9 +1155,10 @@ impl GossipMessage {
                 return Err("piggyback update truncated");
             }
 
-            let (update, _) = StateUpdate::decode(&data[offset..offset + update_len])
-                .ok_or("invalid piggyback update")?;
-            piggyback.push(update);
+            // An invalid update is skipped; the framing above stays strict
+            if let Some((update, _)) = StateUpdate::decode(&data[offset..offset + update_len]) {
+                piggyback.push(update);
+            }
             offset += update_len;
         }
 
@@ -1690,7 +1698,7 @@ mod tests {
         for i in 0..MAX_PIGGYBACK_UPDATES {
             piggyback.push(StateUpdate::ParticipantAdded {
                 room_id: 1,
-                participant_id: i as u64,
+                participant_id: i as u64 + 1,
                 dot,
             });
         }
@@ -1717,6 +1725,126 @@ mod tests {
         let data = [255u8; 20];
         let result = GossipMessage::decode(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_state_update_subscription_roundtrip() {
+        let update = StateUpdate::SubscriptionAdded {
+            track_id: 0x1_0000_0009,
+            participant_id: 0x2_0000_0005,
+            dot: Dot::new(3, 7),
+        };
+        let mut buffer = [0u8; MAX_STATE_UPDATE_SIZE];
+        let len = update.encode(&mut buffer);
+        assert_eq!(StateUpdate::decode(&buffer[..len]), Some((update, len)));
+    }
+
+    #[test]
+    fn test_state_update_decode_rejects_invalid_fields() {
+        // Each of these used to reach an assert (or a CRDT precondition)
+        let dot = Dot::new(1, 1);
+        let info = TrackInfo::default();
+        let invalid = [
+            StateUpdate::ParticipantAdded {
+                room_id: 0,
+                participant_id: 1,
+                dot,
+            },
+            StateUpdate::ParticipantRemoved {
+                room_id: u32::MAX,
+                participant_id: 1,
+                dot,
+            },
+            StateUpdate::ParticipantAdded {
+                room_id: 1,
+                participant_id: 0,
+                dot,
+            },
+            StateUpdate::TrackUpdated {
+                track_id: 0,
+                info,
+                timestamp: 1,
+                actor: 1,
+            },
+            StateUpdate::TrackUpdated {
+                track_id: u64::MAX,
+                info,
+                timestamp: 1,
+                actor: 1,
+            },
+            StateUpdate::TrackUpdated {
+                track_id: 1,
+                info,
+                timestamp: 0,
+                actor: 1,
+            },
+            StateUpdate::SubscriptionAdded {
+                track_id: 0,
+                participant_id: 1,
+                dot,
+            },
+            StateUpdate::SubscriptionRemoved {
+                track_id: 1,
+                participant_id: 0,
+                dot,
+            },
+            StateUpdate::RelaySubscribe {
+                track_id: 0,
+                requester_node: 1,
+            },
+            StateUpdate::RelayUnsubscribe {
+                track_id: 1,
+                requester_node: 0,
+            },
+        ];
+        let mut buffer = [0u8; MAX_STATE_UPDATE_SIZE];
+        for update in invalid {
+            let len = update.encode(&mut buffer);
+            assert_eq!(StateUpdate::decode(&buffer[..len]), None, "{update:?}");
+            // Every truncation is rejected too
+            for short in 0..len {
+                assert_eq!(StateUpdate::decode(&buffer[..short]), None);
+            }
+        }
+        // Dot with clock 0 / actor out of range
+        let update = StateUpdate::ParticipantAdded {
+            room_id: 1,
+            participant_id: 1,
+            dot,
+        };
+        let len = update.encode(&mut buffer);
+        buffer[21..29].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(StateUpdate::decode(&buffer[..len]), None);
+        buffer[13..21].copy_from_slice(&(MAX_ACTORS as u64).to_be_bytes());
+        buffer[21..29].copy_from_slice(&1u64.to_be_bytes());
+        assert_eq!(StateUpdate::decode(&buffer[..len]), None);
+    }
+
+    #[test]
+    fn test_snapshot_with_max_peers_fits() {
+        let members = (0..MAX_PEERS as u64).map(|a| (a, u64::MAX, 2)).collect();
+        let updates = vec![
+            StateUpdate::TrackUpdated {
+                track_id: 1,
+                info: TrackInfo::default(),
+                timestamp: 1,
+                actor: 1,
+            };
+            MAX_PIGGYBACK_UPDATES
+        ];
+        let msg = GossipMessage::StateSnapshot {
+            from: 1,
+            incarnation: 1,
+            members,
+            updates,
+        };
+        let encoded = msg.encode();
+        assert!(encoded.len() <= MAX_MESSAGE_SIZE);
+        let GossipMessage::StateSnapshot { members, .. } = GossipMessage::decode(&encoded).unwrap()
+        else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(members.len(), MAX_SNAPSHOT_MEMBERS);
     }
 
     #[test]

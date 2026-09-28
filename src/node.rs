@@ -88,24 +88,40 @@ pub fn actor_id(cluster: &ClusterConfig) -> Result<u64, NodeError> {
     Ok(id)
 }
 
-/// A running node: distributed state plus its gossip thread.
+/// A running node: distributed state plus, in a configured cluster, its gossip
+/// thread.
 pub struct Node {
     actor_id: u64,
     state: Arc<DistributedState>,
-    gossip_addr: SocketAddr,
+    /// `None` on a single node (`cluster.gossip_enabled` off, the default).
+    gossip_addr: Option<SocketAddr>,
     stop_tx: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Node {
-    /// Create the distributed state and start gossip. The gossip thread also
-    /// stops when `shutdown` is set.
+    /// Create the distributed state and, when `cluster.gossip_enabled`, start
+    /// gossip. The gossip thread also stops when `shutdown` is set.
+    ///
+    /// Without a cluster no gossip socket is opened: gossip is unauthenticated,
+    /// and v1 is single-node.
     pub fn start(config: &NexusConfig, shutdown: Arc<AtomicBool>) -> Result<Self, NodeError> {
         let actor_id = actor_id(&config.cluster)?;
         info!("Node actor ID: {}", actor_id);
 
         let state_config = nexus_state::DistributedStateConfig::new(actor_id);
         let state = Arc::new(DistributedState::new(state_config));
+        if !config.cluster.gossip_enabled {
+            info!("Gossip off (single node): cluster.gossip_enabled is false");
+            assert_eq!(state.local_actor(), actor_id);
+            return Ok(Self {
+                actor_id,
+                state,
+                gossip_addr: None,
+                stop_tx: None,
+                thread: None,
+            });
+        }
         let (updates_tx, updates_rx) = mpsc::channel::<StateUpdate>();
         state.set_broadcast_sender(updates_tx);
 
@@ -131,7 +147,7 @@ impl Node {
         Ok(Self {
             actor_id,
             state,
-            gossip_addr,
+            gossip_addr: Some(gossip_addr),
             stop_tx: Some(stop_tx),
             thread: Some(thread),
         })
@@ -147,8 +163,8 @@ impl Node {
         &self.state
     }
 
-    /// The address the gossip socket bound.
-    pub fn gossip_addr(&self) -> SocketAddr {
+    /// The address the gossip socket bound; `None` without a cluster.
+    pub fn gossip_addr(&self) -> Option<SocketAddr> {
         self.gossip_addr
     }
 
@@ -190,8 +206,16 @@ fn build_swim(
         max_piggyback_updates: config.gossip.max_piggyback_updates,
         seed_peers: config.gossip.seed_peers.clone(),
     };
-    // Port 0: the OS assigns the gossip port.
-    let bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+    // Validated: a specific interface address (port 0: the OS assigns it).
+    let Some(bind_addr) = config.cluster.gossip_bind_addr else {
+        return Err(NodeError::Gossip(
+            "cluster.gossip_bind_addr is not set".into(),
+        ));
+    };
+    assert!(
+        !bind_addr.ip().is_unspecified(),
+        "validated by ClusterConfig"
+    );
     let mut swim = SwimProtocol::new(actor_id, bind_addr, gossip_config)
         .map_err(|e| NodeError::Gossip(format!("{:?}", e)))?;
     swim.set_distributed_state(state.clone());
@@ -322,7 +346,51 @@ mod tests {
     use nexus_signal::websocket::{new_signaling_connections, SignalingConnectionHandle};
 
     fn cluster(node_id: u64) -> ClusterConfig {
-        ClusterConfig { node_id }
+        ClusterConfig {
+            node_id,
+            ..ClusterConfig::default()
+        }
+    }
+
+    /// A config with gossip on, bound to loopback.
+    fn clustered(node_id: u64) -> NexusConfig {
+        let mut config = NexusConfig::default();
+        config.cluster.node_id = node_id;
+        config.cluster.gossip_enabled = true;
+        config.cluster.gossip_bind_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.gossip.probe_interval_ms = 10;
+        config
+    }
+
+    #[test]
+    fn single_node_opens_no_gossip_socket() {
+        let mut config = NexusConfig::default();
+        config.cluster.node_id = 42;
+        assert!(!config.cluster.gossip_enabled, "off by default");
+        let mut node = Node::start(&config, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(node.gossip_addr(), None);
+        assert!(node.thread.is_none());
+        assert_eq!(node.distributed_state().local_actor(), 42);
+        node.stop();
+    }
+
+    #[test]
+    fn gossip_config_is_validated() {
+        let mut config = clustered(1);
+        assert!(config.cluster.validate().is_ok());
+        config.cluster.gossip_bind_addr = None;
+        assert!(config.cluster.validate().is_err());
+        config.cluster.gossip_bind_addr = Some("0.0.0.0:7946".parse().unwrap());
+        assert!(config.cluster.validate().is_err(), "wildcard refused");
+        config.cluster.gossip_bind_addr = Some("[::]:7946".parse().unwrap());
+        assert!(config.cluster.validate().is_err(), "wildcard refused");
+
+        let mut single = NexusConfig::default();
+        single.gossip.seed_peers = vec![nexus_state::SeedPeer::new(
+            2,
+            "192.0.2.2:7946".parse().unwrap(),
+        )];
+        assert!(single.validate().is_err(), "seed peers without a cluster");
     }
 
     #[test]
@@ -351,22 +419,20 @@ mod tests {
 
     #[test]
     fn node_starts_and_stops() {
-        let mut config = NexusConfig::default();
-        config.cluster.node_id = 42;
-        config.gossip.probe_interval_ms = 10;
+        let config = clustered(42);
         let mut node = Node::start(&config, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(node.actor_id(), 42);
         assert_eq!(node.distributed_state().local_actor(), 42);
-        assert_ne!(node.gossip_addr().port(), 0);
+        let addr = node.gossip_addr().expect("gossip on");
+        assert!(addr.ip().is_loopback(), "bound where configured: {addr}");
+        assert_ne!(addr.port(), 0);
         node.stop();
         node.stop(); // idempotent
     }
 
     #[test]
     fn gossip_stops_on_shared_shutdown() {
-        let mut config = NexusConfig::default();
-        config.cluster.node_id = 7;
-        config.gossip.probe_interval_ms = 10;
+        let config = clustered(7);
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut node = Node::start(&config, shutdown.clone()).unwrap();
         shutdown.store(true, Ordering::SeqCst);
