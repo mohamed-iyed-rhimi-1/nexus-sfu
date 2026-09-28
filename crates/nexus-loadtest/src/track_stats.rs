@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 /// Most tracks recorded per client; later tracks are ignored.
 pub const MAX_TRACKS: usize = 64;
@@ -43,6 +43,8 @@ pub struct TrackRxStats {
     pub first_arrival: Instant,
     /// When the last packet arrived.
     pub last_arrival: Instant,
+    /// The same, as wall-clock time (to compare with RTCP sender reports).
+    pub last_arrival_wall: SystemTime,
     /// Publisher SSRC read from the first payload marker (`media::read_marker`).
     pub marker_ssrc: Option<u32>,
     /// Payload markers read.
@@ -73,6 +75,7 @@ impl TrackRxStats {
             timestamp_regressions: 0,
             first_arrival: now,
             last_arrival: now,
+            last_arrival_wall: SystemTime::now(),
             marker_ssrc: None,
             markers: 0,
             marker_mismatches: 0,
@@ -109,6 +112,7 @@ impl TrackRxStats {
     fn record(&mut self, seq: u16, timestamp: u32) {
         self.packets += 1;
         self.last_arrival = Instant::now();
+        self.last_arrival_wall = SystemTime::now();
         // Extend the 16-bit sequence number relative to the highest seen.
         let highest = self.highest_ext_seq;
         let delta = seq.wrapping_sub(highest as u16) as i16 as i64;

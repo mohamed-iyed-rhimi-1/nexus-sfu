@@ -57,17 +57,6 @@ echo "3. Checking for JSON serialization..."
 check_deprecated "serde_json" "serde_json usage" ""
 check_deprecated "to_json|from_json" "JSON methods" ""
 
-# 4. Verify new architecture components
-echo ""
-echo "5. Verifying new architecture components..."
-
-echo -n "  DistributedState in Sfu... "
-if rg "DistributedState" src/sfu.rs > /dev/null 2>&1; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FAIL${NC}"
-    ERRORS=$((ERRORS + 1))
-fi
 
 # 5. Check for loss-based BWE
 echo ""

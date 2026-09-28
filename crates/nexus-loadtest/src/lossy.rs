@@ -5,13 +5,18 @@
 //! received. Loss sits on the client side of the path, so every packet
 //! between the client and the SFU passes through it, whichever candidate
 //! pair ICE selects; no address rewriting or root privileges are needed.
+//!
+//! [`LossRules::rebind`] moves the connection to a new local port while ICE
+//! keeps running, which is what a NAT rebinding looks like to the SFU.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
+use tokio::sync::Notify;
 use webrtc::util::Conn;
 
 /// Most rules per connection.
@@ -152,12 +157,17 @@ impl TapEntry {
     }
 }
 
+/// Most round boundaries a tap records.
+pub const MAX_TAP_MARKS: usize = 64;
+
 /// Bounded record of inbound media datagrams that passed the rules.
 #[derive(Debug, Default)]
 struct Tap {
     entries: Vec<TapEntry>,
     capacity: usize,
     overflow: u64,
+    /// Entry counts at each [`LossRules::mark_tap`].
+    marks: Vec<usize>,
 }
 
 /// Rules shared between a test and the client's socket. Rules can be added
@@ -171,6 +181,24 @@ pub struct LossRules {
     rng: AtomicU64,
     /// Inbound SRTP/SRTCP record, once enabled.
     tap: Mutex<Option<Tap>>,
+    /// The socket of the connection these rules apply to, once bound.
+    slot: Mutex<Option<Arc<SocketSlot>>>,
+}
+
+/// Most sockets a connection is rebound to.
+pub const MAX_REBINDS: usize = 8;
+
+/// The connection's current socket, swappable while receives are pending.
+#[derive(Debug)]
+struct SocketSlot {
+    socket: ArcSwap<UdpSocket>,
+    /// Wakes pending receives after a swap.
+    swapped: Notify,
+    /// Sockets rebound away from, kept open: datagrams to an old port are
+    /// counted and discarded, as behind a NAT whose mapping changed.
+    retired: Mutex<Vec<Arc<UdpSocket>>>,
+    /// Datagrams that reached a retired socket, and when the last one did.
+    retired_rx: Mutex<(u64, Option<std::time::Instant>)>,
 }
 
 impl LossRules {
@@ -226,6 +254,7 @@ impl LossRules {
             entries: Vec::with_capacity(capacity),
             capacity,
             overflow: 0,
+            marks: Vec::new(),
         });
     }
 
@@ -234,6 +263,32 @@ impl LossRules {
         let tap = self.tap.lock().expect("tap lock");
         tap.as_ref()
             .map_or((Vec::new(), 0), |t| (t.entries.clone(), t.overflow))
+    }
+
+    /// Start a new round: entries recorded from now on belong to it (see
+    /// [`LossRules::tap_rounds`]).
+    pub fn mark_tap(&self) {
+        let mut tap = self.tap.lock().expect("tap lock");
+        let tap = tap.as_mut().expect("tap enabled");
+        assert!(tap.marks.len() < MAX_TAP_MARKS, "too many tap marks");
+        assert_eq!(tap.overflow, 0, "rounds of a full tap are meaningless");
+        tap.marks.push(tap.entries.len());
+    }
+
+    /// The tap's entries split at the marks: element 0 is what arrived before
+    /// the first mark, element i what arrived from mark i on.
+    pub fn tap_rounds(&self) -> Vec<Vec<TapEntry>> {
+        let tap = self.tap.lock().expect("tap lock");
+        let Some(tap) = tap.as_ref() else {
+            return Vec::new();
+        };
+        let mut bounds = vec![0];
+        bounds.extend(&tap.marks);
+        bounds.push(tap.entries.len());
+        bounds
+            .windows(2)
+            .map(|w| tap.entries[w[0]..w[1]].to_vec())
+            .collect()
     }
 
     fn record_inbound(&self, datagram: &[u8]) {
@@ -249,6 +304,44 @@ impl LossRules {
         } else {
             tap.overflow += 1;
         }
+    }
+
+    /// Move the connection to a fresh socket on a new local port (NAT
+    /// rebinding): later sends leave from it and pending receives move to it.
+    /// ICE is not told; its candidate keeps the old port. Returns the new
+    /// local address.
+    pub async fn rebind(&self) -> std::io::Result<SocketAddr> {
+        let slot = self.slot.lock().expect("slot lock").clone();
+        let slot = slot.expect("rebind needs a bound LossyUdpConn");
+        let socket = Arc::new(UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?);
+        let local = socket.local_addr()?;
+        let old = {
+            let mut retired = slot.retired.lock().expect("retired lock");
+            assert!(retired.len() < MAX_REBINDS, "too many rebinds");
+            let old = slot.socket.swap(socket);
+            retired.push(Arc::clone(&old));
+            old
+        };
+        slot.swapped.notify_waiters();
+        // Count what still arrives at the old port; ends with the runtime.
+        let counter = Arc::clone(&slot);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while old.recv_from(&mut buf).await.is_ok() {
+                let mut rx = counter.retired_rx.lock().expect("retired rx lock");
+                *rx = (rx.0 + 1, Some(std::time::Instant::now()));
+            }
+        });
+        Ok(local)
+    }
+
+    /// Datagrams that arrived at a port the connection was rebound away from,
+    /// and when the last one arrived.
+    pub fn retired_received(&self) -> (u64, Option<std::time::Instant>) {
+        let slot = self.slot.lock().expect("slot lock").clone();
+        slot.map_or((0, None), |s| {
+            *s.retired_rx.lock().expect("retired rx lock")
+        })
     }
 
     /// Decide whether to drop `datagram` travelling in `direction`.
@@ -298,23 +391,53 @@ impl LossRules {
 /// A UDP socket that applies [`LossRules`] to everything it sends and
 /// receives.
 pub struct LossyUdpConn {
-    socket: UdpSocket,
+    slot: Arc<SocketSlot>,
     rules: Arc<LossRules>,
 }
 
 impl LossyUdpConn {
     /// Bind `addr` (use `0.0.0.0:0`: webrtc-rs advertises each interface
-    /// address with this socket's port).
+    /// address with this socket's port). One connection per rule set.
     pub async fn bind(addr: SocketAddr, rules: Arc<LossRules>) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Ok(Self { socket, rules })
+        let slot = Arc::new(SocketSlot {
+            socket: ArcSwap::from_pointee(socket),
+            swapped: Notify::new(),
+            retired: Mutex::new(Vec::new()),
+            retired_rx: Mutex::new((0, None)),
+        });
+        let mut registered = rules.slot.lock().expect("slot lock");
+        assert!(registered.is_none(), "one connection per LossRules");
+        *registered = Some(Arc::clone(&slot));
+        drop(registered);
+        Ok(Self { slot, rules })
+    }
+
+    fn socket(&self) -> Arc<UdpSocket> {
+        self.slot.socket.load_full()
+    }
+
+    /// One datagram from the current socket; `None` if the socket was swapped
+    /// while waiting (the caller retries on the new one).
+    async fn recv_current(&self, buf: &mut [u8]) -> Option<std::io::Result<(usize, SocketAddr)>> {
+        let notified = self.slot.swapped.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let socket = self.socket();
+        if !Arc::ptr_eq(&socket, &self.slot.socket.load()) {
+            return None; // swapped before the notification was armed
+        }
+        tokio::select! {
+            received = socket.recv_from(buf) => Some(received),
+            _ = &mut notified => None,
+        }
     }
 }
 
 #[async_trait]
 impl Conn for LossyUdpConn {
     async fn connect(&self, addr: SocketAddr) -> webrtc::util::Result<()> {
-        Ok(self.socket.connect(addr).await?)
+        Ok(self.socket().connect(addr).await?)
     }
 
     async fn recv(&self, buf: &mut [u8]) -> webrtc::util::Result<usize> {
@@ -323,9 +446,14 @@ impl Conn for LossyUdpConn {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> webrtc::util::Result<(usize, SocketAddr)> {
-        // Bounded only by the peer: every dropped datagram was received.
+        // Bounded only by the peer (every dropped datagram was received) and
+        // by MAX_REBINDS swaps. A swap never surfaces as an error: webrtc-ice's
+        // UDP mux stops for good on any receive error but a timeout.
         loop {
-            let (n, from) = self.socket.recv_from(buf).await?;
+            let Some(received) = self.recv_current(buf).await else {
+                continue;
+            };
+            let (n, from) = received?;
             if !self.rules.should_drop(Direction::Inbound, &buf[..n]) {
                 self.rules.record_inbound(&buf[..n]);
                 return Ok((n, from));
@@ -337,7 +465,7 @@ impl Conn for LossyUdpConn {
         if self.rules.should_drop(Direction::Outbound, buf) {
             return Ok(buf.len());
         }
-        Ok(self.socket.send(buf).await?)
+        Ok(self.socket().send(buf).await?)
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc::util::Result<usize> {
@@ -345,11 +473,11 @@ impl Conn for LossyUdpConn {
             // Report success, as a lossy network would.
             return Ok(buf.len());
         }
-        Ok(self.socket.send_to(buf, target).await?)
+        Ok(self.socket().send_to(buf, target).await?)
     }
 
     fn local_addr(&self) -> webrtc::util::Result<SocketAddr> {
-        Ok(self.socket.local_addr()?)
+        Ok(self.socket().local_addr()?)
     }
 
     fn remote_addr(&self) -> Option<SocketAddr> {
@@ -471,6 +599,67 @@ mod tests {
         rules.record_inbound(&[0u8; 20]); // STUN: not recorded, not counted
         let (entries, overflow) = rules.tap();
         assert_eq!((entries.len(), overflow), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn rebind_moves_a_pending_receive_and_the_source_port() {
+        let rules = LossRules::new();
+        let conn = Arc::new(
+            LossyUdpConn::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&rules))
+                .await
+                .unwrap(),
+        );
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let old = conn.local_addr().unwrap();
+
+        // A receive pending on the old socket when the swap happens.
+        let receiver = Arc::clone(&conn);
+        let pending = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, from) = receiver.recv_from(&mut buf).await.unwrap();
+            (buf[..n].to_vec(), from)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let new = rules.rebind().await.unwrap();
+        assert_ne!(new.port(), old.port());
+        assert_eq!(conn.local_addr().unwrap().port(), new.port());
+
+        // Sent to the old port: never delivered, only counted. To the new
+        // one: delivered.
+        peer.send_to(b"old", ("127.0.0.1", old.port()))
+            .await
+            .unwrap();
+        peer.send_to(b"new", ("127.0.0.1", new.port()))
+            .await
+            .unwrap();
+        let (data, from) = pending.await.unwrap();
+        assert_eq!((data.as_slice(), from), (&b"new"[..], peer_addr));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while rules.retired_received().0 == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(rules.retired_received().0, 1);
+
+        // Sends leave from the new port.
+        conn.send_to(b"hi", peer_addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (_, from) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from.port(), new.port());
+    }
+
+    #[test]
+    fn tap_rounds_split_at_the_marks() {
+        let rules = LossRules::new();
+        rules.enable_tap(16);
+        let rtp = |seq: u8| [0x80u8, 96, 0, seq, 0, 0, 0, 0, 0, 0, 0, 5];
+        rules.record_inbound(&rtp(1));
+        rules.mark_tap();
+        rules.mark_tap(); // an empty round
+        rules.record_inbound(&rtp(2));
+        rules.record_inbound(&rtp(3));
+        let sizes: Vec<usize> = rules.tap_rounds().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![1, 0, 2]);
     }
 
     #[test]

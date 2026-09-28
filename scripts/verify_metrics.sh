@@ -24,8 +24,10 @@ OUTPUT=$(cargo run --package nexus-metrics --example basic_usage 2>&1)
 echo "   ✅ Example executed successfully"
 echo ""
 
-# Test 4: Verify SFU metrics
-echo "4️⃣  Verifying SFU metrics..."
+# Test 4: Verify SFU metrics. Still exported, but nothing feeds them since
+# Phase 1 (the old path is gone): in a running SFU they read zero, and the
+# dashboard does not show them.
+echo "4️⃣  Verifying SFU metrics (exported, not fed since Phase 1: read zero)..."
 echo "$OUTPUT" | grep -q "nexus_sfu_packets_received_total" && echo "   ✅ Packet counters present"
 echo "$OUTPUT" | grep -q "nexus_sfu_forwarding_latency_seconds_bucket" && echo "   ✅ Latency histogram present"
 echo "$OUTPUT" | grep -q "nexus_sfu_forwarding_latency_seconds_sum" && echo "   ✅ Latency sum present"
@@ -36,10 +38,18 @@ echo ""
 echo "5️⃣  Verifying shard metrics..."
 echo "$OUTPUT" | grep -q 'nexus_shard_rx_datagrams_total{shard="0"}' && echo "   ✅ Shard counters present"
 echo "$OUTPUT" | grep -q 'nexus_shard_sessions{shard="0"}' && echo "   ✅ Shard gauges present"
+# Every series the dashboard plots is exported (the drop panel uses a regex).
+for metric in $(grep -o 'nexus_shard_[a-z_]*' deploy/grafana/dashboard.json | grep -v '_$' | sort -u); do
+    if ! echo "$OUTPUT" | grep -q "^$metric{"; then
+        echo "   ❌ Dashboard series $metric is not exported"
+        exit 1
+    fi
+done
+echo "   ✅ Every dashboard series is exported"
 echo ""
 
-# Test 6: Verify CRDT metrics
-echo "6️⃣  Verifying CRDT metrics..."
+# Test 6: Verify CRDT metrics (exported, not fed since Phase 1: read zero)
+echo "6️⃣  Verifying CRDT metrics (exported, not fed since Phase 1: read zero)..."
 echo "$OUTPUT" | grep -q "nexus_crdt_gossip_messages_sent_total" && echo "   ✅ Gossip counters present"
 echo "$OUTPUT" | grep -q "nexus_crdt_state_sync_latency_seconds_bucket" && echo "   ✅ State sync latency histogram present"
 echo "$OUTPUT" | grep -q "nexus_crdt_active_peers" && echo "   ✅ Peer metrics present"
@@ -67,10 +77,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "✅ All verification checks passed!"
 echo ""
 echo "📊 Metrics Summary:"
-echo "   • SFU metrics: 9 (including latency histogram)"
-echo "   • Shard metrics: every ShardCounters field plus 4 gauges, per shard"
-echo "   • CRDT metrics: 8 (including state sync latency)"
-echo "   • Actor metrics: 8"
+echo "   • Shard metrics: every ShardCounters field plus 4 gauges, per shard (the dashboard)"
+echo "   • SFU and CRDT metrics: exported, not fed since Phase 1 (read zero)"
 echo "   • Total: $METRIC_COUNT metrics exported"
 echo ""
 echo "🎯 Next Steps:"

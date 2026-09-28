@@ -26,8 +26,9 @@ libc = "0.2"
 
 # WebRTC connectivity
 webrtc = "0.10"
-# Conn impl for the loss-injecting socket (lossy.rs)
+# Conn impl for the loss-injecting socket (lossy.rs), and its swappable socket
 async-trait = "0.1"
+arc-swap = "1.8"
 
 # Async runtime
 tokio = { version = "1.44", features = ["full", "rt-multi-thread", "net", "sync", "time", "macros"] }

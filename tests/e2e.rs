@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 use harness::*;
 use nexus_loadtest::client::HeadlessClient;
 use nexus_loadtest::lossy::{Direction, LossRule, LossRules, PacketClass, SrtcpLayout, TapEntry};
+use nexus_loadtest::rtcp_log::ntp_to_system_time;
 use nexus_loadtest::signaling::SignalingConnection;
-use nexus_loadtest::{Announced, RemoteTrack};
+use nexus_loadtest::{Announced, RemoteTrack, TrackRxStats};
 use nexus_sfu::nexus_transport::dtls::DtlsRole;
 use nexus_sfu::nexus_transport::srtp::ProtectionProfile;
 use nexus_sfu::signal::SignalMessage;
@@ -391,8 +392,13 @@ async fn ten_clients_audio_video() {
         check_received(&who, &before[i], &client.track_stats(), &expected[i]);
         assert_eq!(client.signal_events_dropped(), 0, "{who}");
     }
-    let shard = server.dataplane().stats(nexus_dataplane::ShardId::new(0));
-    assert_eq!(shard.counters.commands_rejected, 0, "{shard:?}");
+    let shard = settled_shard_stats(&server).await;
+    let c = &shard.counters;
+    assert_eq!(c.commands_rejected, 0, "{shard:?}");
+    assert_eq!(c.drop_srtp_protect, 0, "{shard:?}");
+    assert_eq!(c.drop_pool_empty, 0, "{shard:?}");
+    assert_eq!(c.drop_send_failed, 0, "{shard:?}");
+    assert_eq!(c.drop_too_large, 0, "{shard:?}");
     assert_eq!(shard.gauges.sessions, TEN as u64, "{shard:?}");
     assert_eq!(
         shard.gauges.subscriptions,
@@ -463,7 +469,10 @@ async fn resubscribe_no_srtp_index_reuse() {
     let ids: Vec<u64> = known.iter().map(|t| t.track_id).collect();
 
     let mut used = BTreeSet::new();
+    let mut round_ssrcs = Vec::with_capacity(RESUBSCRIBE_ROUNDS);
+    let mut first_mids = BTreeSet::new();
     for round in 0..RESUBSCRIBE_ROUNDS {
+        rules.mark_tap();
         let offered = b
             .subscribe_confirmed(&ids, STEP_TIMEOUT)
             .await
@@ -473,6 +482,14 @@ async fn resubscribe_no_srtp_index_reuse() {
         for ssrc in &ssrcs {
             assert!(used.insert(*ssrc), "round {round}: SSRC {ssrc:#x} reused");
         }
+        // The SFU reuses the inactive m-lines: same mids, new SSRCs.
+        let mids: BTreeSet<String> = offered.iter().map(|m| m.mid.clone()).collect();
+        if round == 0 {
+            first_mids = mids;
+        } else {
+            assert_eq!(mids, first_mids, "round {round} reuses round 0's mids");
+        }
+        round_ssrcs.push(ssrcs.clone());
         wait_for_media(&b, &ssrcs, 10, STEP_TIMEOUT).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -496,10 +513,58 @@ async fn resubscribe_no_srtp_index_reuse() {
     let (entries, overflow) = rules.tap();
     assert_eq!(overflow, 0, "tap too small");
     check_no_index_reuse(&entries, layout, &used);
+    check_rounds(&rules.tap_rounds(), &round_ssrcs);
+
+    let shard = settled_shard_stats(&server).await;
+    assert_eq!(shard.counters.commands_rejected, 0, "{shard:?}");
+    assert_eq!(shard.counters.drop_srtp_protect, 0, "{shard:?}");
 
     let _ = a.disconnect().await;
     let _ = b.disconnect().await;
     server.shutdown().await.expect("clean shutdown");
+}
+
+/// Every SRTP and SRTCP SSRC on the wire in round r is one announced in round r
+/// (so none of an earlier round's SSRCs shows up later). `rounds[0]` is what
+/// arrived before the first subscription: nothing.
+fn check_rounds(rounds: &[Vec<TapEntry>], round_ssrcs: &[Vec<u32>]) {
+    assert_eq!(
+        rounds.len(),
+        round_ssrcs.len() + 1,
+        "one tap mark per round"
+    );
+    assert!(
+        rounds[0].is_empty(),
+        "media before subscribing: {:?}",
+        rounds[0]
+    );
+    for (round, (entries, ssrcs)) in rounds[1..].iter().zip(round_ssrcs).enumerate() {
+        let earlier: Vec<u32> = round_ssrcs[..round].iter().flatten().copied().collect();
+        for entry in entries {
+            let ssrc = match entry {
+                TapEntry::Srtp { ssrc, .. } => *ssrc,
+                TapEntry::Srtcp { sender_ssrc, .. } => *sender_ssrc,
+            };
+            assert!(
+                !earlier.contains(&ssrc),
+                "round {round}: SSRC {ssrc:#x} of an earlier round on the wire"
+            );
+            assert!(
+                ssrcs.contains(&ssrc),
+                "round {round}: SSRC {ssrc:#x} not announced in this round ({ssrcs:x?})"
+            );
+        }
+        assert!(!entries.is_empty(), "round {round}: nothing on the wire");
+    }
+}
+
+/// Shard stats after the next once-a-second publish, so counters include
+/// everything that happened before the call.
+async fn settled_shard_stats(
+    server: &nexus_sfu::server::ServerHandle,
+) -> nexus_dataplane::ShardStatsSnapshot {
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    shard_stats(server)
 }
 
 /// The SRTCP layout of the profile `client`'s DTLS session negotiated.
@@ -550,4 +615,401 @@ fn check_no_index_reuse(entries: &[TapEntry], layout: SrtcpLayout, ssrcs: &BTree
         rtcp.len(),
         ssrcs.len()
     );
+}
+
+/// Subscribe `client` to the first `count` tracks announced to it; returns the
+/// announced m-lines of those tracks.
+async fn subscribe_all(client: &mut HeadlessClient, count: usize) -> Vec<Announced> {
+    let known = client
+        .wait_for_known_tracks(count, STEP_TIMEOUT)
+        .await
+        .expect("tracks announced");
+    let ids: Vec<u64> = known.iter().map(|t| t.track_id).take(count).collect();
+    let offered = client
+        .subscribe_confirmed(&ids, STEP_TIMEOUT)
+        .await
+        .expect("subscribed");
+    assert_eq!(offered.len(), count, "{offered:?}");
+    offered
+}
+
+fn ssrcs_of(announced: &[Announced]) -> Vec<u32> {
+    announced.iter().map(|a| a.ssrc).collect()
+}
+
+fn shard_stats(server: &nexus_sfu::server::ServerHandle) -> nexus_dataplane::ShardStatsSnapshot {
+    server.dataplane().stats(nexus_dataplane::ShardId::new(0))
+}
+
+/// Media window after the rebind in `address_change_mid_call`.
+const AFTER_REBIND_WINDOW: Duration = Duration::from_secs(3);
+
+/// Latest resume accepted in `address_change_mid_call` (measured ≈ 2.1-2.3 s; the
+/// margin is for emulated and loaded CI runners).
+const REBIND_RESUME_MAX: Duration = Duration::from_millis(4_500);
+
+/// A and B in a call; A's socket moves to a new local port (a NAT rebinding;
+/// A's ICE agent keeps its candidate, note §17.3). Media resumes both ways
+/// within 3.5 s (not before the silence rule allows), runs with ≤ 1 % loss
+/// afterwards, nothing more reaches A's old port, and the shard counted the
+/// rebinding. Expected resume ≈ 2.0-2.6 s: webrtc-ice sends a binding request
+/// once it has received nothing for 2 s, and the SFU accepts it once A's old
+/// address has been silent for `rebind_silence` (2 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn address_change_mid_call() {
+    let _serial = SERIAL.lock().await;
+    init_logging();
+    let server = start_server().await;
+
+    let a_rules = LossRules::new();
+    let mut a = publishing_client(lossy_client_config(&server, "rebind", &a_rules)).await;
+    let mut b = publishing_client(client_config(&server, "rebind")).await;
+    let a_streams = ssrcs_of(&subscribe_all(&mut a, 2).await);
+    let b_streams = ssrcs_of(&subscribe_all(&mut b, 2).await);
+    wait_for_media(&a, &a_streams, 1, STEP_TIMEOUT).await;
+    wait_for_media(&b, &b_streams, 1, STEP_TIMEOUT).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let rebinds = shard_stats(&server).counters.rebinds;
+    let rebound_at = Instant::now();
+    let new_addr = a_rules.rebind().await.expect("rebinds");
+    let (a_resumed, b_resumed) = tokio::join!(
+        wait_for_resume(&a, &a_streams, rebound_at),
+        wait_for_resume(&b, &b_streams, rebound_at)
+    );
+    eprintln!(
+        "address_change_mid_call: A moved to port {}; media to A resumed after {a_resumed:?}, \
+         A's media to B after {b_resumed:?}",
+        new_addr.port()
+    );
+    assert!(
+        a_resumed < REBIND_RESUME_MAX,
+        "B -> A resumed after {a_resumed:?}"
+    );
+    assert!(
+        b_resumed < REBIND_RESUME_MAX,
+        "A -> B resumed after {b_resumed:?}"
+    );
+    // A's media from the new port is dropped until the old address has been
+    // silent for rebind_silence: an earlier resume means the rule was skipped.
+    let silence = Duration::from_millis(test_config().dataplane.rebind_silence_ms.into());
+    let earliest = silence.saturating_sub(Duration::from_millis(200));
+    assert!(
+        b_resumed >= earliest,
+        "A -> B resumed after {b_resumed:?}, before {earliest:?}"
+    );
+
+    let (a_before, b_before) = (a.track_stats(), b.track_stats());
+    tokio::time::sleep(AFTER_REBIND_WINDOW).await;
+    check_window("A", &a_before, &a.track_stats(), &a_streams);
+    check_window("B", &b_before, &b.track_stats(), &b_streams);
+
+    // The SFU sends to A's new port only: the old one got nothing from 1 s
+    // after media to A resumed.
+    let (retired_rx, last) = a_rules.retired_received();
+    let quiet_from = rebound_at + a_resumed + Duration::from_secs(1);
+    if let Some(last) = last {
+        assert!(
+            last < quiet_from,
+            "A's old port received {:?} after media resumed",
+            last.duration_since(rebound_at + a_resumed)
+        );
+    }
+    eprintln!("address_change_mid_call: {retired_rx} datagrams reached A's old port");
+
+    // Stats are published once a second.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while shard_stats(&server).counters.rebinds == rebinds && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let shard = shard_stats(&server);
+    assert_eq!(shard.counters.rebinds, rebinds + 1, "{shard:?}");
+
+    let _ = a.disconnect().await;
+    let _ = b.disconnect().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// How long after `since` packets on `ssrcs` started arriving again, after
+/// having stopped for at least 500 ms.
+async fn wait_for_resume(client: &HeadlessClient, ssrcs: &[u32], since: Instant) -> Duration {
+    const GAP: Duration = Duration::from_millis(500);
+    let count = || -> u64 {
+        let stats = client.track_stats();
+        let on = |t: &&TrackRxStats| ssrcs.contains(&t.ssrc);
+        stats.iter().filter(on).map(|t| t.packets).sum()
+    };
+    let deadline = since + Duration::from_secs(10);
+    let (mut last, mut changed_at, mut stalled) = (count(), since, false);
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = count();
+        if now == last {
+            stalled |= changed_at.elapsed() >= GAP;
+            continue;
+        }
+        if stalled {
+            return since.elapsed();
+        }
+        (last, changed_at) = (now, Instant::now());
+    }
+    panic!("media on {ssrcs:x?} did not stop and resume within 10 s (stalled: {stalled})");
+}
+
+/// Over one window: each of `ssrcs` received ≥ 10 packets/s with ≤ 1 % of its
+/// sequence numbers missing.
+fn check_window(who: &str, before: &[TrackRxStats], after: &[TrackRxStats], ssrcs: &[u32]) {
+    let window = AFTER_REBIND_WINDOW.as_secs();
+    for ssrc in ssrcs {
+        let find = |all: &[TrackRxStats]| all.iter().find(|t| t.ssrc == *ssrc).cloned();
+        let (b, a) = (find(before).expect("before"), find(after).expect("after"));
+        let received = a.packets - b.packets;
+        let expected = a.highest_ext_seq - b.highest_ext_seq;
+        let missing = expected.saturating_sub(received);
+        assert!(
+            received >= 10 * window,
+            "{who}: {ssrc:#x}: {received} packets"
+        );
+        assert!(
+            missing * 100 <= expected,
+            "{who}: {ssrc:#x}: {missing} of {expected} missing"
+        );
+    }
+}
+
+/// Most error between a sender report's RTP timestamp and the media's,
+/// extrapolated to the report's NTP time (note §17.5).
+const SR_TOLERANCE_MS: f64 = 20.0;
+
+/// A publishes audio + video (webrtc-rs sends SRs every second), B subscribes.
+/// B receives translated SRs on the SSRCs it receives the media on, with RTP
+/// timestamps consistent with that media, and the same CNAME (the one its offer
+/// announced) for both tracks (note §17.5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sender_report_translation() {
+    let _serial = SERIAL.lock().await;
+    init_logging();
+    let server = start_server().await;
+
+    let mut a = publishing_client(client_config(&server, "sender-reports")).await;
+    let mut b = HeadlessClient::new(client_config(&server, "sender-reports"))
+        .await
+        .unwrap();
+    b.connect().await.expect("B connects");
+    b.start_signaling_task().expect("signaling task starts");
+    let offered = subscribe_all(&mut b, 2).await;
+    let ssrcs = ssrcs_of(&offered);
+    wait_for_media(&b, &ssrcs, 1, STEP_TIMEOUT).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let log = b.rtcp_log();
+    let reports_on = |ssrc: u32| {
+        log.sender_reports()
+            .iter()
+            .filter(|r| r.ssrc == ssrc)
+            .count()
+    };
+    while ssrcs.iter().any(|s| reports_on(*s) < 2) {
+        assert!(
+            Instant::now() < deadline,
+            "fewer than 2 SRs per track in 5 s: {:?}",
+            log.sender_reports()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for report in log.sender_reports() {
+        assert!(
+            ssrcs.contains(&report.ssrc),
+            "SR on an unknown SSRC: {report:?}"
+        );
+    }
+    // The SFU's packet count per subscription only grows.
+    for ssrc in &ssrcs {
+        let reports = log.sender_reports();
+        let counts: Vec<u32> = reports
+            .iter()
+            .filter(|r| r.ssrc == *ssrc)
+            .map(|r| r.packet_count)
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] <= w[1]),
+            "{ssrc:#x}: packet count went down: {counts:?}"
+        );
+    }
+
+    let stats = b.track_stats();
+    for m in &offered {
+        let clock = if m.kind == "video" {
+            90_000.0
+        } else {
+            48_000.0
+        };
+        let track = stats.iter().find(|t| t.ssrc == m.ssrc).expect("media");
+        let reports = log.sender_reports();
+        let sr = reports.iter().rev().find(|r| r.ssrc == m.ssrc).unwrap();
+        let error_ms = sr_error_ms(sr, track, clock);
+        eprintln!(
+            "sender_report_translation: {} SR off by {error_ms:.1} ms",
+            m.kind
+        );
+        assert!(
+            error_ms.abs() <= SR_TOLERANCE_MS,
+            "{}: {error_ms} ms: {sr:?}",
+            m.kind
+        );
+    }
+
+    let cnames = log.cnames();
+    for m in &offered {
+        let announced = m.cname.as_deref().expect("offer announces a CNAME");
+        let received: Vec<&str> = cnames
+            .iter()
+            .filter(|(ssrc, _)| *ssrc == m.ssrc)
+            .map(|(_, c)| c.as_str())
+            .collect();
+        assert_eq!(received, vec![announced], "{} SDES: {cnames:?}", m.kind);
+    }
+    assert_eq!(
+        offered[0].cname, offered[1].cname,
+        "one CNAME per publisher"
+    );
+    assert_eq!(log.overflow(), 0);
+    assert!(shard_stats(&server).counters.sr_translated > 0);
+
+    let _ = a.disconnect().await;
+    let _ = b.disconnect().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The SR's RTP timestamp minus the latest received packet's, extrapolated at
+/// `clock` Hz from that packet's arrival to the SR's NTP time, in ms.
+fn sr_error_ms(
+    sr: &nexus_loadtest::rtcp_log::SenderReportRx,
+    track: &TrackRxStats,
+    clock: f64,
+) -> f64 {
+    let sr_time = ntp_to_system_time(sr.ntp_time);
+    let elapsed = match sr_time.duration_since(track.last_arrival_wall) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    };
+    let ticks = sr.rtp_time.wrapping_sub(track.last_timestamp) as i32 as f64;
+    (ticks - elapsed * clock) / clock * 1000.0
+}
+
+/// A's keyframe requests for `ssrc` that arrived at or after `since`.
+fn plis_since(a: &HeadlessClient, ssrc: u32, since: Instant) -> Vec<Instant> {
+    let requests = a.rtcp_log().keyframe_requests();
+    let wanted = |r: &&nexus_loadtest::rtcp_log::KeyframeRequest| {
+        r.media_ssrc == ssrc && r.at >= since && !r.fir
+    };
+    requests.iter().filter(wanted).map(|r| r.at).collect()
+}
+
+/// Wait up to `within` after `since` for A's first PLI on `ssrc`; returns its delay.
+async fn wait_for_pli(a: &HeadlessClient, ssrc: u32, since: Instant, within: Duration) -> Duration {
+    loop {
+        if let Some(at) = plis_since(a, ssrc, since).first() {
+            return at.duration_since(since);
+        }
+        assert!(
+            since.elapsed() < within,
+            "no PLI for {ssrc:#x} within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Keyframe requests (R1, note §17.6): the SFU asks A for a keyframe when B
+/// subscribes, forwards B's PLI, and forwards one of a burst (500 ms throttle).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyframe_requests() {
+    let _serial = SERIAL.lock().await;
+    init_logging();
+    let server = start_server().await;
+
+    // A records RTCP from start_publishing on, before any subscriber.
+    let mut a = publishing_client(client_config(&server, "keyframes")).await;
+    let video = a.published_ssrc(true).await.expect("video SSRC");
+    let mut b = HeadlessClient::new(client_config(&server, "keyframes"))
+        .await
+        .unwrap();
+    b.connect().await.expect("B connects");
+    b.start_signaling_task().expect("signaling task starts");
+
+    // 1. B subscribes: A gets a PLI for its video within 3 s (B's ICE and
+    // DTLS come up in that time: B has no transport before this offer;
+    // 0.2-0.4 s natively, the margin is for emulated CI runners).
+    let subscribed = Instant::now();
+    let offered = subscribe_all(&mut b, 2).await;
+    let on_subscribe = wait_for_pli(&a, video, subscribed, Duration::from_secs(3)).await;
+    let b_video = offered
+        .iter()
+        .find(|m| m.kind == "video")
+        .expect("video")
+        .ssrc;
+    wait_for_media(&b, &[b_video], 1, STEP_TIMEOUT).await;
+
+    // 2. Past the throttle, B's PLI reaches A within 500 ms. Nothing asks A
+    // for a keyframe in between.
+    let quiet = Instant::now();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        plis_since(&a, video, quiet),
+        Vec::<Instant>::new(),
+        "PLI while quiet"
+    );
+    let sent = Instant::now();
+    b.send_pli(b_video).await.expect("PLI sent");
+    let forwarded = wait_for_pli(&a, video, sent, Duration::from_millis(500)).await;
+
+    // 3. Past the throttle again (the settled stats take 1.1 s), 5 PLIs within
+    // 100 ms: exactly one reaches A in the following 400 ms, and the shard
+    // throttled the other four.
+    let quiet = Instant::now();
+    let throttled = settled_shard_stats(&server)
+        .await
+        .counters
+        .keyframe_throttled;
+    assert_eq!(
+        plis_since(&a, video, quiet),
+        Vec::<Instant>::new(),
+        "PLI while quiet"
+    );
+    let burst = Instant::now();
+    for i in 0..5 {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        b.send_pli(b_video).await.expect("PLI sent");
+    }
+    assert!(
+        burst.elapsed() < Duration::from_millis(100),
+        "burst took {:?}",
+        burst.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(500).saturating_sub(burst.elapsed())).await;
+    let arrived = plis_since(&a, video, burst);
+    eprintln!(
+        "keyframe_requests: on subscribe {on_subscribe:?}, forwarded {forwarded:?}, \
+         burst -> {} at {:?}",
+        arrived.len(),
+        arrived
+            .iter()
+            .map(|t| t.duration_since(burst))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(arrived.len(), 1, "one PLI of the burst reaches A");
+
+    let shard = settled_shard_stats(&server).await;
+    assert_eq!(
+        shard.counters.keyframe_throttled,
+        throttled + 4,
+        "{shard:?}"
+    );
+    assert_eq!(a.rtcp_log().overflow(), 0);
+
+    let _ = a.disconnect().await;
+    let _ = b.disconnect().await;
+    server.shutdown().await.expect("clean shutdown");
 }

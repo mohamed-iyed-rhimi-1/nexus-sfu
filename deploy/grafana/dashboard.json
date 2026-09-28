@@ -1,97 +1,16 @@
 {
   "dashboard": {
     "title": "Nexus SFU Metrics",
-    "tags": ["nexus", "sfu", "webrtc"],
+    "tags": [
+      "nexus",
+      "sfu",
+      "webrtc"
+    ],
     "timezone": "browser",
+    "description": "Data plane (nexus_shard_*, per shard). The nexus_sfu_* and nexus_crdt_* series are still exported but nothing feeds them since Phase 1 (they read zero), so no panel shows them.",
     "panels": [
       {
         "id": 1,
-        "title": "Packet Rate",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "rate(nexus_sfu_packets_received_total[1m])",
-            "legendFormat": "Received"
-          },
-          {
-            "expr": "rate(nexus_sfu_packets_forwarded_total[1m])",
-            "legendFormat": "Forwarded"
-          },
-          {
-            "expr": "rate(nexus_sfu_packets_dropped_total[1m])",
-            "legendFormat": "Dropped"
-          }
-        ],
-        "yaxes": [
-          {
-            "label": "packets/sec",
-            "format": "short"
-          }
-        ]
-      },
-      {
-        "id": 2,
-        "title": "Forwarding Latency",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.50, rate(nexus_sfu_forwarding_latency_seconds_bucket[1m]))",
-            "legendFormat": "P50"
-          },
-          {
-            "expr": "histogram_quantile(0.99, rate(nexus_sfu_forwarding_latency_seconds_bucket[1m]))",
-            "legendFormat": "P99"
-          }
-        ],
-        "yaxes": [
-          {
-            "label": "latency (ms)",
-            "format": "ms"
-          }
-        ]
-      },
-      {
-        "id": 3,
-        "title": "Active Entities",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "nexus_sfu_active_tracks",
-            "legendFormat": "Tracks"
-          },
-          {
-            "expr": "nexus_sfu_active_participants",
-            "legendFormat": "Participants"
-          },
-          {
-            "expr": "nexus_sfu_active_rooms",
-            "legendFormat": "Rooms"
-          }
-        ]
-      },
-      {
-        "id": 4,
-        "title": "Bandwidth Usage",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "rate(nexus_sfu_bytes_received_total[1m]) * 8",
-            "legendFormat": "Inbound"
-          },
-          {
-            "expr": "rate(nexus_sfu_bytes_forwarded_total[1m]) * 8",
-            "legendFormat": "Outbound"
-          }
-        ],
-        "yaxes": [
-          {
-            "label": "bits/sec",
-            "format": "bps"
-          }
-        ]
-      },
-      {
-        "id": 5,
         "title": "Shard Datagrams",
         "type": "graph",
         "targets": [
@@ -106,24 +25,121 @@
         ],
         "yaxes": [
           {
-            "label": "CPU %",
-            "format": "percent",
-            "max": 1
+            "label": "datagrams/sec",
+            "format": "short"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Shard Bandwidth",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_shard_rx_bytes_total[1m]) * 8",
+            "legendFormat": "rx shard {{shard}}"
+          },
+          {
+            "expr": "rate(nexus_shard_tx_bytes_total[1m]) * 8",
+            "legendFormat": "tx shard {{shard}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "bits/sec",
+            "format": "bps"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Shard Drops",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate({__name__=~\"nexus_shard_drop_.*_total\"}[1m]) > 0",
+            "legendFormat": "{{__name__}} shard {{shard}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "datagrams/sec",
+            "format": "short"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Sessions, Tracks, Subscriptions",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "nexus_shard_sessions",
+            "legendFormat": "sessions shard {{shard}}"
+          },
+          {
+            "expr": "nexus_shard_tracks",
+            "legendFormat": "tracks shard {{shard}}"
+          },
+          {
+            "expr": "nexus_shard_subscriptions",
+            "legendFormat": "subscriptions shard {{shard}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "count",
+            "format": "short"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "RTCP: Sender Reports and Keyframe Requests",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_shard_sr_translated_total[1m])",
+            "legendFormat": "SRs translated shard {{shard}}"
+          },
+          {
+            "expr": "rate(nexus_shard_keyframe_requests_total[1m])",
+            "legendFormat": "PLIs to publishers shard {{shard}}"
+          },
+          {
+            "expr": "rate(nexus_shard_keyframe_throttled_total[1m])",
+            "legendFormat": "PLIs throttled shard {{shard}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "packets/sec",
+            "format": "short"
           }
         ]
       },
       {
         "id": 6,
-        "title": "CRDT Gossip Rate",
+        "title": "ICE: Address Selection and Consent",
         "type": "graph",
         "targets": [
           {
-            "expr": "rate(nexus_crdt_gossip_messages_sent_total[1m])",
-            "legendFormat": "Sent"
+            "expr": "increase(nexus_shard_nominations_total[5m])",
+            "legendFormat": "nominations shard {{shard}}"
           },
           {
-            "expr": "rate(nexus_crdt_gossip_messages_received_total[1m])",
-            "legendFormat": "Received"
+            "expr": "increase(nexus_shard_rebinds_total[5m])",
+            "legendFormat": "rebinds shard {{shard}}"
+          },
+          {
+            "expr": "increase(nexus_shard_consent_lost_total[5m])",
+            "legendFormat": "consent lost shard {{shard}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "per 5 min",
+            "format": "short"
           }
         ]
       }

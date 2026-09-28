@@ -1408,6 +1408,12 @@ request). Line numbers above have moved (task `client.rs:1114-1184`, `answer_off
   twice` (a new slot restarts the SRTCP index under the same key and SSRC). Restored.
 - Runtime (macOS): `ten_clients` 9.7 s (setup 4.6 s), `resubscribe` ≈ 5 s, suite 27.1 s
   (5 tests); Linux arm64 27.1 s.
+- **Review fixes (with 1.6b):** the tap records round boundaries (`LossRules::mark_tap`,
+  `tap_rounds`); `resubscribe` asserts every SRTP/SRTCP SSRC on the wire in a round is one
+  announced in that round and none of an earlier round's appears later, that rounds 1-2
+  reuse round 0's mids, and, from stats read after the next once-a-second publish,
+  `commands_rejected == 0` and `drop_srtp_protect == 0`. `ten_clients` also asserts
+  `drop_srtp_protect`, `drop_pool_empty`, `drop_send_failed` and `drop_too_large` are 0.
 
 ---
 
@@ -1458,7 +1464,7 @@ request). Line numbers above have moved (task `client.rs:1114-1184`, `answer_off
   sends none. After a rebind the SFU keeps sending to the old port, so the client's receive
   time goes stale: requests start ≈ 2.0-2.2 s after the rebind and repeat every 200 ms. With
   `rebind_silence = 2 s` the first one may be refused and the next accepted: expected
-  resume ≈ 2.2-2.6 s. The test asserts < 5 s and logs the measured value. ICE goes
+  resume ≈ 2.2-2.6 s. The test asserts ≥ `rebind_silence` − 200 ms and < 4.5 s and logs the measured value. ICE goes
   Disconnected after 5 s without input, Failed after 30 s.
 - `register_default_interceptors` (`client.rs:193`) includes the sender and receiver report
   interceptors (reports every 1 s). webrtc-rs sends bare SRs without SDES; the SFU's
@@ -1469,6 +1475,62 @@ request). Line numbers above have moved (task `client.rs:1114-1184`, `answer_off
 fail with the rebinding rule disabled.
 
 **Checkpoint:** all e2e exit tests green (**exit criterion 1**, except CI on macOS: 1.7).
+
+**1.6b done (2026-09-28):**
+- `LossRules::rebind()`: `LossyUdpConn` keeps its socket in an `ArcSwap` registered with its
+  rules (one connection per rule set); a rebind binds a new port, swaps, and wakes pending
+  receives (`Notify`), which move to the new socket; the swap never surfaces as an error. The
+  old socket stays open, and what still reaches it is counted and discarded (a dead NAT
+  mapping; `retired_received`). Unit test: a pending receive moves, the old port no longer
+  delivers (the datagram is counted), sends leave from the new port. `arc-swap = "1.8"`
+  added.
+- `rtcp_log.rs` (new): `RtcpLog`, bounded, records PLI/FIR (media SSRC, arrival), SRs (SSRC,
+  NTP, RTP time, arrival wall clock) and SDES CNAMEs. The publisher's `spawn_rtcp_drain` is
+  replaced by `spawn_rtcp_recorder` (`sender.read_rtcp()`); `on_track` reads each receiver's
+  RTCP; both readers log their error when they stop. `HeadlessClient::rtcp_log`, `send_pli`
+  (`write_rtcp`); `TrackRxStats` gains `last_arrival_wall`; `ntp_to_system_time`.
+- `ShardStats`: nothing to add (`rebinds` existed).
+- Tests:
+  - `address_change_mid_call`: resume measured as the first packet after a ≥ 500 ms stall;
+    2.06-2.26 s both ways on macOS. Bounds: both directions < 3.5 s, and A → B at least
+    `rebind_silence` − 200 ms (A's media from the new port is dropped until the old address
+    has been silent that long; an earlier resume would mean the rule was bypassed). 3 s window
+    after it with ≤ 1 % missing (sequence numbers in the window); A's old port receives
+    nothing from 1 s after media to A resumed (≈ 165 datagrams reach it before); `rebinds`
+    + 1. **Negative check:** with rebinding effectively disabled
+    (`rebind_silence_ms = 29,000`, so an address is never silent long enough within the test)
+    media does not resume within 10 s. Restored.
+  - `sender_report_translation`: ≥ 2 SRs per track in 5 s, only on the announced SSRCs,
+    packet counts never decrease; RTP time vs the media extrapolated to the SR's NTP time:
+    1.3-5.7 ms off (limit 20 ms); SDES CNAME per SSRC = the offer's `a=ssrc … cname`, same
+    for audio and video; `sr_translated`.
+  - `keyframe_requests`: PLI on subscribe 0.2-0.4 s after the subscribe request (B's ICE and
+    DTLS included; asserted < 3 s for emulated runners); no PLI in the quiet periods before step 2 and the burst; B's PLI
+    forwarded in < 2 ms; a burst of 5 with 5 ms gaps → exactly 1 at A, and
+    `keyframe_throttled` exactly + 4 (stats read after the next publish). FIR is recorded but
+    not exercised (webrtc-rs subscribers send PLI).
+- Review fixes outside the tests:
+  - `scripts/ci-local.sh` takes a lock (`$TMPDIR/nexus-ci-local.lock`, owner pid, stale lock
+    taken over) and refuses to start while another run holds it: two runs share
+    `target/ci-local` and the Docker target volumes, and a collision on 2026-09-28 produced a
+    false FAIL (x86_64 `real_path`, while a duplicate container was stopped by hand).
+  - Grafana dashboard: six panels on `nexus_shard_*` only (datagrams, bandwidth, drops by
+    counter, sessions/tracks/subscriptions, SRs and keyframe requests, nominations/rebinds/
+    consent); the `nexus_sfu_*` and `nexus_crdt_*` series (exported, zero since the old path
+    went) are no longer shown, and the dashboard description says so. `verify_metrics.sh`
+    marks those two sections as zero series and checks every `nexus_shard_*` series the
+    dashboard plots is exported.
+  - `verify_cleanup.sh`: the `src/sfu.rs` check removed (the file went in C1+C3). Its other
+    five failing checks (RoomManager, SignalingServer, serde_json, JSON methods, `loss.rs`)
+    predate Phase 1 and are left for 1.9; its `rg` calls without a path hang when stdin is
+    not a terminal (run it with `</dev/null`).
+  - `config/production.toml` no longer uses realtime priority: `[dataplane]` has
+    `realtime_priority = false` since 1.5b-prep, while the old `[worker]` section (live until
+    1.5b, removed in C7) had `realtime_priority = true`. With busy polling and pinning,
+    SCHED_FIFO would make shard 0 spin as a real-time thread on core 0
+    (`DataplaneConfig::warnings()`). `architecture.md` still describes the old SCHED_FIFO
+    worker (rewritten in 1.9).
+- e2e suite: 8 tests, 47 s on macOS.
 
 ---
 
@@ -1957,7 +2019,7 @@ The note's §19 risks stand; these are the ones the audit added.
 
 | Risk | Mitigation |
 |------|------------|
-| Rebind resume ≈ 2.2-2.6 s is close to the 2 s silence rule | Assert < 5 s, log the measured value; if flaky, lower `rebind_silence` in the test config only |
+| Rebind resume ≈ 2.2-2.6 s is close to the 2 s silence rule | Assert ≥ `rebind_silence` − 200 ms and < 4.5 s, log the measured value; if flaky, lower `rebind_silence` in the test config only |
 | A 32-m-line session hits signaling size limits | 1.4 raises the SDP and WebSocket limits and turns silent drops into errors; tested with 32 m-lines |
 | The manual browser check is blocked by HTTPS/token setup | 1.8 documents both setups; the SDK and token work can start before 1.5b |
 | Linux-only code (`LinuxIo`, pinning, GRO check) only runs in the container and CI | Container run is part of every I/O part's checkpoint |
@@ -1988,11 +2050,11 @@ The note's §19 risks stand; these are the ones the audit added.
 | C5 Replaced `nexus-transport` modules | Done | see git log (C5) | Arena, ring buffer, UDP/io_uring/batch transports, ICE agent, `StunServer`, pure-Rust DTLS, `ArenaError` gone; `nexus-transport` is SRTP, STUN, candidates, OpenSSL DTLS, socket setup |
 | C7 Config, README, example | Done | see git log (C7) | Old config sections/fields/env vars removed and refused (fail fast); shard stats on `/metrics`; README, example, TOMLs, dashboard |
 | 1.6a E2E: harness, ten clients, resubscribe | Done | see git log (1.6a) | Signaling task + events, `subscribe_confirmed`/`unsubscribe`, announced history + CNAME, inbound tap; `ten_clients` 9.7 s, suite 27.1 s; negative check fails on SRTCP index reuse |
-| 1.6b E2E: address change, SR, keyframes | Not started | | |
+| 1.6b E2E: address change, SR, keyframes | Done | see git log (1.6b) | `LossRules::rebind`, `RtcpLog` (publisher PLI/FIR, subscriber SR/CNAME), three tests; resume 2.1-2.3 s, SR error ≤ 5.7 ms, burst → 1 PLI; negative check fails with the silence rule disabled. Review fixes (1.6a/1.6b checks, `ci-local.sh` lock, dashboard, scripts) |
 | 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
 | 1.9 Documents, merge | Not started | | |
 
-Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☐ no panic on input · 7 ☐ documents.
+Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☐ no panic on input · 7 ☐ documents.
 
 ### Session log
 
@@ -2532,3 +2594,47 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 09:20, c5e9f76 (8 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
   ```
   Next: review and commit 1.6a, then 1.6b (rebind, RTCP recorders, three tests).
+- 2026-09-28: 1.6a committed (`b0a5ec5`). 1.6b implemented (uncommitted, for review):
+  `LossRules::rebind` (swappable socket, pending receives move, old port counted),
+  `RtcpLog` (publisher PLI/FIR replacing the RTCP drain, subscriber SR/CNAME per receiver),
+  `send_pli`; tests `address_change_mid_call` (resume 2.1-2.3 s), `sender_report_translation`
+  (SR error ≤ 5.7 ms), `keyframe_requests` (burst of 5 → 1). Negative check: with rebinding
+  effectively disabled, media does not resume. Review fixes: stricter 1.6a/1.6b
+  assertions (tap rounds, mid reuse, drop counters, resume bounds, old port quiet, exact
+  throttle count, SR packet counts), RTCP reader errors logged, `ci-local.sh` lock, dashboard
+  and `verify_metrics.sh` on `nexus_shard_*`, `verify_cleanup.sh` without `src/sfu.rs`,
+  `production.toml` realtime note. A first `ci-local.sh all` run collided with a second
+  run (shared `target/ci-local` and Docker volumes; a duplicate container stopped by hand)
+  and reported a false FAIL on x86_64 `real_path`; discarded, which led to the lock. e2e
+  suite 8 tests: 47 s macOS, 48 s Linux arm64, 51 s Linux x86_64 (emulated). Tests 1,412 →
+  1,419 on macOS. **Exit criterion 1 met.** `ci-local.sh all`, alone, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                         146s (1419 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                2s
+  linux-arm64    PASS  clippy                                           8s
+  linux-arm64    PASS  release build                                    1s
+  linux-arm64    PASS  cargo test --workspace                         206s (1425 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           47s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     28s
+  linux-x86_64   PASS  cargo fmt --check                                2s
+  linux-x86_64   PASS  clippy                                          16s
+  linux-x86_64   PASS  release build                                    2s
+  linux-x86_64   PASS  cargo test --workspace                         220s (1425 passed, 0 failed)
+  linux-x86_64   PASS  bench smoke real_path                           63s
+  linux-x86_64   PASS  bench memory (budget 25 KB)                     40s
+  docker         PASS  docker build (linux/amd64)                       7s
+  ci-local 2026-09-28 10:13, b0a5ec5 (13 uncommitted or untracked paths), targets: macos linux-arm64 linux-x86_64 docker, budget 25 KB: PASS
+  ```
+  Next: review and commit 1.6b; left in Phase 1: 1.8 (SDK, browsers), exit criterion 6
+  check, 1.9.
+- 2026-09-28, review of 1.6 (1.6a committed earlier, 1.6b and review fixes): fixes confirmed
+  in code and tests; `ci-local.sh all` alone on `b0a5ec5` + 1.6b: PASS on every target
+  (macOS 1,419, Linux arm64 and x86_64 1,425 passed, docker). Timing bounds widened for
+  emulated runners: PLI on subscribe < 3 s (was 1 s), rebind resume < 4.5 s (was 3.5 s).
+  Negative-check wording corrected (rebinding disabled, not the silence rule). Known limits
+  of the `ci-local.sh` lock, not fixed: an empty pid file during creation reads as stale,
+  two runs can both take over the same stale lock, and Ctrl-C releases the lock while a
+  `docker run` may still be running. **Exit criterion 1 met** (all e2e tests on the new path,
+  `ci-local.sh all`). Committed 1.6b; pushed 1.7, C2-C7, 1.6a, 1.6b. Next: 1.8, then 1.9.

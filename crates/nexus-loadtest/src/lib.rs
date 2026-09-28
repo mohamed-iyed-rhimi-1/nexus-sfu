@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod progress;
 pub mod prometheus;
 pub mod report;
+pub mod rtcp_log;
 pub mod runner;
 pub mod signal_task;
 pub mod signaling;

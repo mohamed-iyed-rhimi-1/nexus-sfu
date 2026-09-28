@@ -14,7 +14,7 @@
 # No target: macos (on a macOS host) and linux-arm64.
 #
 # Jobs run one after another (timing tests share the CPU) and continue after
-# a failure, like `fail-fast: false`. Logs and the summary go to
+# a failure, like `fail-fast: false`. Only one run at a time (a lock in $TMPDIR). Logs and the summary go to
 # target/ci-local/; paste the summary into the phase plan's session log.
 
 set -uo pipefail
@@ -31,6 +31,28 @@ if [ -z "$BUDGET_KB" ]; then
     echo "ci-local: NEXUS_MEM_BUDGET_KB not found in ci.yml" >&2
     exit 2
 fi
+
+# One run at a time: runs share target/ci-local and the Docker target volumes
+# (named per architecture, so also across checkouts). A second run would mix
+# logs and the summary and fight over the volumes (a false FAIL, 2026-09-28).
+# mkdir is atomic; the lock holds the owner's pid, and a lock whose owner is
+# gone is taken over.
+LOCK="${TMPDIR:-/tmp}/nexus-ci-local.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        echo "ci-local: another run holds $LOCK (pid $owner); wait for it or stop it" >&2
+        exit 2
+    fi
+    echo "ci-local: taking over a stale lock (pid ${owner:-unknown} is gone)" >&2
+    rm -rf "$LOCK"
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        echo "ci-local: lost the race for $LOCK" >&2
+        exit 2
+    fi
+fi
+echo $$ >"$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
 
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.txt"

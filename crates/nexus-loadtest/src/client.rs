@@ -33,6 +33,7 @@ use crate::media::{
     read_marker, stamp_marker, AudioGenerator, AudioPattern, VideoGenerator, VideoPattern,
 };
 use crate::metrics::ClientMetrics;
+use crate::rtcp_log::RtcpLog;
 use crate::signal_task::{KnownTracks, RemoteTrack, SignalEvent, SignalTask, TaskContext};
 use crate::signaling::SignalingConnection;
 use crate::track_stats::{TrackRxStats, TrackStatsMap};
@@ -124,6 +125,8 @@ pub struct HeadlessClient {
     audio_sender: Option<Arc<RTCRtpSender>>,
     /// SSRCs the SFU's latest offer announces for the tracks it sends us
     announced: AnnouncedSsrcs,
+    /// RTCP received by the published senders and the remote tracks' receivers
+    rtcp: RtcpLog,
 }
 
 impl HeadlessClient {
@@ -156,6 +159,7 @@ impl HeadlessClient {
             video_sender: None,
             audio_sender: None,
             announced: AnnouncedSsrcs::default(),
+            rtcp: RtcpLog::default(),
         })
     }
 
@@ -424,12 +428,26 @@ impl HeadlessClient {
         let rx_bytes = Arc::clone(&self.rx_bytes);
         let first_frame_received = Arc::clone(&self.first_frame_received);
         let track_stats = self.track_stats.clone();
+        let rtcp = self.rtcp.clone();
 
-        peer_connection.on_track(Box::new(move |track, _receiver, _transceiver| {
+        peer_connection.on_track(Box::new(move |track, receiver, _transceiver| {
             let rx_packets = Arc::clone(&rx_packets);
             let rx_bytes = Arc::clone(&rx_bytes);
             let first_frame_received = Arc::clone(&first_frame_received);
             let track_stats = track_stats.clone();
+            // Sender reports and SDES from the SFU, per receiver (one track each).
+            let rtcp = rtcp.clone();
+            tokio::spawn(async move {
+                loop {
+                    match receiver.read_rtcp().await {
+                        Ok((packets, _)) => rtcp.record(&packets),
+                        Err(e) => {
+                            tracing::debug!("receiver RTCP reader stops: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
 
             Box::pin(async move {
                 tracing::info!(
@@ -694,9 +712,9 @@ impl HeadlessClient {
             .await
             .map_err(|e| ClientError::MediaError(format!("Failed to add audio track: {}", e)))?;
         // RTCP from the SFU (receiver reports, PLI) must be read for the
-        // interceptors to process it.
-        spawn_rtcp_drain(Arc::clone(&video_sender));
-        spawn_rtcp_drain(Arc::clone(&audio_sender));
+        // interceptors to process it; keyframe requests are recorded.
+        spawn_rtcp_recorder(Arc::clone(&video_sender), self.rtcp.clone());
+        spawn_rtcp_recorder(Arc::clone(&audio_sender), self.rtcp.clone());
 
         self.video_track = Some(Arc::clone(&video_track));
         self.audio_track = Some(Arc::clone(&audio_track));
@@ -949,6 +967,32 @@ impl HeadlessClient {
             own_id: self.participant_id,
         }));
         Ok(())
+    }
+
+    /// RTCP received: keyframe requests to our senders, sender reports and
+    /// CNAMEs for the tracks we receive.
+    pub fn rtcp_log(&self) -> &RtcpLog {
+        &self.rtcp
+    }
+
+    /// Send a PLI for `media_ssrc` (an SSRC we receive) to the SFU.
+    pub async fn send_pli(&self, media_ssrc: u32) -> Result<(), ClientError> {
+        use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+        let pc = self
+            .peer_connection
+            .as_ref()
+            .ok_or(ClientError::InvalidState {
+                expected: "Connected",
+                actual: self.state.as_str(),
+            })?;
+        let pli = PictureLossIndication {
+            sender_ssrc: 0,
+            media_ssrc,
+        };
+        pc.write_rtcp(&[Box::new(pli)])
+            .await
+            .map(|_| ())
+            .map_err(|e| ClientError::MediaError(format!("write_rtcp: {e}")))
     }
 
     /// Remote tracks announced so far (`Joined` and `TrackPublished`), by id.
@@ -1227,11 +1271,19 @@ async fn sender_ssrc(sender: &RTCRtpSender) -> u32 {
     params.encodings.first().map_or(0, |e| e.ssrc)
 }
 
-/// Read a sender's incoming RTCP until the sender closes.
-fn spawn_rtcp_drain(sender: Arc<RTCRtpSender>) {
+/// Read a sender's incoming RTCP into `log` until the sender closes. The only
+/// reader of the sender's RTCP: a second one would take part of the packets.
+fn spawn_rtcp_recorder(sender: Arc<RTCRtpSender>, log: RtcpLog) {
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 1500];
-        while sender.read(&mut buf).await.is_ok() {}
+        loop {
+            match sender.read_rtcp().await {
+                Ok((packets, _)) => log.record(&packets),
+                Err(e) => {
+                    tracing::debug!("sender RTCP reader stops: {e}");
+                    break;
+                }
+            }
+        }
     });
 }
 
