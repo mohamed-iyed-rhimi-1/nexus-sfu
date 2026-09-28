@@ -5,7 +5,6 @@
 FROM rust:1.83.0-bookworm AS builder
 
 # Install build dependencies explicitly (TigerStyle: no defaults)
-# liburing-dev: io_uring support for Linux
 # capnproto: Cap'n Proto schema compiler
 # pkg-config: Build configuration helper
 # Not pinned to exact Debian revisions: bookworm replaces them with security
@@ -13,7 +12,6 @@ FROM rust:1.83.0-bookworm AS builder
 # build. The base image tag pins the Debian release.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        liburing-dev \
         capnproto \
         pkg-config \
     && \

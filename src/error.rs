@@ -20,8 +20,8 @@
 // Re-export all sub-error types from nexus-core.
 // These are the single source of truth for error definitions.
 pub use nexus_core::error::{
-    signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
-    SignalingError, SsrcError, TransportError,
+    signaling_error_codes, ApiError, ParseError, RoomError, RtcpError, RtpError, SignalingError,
+    SsrcError, TransportError,
 };
 
 // Re-export the core SfuError for crates that only need
@@ -36,7 +36,7 @@ use thiserror::Error;
 /// ICE and CRDT errors that depend on crates outside nexus-core.
 #[derive(Debug, Error)]
 pub enum SfuError {
-    /// Transport layer error (UDP, io_uring, kqueue)
+    /// Transport layer error (UDP sockets)
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
 
@@ -51,10 +51,6 @@ pub enum SfuError {
     /// WebSocket signaling error
     #[error("signaling error: {0}")]
     Signaling(#[from] SignalingError),
-
-    /// Packet arena error
-    #[error("arena error: {0}")]
-    Arena(#[from] ArenaError),
 
     /// ICE error
     #[error("ICE error: {0}")]
@@ -78,7 +74,6 @@ impl From<CoreSfuError> for SfuError {
             CoreSfuError::Transport(e) => SfuError::Transport(e),
             CoreSfuError::Parse(e) => SfuError::Parse(e),
             CoreSfuError::Room(e) => SfuError::Room(e),
-            CoreSfuError::Arena(e) => SfuError::Arena(e),
             CoreSfuError::Signaling(e) => SfuError::Signaling(e),
             CoreSfuError::Api(e) => SfuError::Api(e),
         }
@@ -102,11 +97,8 @@ mod tests {
 
     #[test]
     fn test_sfu_error_display() {
-        let err = SfuError::Arena(ArenaError::Exhausted {
-            capacity_slots: 1000,
-        });
-        assert!(err.to_string().contains("exhausted"));
-        assert!(err.to_string().contains("1000"));
+        let err = SfuError::Transport(TransportError::BufferExhausted);
+        assert!(err.to_string().contains("buffer exhausted"), "{err}");
     }
 
     #[test]
@@ -344,9 +336,9 @@ mod tests {
     #[test]
     fn test_core_sfu_error_conversion() {
         // Verify CoreSfuError can be converted to root SfuError
-        let core_err = CoreSfuError::Arena(ArenaError::Exhausted { capacity_slots: 42 });
+        let core_err = CoreSfuError::Transport(TransportError::BufferExhausted);
         let root_err: SfuError = core_err.into();
-        assert!(matches!(root_err, SfuError::Arena(_)));
+        assert!(matches!(root_err, SfuError::Transport(_)));
     }
 
     #[test]

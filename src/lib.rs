@@ -39,7 +39,7 @@ pub mod types;
 // Crate Re-exports
 // =============================================================================
 // Re-export workspace crates for direct access. Types are also available
-// through the re-export modules above (e.g., nexus_transport::ice::IceAgent).
+// through the crate paths (e.g., nexus_transport::srtp::SrtpInbound).
 
 // -----------------------------------------------------------------------------
 // nexus-transport: Low-level transport (UDP, SRTP, DTLS, ICE)
@@ -96,16 +96,6 @@ pub use nexus_webrtc;
 // All crate re-exports reference crate paths directly (no wrapper modules).
 
 // -----------------------------------------------------------------------------
-// nexus-transport: arena, ICE, TURN
-// -----------------------------------------------------------------------------
-pub use nexus_transport::arena::{PacketArena, PacketSlot, SLOT_SIZE_BYTES};
-pub use nexus_transport::ice::{
-    Candidate, CandidateGatherer, CandidatePair, CandidatePairState, CandidateType, Checklist,
-    ChecklistState, IceAgent, IceConfig, IceConnectionState, IceCredentials, IceError,
-    IceGatheringState, IceRole, StunAttribute, StunClass, StunMessage, StunMethod,
-};
-
-// -----------------------------------------------------------------------------
 // nexus-media: RTP/RTCP types
 // -----------------------------------------------------------------------------
 pub use nexus_media::rtcp::{ReceiverReportBlock, RtcpHeader, RtcpType, SenderReport};
@@ -129,8 +119,8 @@ pub use config::{
     WorkerConfig,
 };
 pub use error::{
-    signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
-    SfuError, SignalingError, TransportError,
+    signaling_error_codes, ApiError, ParseError, RoomError, RtcpError, RtpError, SfuError,
+    SignalingError, TransportError,
 };
 pub use tracing::{
     init_tracing, init_tracing_extended, ExtendedLoggingConfig, HotPathMetrics,

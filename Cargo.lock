@@ -702,19 +702,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1554,16 +1541,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595a0399f411a508feb2ec1e970a4a30c249351e30208960d58298de8660b0e5"
-dependencies = [
- "bitflags 1.3.2",
- "libc",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1770,15 +1747,6 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
-
-[[package]]
-name = "memmap2"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "memoffset"
@@ -2025,26 +1993,18 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
- "core_affinity",
  "crc32fast",
- "crossbeam",
  "ctr",
  "foreign-types",
  "getrandom 0.2.17",
  "hmac",
- "io-uring",
  "libc",
  "md-5",
- "memmap2",
- "nexus-core",
- "nexus-media",
  "openssl",
  "openssl-sys",
  "proptest",
- "rcgen 0.12.1",
  "ring 0.17.14",
  "sha1",
- "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2683,18 +2643,6 @@ dependencies = [
  "ring 0.16.20",
  "time",
  "x509-parser",
- "yasna",
-]
-
-[[package]]
-name = "rcgen"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48406db8ac1f3cbc7dcdb56ec355343817958a356ff430259bb07baf7607e1e1"
-dependencies = [
- "pem",
- "ring 0.17.14",
- "time",
  "yasna",
 ]
 
@@ -4141,7 +4089,7 @@ dependencies = [
  "lazy_static",
  "log",
  "rand 0.8.5",
- "rcgen 0.11.3",
+ "rcgen",
  "regex",
  "ring 0.17.14",
  "rtcp",
@@ -4204,7 +4152,7 @@ dependencies = [
  "p384",
  "rand 0.8.5",
  "rand_core 0.6.4",
- "rcgen 0.11.3",
+ "rcgen",
  "ring 0.17.14",
  "rustls 0.21.12",
  "sec1",

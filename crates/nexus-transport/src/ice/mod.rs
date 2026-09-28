@@ -1,29 +1,10 @@
-//! ICE (Interactive Connectivity Establishment) implementation.
+//! ICE pieces the SFU uses (RFC 8445, RFC 5389).
 //!
-//! Implements RFC 8445 for NAT traversal in WebRTC connections.
-//! This module provides candidate gathering, connectivity checks,
-//! and ICE state machine management.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                        ICE Agent                                 │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │                                                                  │
-//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-//! │  │   Gatherer   │  │  CheckList   │  │    STUN      │          │
-//! │  │              │──▶│              │──▶│   Server    │          │
-//! │  └──────────────┘  └──────────────┘  └──────────────┘          │
-//! │         │                 │                  │                  │
-//! │         ▼                 ▼                  ▼                  │
-//! │  ┌─────────────────────────────────────────────────────────┐   │
-//! │  │                  Candidate Pairs                         │   │
-//! │  │  (sorted by priority, checked for connectivity)          │   │
-//! │  └─────────────────────────────────────────────────────────┘   │
-//! │                                                                  │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
+//! The SFU is ICE-lite: the shard answers binding requests itself
+//! (`nexus-dataplane`'s slim STUN scan, on `stun`'s parsing and integrity
+//! functions). This module keeps STUN (`stun`), candidates (`candidate`), host
+//! interface enumeration (`gather`) and the ICE types; the full ICE agent and
+//! checklist were removed in Phase 1 (C5).
 //!
 //! # TigerStyle Compliance
 //!
@@ -32,17 +13,13 @@
 //! - Comprehensive assertions on all boundaries
 //! - Zero dynamic allocation after init
 
-pub mod agent;
 pub mod candidate;
-pub mod checklist;
 pub mod error;
 pub mod gather;
 pub mod stun;
 pub mod types;
 
-pub use agent::IceAgent;
 pub use candidate::{Candidate, CandidatePair, CandidatePairState, CandidateType};
-pub use checklist::{Checklist, ChecklistState};
 pub use error::IceError;
 pub use gather::{CandidateGatherer, GatheredCandidates, GatheringState};
 pub use stun::{StunAttribute, StunClass, StunMessage, StunMethod};

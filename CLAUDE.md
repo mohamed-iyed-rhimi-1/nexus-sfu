@@ -22,9 +22,9 @@ targets are not met yet.
 **Current phase: 1** (`docs/plans/phase-1.md`, from the approved design note
 `docs/design/dataplane-v1.md`). Work on the `phase-1` branch; it merges into `main` (the
 trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
-soon (scope in `docs/dataplane-design.md` §2). The old data plane is being deleted (the
-plan's deletion steps); do not fix bugs in what is left of it (the replaced `nexus-transport`
-modules: arena, ring buffer, io_uring, UDP batch, ICE agent, pure-Rust DTLS).
+soon (scope in `docs/dataplane-design.md` §2). The old data plane is deleted (the plan's
+deletion steps C1-C6); what remains of it is configuration (`[worker]`, `[memory]`,
+`[actor]`), removed in C7.
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -80,7 +80,7 @@ cd sdk && npm run build
 
 On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto`
 installed, the repo mounted, and named volumes for `target/` and the
-cargo registry. Many paths differ on Linux (io_uring, `recvmmsg`, core pinning,
+cargo registry. Many paths differ on Linux (`recvmmsg`/`sendmmsg`, core pinning,
 `panic = "abort"` in release).
 
 `scripts/ci-local.sh` does this and runs the jobs of `ci.yml` locally. By default it runs
@@ -119,7 +119,7 @@ src/                 Binary crate: main.rs, server.rs (startup), node.rs (node i
 crates/
   nexus-core/        Shared types, config primitives
   nexus-dataplane/   The data plane: shards, commands/events, SRTP, rewrite, I/O
-  nexus-transport/   UDP, io_uring, ICE, DTLS (OpenSSL), SRTP, arena, ring buffer
+  nexus-transport/   SRTP, STUN, candidates, OpenSSL DTLS engine, socket setup
   nexus-media/       RTP/RTCP parsing, codec detection
   nexus-webrtc/      SDP parsing, printing and offer/answer negotiation
   nexus-signal/      WebSocket signaling (QUIC module is a stub)

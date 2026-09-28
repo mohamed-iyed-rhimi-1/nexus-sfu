@@ -1265,6 +1265,26 @@ the tree). `OpenSslDtlsEngine::new` removed; its test callers (`openssl_backend.
 their own, and the test of `new` itself went with it. CLAUDE.md and README describe the
 crate as SDP.
 
+**C5 done (2026-09-28):** `nexus-transport` loses `arena.rs`, its two proptests,
+`ring_buffer.rs`, `batch.rs`, `udp.rs`, `media_transport.rs`, `io_uring.rs`; ICE `agent.rs`
+and `checklist.rs`; `StunServer` (`stun/server.rs` becomes `stun/request.rs`: the binding
+request/indication builders and `generate_transaction_id`, with their tests; the two tests of
+`StunServer`'s panic fixes went with it, the shard's STUN scan has its own); the pure-Rust
+DTLS (`session.rs`, `handshake.rs`, `record.rs`, `crypto.rs`). `SrtpProfile` and
+`SrtpKeyMaterial` (the only parts of `crypto.rs` the OpenSSL engine used) moved to
+`dtls/srtp_keys.rs` with their seven tests. Features `io_uring` and `sim`, the `io-uring`
+dependency, and `nexus-core`, `nexus-media`, `memmap2`, `crossbeam`, `core_affinity`, `sha2`,
+`rcgen` dropped (`Cargo.lock`: `crossbeam`, `io-uring`, `memmap2`, `rcgen` leave the tree).
+Kept as planned: `srtp`, `dtls` (OpenSSL engine, certificate, types, error), `ice` (`stun`,
+`candidate`, `gather`, `types`, `error`), `socket_config`, `gro`, `gso`; `ring` stays.
+Also removed, since nothing constructs them: `ArenaError` and the `Arena` variants (core and
+root `SfuError`), `TransportError::IoUringQueueFull`/`IoUringInitFailed` (three error
+tests now use `BufferExhausted`); the root `lib.rs` arena and ICE-agent re-exports; the
+Dockerfile's `liburing-dev`. The grep check of the code notes below: what remains is the
+`[memory]` config (C7), Cap'n Proto's own "arena" in `nexus-signal`, and one `lib.rs`
+comment (1.9). Crate docs (`lib.rs`, `ice`, `dtls`), CLAUDE.md and README describe what is
+left.
+
 **Code notes (audited 2026-09-26):** `tests/pps_pipeline.rs` is `#![cfg(feature = "sim")]`,
 not in CI: delete, don't port. After C5, `grep -rn "arena\|io_uring\|MediaTransport" crates
 src` must be empty outside comments updated in 1.9. Before each step, `grep -rn` the removed
@@ -1884,7 +1904,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Done | see git log (C1+C3) | ≈ 7,100 lines of old path + `sfu.rs` (2,284) gone; 20 root dependencies, `build.rs`, `proto/`, `protoc` no longer needed |
 | C4 `nexus-actor`, `nexus-dst` | Done | see git log (C4) | Both crates, `ActorMetrics` and the `nexus_actor_*` series gone; `[actor]` checked against the orchestrator's limits until C7 |
 | C6 `WebRtcTransport`, session, demux | Done | see git log (C6) | `nexus-webrtc` is SDP only (≈ 5,800 lines gone); `OpenSslDtlsEngine::new` removed |
-| C5 Replaced `nexus-transport` modules | Not started | | |
+| C5 Replaced `nexus-transport` modules | Done | see git log (C5) | Arena, ring buffer, UDP/io_uring/batch transports, ICE agent, `StunServer`, pure-Rust DTLS, `ArenaError` gone; `nexus-transport` is SRTP, STUN, candidates, OpenSSL DTLS, socket setup |
 | C7 Config, README, example | Not started | | |
 | 1.6a E2E: harness, ten clients, resubscribe | Not started | | |
 | 1.6b E2E: address change, SR, keyframes | Not started | | |
@@ -2365,3 +2385,26 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 08:25, 08adb78 (14 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
   ```
   Next: review and commit C6, then C5 (the replaced `nexus-transport` modules).
+- 2026-09-28: C6 committed (`3d914bc`). C5 implemented (uncommitted, for review): the old
+  `nexus-transport` modules deleted (≈ 17,000 lines), `SrtpProfile`/`SrtpKeyMaterial` moved
+  to `dtls/srtp_keys.rs`, `StunServer` gone (`stun/request.rs` keeps the request builders),
+  seven crate dependencies and the `io_uring`/`sim` features dropped, `ArenaError` and the
+  io_uring error variants removed, `liburing-dev` out of the Dockerfile. Tests 1,632 →
+  1,417: 223 tests in the deleted files, minus the 10 moved, plus the 2 `StunServer` tests
+  in `stun/mod.rs`. `Cargo.lock`: `crossbeam`, `io-uring`, `memmap2`, `rcgen` 0.12 gone
+  (`rcgen` 0.11.3 stays for webrtc-rs; its references lose the version suffix).
+  `ci-local.sh macos linux-arm64 docker`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                0s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                          97s (1417 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                          11s
+  linux-arm64    PASS  release build                                   59s
+  linux-arm64    PASS  cargo test --workspace                         136s (1423 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           39s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     22s
+  docker         PASS  docker build (linux/amd64)                      91s
+  ci-local 2026-09-28 08:38, 3d914bc (33 uncommitted or untracked paths), targets: macos linux-arm64 docker, budget 25 KB: PASS
+  ```
+  Next: review and commit C5, then C7 (config, README, example; shard metrics export).

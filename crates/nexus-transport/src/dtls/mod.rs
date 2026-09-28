@@ -1,23 +1,7 @@
-//! DTLS 1.2 Implementation.
-//!
-//! Secure datagram transport for WebRTC.
-//! Implements RFC 6347 (DTLS 1.2) with RFC 5764 (DTLS-SRTP).
-//!
-//! # Architecture
-//!
-//! - `handshake`: DTLS handshake state machine with RFC-compliant transitions
-//! - `record`: Record layer parsing, construction, and fragmentation
-//! - `crypto`: Cryptographic operations including proper P-256 ECDHE
-//! - `session`: Connection state management with timeout enforcement
-//!
-//! # Production Features
-//!
-//! - Complete RFC 6347 state machine with explicit transitions
-//! - Retransmission with exponential backoff (1s initial, 6 max retries)
-//! - 30-second handshake timeout enforcement
-//! - Record fragmentation/reassembly for messages up to 16KB
-//! - Proper P-256 ECDHE using ring library
-//! - Comprehensive compile-time assertions
+//! DTLS for the control plane: the OpenSSL engine (`OpenSslDtlsEngine`) on a
+//! process-wide certificate (`DtlsCertificate`), DTLS 1.2 with the `use_srtp`
+//! extension (RFC 5764), and the exported SRTP keying material (`srtp_keys`).
+//! The pure-Rust handshake, record layer and session were removed in Phase 1 (C5).
 //!
 //! # TigerStyle Compliance
 //!
@@ -28,26 +12,14 @@
 //! - Bounded loops and retries
 //! - No panics on hot path (only assertions for programmer errors)
 
-mod crypto;
 mod error;
-mod handshake;
 mod openssl_backend;
-mod record;
-mod session;
+mod srtp_keys;
 mod types;
 
-pub use crypto::{
-    compute_ecdhe_shared_secret_ring, generate_ecdhe_keypair_ring, CipherSuite, KeyMaterial,
-    SrtpKeyMaterial, SrtpProfile,
-};
 pub use error::DtlsError;
-pub use handshake::{
-    ClientHandshakeState, DtlsClientHandshake, Flight, FragmentBuffer, HandshakeState,
-    HandshakeType, SrtpKeys,
-};
 pub use openssl_backend::{DtlsCertificate, OpenSslDtlsEngine, DTLS_MTU, MAX_BIO_READ};
-pub use record::{ContentType, FragmentAssembler, RecordLayer};
-pub use session::{DtlsSession, SessionConfig, SessionState, HANDSHAKE_TIMEOUT_MS};
+pub use srtp_keys::{SrtpKeyMaterial, SrtpProfile};
 pub use types::*;
 
 /// Maximum DTLS record size.

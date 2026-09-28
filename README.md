@@ -62,7 +62,7 @@ The orchestrator runs a `tokio::select!` loop with 4 modules:
 | Crate | Purpose |
 |-------|---------|
 | `nexus-core` | Shared types, config, error definitions |
-| `nexus-transport` | UDP, ICE, DTLS, SRTP, arena allocator, ring buffers, io_uring |
+| `nexus-transport` | SRTP, STUN, candidates, the OpenSSL DTLS engine, socket setup |
 | `nexus-media` | RTP/RTCP parsing (SIMD), codec detection (H264/VP8/VP9/AV1/Opus), simulcast |
 | `nexus-webrtc` | SDP parsing, printing and offer/answer negotiation |
 | `nexus-state` | CRDTs (Orswot, LWWReg, GCounter), SWIM gossip, distributed state |
@@ -78,7 +78,6 @@ The orchestrator runs a `tokio::select!` loop with 4 modules:
 
 - Rust 1.83+ (see `rust-toolchain.toml`)
 - Cap'n Proto compiler (`capnp`)
-- Linux with `liburing-dev` for io_uring support (optional)
 
 ### Build
 

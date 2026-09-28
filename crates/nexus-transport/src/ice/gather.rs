@@ -578,8 +578,8 @@ impl CandidateGatherer {
         server_addr: SocketAddr,
         interface_idx: u8,
     ) -> Result<Option<Candidate>, IceError> {
+        use super::stun::generate_transaction_id;
         use super::stun::message::{StunClass, StunMessage, StunMethod, STUN_BUFFER_SIZE};
-        use super::stun::server::generate_transaction_id;
 
         // Precondition: interface_idx must be within bounds (TigerStyle)
         assert!(
@@ -767,8 +767,8 @@ impl CandidateGatherer {
         turn_config: &super::types::TurnServerConfig,
         server_idx: u8,
     ) -> Result<Option<Candidate>, IceError> {
+        use super::stun::generate_transaction_id;
         use super::stun::message::{StunClass, StunMessage, STUN_BUFFER_SIZE};
-        use super::stun::server::generate_transaction_id;
 
         // Precondition: server_idx must be within bounds (TigerStyle)
         assert!(
@@ -1238,7 +1238,7 @@ fn enumerate_interfaces_where(
 mod tests {
     use super::*;
     use crate::ice::candidate::CandidateType;
-    use crate::ice::stun::server::generate_transaction_id;
+    use crate::ice::stun::generate_transaction_id;
 
     // ========================================================================
     // Basic Gathering Tests

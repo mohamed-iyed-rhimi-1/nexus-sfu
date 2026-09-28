@@ -35,8 +35,8 @@ use openssl::x509::X509;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use super::crypto::SrtpKeyMaterial;
 use super::error::DtlsError;
+use super::srtp_keys::SrtpKeyMaterial;
 use super::types::DtlsRole;
 
 /// Maximum bytes read from BIO per call, and the largest datagram `process` accepts.
@@ -599,18 +599,28 @@ impl OpenSslDtlsEngine {
                 if id == SrtpProfileId::SRTP_AES128_CM_SHA1_80 {
                     (
                         0x0001u16,
-                        super::crypto::SrtpProfile::Aes128CmHmacSha1_80,
+                        super::srtp_keys::SrtpProfile::Aes128CmHmacSha1_80,
                         16usize,
                         14usize,
                     )
                 } else if id == SrtpProfileId::SRTP_AEAD_AES_128_GCM {
-                    (0x0007u16, super::crypto::SrtpProfile::AeadAes128Gcm, 16, 12)
+                    (
+                        0x0007u16,
+                        super::srtp_keys::SrtpProfile::AeadAes128Gcm,
+                        16,
+                        12,
+                    )
                 } else if id == SrtpProfileId::SRTP_AEAD_AES_256_GCM {
-                    (0x0008u16, super::crypto::SrtpProfile::AeadAes256Gcm, 32, 12)
+                    (
+                        0x0008u16,
+                        super::srtp_keys::SrtpProfile::AeadAes256Gcm,
+                        32,
+                        12,
+                    )
                 } else if id == SrtpProfileId::SRTP_AES128_CM_SHA1_32 {
                     (
                         0x0002u16,
-                        super::crypto::SrtpProfile::Aes128CmHmacSha1_32,
+                        super::srtp_keys::SrtpProfile::Aes128CmHmacSha1_32,
                         16,
                         14,
                     )

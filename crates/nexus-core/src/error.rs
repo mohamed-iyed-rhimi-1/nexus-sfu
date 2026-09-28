@@ -31,7 +31,7 @@ use thiserror::Error;
 /// via wrapper enums in their own error modules.
 #[derive(Debug, Error)]
 pub enum SfuError {
-    /// Transport layer error (UDP, io_uring, kqueue)
+    /// Transport layer error (UDP sockets)
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
 
@@ -42,10 +42,6 @@ pub enum SfuError {
     /// Room management error
     #[error("room error: {0}")]
     Room(#[from] RoomError),
-
-    /// Packet arena error
-    #[error("arena error: {0}")]
-    Arena(#[from] ArenaError),
 
     /// WebSocket signaling error
     #[error("signaling error: {0}")]
@@ -62,7 +58,7 @@ pub enum SfuError {
 
 /// Transport layer errors.
 ///
-/// Covers UDP socket operations, io_uring (Linux), and kqueue (macOS).
+/// Covers UDP socket operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
     /// Failed to bind socket to address
@@ -91,14 +87,6 @@ pub enum TransportError {
     /// Socket buffer exhausted
     #[error("buffer exhausted")]
     BufferExhausted,
-
-    /// io_uring submission queue full (Linux only)
-    #[error("io_uring submission queue full")]
-    IoUringQueueFull,
-
-    /// io_uring initialization failed (Linux only)
-    #[error("io_uring initialization failed: {message}")]
-    IoUringInitFailed { message: String },
 
     /// Configuration error
     #[error("configuration error: {message}")]
@@ -266,48 +254,6 @@ impl fmt::Display for RtcpError {
 }
 
 impl std::error::Error for RtcpError {}
-
-// ---------------------------------------------------------------------------
-// Arena errors
-// ---------------------------------------------------------------------------
-
-/// Packet arena errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArenaError {
-    /// Arena free list exhausted
-    Exhausted { capacity_slots: u32 },
-
-    /// Invalid slot index
-    InvalidSlot { index: u32, capacity_slots: u32 },
-
-    /// Memory mapping failed
-    MmapFailed,
-}
-
-impl fmt::Display for ArenaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ArenaError::Exhausted { capacity_slots } => {
-                write!(f, "arena exhausted: all {} slots in use", capacity_slots)
-            }
-            ArenaError::InvalidSlot {
-                index,
-                capacity_slots,
-            } => {
-                write!(
-                    f,
-                    "invalid slot index {}, capacity is {}",
-                    index, capacity_slots
-                )
-            }
-            ArenaError::MmapFailed => {
-                write!(f, "memory mapping failed")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ArenaError {}
 
 // ---------------------------------------------------------------------------
 // Signaling errors
@@ -783,11 +729,8 @@ mod tests {
 
     #[test]
     fn test_sfu_error_display() {
-        let err = SfuError::Arena(ArenaError::Exhausted {
-            capacity_slots: 1000,
-        });
-        assert!(err.to_string().contains("exhausted"));
-        assert!(err.to_string().contains("1000"));
+        let err = SfuError::Transport(TransportError::BufferExhausted);
+        assert!(err.to_string().contains("buffer exhausted"), "{err}");
     }
 
     #[test]

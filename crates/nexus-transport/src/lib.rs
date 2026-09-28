@@ -23,75 +23,38 @@
 
 //! # nexus-transport
 //!
-//! Standalone transport layer for Nexus SFU.
+//! The protocol pieces the SFU's two planes share:
 //!
-//! Contains UDP I/O (io_uring on Linux, kqueue on macOS), ICE agent,
-//! DTLS handshake, SRTP encryption, PacketArena, RingBuffer, and
-//! BatchSender. Depends only on nexus-core and nexus-media.
+//! - `srtp` — SRTP/SRTCP per direction (`SrtpInbound`, `SrtpOutbound`, used by the
+//!   shard) and `SrtpContext` (the reference the tests and peers use)
+//! - `dtls` — the OpenSSL DTLS engine the control plane runs handshakes with, its
+//!   shared certificate, and the exported SRTP keying material
+//! - `ice` — STUN encoding, parsing and integrity (the shard's STUN scan and the test
+//!   peers), candidates, and host interface enumeration
+//! - `socket_config` — socket buffer sizes (and GRO/GSO options, unused by the shard)
+//! - `gro`, `gso` — GRO splitting and GSO sending helpers (not used by the shard)
 //!
-//! # Module Structure
-//!
-//! - `arena` — Pre-allocated memory pool for zero-allocation packet handling
-//! - `ring_buffer` — Lock-free SPSC ring buffer for per-track packet storage
-//! - `udp` — UDP transport with platform-specific I/O (io_uring/kqueue)
-//! - `io_uring` — Dedicated io_uring transport with SQPOLL and multishot receive
-//! - `batch` — BatchSender for sendmmsg-based multi-packet transmission
-//! - `ice` — ICE agent, STUN client/server, and candidate gathering
-//! - `dtls` — DTLS handshake and session management
-//! - `srtp` — SRTP encryption and decryption
-//! - `socket_config` — High-performance socket configuration (16MB buffers, GRO/GSO)
-//! - `gro` — GRO (Generic Receive Offload) packet splitter
-//! - `gso` — GSO (Generic Segmentation Offload) batch sender
+//! The old data plane's transport (arena, ring buffer, UDP and io_uring transports,
+//! batch sender, ICE agent, pure-Rust DTLS) was removed in Phase 1 (C5).
 
-pub mod arena;
-pub mod batch;
 pub mod dtls;
 pub mod gro;
 pub mod gso;
 pub mod ice;
-pub mod io_uring;
-pub mod media_transport;
-pub mod ring_buffer;
 pub mod socket_config;
 pub mod srtp;
-pub mod udp;
-
-#[cfg(test)]
-mod arena_proptest;
-
-#[cfg(test)]
-mod arena_refcount_proptest;
-
-// Re-export key types at crate root for convenience.
-pub use arena::{
-    create_partitions, ArenaPartition, PacketArena, PacketSlot, PartitionedPacketSlot,
-    SLOT_SIZE_BYTES,
-};
-pub use batch::{BatchSender, BatchSenderStats, BatchSenderStatsSnapshot};
-pub use ring_buffer::RingBuffer;
-pub use udp::{
-    ReceiveMode, RecvPacket, TransportConfig, TransportStats, TransportStatsSnapshot, UdpTransport,
-};
-
-// Re-export io_uring types.
-pub use io_uring::{
-    create_transport_with_fallback, IoUringConfig, IoUringReceiveMode, IoUringRecvPacket,
-    IoUringStats, IoUringStatsSnapshot, IoUringTransport,
-};
 
 // Re-export ICE types.
 pub use ice::{
-    Candidate, CandidateGatherer, CandidatePair, CandidatePairState, CandidateType, Checklist,
-    ChecklistState, GatheredCandidates, GatheringState, IceAgent, IceConfig, IceConnectionState,
-    IceCredentials, IceError, IceGatheringState, IceRole, StunAttribute, StunClass, StunMessage,
-    StunMethod,
+    Candidate, CandidateGatherer, CandidatePair, CandidatePairState, CandidateType,
+    GatheredCandidates, GatheringState, IceConfig, IceConnectionState, IceCredentials, IceError,
+    IceGatheringState, IceRole, StunAttribute, StunClass, StunMessage, StunMethod,
 };
 
 // Re-export DTLS types.
 pub use dtls::{
-    CipherSuite as DtlsCipherSuite, ContentType, DtlsError, DtlsSession, HandshakeState,
-    HandshakeType, KeyMaterial as DtlsKeyMaterial, RecordLayer, SessionConfig, SessionState,
-    SrtpProfile,
+    DtlsCertificate, DtlsError, DtlsRole, OpenSslDtlsEngine,
+    SrtpKeyMaterial as DtlsSrtpKeyMaterial, SrtpProfile,
 };
 
 // Re-export SRTP types.
@@ -115,6 +78,3 @@ pub use gro::{
 
 // Re-export GSO types.
 pub use gso::{GsoBatchSender, GsoStats, GsoStatsSnapshot, MAX_GSO_BUFFER_SIZE, MAX_GSO_SEGMENTS};
-
-// Re-export media transport types.
-pub use media_transport::{MediaRecvPacket, MediaTransport, TransportMode};

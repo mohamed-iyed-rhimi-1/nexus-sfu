@@ -22,8 +22,8 @@ pub use types::{
 // Consumers can use `nexus_core::SfuError` instead of
 // `nexus_core::error::SfuError`.
 pub use error::{
-    signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
-    SfuError, SignalingError, SsrcError, TransportError,
+    signaling_error_codes, ApiError, ParseError, RoomError, RtcpError, RtpError, SfuError,
+    SignalingError, SsrcError, TransportError,
 };
 
 // Re-export config primitives and validation trait.
