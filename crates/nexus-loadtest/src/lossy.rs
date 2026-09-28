@@ -86,6 +86,80 @@ struct RuleState {
 /// Bytes of a dropped datagram kept by [`LossRules::first_dropped`].
 const DROPPED_SAMPLE_BYTES: usize = 32;
 
+/// Trailer bytes an SRTCP tap entry keeps: enough for E+index before a 10-byte
+/// AES-CM tag, and for E+index after a GCM tag.
+const SRTCP_TRAILER: usize = 14;
+
+/// Where SRTCP carries its E flag and index (RFC 3711 §3.4, RFC 7714 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SrtcpLayout {
+    /// AEAD: E+index is the last word, after the tag.
+    Gcm,
+    /// AES_CM_128_HMAC_SHA1_80: E+index precedes the 10-byte tag.
+    AesCm80,
+}
+
+/// One inbound SRTP or SRTCP datagram, from its cleartext fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TapEntry {
+    Srtp {
+        ssrc: u32,
+        seq: u16,
+    },
+    Srtcp {
+        sender_ssrc: u32,
+        /// The datagram's last bytes; see [`TapEntry::srtcp_e_index`].
+        trailer: [u8; SRTCP_TRAILER],
+    },
+}
+
+impl TapEntry {
+    /// Classify a datagram: SRTP (RTP version 2, not an RTCP packet type) or
+    /// SRTCP (packet type 192-223, RFC 5761). Anything else, or too short, is `None`.
+    pub fn of(datagram: &[u8]) -> Option<Self> {
+        if datagram.len() < 12 || datagram[0] >> 6 != 2 {
+            return None;
+        }
+        let word = |at: usize| u32::from_be_bytes(datagram[at..at + 4].try_into().unwrap());
+        if (192..=223).contains(&datagram[1]) {
+            // 8-byte header, E+index, a 10-byte tag at least.
+            if datagram.len() < 8 + 4 + 10 {
+                return None;
+            }
+            let mut trailer = [0u8; SRTCP_TRAILER];
+            trailer.copy_from_slice(&datagram[datagram.len() - SRTCP_TRAILER..]);
+            return Some(Self::Srtcp {
+                sender_ssrc: word(4),
+                trailer,
+            });
+        }
+        Some(Self::Srtp {
+            ssrc: word(8),
+            seq: u16::from_be_bytes([datagram[2], datagram[3]]),
+        })
+    }
+
+    /// The E+index word of an SRTCP entry under `layout` (E is the top bit).
+    pub fn srtcp_e_index(&self, layout: SrtcpLayout) -> Option<u32> {
+        let Self::Srtcp { trailer, .. } = self else {
+            return None;
+        };
+        let at = match layout {
+            SrtcpLayout::Gcm => SRTCP_TRAILER - 4,
+            SrtcpLayout::AesCm80 => 0,
+        };
+        Some(u32::from_be_bytes(trailer[at..at + 4].try_into().unwrap()))
+    }
+}
+
+/// Bounded record of inbound media datagrams that passed the rules.
+#[derive(Debug, Default)]
+struct Tap {
+    entries: Vec<TapEntry>,
+    capacity: usize,
+    overflow: u64,
+}
+
 /// Rules shared between a test and the client's socket. Rules can be added
 /// while the client runs.
 #[derive(Debug, Default)]
@@ -95,6 +169,8 @@ pub struct LossRules {
     passed_total: AtomicU64,
     /// Deterministic generator state for `rate_permille`.
     rng: AtomicU64,
+    /// Inbound SRTP/SRTCP record, once enabled.
+    tap: Mutex<Option<Tap>>,
 }
 
 impl LossRules {
@@ -138,6 +214,41 @@ impl LossRules {
             self.dropped_total.load(Ordering::Relaxed),
             self.passed_total.load(Ordering::Relaxed),
         )
+    }
+
+    /// Record every inbound SRTP and SRTCP datagram that is not dropped, up to
+    /// `capacity` entries (later ones are counted in [`LossRules::tap`]).
+    pub fn enable_tap(&self, capacity: usize) {
+        assert!(capacity > 0);
+        let mut tap = self.tap.lock().expect("tap lock");
+        assert!(tap.is_none(), "tap already enabled");
+        *tap = Some(Tap {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+            overflow: 0,
+        });
+    }
+
+    /// The tap's entries in arrival order, and how many did not fit.
+    pub fn tap(&self) -> (Vec<TapEntry>, u64) {
+        let tap = self.tap.lock().expect("tap lock");
+        tap.as_ref()
+            .map_or((Vec::new(), 0), |t| (t.entries.clone(), t.overflow))
+    }
+
+    fn record_inbound(&self, datagram: &[u8]) {
+        let mut tap = self.tap.lock().expect("tap lock");
+        let Some(tap) = tap.as_mut() else {
+            return;
+        };
+        let Some(entry) = TapEntry::of(datagram) else {
+            return;
+        };
+        if tap.entries.len() < tap.capacity {
+            tap.entries.push(entry);
+        } else {
+            tap.overflow += 1;
+        }
     }
 
     /// Decide whether to drop `datagram` travelling in `direction`.
@@ -216,6 +327,7 @@ impl Conn for LossyUdpConn {
         loop {
             let (n, from) = self.socket.recv_from(buf).await?;
             if !self.rules.should_drop(Direction::Inbound, &buf[..n]) {
+                self.rules.record_inbound(&buf[..n]);
                 return Ok((n, from));
             }
         }
@@ -281,6 +393,84 @@ mod tests {
             .filter(|_| rules.should_drop(Direction::Inbound, &[0x80]))
             .count();
         assert!((800..1200).contains(&dropped), "{dropped}");
+    }
+
+    fn srtcp(len: usize) -> Vec<u8> {
+        let mut d = vec![0u8; len];
+        d[0] = 0x80;
+        d[1] = 200; // SR
+        d[4..8].copy_from_slice(&0xAABB_CCDDu32.to_be_bytes());
+        d
+    }
+
+    #[test]
+    fn tap_entry_parses_srtp_and_srtcp() {
+        let mut rtp = vec![0u8; 20];
+        rtp[0] = 0x80;
+        rtp[1] = 96;
+        rtp[2..4].copy_from_slice(&513u16.to_be_bytes());
+        rtp[8..12].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        assert_eq!(
+            TapEntry::of(&rtp),
+            Some(TapEntry::Srtp {
+                ssrc: 0x0102_0304,
+                seq: 513
+            })
+        );
+
+        // GCM: ... tag(16) | E+index.
+        let mut gcm = srtcp(8 + 28 + 16 + 4);
+        let n = gcm.len();
+        gcm[n - 4..].copy_from_slice(&0x8000_0007u32.to_be_bytes());
+        let entry = TapEntry::of(&gcm).unwrap();
+        assert!(matches!(
+            entry,
+            TapEntry::Srtcp {
+                sender_ssrc: 0xAABB_CCDD,
+                ..
+            }
+        ));
+        assert_eq!(entry.srtcp_e_index(SrtcpLayout::Gcm), Some(0x8000_0007));
+
+        // AES-CM: ... | E+index | tag(10).
+        let mut cm = srtcp(8 + 28 + 4 + 10);
+        let n = cm.len();
+        cm[n - 14..n - 10].copy_from_slice(&0x8000_0009u32.to_be_bytes());
+        let entry = TapEntry::of(&cm).unwrap();
+        assert_eq!(entry.srtcp_e_index(SrtcpLayout::AesCm80), Some(0x8000_0009));
+    }
+
+    #[test]
+    fn tap_entry_refuses_what_is_not_srtp() {
+        assert_eq!(TapEntry::of(&[]), None);
+        assert_eq!(
+            TapEntry::of(&[0x80; 11]),
+            None,
+            "shorter than an RTP header"
+        );
+        assert_eq!(TapEntry::of(&[0x00; 20]), None, "STUN");
+        assert_eq!(TapEntry::of(&[22; 20]), None, "DTLS");
+        assert_eq!(
+            TapEntry::of(&srtcp(21)),
+            None,
+            "SRTCP without room for a tag"
+        );
+        let rtp = TapEntry::Srtp { ssrc: 1, seq: 1 };
+        assert_eq!(rtp.srtcp_e_index(SrtcpLayout::Gcm), None);
+    }
+
+    #[test]
+    fn tap_is_bounded_and_records_media_only() {
+        let rules = LossRules::new();
+        assert_eq!(rules.tap(), (Vec::new(), 0), "off until enabled");
+        rules.enable_tap(2);
+        let rtp = [0x80u8, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5];
+        for _ in 0..3 {
+            rules.record_inbound(&rtp);
+        }
+        rules.record_inbound(&[0u8; 20]); // STUN: not recorded, not counted
+        let (entries, overflow) = rules.tap();
+        assert_eq!((entries.len(), overflow), (2, 1));
     }
 
     #[test]

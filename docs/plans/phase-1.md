@@ -1,6 +1,6 @@
 # Phase 1 — New data plane, one shard
 
-**State: in progress** (1.1-1.5b done; plan written 2026-09-26, audited against the code the same day).
+**State: in progress** (1.1-1.5b, 1.7, C1-C7, 1.6a done; plan written 2026-09-26, audited against the code the same day).
 
 **Design:** [`docs/design/dataplane-v1.md`](../design/dataplane-v1.md) (approved; §16 gives the
 parts and order, §17 the tests), within [`docs/dataplane-design.md`](../dataplane-design.md)
@@ -1372,6 +1372,43 @@ temporarily bypassed (reuse the first SSRC), then restored. Suite runtime noted.
 (`harness.rs:21`, `SERIAL`), and the three Phase 0 tests took ≈ 10 s, so `ten_clients` must
 stay under 30 s.
 
+**Re-audited against `c5e9f76` (2026-09-28), before starting:** offer bookkeeping already
+existed (`nexus-loadtest` `announced.rs`, from 1.5b: mid → track id and SSRC, replaced per
+offer); what was missing is a history across offers and the CNAME. `discover_and_subscribe`
+sent every id in one `Subscribe`, which the SFU refuses above 10 (`TOO_MANY_TRACKS`, whole
+request). Line numbers above have moved (task `client.rs:1114-1184`, `answer_offer` `:1295`).
+
+**1.6a done (2026-09-28):**
+- `signal_task.rs` (new): `SignalTask`, started once by `HeadlessClient::start_signaling_task`
+  (a second start is an error; `pump_signaling` refuses to run while it does). It answers
+  offers, adds candidates, records `TrackPublished`/`TrackUnpublished` in `KnownTracks`
+  (with `Joined.tracks`), and forwards `Subscribed`, `Unsubscribed`, `Error` and
+  `OfferAnswered{tracks, announced}` through a bounded channel (256; overflow counted,
+  `signal_events_dropped`). `discover_and_subscribe` starts it instead of its own loop.
+- Client API: `known_tracks`, `wait_for_known_tracks`, `subscribe_confirmed` (requests of
+  ≤ 10, waits for every confirmation and an answered offer carrying all ids),
+  `unsubscribe` (waits for `Unsubscribed` and the offer after it that no longer lists the
+  ids), `announced_history`. `subscribe_batch` splits into requests of ≤ 10
+  (`MAX_SUBSCRIBE_BATCH`), which also fixes the load generator above 10 tracks. The
+  `[diag]` transceiver dumps are gone.
+- `AnnouncedSsrcs`: CNAME per m-line, bounded history (256) of every (mid, SSRC) announced.
+- `LossRules::enable_tap(capacity)` / `tap()`: inbound SRTP (SSRC, seq) and SRTCP (sender
+  SSRC, 14-byte trailer) of datagrams that pass; `TapEntry::srtcp_e_index(SrtcpLayout)`
+  reads E+index after the GCM tag or before the AES-CM tag. Unit tests for the parser, the
+  bound, history and CNAME.
+- Tests `ten_clients_audio_video` (8 worker threads; 18 tracks per client in two requests;
+  per client exactly the 18 announced SSRCs, rate, loss, timestamps, markers of the right
+  publisher; shard gauges 10 sessions / 180 subscriptions, 0 commands rejected) and
+  `resubscribe_no_srtp_index_reuse` (3 rounds; new SSRCs each round; the offer after
+  `Unsubscribe` drops them; tap: no (SSRC, seq) or (SSRC, SRTCP index) repeats, E set, SRTP
+  on all 6 SSRCs).
+- **Negative check:** with the allocator reusing its first two offsets, the shard's
+  `OutSsrcNotMonotonic` check and `SrtpOutbound::register`'s offset rule removed (and the
+  test's own SSRC-reuse assert off), the test fails on the wire: `SRTCP (0x7059d60f, 0) sent
+  twice` (a new slot restarts the SRTCP index under the same key and SSRC). Restored.
+- Runtime (macOS): `ten_clients` 9.7 s (setup 4.6 s), `resubscribe` ≈ 5 s, suite 27.1 s
+  (5 tests); Linux arm64 27.1 s.
+
 ---
 
 ### 1.6b E2E: address change, SR translation, keyframes
@@ -1401,6 +1438,18 @@ stay under 30 s.
   `AddressSelected{Rebound}` without tapping the event channel.
 - Tests `address_change_mid_call`, `sender_report_translation`, `keyframe_requests` (note
   §17.3, §17.5, §17.6).
+
+**Re-audited against `c5e9f76` (2026-09-28):**
+- `ShardStats` already has `rebinds` (`shard/stats.rs`), counted in `switch_to` and readable
+  through `server.dataplane().stats(ShardId::new(0))`: nothing to add in `stats.rs`.
+- The publisher already reads each sender's RTCP (`spawn_rtcp_drain`, discarding); the
+  PLI/FIR recorder **replaces** it, or two readers split the packets.
+- `arc-swap` is only transitive (1.8.1 in `Cargo.lock`, via webrtc); add it to
+  `nexus-loadtest` as `1.8`.
+- The shard, not the orchestrator, sends the PLI on subscribe (`subscribe`, or
+  `install_srtp` when DTLS finishes later), throttled 500 ms per track (`PLI_THROTTLE`), and
+  also to audio tracks: step 2 and 3 of the test wait > 500 ms after the previous PLI.
+- The tap and signaling task of 1.6a are there; `on_track` is `client.rs:~430`.
 
 **Code notes (audited 2026-09-26):**
 - **Keepalive timing** (corrects note §17.3). webrtc-ice sends a binding request on the
@@ -1938,7 +1987,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | C6 `WebRtcTransport`, session, demux | Done | see git log (C6) | `nexus-webrtc` is SDP only (≈ 5,800 lines gone); `OpenSslDtlsEngine::new` removed |
 | C5 Replaced `nexus-transport` modules | Done | see git log (C5) | Arena, ring buffer, UDP/io_uring/batch transports, ICE agent, `StunServer`, pure-Rust DTLS, `ArenaError` gone; `nexus-transport` is SRTP, STUN, candidates, OpenSSL DTLS, socket setup |
 | C7 Config, README, example | Done | see git log (C7) | Old config sections/fields/env vars removed and refused (fail fast); shard stats on `/metrics`; README, example, TOMLs, dashboard |
-| 1.6a E2E: harness, ten clients, resubscribe | Not started | | |
+| 1.6a E2E: harness, ten clients, resubscribe | Done | see git log (1.6a) | Signaling task + events, `subscribe_confirmed`/`unsubscribe`, announced history + CNAME, inbound tap; `ten_clients` 9.7 s, suite 27.1 s; negative check fails on SRTCP index reuse |
 | 1.6b E2E: address change, SR, keyframes | Not started | | |
 | 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
 | 1.9 Documents, merge | Not started | | |
@@ -2462,3 +2511,24 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 08:55, cf105a8 (29 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
   ```
   Next: review and commit C7. Left in Phase 1: 1.6a, 1.6b (e2e), 1.8 (SDK, browsers), 1.9.
+- 2026-09-28: 1.6a implemented (uncommitted, for review), after re-auditing 1.6a/1.6b against
+  `c5e9f76` (corrections in both parts: bookkeeping and `rebinds` already existed, the RTCP
+  drain must be replaced, `arc-swap` is transitive, 10-id `Subscribe` cap). `nexus-loadtest`:
+  `signal_task.rs`, client subscribe/unsubscribe with confirmations, `subscribe_batch` in
+  requests of ≤ 10, announced history and CNAME, inbound SRTP/SRTCP tap. Tests
+  `ten_clients_audio_video` and `resubscribe_no_srtp_index_reuse` pass; the second fails as
+  expected with the SSRC protections bypassed. Tests 1,405 → 1,412 on macOS.
+  `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                         125s (1412 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                           9s
+  linux-arm64    PASS  release build                                   58s
+  linux-arm64    PASS  cargo test --workspace                         145s (1418 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           40s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     19s
+  ci-local 2026-09-28 09:20, c5e9f76 (8 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit 1.6a, then 1.6b (rebind, RTCP recorders, three tests).

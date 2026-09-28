@@ -33,6 +33,7 @@ use crate::media::{
     read_marker, stamp_marker, AudioGenerator, AudioPattern, VideoGenerator, VideoPattern,
 };
 use crate::metrics::ClientMetrics;
+use crate::signal_task::{KnownTracks, RemoteTrack, SignalEvent, SignalTask, TaskContext};
 use crate::signaling::SignalingConnection;
 use crate::track_stats::{TrackRxStats, TrackStatsMap};
 
@@ -102,8 +103,8 @@ pub struct HeadlessClient {
     first_frame_received: Arc<AtomicBool>,
     /// Timestamp when we started waiting for the first frame
     first_frame_start: Option<Instant>,
-    /// Flag to stop background signaling task
-    signaling_stop_flag: Option<Arc<AtomicBool>>,
+    /// The signaling task, once started: then the only signaling reader
+    signal_task: Option<SignalTask>,
     /// Previous rx_packets count for computing per-interval deltas
     last_rx_count: u64,
     /// Timestamp of last sync_metrics call
@@ -114,6 +115,8 @@ pub struct HeadlessClient {
     ice_connected: Arc<AtomicBool>,
     /// Remote track IDs announced by the SFU (Joined + TrackPublished), not yet subscribed
     announced_tracks: Vec<TrackId>,
+    /// Every remote track announced (Joined + TrackPublished), shared with the task
+    known: KnownTracks,
     /// What was received on each remote track, by SSRC
     track_stats: TrackStatsMap,
     /// Senders of the published video and audio tracks
@@ -142,12 +145,13 @@ impl HeadlessClient {
             rx_bytes: Arc::new(AtomicU64::new(0)),
             first_frame_received: Arc::new(AtomicBool::new(false)),
             first_frame_start: None,
-            signaling_stop_flag: None,
+            signal_task: None,
             last_rx_count: 0,
             metrics_sync_instant: None,
             last_per_packet_time: None,
             ice_connected: Arc::new(AtomicBool::new(false)),
             announced_tracks: Vec::new(),
+            known: KnownTracks::default(),
             track_stats: TrackStatsMap::default(),
             video_sender: None,
             audio_sender: None,
@@ -372,12 +376,11 @@ impl HeadlessClient {
 
         self.participant_id = Some(join_response.participant_id);
         // Tracks published before we joined are only listed here, never re-announced
-        self.note_announced_tracks(
-            join_response
-                .tracks
-                .iter()
-                .map(|t| (t.track_id, t.publisher_id)),
-        );
+        self.note_announced_tracks(join_response.tracks.iter().map(|t| RemoteTrack {
+            track_id: t.track_id,
+            publisher_id: t.publisher_id,
+            kind: t.kind.clone(),
+        }));
 
         // Step 3: Create WebRTC peer connection
         let peer_connection = self.create_peer_connection().await?;
@@ -510,17 +513,15 @@ impl HeadlessClient {
     }
 
     /// Record announced remote tracks, skipping our own and duplicates
-    fn note_announced_tracks(
-        &mut self,
-        tracks: impl IntoIterator<Item = (TrackId, ParticipantId)>,
-    ) {
-        for (track_id, publisher_id) in tracks {
-            if Some(publisher_id) == self.participant_id
-                || self.announced_tracks.contains(&track_id)
+    fn note_announced_tracks(&mut self, tracks: impl IntoIterator<Item = RemoteTrack>) {
+        for track in tracks {
+            if Some(track.publisher_id) == self.participant_id
+                || self.announced_tracks.contains(&track.track_id)
             {
                 continue;
             }
-            self.announced_tracks.push(track_id);
+            self.announced_tracks.push(track.track_id);
+            self.known.note(track);
         }
     }
 
@@ -532,6 +533,12 @@ impl HeadlessClient {
             expected: "Connected",
             actual: "Disconnected",
         };
+        if self.signal_task.is_some() {
+            // Two readers on one connection would each miss what the other took.
+            return Err(ClientError::Signaling(
+                "the signaling task is the only reader once started".to_string(),
+            ));
+        }
         let signaling = Arc::clone(self.signaling.as_ref().ok_or_else(not_connected)?);
         let peer_connection = Arc::clone(self.peer_connection.as_ref().ok_or_else(not_connected)?);
 
@@ -565,9 +572,14 @@ impl HeadlessClient {
             SignalMessage::TrackPublished {
                 track_id,
                 publisher_id,
+                kind,
                 ..
             } => {
-                self.note_announced_tracks([(track_id, publisher_id)]);
+                self.note_announced_tracks([RemoteTrack {
+                    track_id,
+                    publisher_id,
+                    kind,
+                }]);
                 Ok(Some(Pumped::Other))
             }
             SignalMessage::Subscribed { track_ids } => {
@@ -739,10 +751,12 @@ impl HeadlessClient {
         self.subscribe_batch(&[track_id]).await
     }
 
-    /// Subscribe to several tracks with one Subscribe message
+    /// Subscribe to several tracks, in Subscribe messages of at most
+    /// `MAX_SUBSCRIBE_BATCH` ids
     ///
-    /// The SFU confirms with Subscribed and renegotiates once for the whole
-    /// batch; the resulting Offer is answered by `pump_signaling`.
+    /// The SFU confirms each with Subscribed and renegotiates (requests that
+    /// arrive while an offer is outstanding share the next offer); the offers
+    /// are answered by `pump_signaling` or the signaling task.
     /// Also starts the time-to-first-frame clock.
     pub async fn subscribe_batch(&mut self, track_ids: &[TrackId]) -> Result<(), ClientError> {
         if track_ids.is_empty() {
@@ -761,13 +775,12 @@ impl HeadlessClient {
             actual: self.state.as_str(),
         })?;
 
-        let peer_connection = self
-            .peer_connection
-            .as_ref()
-            .ok_or(ClientError::InvalidState {
+        if self.peer_connection.is_none() {
+            return Err(ClientError::InvalidState {
                 expected: "Connected",
                 actual: self.state.as_str(),
-            })?;
+            });
+        }
 
         // Record subscription start time for time-to-first-frame tracking
         self.subscription_start = Some(Instant::now());
@@ -777,68 +790,14 @@ impl HeadlessClient {
         // The handler from connect() already increments rx_packets, rx_bytes, and
         // sets first_frame_received for all incoming tracks.
 
-        // --- Diagnostic: dump transceiver state BEFORE subscribing ---
-        {
-            let transceivers = peer_connection.get_transceivers().await;
-            tracing::info!(
-                "[diag] Before subscribe(track_ids={:?}): {} transceivers, signaling_state={:?}, conn_state={:?}",
-                track_ids,
-                transceivers.len(),
-                peer_connection.signaling_state(),
-                peer_connection.connection_state(),
-            );
-            for (i, t) in transceivers.iter().enumerate() {
-                let mid = t.mid();
-                let direction = t.direction();
-                let current_direction = t.current_direction();
-                let kind = t.kind();
-                tracing::info!(
-                    "[diag]   transceiver[{}]: mid={:?} kind={:?} direction={:?} current_direction={:?}",
-                    i, mid, kind, direction, current_direction,
-                );
-                {
-                    let receiver = t.receiver().await;
-                    let tracks = receiver.tracks().await;
-                    for track in &tracks {
-                        tracing::info!(
-                            "[diag]     receiver track: ssrc={} rid='{}' codec='{}'",
-                            track.ssrc(),
-                            track.rid(),
-                            track.codec().capability.mime_type,
-                        );
-                    }
-                    if tracks.is_empty() {
-                        tracing::info!("[diag]     receiver: no tracks");
-                    }
-                }
-            }
-            if let Some(rd) = peer_connection.remote_description().await {
-                tracing::info!("[diag]   remote_description type={:?}", rd.sdp_type);
-                // Log the m= lines from the remote SDP to see what the SFU sent
-                for line in rd.sdp.lines() {
-                    if line.starts_with("m=")
-                        || line.starts_with("a=ssrc:")
-                        || line.starts_with("a=mid:")
-                        || line.starts_with("a=msid:")
-                    {
-                        tracing::info!("[diag]   remote SDP: {}", line);
-                    }
-                }
-            } else {
-                // Expected for subscribe-only clients: the first SFU offer follows Subscribe
-                tracing::info!("[diag]   no remote description yet");
-            }
-        }
-
-        // Send subscribe message via signaling
-        {
+        // The SFU takes at most MAX_SUBSCRIBE_BATCH ids per request.
+        for chunk in track_ids.chunks(MAX_SUBSCRIBE_BATCH) {
             let mut sig = signaling.lock().await;
-            tracing::info!("[diag] Sending Subscribe {{ track_ids: {:?} }}", track_ids);
             sig.send(SignalMessage::Subscribe {
-                track_ids: track_ids.to_vec(),
+                track_ids: chunk.to_vec(),
             })
             .await
-            .map_err(|_| ClientError::SubscriptionFailed(track_ids[0]))?;
+            .map_err(|_| ClientError::SubscriptionFailed(chunk[0]))?;
         }
 
         self.state = ClientState::Subscribing;
@@ -966,6 +925,172 @@ impl HeadlessClient {
         self.participant_id
     }
 
+    /// Start the signaling task: from now on it is the only reader of the
+    /// signaling connection (`pump_signaling` refuses to run). Call it after
+    /// `start_publishing`, or after `connect` for a client that only receives.
+    pub fn start_signaling_task(&mut self) -> Result<(), ClientError> {
+        if self.signal_task.is_some() {
+            return Err(ClientError::Signaling(
+                "the signaling task is already running".to_string(),
+            ));
+        }
+        let (Some(signaling), Some(peer_connection)) = (&self.signaling, &self.peer_connection)
+        else {
+            return Err(ClientError::InvalidState {
+                expected: "Connected",
+                actual: self.state.as_str(),
+            });
+        };
+        self.signal_task = Some(SignalTask::spawn(TaskContext {
+            signaling: Arc::clone(signaling),
+            peer_connection: Arc::clone(peer_connection),
+            announced: self.announced.clone(),
+            known: self.known.clone(),
+            own_id: self.participant_id,
+        }));
+        Ok(())
+    }
+
+    /// Remote tracks announced so far (`Joined` and `TrackPublished`), by id.
+    pub fn known_tracks(&self) -> Vec<RemoteTrack> {
+        self.known.snapshot()
+    }
+
+    /// Wait until at least `count` remote tracks are known.
+    pub async fn wait_for_known_tracks(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<RemoteTrack>, ClientError> {
+        assert!(self.signal_task.is_some(), "start the signaling task first");
+        let deadline = Instant::now() + timeout;
+        loop {
+            let known = self.known.snapshot();
+            if known.len() >= count {
+                return Ok(known);
+            }
+            if Instant::now() >= deadline {
+                return Err(ClientError::Timeout("announced tracks"));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Every m-line the SFU has announced to us, in the order first seen, and
+    /// how many did not fit the history.
+    pub fn announced_history(&self) -> (Vec<Announced>, u64) {
+        self.announced.history()
+    }
+
+    /// Events the signaling task dropped because nobody read them.
+    pub fn signal_events_dropped(&self) -> u64 {
+        self.signal_task.as_ref().map_or(0, SignalTask::dropped)
+    }
+
+    /// Subscribe to `track_ids` (requests of at most `MAX_SUBSCRIBE_BATCH`) and
+    /// wait until every id is confirmed and an answered offer carries them all.
+    /// Returns that offer's announced m-lines. Needs the signaling task.
+    pub async fn subscribe_confirmed(
+        &mut self,
+        track_ids: &[TrackId],
+        timeout: Duration,
+    ) -> Result<Vec<Announced>, ClientError> {
+        assert!(!track_ids.is_empty());
+        self.require_task()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.subscribe_batch(track_ids).await?;
+        let mut confirmed = std::collections::BTreeSet::new();
+        let mut offered = None;
+        while !(track_ids.iter().all(|id| confirmed.contains(id)) && offered.is_some()) {
+            match self
+                .next_signal_event(deadline, "Subscribed and offer")
+                .await?
+            {
+                SignalEvent::Subscribed(ids) => confirmed.extend(ids),
+                SignalEvent::OfferAnswered { tracks, announced } => {
+                    let has = |id: &TrackId| tracks.iter().any(|t| t.track_id == *id);
+                    if track_ids.iter().all(has) {
+                        offered = Some(announced);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(offered.expect("loop ends with an offer"))
+    }
+
+    /// Unsubscribe from `track_ids` and wait for the `Unsubscribed` confirmation
+    /// and the answered offer that follows it, which no longer lists them.
+    /// Returns that offer's announced m-lines. Needs the signaling task.
+    pub async fn unsubscribe(
+        &mut self,
+        track_ids: &[TrackId],
+        timeout: Duration,
+    ) -> Result<Vec<Announced>, ClientError> {
+        assert!(!track_ids.is_empty() && track_ids.len() <= MAX_SUBSCRIBE_BATCH);
+        self.require_task()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.send_signal(SignalMessage::Unsubscribe {
+            track_ids: track_ids.to_vec(),
+        })
+        .await?;
+        let mut confirmed = std::collections::BTreeSet::new();
+        loop {
+            let all_confirmed = track_ids.iter().all(|id| confirmed.contains(id));
+            match self
+                .next_signal_event(deadline, "Unsubscribed and offer")
+                .await?
+            {
+                SignalEvent::Unsubscribed(ids) => confirmed.extend(ids),
+                // The SFU sends Unsubscribed before renegotiating: an offer seen
+                // after the confirmation is the one that drops the m-lines.
+                SignalEvent::OfferAnswered { tracks, announced } if all_confirmed => {
+                    let gone = |id: &TrackId| tracks.iter().all(|t| t.track_id != *id);
+                    if track_ids.iter().all(gone) {
+                        return Ok(announced);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn require_task(&self) -> Result<(), ClientError> {
+        if self.signal_task.is_none() {
+            return Err(ClientError::Signaling(
+                "start the signaling task first".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn send_signal(&self, msg: SignalMessage) -> Result<(), ClientError> {
+        let signaling = self.signaling.as_ref().ok_or(ClientError::InvalidState {
+            expected: "Connected",
+            actual: self.state.as_str(),
+        })?;
+        let mut sig = signaling.lock().await;
+        sig.send(msg)
+            .await
+            .map_err(|e| ClientError::Signaling(format!("send failed: {e}")))
+    }
+
+    /// The next event from the signaling task; an SFU error fails the wait.
+    async fn next_signal_event(
+        &mut self,
+        deadline: tokio::time::Instant,
+        what: &'static str,
+    ) -> Result<SignalEvent, ClientError> {
+        let task = self.signal_task.as_mut().expect("checked by require_task");
+        match task.next(deadline).await {
+            None => Err(ClientError::Timeout(what)),
+            Some(SignalEvent::Error { code, message }) => {
+                Err(ClientError::Signaling(format!("{code}: {message}")))
+            }
+            Some(event) => Ok(event),
+        }
+    }
+
     /// Drain pending signaling messages, discover published tracks, and subscribe to them.
     ///
     /// This should be called on viewer/subscriber clients after the broadcaster
@@ -1049,148 +1174,18 @@ impl HeadlessClient {
             discovered_tracks.len()
         );
 
-        // --- Diagnostic: dump transceiver state AFTER Phase 3 ---
-        {
-            let peer_connection = self.peer_connection.as_ref().unwrap();
-            let transceivers = peer_connection.get_transceivers().await;
-            tracing::info!(
-                "[diag] After Phase 3: got_renegotiation_offer={}, {} transceivers, signaling_state={:?}, conn_state={:?}",
-                got_renegotiation_offer,
-                transceivers.len(),
-                peer_connection.signaling_state(),
-                peer_connection.connection_state(),
-            );
-            for (i, t) in transceivers.iter().enumerate() {
-                let mid = t.mid();
-                let direction = t.direction();
-                let current_direction = t.current_direction();
-                let kind = t.kind();
-                tracing::info!(
-                    "[diag]   transceiver[{}]: mid={:?} kind={:?} direction={:?} current_direction={:?}",
-                    i, mid, kind, direction, current_direction,
-                );
-                {
-                    let receiver = t.receiver().await;
-                    let tracks = receiver.tracks().await;
-                    for track in &tracks {
-                        tracing::info!(
-                            "[diag]     receiver track: ssrc={} rid='{}' codec='{}'",
-                            track.ssrc(),
-                            track.rid(),
-                            track.codec().capability.mime_type,
-                        );
-                    }
-                    if tracks.is_empty() {
-                        tracing::info!("[diag]     receiver: no tracks");
-                    }
-                }
-            }
-            if let Some(rd) = peer_connection.remote_description().await {
-                tracing::info!("[diag]   remote_description type={:?}", rd.sdp_type);
-                for line in rd.sdp.lines() {
-                    if line.starts_with("m=")
-                        || line.starts_with("a=ssrc:")
-                        || line.starts_with("a=mid:")
-                        || line.starts_with("a=msid:")
-                        || line.starts_with("a=sendonly")
-                        || line.starts_with("a=recvonly")
-                        || line.starts_with("a=sendrecv")
-                        || line.starts_with("a=inactive")
-                    {
-                        tracing::info!("[diag]   remote SDP: {}", line);
-                    }
-                }
-            } else {
-                tracing::warn!("[diag]   NO remote description set after Phase 3");
-            }
-            tracing::info!(
-                "[diag]   rx_packets={} rx_bytes={} first_frame_received={}",
-                self.rx_packets.load(Ordering::Relaxed),
-                self.rx_bytes.load(Ordering::Relaxed),
-                self.first_frame_received.load(Ordering::Relaxed),
-            );
-        }
-
-        // Spawn a background signaling handler to process any late-arriving
-        // renegotiation offers from the SFU during the metrics collection phase.
-        // Without this, offers that arrive after Phase 3 exits would sit unread
-        // in the WebSocket buffer and the viewer's new session would never complete.
-        {
-            let signaling = Arc::clone(self.signaling.as_ref().unwrap());
-            let peer_connection = Arc::clone(self.peer_connection.as_ref().unwrap());
-            let announced = self.announced.clone();
-            let stop_flag = Arc::new(AtomicBool::new(false));
-            self.signaling_stop_flag = Some(Arc::clone(&stop_flag));
-
-            tokio::spawn(async move {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    let recv_result = {
-                        let mut sig = signaling.lock().await;
-                        tokio::time::timeout(Duration::from_millis(200), sig.recv()).await
-                    };
-
-                    match recv_result {
-                        Ok(Ok(msg)) => {
-                            tracing::info!(
-                                "[bg-signaling] Received message: {:?}",
-                                std::mem::discriminant(&msg)
-                            );
-                            match msg {
-                                SignalMessage::Offer { sdp, tracks } => {
-                                    tracing::info!("[bg-signaling] Received renegotiation offer");
-                                    match answer_offer(
-                                        &peer_connection,
-                                        &signaling,
-                                        sdp,
-                                        &tracks,
-                                        &announced,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => tracing::info!(
-                                            "[bg-signaling] Renegotiation answer sent"
-                                        ),
-                                        Err(e) => tracing::warn!(
-                                            "[bg-signaling] Renegotiation failed: {}",
-                                            e
-                                        ),
-                                    }
-                                }
-                                SignalMessage::IceCandidate {
-                                    candidate,
-                                    sdp_mid,
-                                    sdp_mline_index,
-                                } => {
-                                    tracing::info!("[bg-signaling] Received ICE candidate");
-                                    add_remote_candidate(
-                                        &peer_connection,
-                                        candidate,
-                                        sdp_mid,
-                                        sdp_mline_index,
-                                    )
-                                    .await;
-                                }
-                                other => {
-                                    tracing::info!("[bg-signaling] Ignoring message: {:?}", other);
-                                }
-                            }
-                        }
-                        Ok(Err(_)) => break,
-                        Err(_) => continue, // recv timeout, keep looping
-                    }
-                }
-                tracing::debug!("[bg-signaling] Background signaling handler stopped");
-            });
-        }
+        // From here on the signaling task answers late renegotiation offers;
+        // without it they would sit unread and the new session never complete.
+        self.start_signaling_task()?;
 
         Ok(discovered_tracks)
     }
 
     /// Disconnect and cleanup
     pub async fn disconnect(&mut self) -> Result<(), ClientError> {
-        // Stop background signaling handler
-        if let Some(flag) = self.signaling_stop_flag.take() {
-            flag.store(true, Ordering::Relaxed);
+        // Stop the signaling task
+        if let Some(task) = self.signal_task.take() {
+            task.stop();
         }
 
         // Stop publishing task
@@ -1291,14 +1286,15 @@ fn spawn_media_loop(
     });
 }
 
-/// Apply an SFU offer and reply with our answer (the SFU is the sole offerer)
-async fn answer_offer(
+/// Apply an SFU offer and reply with our answer (the SFU is the sole offerer).
+/// Returns the m-lines the offer announces for tracks sent to us.
+pub(crate) async fn answer_offer(
     peer_connection: &RTCPeerConnection,
     signaling: &Mutex<SignalingConnection>,
     sdp: String,
     tracks: &[OfferTrack],
     announced: &AnnouncedSsrcs,
-) -> Result<(), ClientError> {
+) -> Result<Vec<Announced>, ClientError> {
     tracing::debug!("Received SFU offer:\n{}", sdp);
     let offer = RTCSessionDescription::offer(sdp.clone())
         .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
@@ -1306,7 +1302,7 @@ async fn answer_offer(
         .set_remote_description(offer)
         .await
         .map_err(|e| ClientError::RemoteDescriptionFailed(e.to_string()))?;
-    announced.update(&sdp, tracks);
+    let offered = announced.update(&sdp, tracks);
 
     let answer = peer_connection
         .create_answer(None)
@@ -1322,11 +1318,12 @@ async fn answer_offer(
         .await
         .send(SignalMessage::Answer { sdp: answer.sdp })
         .await
-        .map_err(|e| ClientError::OfferFailed(format!("Failed to send answer: {}", e)))
+        .map_err(|e| ClientError::OfferFailed(format!("Failed to send answer: {}", e)))?;
+    Ok(offered)
 }
 
 /// Add a trickled ICE candidate from the SFU; invalid ones are logged, not fatal
-async fn add_remote_candidate(
+pub(crate) async fn add_remote_candidate(
     peer_connection: &RTCPeerConnection,
     candidate: String,
     sdp_mid: Option<String>,
@@ -1342,6 +1339,9 @@ async fn add_remote_candidate(
         tracing::debug!("Failed to add ICE candidate: {}", e);
     }
 }
+
+/// Most track ids the SFU accepts in one Subscribe (`MAX_TRACKS_PER_REQUEST`).
+pub const MAX_SUBSCRIBE_BATCH: usize = 10;
 
 /// Synthetic video bitrate: typical for 320x240@15fps VP8 (a raw I420 frame
 /// per tick would be ~14 Mbit/s and ~1,400 packets/s per track)

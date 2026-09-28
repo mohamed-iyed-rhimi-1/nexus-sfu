@@ -124,4 +124,12 @@ pub enum ClientError {
     /// Media generation error
     #[error("Media generation error: {0}")]
     MediaError(String),
+
+    /// The SFU refused a request, or the signaling task is in the wrong state
+    #[error("Signaling: {0}")]
+    Signaling(String),
+
+    /// A wait for the SFU timed out
+    #[error("Timed out waiting for {0}")]
+    Timeout(&'static str),
 }

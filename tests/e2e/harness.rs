@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nexus_loadtest::client::HeadlessClient;
 use nexus_loadtest::lossy::LossRules;
 use nexus_loadtest::{ClientConfig, ClientRole, ConnectionOptions, TrackRxStats};
 use nexus_sfu::config::NexusConfig;
@@ -97,6 +98,35 @@ pub fn lossy_client_config(
     ClientConfig {
         loss: Some(Arc::clone(rules)),
         ..client_config(server, room)
+    }
+}
+
+/// A client that joined, publishes audio + video with ICE up, and has its
+/// signaling task running.
+pub async fn publishing_client(config: ClientConfig) -> HeadlessClient {
+    let mut client = HeadlessClient::new(config).await.unwrap();
+    client.connect().await.expect("connects");
+    client.start_publishing().await.expect("publishes");
+    client
+        .start_signaling_task()
+        .expect("signaling task starts");
+    client
+}
+
+/// Wait until `client` has received at least `min` packets on each of `ssrcs`.
+pub async fn wait_for_media(client: &HeadlessClient, ssrcs: &[u32], min: u64, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let stats = client.track_stats();
+        let has = |ssrc: &u32| stats.iter().any(|t| t.ssrc == *ssrc && t.packets >= min);
+        if ssrcs.iter().all(has) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no media on {ssrcs:x?}: {stats:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 
 use harness::*;
 use nexus_loadtest::client::HeadlessClient;
-use nexus_loadtest::lossy::{Direction, LossRule, LossRules, PacketClass};
+use nexus_loadtest::lossy::{Direction, LossRule, LossRules, PacketClass, SrtcpLayout, TapEntry};
 use nexus_loadtest::signaling::SignalingConnection;
+use nexus_loadtest::{Announced, RemoteTrack};
 use nexus_sfu::nexus_transport::dtls::DtlsRole;
 use nexus_sfu::nexus_transport::srtp::ProtectionProfile;
 use nexus_sfu::signal::SignalMessage;
@@ -159,7 +160,7 @@ async fn wait_for_tracks(a: &HeadlessClient, b: &HeadlessClient, n: usize, timeo
 
 /// Per received track over the window: packets arrive at a plausible rate,
 /// sequence numbers are continuous, timestamps advance, and the SSRC stays
-/// the same (exactly one audio and one video stream, no new SSRCs). The arriving
+/// the same (exactly one stream per announced SSRC, no new SSRCs). The arriving
 /// SSRCs are the keys of `expected`; each carries the kind and the publisher SSRC
 /// its payload markers must name, unchanged.
 fn check_received(
@@ -176,8 +177,8 @@ fn check_received(
     );
     assert_eq!(
         after.len(),
-        2,
-        "{who}: exactly two SSRCs received: {after:?}"
+        expected.len(),
+        "{who}: exactly the announced SSRCs received: {after:?}"
     );
 
     let window = MEDIA_WINDOW.as_secs();
@@ -331,4 +332,222 @@ async fn dtls_survives_lost_first_flight() {
 
     let _ = client.disconnect().await;
     server.shutdown().await.expect("clean shutdown");
+}
+
+/// Clients in `ten_clients_audio_video`.
+const TEN: usize = 10;
+
+/// Ten participants in one room, each publishing audio + video and subscribed
+/// to the other nine's 18 tracks (20 m-lines per session, note §17.2). Each
+/// receives exactly its 18 announced streams, each from the right publisher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn ten_clients_audio_video() {
+    let _serial = SERIAL.lock().await;
+    init_logging();
+    let started = Instant::now();
+    let server = start_server().await;
+
+    let mut clients = Vec::with_capacity(TEN);
+    for _ in 0..TEN {
+        clients.push(publishing_client(client_config(&server, "ten")).await);
+    }
+    // Publisher id -> (video SSRC, audio SSRC), what the payload markers name.
+    let mut published = BTreeMap::new();
+    for client in &clients {
+        let id = client.participant_id().expect("joined");
+        let video = client.published_ssrc(true).await.expect("video SSRC");
+        let audio = client.published_ssrc(false).await.expect("audio SSRC");
+        published.insert(id, (video, audio));
+    }
+    let others = 2 * (TEN - 1);
+    for client in &mut clients {
+        let known = client
+            .wait_for_known_tracks(others, STEP_TIMEOUT)
+            .await
+            .expect("every other track announced");
+        assert_eq!(known.len(), others, "{known:?}");
+        let ids: Vec<u64> = known.iter().map(|t| t.track_id).collect();
+        // 18 ids: the client sends two requests (the SFU takes 10 per request).
+        let offered = client
+            .subscribe_confirmed(&ids, STEP_TIMEOUT)
+            .await
+            .expect("subscribed to all");
+        assert_eq!(offered.len(), others, "{offered:?}");
+    }
+    let setup = started.elapsed();
+
+    let expected: Vec<BTreeMap<u32, (String, u32)>> = clients
+        .iter()
+        .map(|c| streams_from(&c.announced_ssrcs(), &c.known_tracks(), &published))
+        .collect();
+    for (client, streams) in clients.iter().zip(&expected) {
+        let ssrcs: Vec<u32> = streams.keys().copied().collect();
+        wait_for_media(client, &ssrcs, 1, STEP_TIMEOUT).await;
+    }
+    let before: Vec<_> = clients.iter().map(HeadlessClient::track_stats).collect();
+    tokio::time::sleep(MEDIA_WINDOW).await;
+    for (i, client) in clients.iter().enumerate() {
+        let who = format!("client {i}");
+        check_received(&who, &before[i], &client.track_stats(), &expected[i]);
+        assert_eq!(client.signal_events_dropped(), 0, "{who}");
+    }
+    let shard = server.dataplane().stats(nexus_dataplane::ShardId::new(0));
+    assert_eq!(shard.counters.commands_rejected, 0, "{shard:?}");
+    assert_eq!(shard.gauges.sessions, TEN as u64, "{shard:?}");
+    assert_eq!(
+        shard.gauges.subscriptions,
+        (TEN * others) as u64,
+        "{shard:?}"
+    );
+    eprintln!(
+        "ten_clients_audio_video: setup {setup:?}, total {:?}",
+        started.elapsed()
+    );
+
+    for client in &mut clients {
+        let _ = client.disconnect().await;
+    }
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// For each announced m-line: its SSRC -> (kind, the publisher's SSRC of that
+/// kind), through the announced track id and the track's publisher.
+fn streams_from(
+    announced: &[Announced],
+    known: &[RemoteTrack],
+    published: &BTreeMap<u64, (u32, u32)>,
+) -> BTreeMap<u32, (String, u32)> {
+    let mut streams = BTreeMap::new();
+    for a in announced {
+        let track_id = a.track_id.expect("announced m-line is in Offer.tracks");
+        let track = known.iter().find(|t| t.track_id == track_id);
+        let track = track.unwrap_or_else(|| panic!("track {track_id} not announced"));
+        assert_eq!(track.kind, a.kind, "{a:?}");
+        let (video, audio) = published[&track.publisher_id];
+        let publisher_ssrc = if a.kind == "video" { video } else { audio };
+        assert!(streams
+            .insert(a.ssrc, (a.kind.clone(), publisher_ssrc))
+            .is_none());
+    }
+    streams
+}
+
+/// Unsubscribe/resubscribe rounds in `resubscribe_no_srtp_index_reuse`.
+const RESUBSCRIBE_ROUNDS: usize = 3;
+
+/// Inbound datagrams B's tap can hold (≈ 150 packets/s for a few seconds).
+const TAP_CAPACITY: usize = 50_000;
+
+/// B subscribes to A's two tracks, receives for 1 s and unsubscribes, three
+/// times (note §17.4). Each subscription arrives on new SSRCs, and on the wire
+/// no (SSRC, sequence number) or (SSRC, SRTCP index) pair repeats: the SFU never
+/// encrypts two packets under the same key, SSRC and index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resubscribe_no_srtp_index_reuse() {
+    let _serial = SERIAL.lock().await;
+    init_logging();
+    let server = start_server().await;
+
+    let mut a = publishing_client(client_config(&server, "resubscribe")).await;
+    let rules = LossRules::new();
+    rules.enable_tap(TAP_CAPACITY);
+    let mut b = HeadlessClient::new(lossy_client_config(&server, "resubscribe", &rules))
+        .await
+        .unwrap();
+    b.connect().await.expect("B connects");
+    b.start_signaling_task().expect("signaling task starts");
+    let known = b
+        .wait_for_known_tracks(2, STEP_TIMEOUT)
+        .await
+        .expect("A's tracks announced");
+    let ids: Vec<u64> = known.iter().map(|t| t.track_id).collect();
+
+    let mut used = BTreeSet::new();
+    for round in 0..RESUBSCRIBE_ROUNDS {
+        let offered = b
+            .subscribe_confirmed(&ids, STEP_TIMEOUT)
+            .await
+            .expect("subscribed");
+        let ssrcs: Vec<u32> = offered.iter().map(|m| m.ssrc).collect();
+        assert_eq!(ssrcs.len(), 2, "round {round}: {offered:?}");
+        for ssrc in &ssrcs {
+            assert!(used.insert(*ssrc), "round {round}: SSRC {ssrc:#x} reused");
+        }
+        wait_for_media(&b, &ssrcs, 10, STEP_TIMEOUT).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The offer that follows Unsubscribe no longer announces the SSRCs (the
+        // m-lines go inactive), so webrtc-rs replaces the receivers before the
+        // next subscription brings new ones.
+        let after = b
+            .unsubscribe(&ids, STEP_TIMEOUT)
+            .await
+            .expect("unsubscribed");
+        assert!(
+            after.iter().all(|m| !ssrcs.contains(&m.ssrc)),
+            "round {round}: still announced after Unsubscribe: {after:?}"
+        );
+    }
+    let (history, overflow) = b.announced_history();
+    assert_eq!(overflow, 0);
+    assert_eq!(history.len(), 2 * RESUBSCRIBE_ROUNDS, "{history:?}");
+
+    let layout = srtcp_layout(&server, &b);
+    let (entries, overflow) = rules.tap();
+    assert_eq!(overflow, 0, "tap too small");
+    check_no_index_reuse(&entries, layout, &used);
+
+    let _ = a.disconnect().await;
+    let _ = b.disconnect().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The SRTCP layout of the profile `client`'s DTLS session negotiated.
+fn srtcp_layout(server: &nexus_sfu::server::ServerHandle, client: &HeadlessClient) -> SrtcpLayout {
+    let id = client.participant_id().expect("joined");
+    let established = server.established();
+    let session = established.iter().find(|e| e.participant == id);
+    match session.expect("DTLS established").profile {
+        ProtectionProfile::AeadAes128Gcm => SrtcpLayout::Gcm,
+        ProtectionProfile::Aes128CmHmacSha1_80 => SrtcpLayout::AesCm80,
+        other => panic!("unexpected profile {other:?}"),
+    }
+}
+
+/// No (SSRC, seq) and no (SSRC, SRTCP index) repeats on the wire; SRTP arrived
+/// on every SSRC in `ssrcs`; every SRTCP packet is encrypted (E set).
+fn check_no_index_reuse(entries: &[TapEntry], layout: SrtcpLayout, ssrcs: &BTreeSet<u32>) {
+    let mut rtp = BTreeSet::new();
+    let mut rtcp = BTreeSet::new();
+    for entry in entries {
+        match entry {
+            TapEntry::Srtp { ssrc, seq } => {
+                assert!(
+                    rtp.insert((*ssrc, *seq)),
+                    "SRTP ({ssrc:#x}, {seq}) sent twice"
+                );
+            }
+            TapEntry::Srtcp { sender_ssrc, .. } => {
+                let word = entry.srtcp_e_index(layout).expect("SRTCP entry");
+                assert_ne!(word >> 31, 0, "SRTCP from {sender_ssrc:#x} not encrypted");
+                let index = word & 0x7FFF_FFFF;
+                assert!(
+                    rtcp.insert((*sender_ssrc, index)),
+                    "SRTCP ({sender_ssrc:#x}, {index}) sent twice"
+                );
+            }
+        }
+    }
+    for ssrc in ssrcs {
+        assert!(
+            rtp.iter().any(|(s, _)| s == ssrc),
+            "no SRTP on the wire for {ssrc:#x}"
+        );
+    }
+    eprintln!(
+        "resubscribe: {} SRTP and {} SRTCP datagrams checked on {} SSRCs",
+        rtp.len(),
+        rtcp.len(),
+        ssrcs.len()
+    );
 }

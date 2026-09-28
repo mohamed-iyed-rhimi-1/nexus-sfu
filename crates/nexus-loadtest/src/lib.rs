@@ -40,6 +40,7 @@ pub mod progress;
 pub mod prometheus;
 pub mod report;
 pub mod runner;
+pub mod signal_task;
 pub mod signaling;
 pub mod track_stats;
 
@@ -56,4 +57,5 @@ pub use progress::ProgressDisplay;
 pub use prometheus::{PrometheusServer, PrometheusState};
 pub use report::{ReportGenerator, TargetValidation, TestReport};
 pub use runner::TestRunner;
+pub use signal_task::{RemoteTrack, SignalEvent};
 pub use track_stats::{TrackRxStats, TrackStatsMap};
