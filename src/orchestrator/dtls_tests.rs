@@ -10,9 +10,9 @@ fn certificate() -> DtlsCertificate {
     DtlsCertificate::generate().unwrap()
 }
 
-/// A peer engine in `role` (the SFU takes the other one).
+/// A peer engine in `role` (the SFU takes the other one), on its own certificate.
 fn peer(role: DtlsRole) -> OpenSslDtlsEngine {
-    OpenSslDtlsEngine::new(role).unwrap()
+    OpenSslDtlsEngine::with_certificate(role, &certificate())
 }
 
 /// A buffer of whole DTLS records, one record per datagram.

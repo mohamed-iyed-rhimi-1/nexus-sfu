@@ -344,18 +344,6 @@ pub struct OpenSslDtlsEngine {
 }
 
 impl OpenSslDtlsEngine {
-    /// Create a DTLS engine with a certificate of its own.
-    ///
-    /// Generates a self-signed ECDSA P-256 certificate and configures
-    /// the OpenSSL context for DTLS 1.2 with SRTP extension. The old path's
-    /// per-session engine; the new control plane uses `with_certificate`.
-    ///
-    /// # Arguments
-    /// * `role` — Client or Server
-    pub fn new(role: DtlsRole) -> Result<Self, DtlsError> {
-        Ok(Self::with_certificate(role, &DtlsCertificate::generate()?))
-    }
-
     /// Create a DTLS engine on a shared certificate: only the per-session `Ssl` is
     /// built (at `start_handshake`), from the certificate's context.
     pub fn with_certificate(role: DtlsRole, certificate: &DtlsCertificate) -> Self {
@@ -763,6 +751,11 @@ impl OpenSslDtlsEngine {
 mod tests {
     use super::*;
 
+    /// An engine on a certificate of its own (a peer with its own identity).
+    fn own_engine(role: DtlsRole) -> OpenSslDtlsEngine {
+        OpenSslDtlsEngine::with_certificate(role, &DtlsCertificate::generate().unwrap())
+    }
+
     /// Run a handshake between `client` and `server` in memory. Bounded: a DTLS 1.2
     /// handshake takes two round trips; 16 exchanges is ample.
     fn handshake(client: &mut OpenSslDtlsEngine, server: &mut OpenSslDtlsEngine) {
@@ -879,7 +872,7 @@ mod tests {
     #[test]
     fn flights_are_cut_into_records_that_fit_the_mtu() {
         let certificate = DtlsCertificate::generate().unwrap();
-        let mut client = OpenSslDtlsEngine::new(DtlsRole::Client).unwrap();
+        let mut client = own_engine(DtlsRole::Client);
         let mut server = OpenSslDtlsEngine::with_certificate(DtlsRole::Server, &certificate);
         assert!(server.start_handshake().unwrap().is_empty());
         let hello = client.start_handshake().unwrap();
@@ -909,10 +902,10 @@ mod tests {
             assert!(engine.process(&[]).is_err());
             assert!(engine.process(&oversized).is_err());
         };
-        let mut idle = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        let mut idle = own_engine(DtlsRole::Server);
         check(&mut idle);
-        let mut client = OpenSslDtlsEngine::new(DtlsRole::Client).unwrap();
-        let mut server = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        let mut client = own_engine(DtlsRole::Client);
+        let mut server = own_engine(DtlsRole::Server);
         server.start_handshake().unwrap();
         check(&mut server);
         handshake_started(&mut client, &mut server);
@@ -943,19 +936,12 @@ mod tests {
 
     #[test]
     fn role_and_start_are_errors_once_started() {
-        let mut engine = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
+        let mut engine = own_engine(DtlsRole::Server);
         engine.set_role(DtlsRole::Client).unwrap();
         engine.set_role(DtlsRole::Server).unwrap();
         engine.start_handshake().unwrap();
         assert!(engine.set_role(DtlsRole::Client).is_err());
         assert_eq!(engine.role(), DtlsRole::Server);
         assert!(engine.start_handshake().is_err());
-    }
-
-    #[test]
-    fn new_generates_a_certificate_per_engine() {
-        let a = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
-        let b = OpenSslDtlsEngine::new(DtlsRole::Server).unwrap();
-        assert_ne!(a.fingerprint(), b.fingerprint());
     }
 }

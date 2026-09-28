@@ -23,8 +23,8 @@ targets are not met yet.
 `docs/design/dataplane-v1.md`). Work on the `phase-1` branch; it merges into `main` (the
 trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
 soon (scope in `docs/dataplane-design.md` §2). The old data plane is being deleted (the
-plan's deletion steps); do not fix bugs in what is left of it (`nexus-webrtc`'s transport and
-session, the replaced `nexus-transport` modules).
+plan's deletion steps); do not fix bugs in what is left of it (the replaced `nexus-transport`
+modules: arena, ring buffer, io_uring, UDP batch, ICE agent, pure-Rust DTLS).
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -121,7 +121,7 @@ crates/
   nexus-dataplane/   The data plane: shards, commands/events, SRTP, rewrite, I/O
   nexus-transport/   UDP, io_uring, ICE, DTLS (OpenSSL), SRTP, arena, ring buffer
   nexus-media/       RTP/RTCP parsing, codec detection
-  nexus-webrtc/      WebRTC session state machine, SDP, packet demux
+  nexus-webrtc/      SDP parsing, printing and offer/answer negotiation
   nexus-signal/      WebSocket signaling (QUIC module is a stub)
   nexus-bwe/         GCC, REMB (not fed by the live path)
   nexus-api/         REST API with JWT

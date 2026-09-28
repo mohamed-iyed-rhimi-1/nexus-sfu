@@ -1254,6 +1254,17 @@ README crate table and the `nexus-dst` command, CLAUDE.md layout. `Cargo.lock`: 
 crates only. With `nexus-dst` gone nothing turns on `nexus-transport/sim`: its sim-gated
 code is no longer built by the workspace (deleted in C5).
 
+**C6 done (2026-09-28):** the whole `nexus-webrtc` `webrtc` module deleted (`transport.rs`,
+`session.rs`, `demux.rs`, `types.rs`, `error.rs`, `mod.rs`; nothing outside the crate used
+it, and `sdp` does not import it), with its re-exports and the `test-hooks` feature. The crate
+is SDP only: its dependencies shrink to `nexus-core`, `nexus-media`, `thiserror` (dev:
+`proptest`); `nexus-transport`, `serde`, `tracing`, `rand`, `parking_lot`, `arc-swap`,
+`dashmap` and dev `tokio` dropped (`Cargo.lock`: dependency lines only, no package leaves
+the tree). `OpenSslDtlsEngine::new` removed; its test callers (`openssl_backend.rs`,
+`src/orchestrator/dtls_tests.rs`) build peers with `with_certificate` on a certificate of
+their own, and the test of `new` itself went with it. CLAUDE.md and README describe the
+crate as SDP.
+
 **Code notes (audited 2026-09-26):** `tests/pps_pipeline.rs` is `#![cfg(feature = "sim")]`,
 not in CI: delete, don't port. After C5, `grep -rn "arena\|io_uring\|MediaTransport" crates
 src` must be empty outside comments updated in 1.9. Before each step, `grep -rn` the removed
@@ -1872,7 +1883,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | C2 Old benches | Done | see git log (C2) | `forwarding.rs` deleted; `packet_processing.rs` keeps RTCP parsing, demux groups dropped; root `test-hooks` dev-dependency removed (from C6) |
 | C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Done | see git log (C1+C3) | ≈ 7,100 lines of old path + `sfu.rs` (2,284) gone; 20 root dependencies, `build.rs`, `proto/`, `protoc` no longer needed |
 | C4 `nexus-actor`, `nexus-dst` | Done | see git log (C4) | Both crates, `ActorMetrics` and the `nexus_actor_*` series gone; `[actor]` checked against the orchestrator's limits until C7 |
-| C6 `WebRtcTransport`, session, demux | Not started | | Before C5 |
+| C6 `WebRtcTransport`, session, demux | Done | see git log (C6) | `nexus-webrtc` is SDP only (≈ 5,800 lines gone); `OpenSslDtlsEngine::new` removed |
 | C5 Replaced `nexus-transport` modules | Not started | | |
 | C7 Config, README, example | Not started | | |
 | 1.6a E2E: harness, ten clients, resubscribe | Not started | | |
@@ -2336,3 +2347,21 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 08:18, 372cbcd (49 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
   ```
   Next: review and commit C4, then C6 (before C5).
+- 2026-09-28: C4 committed (`08adb78`). C6 implemented (uncommitted, for review):
+  `nexus-webrtc` reduced to `sdp` (the `webrtc` module, its re-exports, `test-hooks` and
+  seven dependencies gone), `OpenSslDtlsEngine::new` removed (tests use
+  `with_certificate`). Tests 1,683 → 1,632: the module's 50 tests and the test of `new`.
+  `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                0s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                          78s (1632 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                2s
+  linux-arm64    PASS  clippy                                           6s
+  linux-arm64    PASS  release build                                   54s
+  linux-arm64    PASS  cargo test --workspace                          84s (1638 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           36s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     20s
+  ci-local 2026-09-28 08:25, 08adb78 (14 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit C6, then C5 (the replaced `nexus-transport` modules).

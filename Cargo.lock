@@ -2055,18 +2055,10 @@ dependencies = [
 name = "nexus-webrtc"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
- "dashmap",
  "nexus-core",
  "nexus-media",
- "nexus-transport",
- "parking_lot",
  "proptest",
- "rand 0.8.5",
- "serde",
  "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

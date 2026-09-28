@@ -64,7 +64,7 @@ The orchestrator runs a `tokio::select!` loop with 4 modules:
 | `nexus-core` | Shared types, config, error definitions |
 | `nexus-transport` | UDP, ICE, DTLS, SRTP, arena allocator, ring buffers, io_uring |
 | `nexus-media` | RTP/RTCP parsing (SIMD), codec detection (H264/VP8/VP9/AV1/Opus), simulcast |
-| `nexus-webrtc` | WebRTC session state machine, SDP negotiation, packet demux |
+| `nexus-webrtc` | SDP parsing, printing and offer/answer negotiation |
 | `nexus-state` | CRDTs (Orswot, LWWReg, GCounter), SWIM gossip, distributed state |
 | `nexus-bwe` | GCC bandwidth estimation (delay + loss), REMB, probing, speaker detection |
 | `nexus-signal` | WebSocket signaling (a QUIC module exists but is not started) |
