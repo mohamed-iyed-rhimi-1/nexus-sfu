@@ -1205,9 +1205,18 @@ session, C4 and C6 one, C5 and C7 one.
 | C2 | 1.7 | (`real_path` and `memory` were rewritten in place by 1.7, so CI's bench smoke and memory budget never lose coverage.) `benches/forwarding.rs` (measures `SsrcRouter`); `benches/packet_processing.rs` ported to the shard's classifier or deleted (it imports `quick_classify`/`PacketType` from `nexus-webrtc` `demux.rs`) | `Cargo.toml` `[[bench]]` entries |
 | C1+C3 | C2 (the old benches use the worker and router) | `Sfu` and the packet loop (`src/sfu.rs`), `SRTCP_SENT_CACHE`, `tests/pps_pipeline.rs`, root `sim` feature, `src/spin.rs`, `src/clock.rs`, `DrainState`, `DropTracker`; `src/worker/`, `src/forward/`, `src/transport/`; `src/proto.rs` and the root `build.rs` prost step (the root crate `include!`s its output only in `proto.rs`) and `check_io_uring_feature` (root `build.rs:19,31`) with the root `io_uring` feature; `lib.rs` modules and re-exports (39, 47, 50, 52, 56, 59, 134-139, 161-190); `CoreSfuError::Worker` / `WorkerError` (`nexus-core/src/error.rs:52`, `:322`) and the root `src/error.rs:24,61,85` wrappers | Merged because `worker/pool.rs` uses `SpinLoop` (`:367`, `:786`), `clock::now_us` (`:2296`) and `sfu::forget_publisher_srtcp` (`:4038`): deleting `sfu.rs` alone does not build. Root deps removed if unused after the step, each checked by a build: `prost`, `prost-build`, `capnp`, `capnpc`, `crossbeam`, `dashmap`, `memmap2`, `core_affinity`, `once_cell`, and the already unused `sysinfo`, `getrandom`, `tokio-util`, `futures-util`, `tokio-tungstenite`, `hyper`, `tower`, `tower-http`, `axum`, `rustls`, `tokio-rustls`, `rustls-pemfile`, `http`. `protoc` stays required (`nexus-signal` compiles its own schemas); CLAUDE.md unchanged on that point |
 | C4 | C1+C3 (the worker imports `nexus-actor` migration types) | `crates/nexus-actor`, `crates/nexus-dst` (it also turns on `nexus-transport/sim` for the whole workspace), workspace entries, `config/mod.rs:157-181` limits (use the orchestrator's constants), `config/tests.rs:333-338`, `lib.rs:70-75`; the `nexus_actor_*` gauges (`nexus-metrics/src/prometheus.rs:228-242`), their test, `scripts/verify_metrics.sh:51` | `nexus_actor::MAX_ROOMS` is 1,000, the orchestrator's `MAX_ROOMS` 10,000 (`room.rs:13`): validation accepts more rooms after this step; tests updated to the new limit. `nexus-core/types.rs` and `production.toml` comments that mention actors |
-| C6 | C1+C3, C2 (`Sfu` and the old benches use `WebRtcTransport` and `test-hooks`) | `nexus-webrtc`: `webrtc/transport.rs`, `webrtc/session.rs`, `webrtc/demux.rs`, `webrtc/mod.rs` constants, the `test-hooks` feature and the root dev-dependency that enables it (`Cargo.toml:125`; no bench needs it after 1.7), `OpenSslDtlsEngine::new` (per-session certificate) | SDP stays |
+| C6 | C1+C3, C2 (`Sfu` and the old benches use `WebRtcTransport` and `test-hooks`) | `nexus-webrtc`: `webrtc/transport.rs`, `webrtc/session.rs`, `webrtc/demux.rs`, `webrtc/mod.rs` constants, the `test-hooks` feature (the root dev-dependency that enabled it went in C2), `OpenSslDtlsEngine::new` (per-session certificate) | SDP stays |
 | C5 | C6 (`webrtc/session.rs:69-74` imports `DtlsSession`, `IceAgent`, `IceConfig` and more), C4 (`nexus-dst` uses the arena) | `nexus-transport`: `arena.rs`, `ring_buffer.rs`, `batch.rs`, `udp.rs`, `media_transport.rs`, `io_uring.rs`, `arena_proptest.rs`, `arena_refcount_proptest.rs`, the crate's `io_uring` and `sim` features; ICE `agent.rs`, `checklist.rs`, and `StunServer`; pure-Rust DTLS (`dtls/session.rs`, `handshake.rs`, `record.rs`, and the parts of `dtls/crypto.rs` nothing imports) | Keep `ice/stun/server.rs`'s `create_binding_request` and `generate_transaction_id` (used by `gather.rs` and the tests: move them if `server.rs` goes), `SrtpProfile` and `SrtpKeyMaterial` from `dtls/crypto.rs` (used by `openssl_backend.rs:37`), `gro.rs`, `gso.rs`, `socket_config.rs`, `stun/`, `candidate.rs`, `gather.rs` enumeration, `SrtpContext` (tests use it). `ring` stays (SRTP GCM) |
 | C7 | C4, C1+C3 | Config fields of note §14 (`[worker]`, `[memory]`, `actor.*`, `transport.batch_*`, `stun_servers`, `--workers`, `NEXUS_WORKER_COUNT`, `NEXUS_ARENA_SIZE_MB`), the arena ≥ 16 MB and workers ≤ 2 × CPU checks in `validate_cross_module` (`config/mod.rs:148-155`, `:183-196`), `config/*.toml`, README config and feature sections (lines 32-33, 65, 73, 84, 123-127, 142-143, 201), `nexus-metrics` `WorkerPoolMetrics` (`worker.rs:122`) → shard metrics (note §5.4) | `examples/basic_sfu.rs` (reads `memory.*`, `worker.*`, `batch_*`: rewrite or delete, or `--all-targets` breaks); e2e `harness.rs:56-58`; `deploy/docker/run.sh` unchanged for one shard (publishes `10000/udp`) |
+
+**C2 done (2026-09-28):** `benches/forwarding.rs` and its `[[bench]]` deleted.
+`packet_processing.rs` keeps its four `rtcp_parse` benches (`nexus-media`, which stays; the
+shard uses `SenderReport::parse` and `PliPacket::parse`) and loses the three demux groups
+(`quick_classify`, deleted in C6): the shard's classifier is a first-byte range check inside
+ingress, measured as part of `real_path`'s `ingress`, so it is not made public for a
+micro-bench. Moved here from C6: the root dev-dependency `nexus-webrtc` with `test-hooks`
+(its only users were the old `real_path` and `memory`); C6 still removes the feature from
+`nexus-webrtc`. No bench imports `nexus_webrtc` now. CLAUDE.md's bench list updated.
 
 **Code notes (audited 2026-09-26):** `tests/pps_pipeline.rs` is `#![cfg(feature = "sim")]`,
 not in CI: delete, don't port. After C5, `grep -rn "arena\|io_uring\|MediaTransport" crates
@@ -1824,7 +1833,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.5b-prep Node module, config, negotiator options, loadtest marker | Done | see git log (1.5b-prep) | `node.rs`, `[dataplane]` config, `with_ice_lite` + Track rtcp-fb parameter (golden old-path offer), loadtest marker + announced SSRCs; moved in: sha-256 fingerprint choice, `SsrcAllocator` fixes, shard DTLS from the selected address only. Old path green (e2e 3/3) |
 | 1.5b Switch (one commit) | Done | see git log (1.5b) | New path live: e2e 3/3 (both DTLS roles, AES-GCM), SSRCs rewritten. Early browser check: Chrome 153 passes (GCM, ICE-lite, media both ways) after the stable-PT fix; Firefox deferred to 1.8 (owner's decision) |
 | 1.7 Benches, memory budget, CI | Done | see git log (1.7) | 1.7a: `real_path` on the shard, 0 allocations per packet, `ENOBUFS` fallback, macOS CI job, `--locked`, timeouts, release pinned. 1.7b: `memory` on both planes, 16.9 KB per participant checked (session state), signaling ≈ 49/57 KB reported apart, budget 25 in `ci.yml`. Before C2. CI unavailable (billing lock): `scripts/ci-local.sh` stands in |
-| C2 Old benches | Not started | | |
+| C2 Old benches | Done | see git log (C2) | `forwarding.rs` deleted; `packet_processing.rs` keeps RTCP parsing, demux groups dropped; root `test-hooks` dev-dependency removed (from C6) |
 | C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Not started | | |
 | C4 `nexus-actor`, `nexus-dst` | Not started | | |
 | C6 `WebRtcTransport`, session, demux | Not started | | Before C5 |
@@ -1835,7 +1844,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
 | 1.9 Documents, merge | Not started | | |
 
-Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ◐ 25 KB budget (16.9 KB checked, session state only; enforced by `ci.yml` and `ci-local.sh`; the review's `all` run passed before the 2026-09-28 fixes, one more after them) · 4 ☐ browsers · 5 ☐ old path
+Exit criteria: 1 ☐ e2e · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☐ old path
 deleted · 6 ☐ no panic on input · 7 ☐ documents.
 
 ### Session log
@@ -2208,3 +2217,42 @@ Add one line per working session: date, part, what was done, what is left.
   Linux figures identical to macOS (16.9 KB checked; ws 49.2 KB, wss 56.8 KB). Not run after
   these fixes: `linux-x86_64`, `docker` (the review's `all` run predates them). Stopped for
   review; not committed.
+- 2026-09-28: `ci-local.sh all` on the 1.7 commit (a detached worktree at `964291d`, so the
+  run saw exactly the commit): PASS on every target. Exit criterion 3 checked off.
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                          82s
+  macos          PASS  cargo test --workspace                         150s (2058 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                2s
+  linux-arm64    PASS  clippy                                          10s
+  linux-arm64    PASS  release build                                   62s
+  linux-arm64    PASS  cargo test --workspace                         120s (2064 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           46s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     19s
+  linux-x86_64   PASS  cargo fmt --check                                3s
+  linux-x86_64   PASS  clippy                                          24s
+  linux-x86_64   PASS  release build                                   88s
+  linux-x86_64   PASS  cargo test --workspace                         165s (2064 passed, 0 failed)
+  linux-x86_64   PASS  bench smoke real_path                           80s
+  linux-x86_64   PASS  bench memory (budget 25 KB)                     25s
+  docker         PASS  docker build (linux/amd64)                     394s
+  ci-local 2026-09-28 07:50, 964291d (clean), targets: macos linux-arm64 linux-x86_64 docker, budget 25 KB: PASS
+  ```
+  x86_64 memory figures identical (16.9 KB checked; signaling ws 49.2 KB, wss 56.9 KB).
+- 2026-09-28: C2 implemented (uncommitted, for review): `benches/forwarding.rs` deleted;
+  `packet_processing.rs` down to its RTCP parse benches (demux groups dropped); root
+  dev-dependency on `nexus-webrtc` `test-hooks` removed (moved from C6); CLAUDE.md bench
+  list. `Cargo.lock` unchanged. `ci-local.sh` (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                          93s (2058 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                          11s
+  linux-arm64    PASS  release build                                   56s
+  linux-arm64    PASS  cargo test --workspace                         104s (2064 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           35s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     19s
+  ci-local 2026-09-28 07:56, 964291d (5 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit C2, then C1+C3.

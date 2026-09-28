@@ -121,8 +121,6 @@ proptest = "1.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
 webrtc = "0.10"
-# Session hooks used by benches/real_path.rs and benches/memory.rs
-nexus-webrtc = { path = "crates/nexus-webrtc", features = ["test-hooks"] }
 # webrtc-rs clients for tests/e2e.rs
 nexus-loadtest = { path = "crates/nexus-loadtest" }
 # Alternative SRTP backends compared in benches/srtp_backends.rs
@@ -146,10 +144,6 @@ harness = false
 
 [[bench]]
 name = "udp_floor"
-harness = false
-
-[[bench]]
-name = "forwarding"
 harness = false
 
 [[bench]]

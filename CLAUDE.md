@@ -135,8 +135,8 @@ crates/
                      (per-track receive stats, loss injection in lossy.rs)
 sdk/                 TypeScript client SDK
 tests/               e2e.rs (+ e2e/harness.rs), pps_pipeline.rs (--features sim)
-benches/             real_path, memory, srtp_backends, udp_floor (trusted);
-                     forwarding, packet_processing, crdt_sync
+benches/             real_path, memory (+ memory/signaling.rs), srtp_backends, udp_floor
+                     (trusted); packet_processing (RTCP parsing), crdt_sync
 deploy/              Docker, Grafana dashboard
 ```
 

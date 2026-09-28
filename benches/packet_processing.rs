@@ -1,26 +1,22 @@
-//! Packet Processing Benchmarks for Nexus SFU
+//! RTCP parsing benchmarks (`nexus-media`): Sender Reports, Receiver Report
+//! blocks, PLI, NACK.
 //!
-//! Benchmarks RTCP parsing and packet demux classification.
-//! Complements benches/forwarding.rs which covers RTP parsing.
+//! The shard parses SRs and PLIs with these functions; RR and NACK parse into
+//! `Vec`s and are not used on the shard (it counts and ignores them). The old
+//! demux classification groups were removed with the old path (Phase 1, C2):
+//! the shard's classifier is a first-byte range check whose cost is part of
+//! `real_path`'s `ingress` numbers.
 //!
 //! Run with: cargo bench --bench packet_processing
-//!
-//! # Benchmarks
-//!
-//! - RTCP parsing: Sender Reports, Receiver Reports, PLI, NACK
-//! - Packet demux: Classification of RTP vs RTCP vs STUN vs DTLS
 //!
 //! # Performance Targets
 //!
 //! - RTCP SR parsing: ~30-50ns per packet
 //! - RTCP RR block parsing: ~20-30ns per block
-//! - Packet demux: ~5-10ns per packet
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use nexus_webrtc::webrtc::{quick_classify, PacketType};
-
-// Re-export RTCP types from nexus-media
+// RTCP types from nexus-media
 use nexus_media::rtcp::{NackPacket, PliPacket, ReceiverReportBlock, SenderReport};
 
 // =============================================================================
@@ -125,93 +121,6 @@ fn create_nack_packet() -> Vec<u8> {
 }
 
 // =============================================================================
-// Demux Packet Generators
-// =============================================================================
-
-/// Create a minimal STUN binding request packet.
-fn create_stun_packet() -> Vec<u8> {
-    let mut packet = vec![0u8; 20];
-    // STUN header
-    packet[0] = 0x00; // Message type high byte
-    packet[1] = 0x01; // Binding Request
-    packet[2] = 0x00; // Message length high byte
-    packet[3] = 0x00; // Message length low byte (no attributes)
-                      // Magic cookie
-    packet[4..8].copy_from_slice(&0x2112A442_u32.to_be_bytes());
-    // Transaction ID (12 bytes)
-    for (i, byte) in packet[8..20].iter_mut().enumerate() {
-        *byte = i as u8;
-    }
-    packet
-}
-
-/// Create a minimal DTLS handshake packet.
-fn create_dtls_packet() -> Vec<u8> {
-    let mut packet = vec![0u8; 13];
-    packet[0] = 22; // Content type: Handshake
-    packet[1] = 0xFE; // Version high byte (DTLS 1.2)
-    packet[2] = 0xFD; // Version low byte
-                      // Epoch (2 bytes)
-    packet[3] = 0x00;
-    packet[4] = 0x00;
-    // Sequence number (6 bytes)
-    packet[5..11].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
-    // Length (2 bytes) - 0 for minimal packet
-    packet[11] = 0x00;
-    packet[12] = 0x00;
-    packet
-}
-
-/// Create a minimal RTP packet.
-fn create_rtp_packet() -> Vec<u8> {
-    let mut packet = vec![0u8; 12];
-    packet[0] = 0x80; // V=2, P=0, X=0, CC=0
-    packet[1] = 0x60; // M=0, PT=96
-    packet[2..4].copy_from_slice(&1234_u16.to_be_bytes());
-    packet[4..8].copy_from_slice(&5678_u32.to_be_bytes());
-    packet[8..12].copy_from_slice(&0xDEADBEEF_u32.to_be_bytes());
-    packet
-}
-
-/// Create a minimal RTCP packet.
-fn create_rtcp_packet() -> Vec<u8> {
-    let mut packet = vec![0u8; 8];
-    packet[0] = 0x80; // V=2, P=0, RC=0
-    packet[1] = 200; // PT=200 (SR) - maps to payload type 72 in demux
-    packet[2] = 0x00;
-    packet[3] = 0x01; // Length = 1 word
-    packet[4..8].copy_from_slice(&0xDEADBEEF_u32.to_be_bytes());
-    packet
-}
-
-/// Create a batch of mixed packets for realistic demux benchmarking.
-fn create_mixed_packet_batch() -> Vec<Vec<u8>> {
-    let mut packets = Vec::with_capacity(64);
-
-    // 70% RTP (typical media-heavy workload)
-    for _ in 0..45 {
-        packets.push(create_rtp_packet());
-    }
-
-    // 15% RTCP
-    for _ in 0..10 {
-        packets.push(create_rtcp_packet());
-    }
-
-    // 10% STUN (ICE keepalives)
-    for _ in 0..6 {
-        packets.push(create_stun_packet());
-    }
-
-    // 5% DTLS
-    for _ in 0..3 {
-        packets.push(create_dtls_packet());
-    }
-
-    packets
-}
-
-// =============================================================================
 // RTCP Parsing Benchmarks
 // =============================================================================
 
@@ -287,106 +196,12 @@ fn bench_rtcp_nack_parse(c: &mut Criterion) {
     group.finish();
 }
 
-// =============================================================================
-// Packet Demux Benchmarks
-// =============================================================================
-
-/// Benchmark packet type classification for individual packet types.
-///
-/// Target: ~5-10ns per packet
-fn bench_demux_classify_individual(c: &mut Criterion) {
-    let mut group = c.benchmark_group("demux_classify");
-    group.throughput(Throughput::Elements(1));
-
-    let stun = create_stun_packet();
-    let dtls = create_dtls_packet();
-    let rtp = create_rtp_packet();
-    let rtcp = create_rtcp_packet();
-
-    group.bench_function("stun", |b| {
-        b.iter(|| {
-            let result = quick_classify(black_box(&stun));
-            black_box(result)
-        });
-    });
-
-    group.bench_function("dtls", |b| {
-        b.iter(|| {
-            let result = quick_classify(black_box(&dtls));
-            black_box(result)
-        });
-    });
-
-    group.bench_function("rtp", |b| {
-        b.iter(|| {
-            let result = quick_classify(black_box(&rtp));
-            black_box(result)
-        });
-    });
-
-    group.bench_function("rtcp", |b| {
-        b.iter(|| {
-            let result = quick_classify(black_box(&rtcp));
-            black_box(result)
-        });
-    });
-
-    group.finish();
-}
-
-/// Benchmark batch packet classification with realistic distribution.
-///
-/// Simulates actual SFU workload: 70% RTP, 15% RTCP, 10% STUN, 5% DTLS
-fn bench_demux_classify_batch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("demux_classify_batch");
-    group.throughput(Throughput::Elements(64));
-
-    let batch = create_mixed_packet_batch();
-    let packet_refs: Vec<&[u8]> = batch.iter().map(|p| p.as_slice()).collect();
-
-    group.bench_function("64_mixed_packets", |b| {
-        b.iter(|| {
-            let mut results = [PacketType::Unknown; 64];
-            for (i, packet) in packet_refs.iter().enumerate() {
-                results[i] = quick_classify(black_box(packet));
-            }
-            black_box(results)
-        });
-    });
-
-    group.finish();
-}
-
-/// Benchmark demux throughput with pure RTP stream.
-fn bench_demux_rtp_only(c: &mut Criterion) {
-    let mut group = c.benchmark_group("demux_rtp_only");
-    group.throughput(Throughput::Elements(64));
-
-    let packets: Vec<Vec<u8>> = (0..64).map(|_| create_rtp_packet()).collect();
-    let packet_refs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
-
-    group.bench_function("64_rtp_packets", |b| {
-        b.iter(|| {
-            let mut results = [PacketType::Unknown; 64];
-            for (i, packet) in packet_refs.iter().enumerate() {
-                results[i] = quick_classify(black_box(packet));
-            }
-            black_box(results)
-        });
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_rtcp_sender_report_parse,
     bench_rtcp_receiver_report_parse,
     bench_rtcp_pli_parse,
     bench_rtcp_nack_parse,
-    bench_demux_classify_individual,
-    bench_demux_classify_batch,
-    bench_demux_rtp_only,
 );
 
 criterion_main!(benches);
