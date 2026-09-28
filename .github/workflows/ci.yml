@@ -127,6 +127,22 @@ jobs:
       # it is set in the same step as the tests.
       - run: ulimit -n 4096 && cargo test --workspace --locked
 
+  sdk:
+    name: SDK (build, unit tests)
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # One pin for CI, ci-local.sh and developers (`nvm use` in sdk/)
+          node-version-file: sdk/.nvmrc
+      - run: npm ci
+      - run: npm test
+
   docker:
     name: Docker image
     timeout-minutes: 60

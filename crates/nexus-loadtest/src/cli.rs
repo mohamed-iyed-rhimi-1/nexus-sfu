@@ -1,7 +1,8 @@
 //! CLI parsing module using clap
 //!
 //! Provides command-line argument parsing for the nexus-loadtest tool.
-//! Supports three test scenarios: webinar, conference, and stress.
+//! Supports three test scenarios (webinar, conference, stress) and `token`, which
+//! prints a dev JWT.
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -135,6 +136,18 @@ pub enum Command {
         /// Port for Prometheus metrics HTTP endpoint (only used with --output prometheus)
         #[arg(long, default_value = "9090")]
         prometheus_port: u16,
+    },
+
+    /// Print a dev JWT for a browser or SDK client, signed with --jwt-secret or
+    /// NEXUS_JWT_SECRET (the SFU's `security.jwt_secret`)
+    Token {
+        /// Subject claim (`sub`); any non-empty name
+        #[arg(long, required = true)]
+        sub: String,
+
+        /// Lifetime in seconds
+        #[arg(long, default_value = "3600")]
+        ttl: u64,
     },
 }
 

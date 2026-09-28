@@ -389,6 +389,24 @@ fn resolve_token(options: &ConnectionOptions, subject: &str) -> Result<String, S
     let secret = options.jwt_secret.as_deref().ok_or_else(|| {
         SignalingError::AuthFailed("no --token or --jwt-secret provided".to_string())
     })?;
+    mint_token(secret, subject, MINTED_TOKEN_TTL_SECS)
+}
+
+/// The SFU refuses shorter secrets (`nexus_api::auth::MIN_SECRET_LEN`).
+pub const MIN_SECRET_LEN: usize = 32;
+
+/// An HS256 JWT with `sub`, `iat` and `exp = now + ttl_secs`, as the SFU validates it.
+pub fn mint_token(secret: &str, subject: &str, ttl_secs: u64) -> Result<String, SignalingError> {
+    if secret.len() < MIN_SECRET_LEN {
+        return Err(SignalingError::AuthFailed(format!(
+            "JWT secret must be at least {MIN_SECRET_LEN} characters (the SFU refuses shorter ones)"
+        )));
+    }
+    if subject.is_empty() || ttl_secs == 0 {
+        return Err(SignalingError::AuthFailed(
+            "token needs a non-empty subject and a TTL above 0".to_string(),
+        ));
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -396,7 +414,7 @@ fn resolve_token(options: &ConnectionOptions, subject: &str) -> Result<String, S
     let claims = serde_json::json!({
         "sub": subject,
         "iat": now,
-        "exp": now + MINTED_TOKEN_TTL_SECS,
+        "exp": now + ttl_secs,
     });
     jsonwebtoken::encode(
         &jsonwebtoken::Header::default(),
@@ -548,6 +566,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.claims["sub"], "loadtest-viewer");
+    }
+
+    #[test]
+    fn test_mint_token_sets_ttl_and_refuses_short_secrets() {
+        let secret = "dev-secret-minimum-32-characters-long";
+        let token = mint_token(secret, "alice", 120).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.required_spec_claims.insert("exp".to_string());
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .unwrap();
+        assert_eq!(decoded.claims["sub"], "alice");
+        let iat = decoded.claims["iat"].as_u64().unwrap();
+        assert_eq!(decoded.claims["exp"].as_u64().unwrap(), iat + 120);
+
+        let short = "x".repeat(MIN_SECRET_LEN - 1);
+        assert!(matches!(
+            mint_token(&short, "alice", 120),
+            Err(SignalingError::AuthFailed(_))
+        ));
+        assert!(mint_token(secret, "", 120).is_err());
+        assert!(mint_token(secret, "alice", 0).is_err());
     }
 
     #[test]

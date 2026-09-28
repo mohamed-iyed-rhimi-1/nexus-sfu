@@ -323,15 +323,43 @@ async fn publish_answer_adds_tracks_on_the_shard() {
     let stats = h.stats().await;
     assert_eq!(stats.gauges.tracks, 2, "{stats:?}");
     assert_eq!(stats.gauges.sessions, 1, "only the publisher has a session");
-    let published: Vec<u64> = h
-        .drain(2)
-        .into_iter()
+    let peer = h.drain(2);
+    let published: Vec<u64> = peer
+        .iter()
         .filter_map(|m| match m {
-            SignalMessage::TrackPublished { track_id, .. } => Some(track_id),
+            SignalMessage::TrackPublished { track_id, .. } => Some(*track_id),
             _ => None,
         })
         .collect();
     assert_eq!(published, tracks);
+    assert!(
+        own_tracks(&peer).is_empty(),
+        "Published goes to the publisher only"
+    );
+    // The publisher learns its own ids, with the m-line of each.
+    let own = own_tracks(&h.drain(1));
+    assert_eq!(
+        own,
+        [
+            (tracks[0], "0".to_string(), "audio".to_string()),
+            (tracks[1], "1".to_string(), "video".to_string()),
+        ]
+    );
+}
+
+/// The `Published` messages among `messages`: (track id, mid, kind).
+fn own_tracks(messages: &[SignalMessage]) -> Vec<(u64, String, String)> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            SignalMessage::Published {
+                track_id,
+                mid,
+                kind,
+            } => Some((*track_id, mid.clone(), kind.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -493,6 +521,11 @@ async fn unpublished_mline_is_reused_by_the_next_publish() {
     assert_eq!(states.mlines[0].role, negotiation::MlineRole::Inactive);
     // Chrome reuses the transceiver, and with it the SSRC (m-line 0: 5,000 again).
     let again = publish_kinds(&mut h, 1, &["audio"], 5_000);
+    assert_eq!(
+        own_tracks(&h.drain(1)),
+        [(again[0], "0".to_string(), "audio".to_string())],
+        "the publisher learns the new id on the reused m-line"
+    );
     let states = &h.orchestrator.negotiation.states[&1];
     assert_eq!(states.mlines.len(), 2, "mid 0 reused");
     assert_eq!(states.mlines[0].role, negotiation::MlineRole::Publish);
@@ -510,6 +543,68 @@ async fn unpublished_mline_is_reused_by_the_next_publish() {
     );
     // The shard accepted it (`stats` fails on any refusal).
     assert_eq!(h.stats().await.gauges.tracks, 2);
+}
+
+/// A publish m-line the answer refuses (a duplicate SSRC, or declined) turns inactive,
+/// and the next publish of its kind reuses it and registers.
+#[tokio::test]
+async fn refused_publish_mline_is_released_and_reused() {
+    let mut h = Harness::new();
+    h.join(1);
+    let first = publish_kinds(&mut h, 1, &["audio"], 5_000);
+    h.drain(1);
+
+    // Refused at answer time: m-line 1 answers with 5,000, the SSRC of track `first`
+    h.send(1, publish_msg(&["audio"]));
+    let (offer, _) = h.offer(1);
+    let answer = answer_for(&offer, 4_999, &[]);
+    h.send(1, SignalMessage::Answer { sdp: answer });
+    let replies = h.drain(1);
+    assert_eq!(error_codes(replies.clone()), ["DUPLICATE_SSRC"]);
+    assert!(own_tracks(&replies).is_empty());
+    let states = &h.orchestrator.negotiation.states[&1];
+    assert_eq!(states.published_tracks, first);
+    assert_eq!(states.mlines[1].role, negotiation::MlineRole::Inactive);
+
+    // Declined (port 0): no track, no error, the m-line is released too
+    h.send(1, publish_msg(&["audio"]));
+    let (offer, _) = h.offer(1);
+    assert_eq!(mline_directions(&offer)[1], ("1".to_string(), "recvonly"));
+    h.send(
+        1,
+        SignalMessage::Answer {
+            sdp: answer_for(&offer, 6_000, &["1"]),
+        },
+    );
+    assert!(own_tracks(&h.drain(1)).is_empty());
+    let states = &h.orchestrator.negotiation.states[&1];
+    assert_eq!(states.mlines[1].role, negotiation::MlineRole::Inactive);
+
+    // The next publish reuses m-line 1 and registers
+    let again = publish_kinds(&mut h, 1, &["audio"], 7_000);
+    assert_eq!(
+        own_tracks(&h.drain(1)),
+        [(again[0], "1".to_string(), "audio".to_string())]
+    );
+    let states = &h.orchestrator.negotiation.states[&1];
+    assert_eq!(states.mlines.len(), 2, "mid 1 reused, no new m-line");
+    assert_eq!(states.mlines[1].role, negotiation::MlineRole::Publish);
+    assert_eq!(h.stats().await.gauges.tracks, 2);
+}
+
+/// Each m-line's mid and direction attribute, in offer order.
+fn mline_directions(sdp: &str) -> Vec<(String, &'static str)> {
+    sdp.split("\r\nm=")
+        .skip(1)
+        .map(|s| {
+            let mid = s.lines().find_map(|l| l.strip_prefix("a=mid:")).unwrap();
+            let dir = ["recvonly", "sendonly", "inactive", "sendrecv"]
+                .into_iter()
+                .find(|d| s.lines().any(|l| l == format!("a={d}")))
+                .unwrap();
+            (mid.to_string(), dir)
+        })
+        .collect()
 }
 
 /// The PT of each m-line's first `a=rtpmap`, by mid.

@@ -18,6 +18,10 @@ use tracing::level_filters::LevelFilter;
 async fn main() -> ExitCode {
     // Parse CLI arguments
     let cli = Cli::parse();
+    // Before logging starts: stdout carries only the token.
+    if let Command::Token { sub, ttl } = &cli.command {
+        return print_token(cli.jwt_secret.clone(), sub, *ttl);
+    }
 
     // Initialize logging based on verbose flag
     let log_level = if cli.verbose {
@@ -81,6 +85,7 @@ async fn main() -> ExitCode {
             let base = base_config(sfu_url, duration, output, report_file, prometheus_port);
             run_conference(base, room, participants).await
         }
+        Command::Token { .. } => unreachable!("handled before logging starts"),
         Command::Stress {
             sfu_url,
             rooms,
@@ -108,6 +113,24 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             tracing::error!("Load test failed: {}", e);
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `token`: print a JWT minted with `--jwt-secret`, else `NEXUS_JWT_SECRET`.
+fn print_token(secret: Option<String>, sub: &str, ttl: u64) -> ExitCode {
+    let Some(secret) = secret.or_else(|| std::env::var("NEXUS_JWT_SECRET").ok()) else {
+        eprintln!("error: no --jwt-secret given and NEXUS_JWT_SECRET is not set");
+        return ExitCode::from(2);
+    };
+    match nexus_loadtest::signaling::mint_token(&secret, sub, ttl) {
+        Ok(token) => {
+            println!("{token}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::from(2)
         }
     }

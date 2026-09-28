@@ -4,7 +4,8 @@
 # sync: a command added to ci.yml is added here.
 #
 # Usage: scripts/ci-local.sh [target...]
-#   macos          fmt, clippy, tests on this Mac (the `macos` job; macOS host only)
+#   macos          fmt, clippy, tests on this Mac (the `macos` job; macOS host only),
+#                  and the SDK build and unit tests (the `sdk` job; needs npm)
 #   linux-arm64    fmt, clippy, release build, tests, bench smoke in Docker
 #   linux-x86_64   the same under --platform linux/amd64 (emulated on Apple
 #                  Silicon: slow, and timing asserts may flake)
@@ -65,6 +66,11 @@ test_totals() {
         awk '{p += $4; f += $6} END {printf "%d passed, %d failed", p, f}'
 }
 
+# node:test totals from a log: "<passed> passed, <failed> failed" (the last run).
+node_totals() {
+    awk '/^# pass / {p = $3} /^# fail / {f = $3} END {printf "%d passed, %d failed", p, f}' "$1"
+}
+
 # Runs one step, logging to $OUT/<job>.log; records PASS/FAIL in the summary.
 # Usage: step <job> <description> <command...>
 step() {
@@ -78,6 +84,7 @@ step() {
     status=$?
     end=$(date +%s)
     case "$what" in
+    sdk*) detail=" ($(node_totals "$log"))" ;;
     *test*) detail=" ($(test_totals "$log"))" ;;
     esac
     if [ $status -eq 0 ]; then
@@ -109,6 +116,17 @@ run_macos() {
     # e2e and loopback tests. Not beyond what this shell may raise it to.
     ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -Hn)"
     step macos "cargo test --workspace" cargo test --workspace --locked
+    # The `sdk` job (ubuntu in CI; the SDK has no platform-specific code).
+    if command -v npm >/dev/null; then
+        # Same Node major as the `sdk` job (sdk/.nvmrc)
+        step macos "sdk npm ci + npm test" sh -c \
+            'cd sdk && want="$(cat .nvmrc)" && have="$(node -p "process.versions.node.split(\".\")[0]")" &&
+             { [ "$have" = "$want" ] || { echo "node $have, sdk/.nvmrc wants $want" >&2; exit 1; }; } &&
+             npm ci && npm test'
+    else
+        echo "ci-local: npm missing, the sdk step cannot run" >&2
+        FAILED=1
+    fi
 }
 
 # The Linux image: the pinned toolchain plus the packages ci.yml installs.

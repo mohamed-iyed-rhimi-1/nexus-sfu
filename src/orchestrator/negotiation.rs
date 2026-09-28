@@ -325,8 +325,11 @@ impl NegotiationManager {
                 .mid
                 .as_ref()
                 .is_some_and(|m| publish_mids.iter().any(|p| p == m.as_str()));
-            if is_publish {
-                self.register_publish(participant_id, id, media, sessions, plane);
+            if is_publish && !self.register_publish(participant_id, id, media, sessions, plane) {
+                // Refused: free the m-line for `claim_mline`, so the next offer does not
+                // carry it as a publish m-line nobody will register
+                let mid = media.mid.as_ref().map_or("", |m| m.as_str());
+                self.release_unregistered_publish(participant_id, mid);
             }
         }
         outcome.activated =
@@ -501,7 +504,7 @@ impl NegotiationManager {
     // ── Tracks ───────────────────────────────────────────────────────
 
     /// One track per answered publish m-line: `AddTrack`, the registry, the cluster
-    /// state, and `TrackPublished` to the room.
+    /// state, `TrackPublished` to the room and `Published` to the publisher.
     fn register_publish(
         &mut self,
         participant_id: u64,
@@ -509,9 +512,9 @@ impl NegotiationManager {
         media: &MediaDescription,
         sessions: &HashMap<u64, ParticipantHandle>,
         plane: &mut Plane,
-    ) {
+    ) -> bool {
         let Some(room) = sessions.get(&participant_id).and_then(|h| h.room_id) else {
-            return; // left the room while the offer was outstanding
+            return false; // left the room while the offer was outstanding
         };
         let published = self
             .states
@@ -519,26 +522,26 @@ impl NegotiationManager {
             .map_or(0, |s| s.published_tracks.len());
         if published >= MAX_TRACKS_PER_SESSION {
             send_error(sessions, participant_id, "TOO_MANY_TRACKS", "Track limit");
-            return;
+            return false;
         }
         let cname = format!("nexus-{participant_id}");
         let spec = match track_spec(media, cname.as_bytes()) {
             Ok(Some(spec)) => spec,
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(e) => {
                 send_error(sessions, participant_id, "INVALID_TRACK", &e.to_string());
-                return;
+                return false;
             }
         };
         let Some(entry) = plane.transports.get_mut(id) else {
-            return;
+            return false;
         };
         let shard = entry.shard;
         // The peer's SSRCs must not collide with the session's own (RTCP SSRC, out SSRCs).
         let ssrcs = media.get_ssrc_values();
         if !ssrcs.iter().all(|&s| entry.ssrcs.note_peer_ssrc(s)) {
             send_error(sessions, participant_id, "SSRC_COLLISION", "SSRC in use");
-            return;
+            return false;
         }
         let duplicate = spec.ssrc.is_some()
             && plane.tracks.by_publisher(participant_id).iter().any(|t| {
@@ -554,7 +557,7 @@ impl NegotiationManager {
                 "DUPLICATE_SSRC",
                 "SSRC published twice",
             );
-            return;
+            return false;
         }
         let track = plane.ids.track();
         let command = Command::AddTrack {
@@ -563,7 +566,7 @@ impl NegotiationManager {
             spec: Box::new(spec),
         };
         if !plane.push(shard, command, participant_id) {
-            return;
+            return false;
         }
         let audio = spec.kind == nexus_core::MediaKind::Audio;
         let info = TrackInfo {
@@ -593,6 +596,19 @@ impl NegotiationManager {
             spec.ssrc
         );
         notify_track_published(participant_id, track.get(), audio, sessions, plane);
+        // The publisher learns its own track id only here (peers get TrackPublished).
+        let mid = media.mid.as_ref().map_or("", |m| m.as_str());
+        debug_assert!(!mid.is_empty(), "publish m-lines are matched by mid");
+        send_to(
+            sessions,
+            participant_id,
+            SignalMessage::Published {
+                track_id: track.get(),
+                mid: mid.to_string(),
+                kind: if audio { "audio" } else { "video" }.to_string(),
+            },
+        );
+        true
     }
 
     /// `Subscribe` for every accepted subscribe m-line not yet on the shard, in
@@ -815,6 +831,20 @@ impl NegotiationManager {
 
     /// The publisher unpublished the track of its m-line `mid`: the m-line turns
     /// inactive and can carry a later publish or subscription of its kind.
+    /// A publish m-line of the last answer that registered no track turns inactive.
+    fn release_unregistered_publish(&mut self, participant_id: u64, mid: &str) {
+        let Some(state) = self.states.get_mut(&participant_id) else {
+            return;
+        };
+        if let Some(slot) = state
+            .mlines
+            .iter_mut()
+            .find(|s| s.role == MlineRole::Publish && s.mid == mid)
+        {
+            slot.role = MlineRole::Inactive;
+        }
+    }
+
     pub fn release_publish(&mut self, participant_id: u64, track: TrackId, mid: &[u8]) {
         let Some(state) = self.states.get_mut(&participant_id) else {
             return;

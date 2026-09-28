@@ -13,13 +13,17 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "engines": {
+    "node": ">=20"
+  },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "keywords": ["webrtc", "sfu", "media", "video", "audio"],
   "author": "",

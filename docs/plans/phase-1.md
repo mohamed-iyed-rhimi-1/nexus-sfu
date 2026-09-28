@@ -1,6 +1,6 @@
 # Phase 1 — New data plane, one shard
 
-**State: in progress** (1.1-1.5b, 1.7, C1-C7, 1.6a done; plan written 2026-09-26, audited against the code the same day).
+**State: in progress** (1.1-1.5b, 1.6a, 1.6b, 1.7, C1-C7 done; 1.8 code done; plan written 2026-09-26, audited against the code the same day).
 
 **Design:** [`docs/design/dataplane-v1.md`](../design/dataplane-v1.md) (approved; §16 gives the
 parts and order, §17 the tests), within [`docs/dataplane-design.md`](../dataplane-design.md)
@@ -1969,6 +1969,127 @@ anything that failed.
 **Checkpoint:** SDK tests green; the recorded check passes (**exit criterion 4**). Step 6
 (network switch) passes or is recorded as the known ICE-restart limitation.
 
+**Code notes (implementation audit 2026-09-28, before the code):**
+- **A publisher never learned its own track ids.** `Joined` excludes self, `TrackPublished`
+  skips the publisher, and `Offer.tracks` lists only subscribe m-lines, so `unpublish(trackId)`
+  had nothing to send.
+  - Owner's decision: a new server message `Published { track_id, mid, kind }`, sent only to
+    the publisher from `register_publish`, once per registered track.
+  - This is a protocol addition. No D/R decision changes.
+  - Loadtest and e2e ignore it (`_ =>` arms).
+- **`Leave` ends the session.** The server removes it, and anything later on that socket is
+  dropped.
+  - `leave()` sends `Leave`, then closes the peer connection and the socket.
+  - Rejoin is `connect()` + `join()`: a new socket, a new participant id, a new PC.
+  - `SignalingTransport.close()` drops queued messages, so a `Leave` queued while
+    disconnected cannot end the next session. Handlers of a replaced socket are ignored,
+    so there is no stray reconnect.
+- **`Unpublish` sends the publisher no offer.** `unpublish()` detaches the track
+  (`replaceTrack(null)`) and sets the transceiver to `recvonly`, not `inactive`, because
+  the SFU may reuse that m-line for a subscription (`claim_mline`).
+- **`Subscribe`:** more than 10 ids fail the whole request (`TOO_MANY_TRACKS`), so the SDK
+  splits into chunks of `MAX_TRACKS_PER_REQUEST = 10`. `Unsubscribe` is split the same way.
+- **Token:** the flag is the existing global `--jwt-secret`, falling back to
+  `NEXUS_JWT_SECRET`. `mint_token` refuses secrets shorter than 32 characters, as the SFU
+  does.
+- **SDK defaults:** `iceServers` defaults to `[]` (ICE-lite; no Google STUN).
+  `createRoom(name)` relies on rooms being idempotent by name.
+- **Clearing TLS:** `NEXUS_TLS_CERT_PATH=` / `NEXUS_TLS_KEY_PATH=` (empty) do not give plain
+  WS. They also clear `[quic] cert_path`, which validation refuses. The page README uses a
+  config copy with the `[transport]` TLS paths cleared.
+- **SDK tests:** `node:test` against `dist/`, with no new dependencies. They run in the
+  `ci.yml` `sdk` job and in `ci-local.sh` (macOS target).
+  - Node is pinned in `sdk/.nvmrc` (20). `ci.yml` reads it with `node-version-file`,
+    `ci-local.sh` refuses a different major, and `engines` says `>=20`.
+- **Review fixes (2026-09-28):**
+  - **Matching errors to requests.** SFU errors carry no request id. The orchestrator
+    handles a participant's messages in order and replies to each synchronously
+    (`handle_message`, `Ping` → `Pong` included). So the SDK sends a `Ping` behind each
+    Publish, Subscribe and Answer, and an error belongs to the oldest request whose
+    `Pong` has not arrived yet. The 30 s keepalive `Ping` is counted too.
+    - A Subscribe error no longer rejects a publish that is in flight.
+    - Limit, documented on `NexusClient`: a `Ping` the SFU drops (above 100 messages per
+      second) shifts the matching. The publish timeout still cleans up.
+  - **A refused or timed-out publish undoes its state:**
+    - it leaves `localTracks` and `unattachedTracks`;
+    - `offerPending` is cleared when no offer is coming, and queued requests go out;
+    - an attached track is detached.
+    - Answer-time refusals (`INVALID_TRACK`, `SSRC_COLLISION`, ...) fail one track each,
+      in m-line order. A track with neither `Published` nor a refusal by the `Pong` fails
+      as `NOT_REGISTERED`.
+    - In each case the same track can be published again.
+  - `requestTimeoutMs` option (tests use 30 ms). Tests 9 → 14. Negative check: when errors
+    are matched by code only, the Subscribe-error test fails.
+  - **Server: a refused publish m-line is released (second review).**
+    - `register_publish` returns whether it registered a track.
+    - On every refusal (declined or no SSRC, `INVALID_TRACK`, `SSRC_COLLISION`,
+      `DUPLICATE_SSRC`, the track limit, a failed push) the caller turns the m-line
+      `Inactive`. Before, it stayed `Publish`: it was re-offered as a `recvonly` m-line no
+      track would ever register, and `claim_mline` could not reuse it.
+    - Test: `refused_publish_mline_is_released_and_reused`. Negative check: without the
+      release, the m-line stays `Publish` and the test fails.
+  - **SDK fences (second review):**
+    - A publish whose `Pong` came with no offer is one the SFU queued (`serverQueued`). An
+      answer's replies are its m-line results, then the queued publish's outcome. So an
+      answer-time `TOO_MANY_TRACKS`/`OFFER_FAILED`/... with no m-line pending fails the
+      queued publish's tracks, and no others.
+      - Negative check: failing the first unattached track instead fails the new test.
+      - Limit, documented: a failed subscription renegotiation in the same answer also
+        fails a queued publish.
+    - Create, Join, Unpublish and Unsubscribe are fenced too. `createRoom`/`join` reject
+      only on their own errors, and no error of theirs touches a publish.
+    - A disconnect drops the fences and the queued `Ping`s.
+    - A `Published` after the publish timed out emits `lateTrackPublished`
+      `{ trackId, mid }`, so the app can `unpublish` it.
+    - The mock SFU offers every m-line with its direction, so the republish tests offer
+      what the SFU now does (a refused m-line inactive, then reused `recvonly`).
+    - SDK tests 14 → 20.
+  - The README no longer overwrites `certs/dev-*.pem`: a LAN certificate goes in
+    `certs/lan-*.pem` through `NEXUS_TLS_*`. It adds an HTTPS static server (Python stdlib,
+    same certificate), and passes the secret in `NEXUS_JWT_SECRET`. These commands were run
+    once: PKCS#8 key, HTTPS 200, SFU TLS 1.3 handshake on 8080.
+
+**Recorded check.**
+
+*Chromium pre-check (automated), 2026-09-28:*
+- Setup:
+  - HeadlessChrome 153 through Playwright, three tabs on one Mac, `fake=1` media;
+  - SFU from this branch with plain WS and `NEXUS_ANNOUNCED_IPS=192.168.100.88`;
+  - the page served from `localhost`.
+- Step 2: media flows both ways.
+  - `a=ice-lite` in every offer.
+  - Chrome is DTLS client.
+  - `srtpCipher` is `SRTP_AEAD_AES_128_GCM`; the SFU logs `AeadAes128Gcm` for all 8
+    sessions.
+  - 0 packets lost.
+  - The remote candidate is `host 192.168.100.88:10000`.
+- Step 3: a third tab joining late decoded its first video frame 166 ms and 233 ms after
+  Start (PLI on subscribe).
+- Step 4 (lip sync) cannot be judged headless.
+- Step 5:
+  - Unpublish then republish of the camera: peers got `TrackUnpublished`, then the new
+    track on the reused m-line, decoding at ≈ 30 fps.
+  - Leave then rejoin: peers got `ParticipantLeft` and `TrackUnpublished`, then the new
+    participant's tracks. The rejoined tab decoded both peers after 112 ms.
+- No warning or error in the SFU log.
+
+*Owner's check (§17.9 steps 1-6):* to fill in.
+
+| Field | Value |
+|-------|-------|
+| Date | |
+| Machine A: OS, browser + version, network | |
+| Machine B: OS, browser + version, network | |
+| SFU host, `NEXUS_ANNOUNCED_IPS`, signaling (ws/wss) | |
+| Negotiated SRTP cipher (Chrome / Firefox) | |
+| ICE-lite remote shown (`webrtc-internals` / `about:webrtc`) | |
+| 1-2. Both see and hear each other | |
+| 3. Third tab late, video within ≈ 1 s | |
+| 4. Lip sync | |
+| 5. Unpublish/republish, leave/rejoin | |
+| 6. Wi-Fi ↔ wired switch (recovers, or ICE restart = known limit) | |
+| Anything that failed | |
+
 ---
 
 ### 1.9 Documents and merge
@@ -2051,7 +2172,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | C7 Config, README, example | Done | see git log (C7) | Old config sections/fields/env vars removed and refused (fail fast); shard stats on `/metrics`; README, example, TOMLs, dashboard |
 | 1.6a E2E: harness, ten clients, resubscribe | Done | see git log (1.6a) | Signaling task + events, `subscribe_confirmed`/`unsubscribe`, announced history + CNAME, inbound tap; `ten_clients` 9.7 s, suite 27.1 s; negative check fails on SRTCP index reuse |
 | 1.6b E2E: address change, SR, keyframes | Done | see git log (1.6b) | `LossRules::rebind`, `RtcpLog` (publisher PLI/FIR, subscriber SR/CNAME), three tests; resume 2.1-2.3 s, SR error ≤ 5.7 ms, burst → 1 PLI; negative check fails with the silence rule disabled. Review fixes (1.6a/1.6b checks, `ci-local.sh` lock, dashboard, scripts) |
-| 1.8 SDK, browser page, manual check | Not started | | Browser versions, cipher, results |
+| 1.8 SDK, browser page, manual check | Code done (see git log (1.8)); owner's check pending | | `Published` to the publisher, `nexus-loadtest token`, SDK `createRoom`/`publish`/`unpublish`/`unsubscribe`/`leave`/`getStats`, ≤ 10 ids per request, `node:test` (20) in CI, `examples/web/`, review fixes (fenced error matching, refused-publish cleanup, refused publish m-lines released on the server). Chromium 153 pre-check passes steps 2, 3, 5 (GCM, ICE-lite, late join ≈ 0.2 s). Exit criterion 4 waits for the owner's Chrome + Firefox run on two machines |
 | 1.9 Documents, merge | Not started | | |
 
 Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☐ no panic on input · 7 ☐ documents.
@@ -2638,3 +2759,107 @@ Add one line per working session: date, part, what was done, what is left.
   two runs can both take over the same stale lock, and Ctrl-C releases the lock while a
   `docker run` may still be running. **Exit criterion 1 met** (all e2e tests on the new path,
   `ci-local.sh all`). Committed 1.6b; pushed 1.7, C2-C7, 1.6a, 1.6b. Next: 1.8, then 1.9.
+- 2026-09-28: 1.8 planned and implemented (uncommitted, for review). The plan audit found
+  three things the SDK could not do from the plan's text: a publisher never learned its own
+  track ids, `Leave` ends the session, and `Unpublish` sends the publisher no offer (1.8 code
+  notes).
+  - Owner's decisions: a new `Published` message; `node:test` with no new dependencies; the
+    SDK in `ci.yml` and `ci-local.sh`; a Chromium pre-check here and the full §17.9 check by
+    the owner.
+  - Done:
+    - `Published` from `register_publish`, with orchestrator and serde tests;
+    - `nexus-loadtest token` (`mint_token`, refuses secrets under 32 characters);
+    - the SDK calls and signaling fixes (queue dropped on close, a replaced socket ignored);
+    - `sdk/test/client.test.mjs` (9 tests);
+    - `examples/web/` page and README.
+  - Chromium pre-check passes steps 2, 3 and 5 (Recorded check in 1.8).
+  - Found: an empty `NEXUS_TLS_*` does not give plain WS, because the QUIC cert path is
+    refused. The README uses a config copy instead.
+  - Tests 1,419 → 1,421 on macOS. `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                          10s
+  macos          PASS  cargo test --workspace                         163s (1421 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            5s (9 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                6s
+  linux-arm64    PASS  clippy                                          21s
+  linux-arm64    PASS  release build                                   90s
+  linux-arm64    PASS  cargo test --workspace                         303s (1427 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           44s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     22s
+  ci-local 2026-09-28 12:06, 8b7a688 (16 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review and commit 1.8. The owner runs §17.9 with Chrome and Firefox on two
+  machines and fills in the table in 1.8; then exit criterion 4, the exit criterion 6
+  check, and 1.9.
+- 2026-09-28, review of 1.8 (uncommitted, for review): five verified findings fixed.
+  - The SDK matches each SFU error to its request with a `Ping` fence, so a Subscribe
+    error no longer rejects a publish.
+  - A refused or timed-out publish undoes its state and releases queued requests.
+  - Answer-time refusals and unregistered m-lines detach the track, so it can be
+    republished.
+  - `node --test test/*.test.mjs`; Node pinned in `sdk/.nvmrc` (used by `ci.yml` and
+    checked by `ci-local.sh`).
+  - README: a LAN certificate in `certs/lan-*.pem`, an HTTPS static server, and
+    `NEXUS_JWT_SECRET`.
+  - SDK tests 9 → 14, with a negative check (details in the 1.8 code notes).
+  - Found while testing: an `async` test helper that returned the publish promise waited
+    for it (promise flattening), and a failed test left a keepalive timer running. Tests
+    now close their clients in `afterEach`.
+  - `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                0s
+  macos          PASS  clippy                                           2s
+  macos          PASS  cargo test --workspace                         113s (1421 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            3s (14 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                2s
+  linux-arm64    PASS  clippy                                           3s
+  linux-arm64    PASS  release build                                    1s
+  linux-arm64    PASS  cargo test --workspace                          91s (1427 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                            2s
+  linux-arm64    PASS  bench memory (budget 25 KB)                      5s
+  ci-local 2026-09-28 13:48, 8b7a688 (17 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review, then commit 1.8. Then the owner's §17.9 run with Chrome and Firefox (the
+  table in 1.8), exit criterion 6, and 1.9.
+- 2026-09-28, second review of 1.8 (uncommitted, for review):
+  - Server: a refused publish m-line is released (`register_publish` → bool,
+    `release_unregistered_publish`). New orchestrator test, with a negative check.
+  - SDK:
+    - an answer-time refusal of a queued publish fails that publish's tracks only
+      (`serverQueued`);
+    - Create, Join, Unpublish and Unsubscribe are fenced;
+    - a disconnect drops the fences and the queued `Ping`s;
+    - `lateTrackPublished`.
+  - The mock offers full m-line lists. Tests: SDK 14 → 20 (negative check on the queued
+    publish), Rust 1,421 → 1,422 (macOS).
+  - **e2e:** green in `ci-local.sh` (macOS and Linux arm64). The separate run right after
+    it failed once: `sender_report_translation` measured a video SR error of 28.9 ms
+    against the 20 ms `SR_TOLERANCE_MS`. Three reruns passed (8/8, 46 s each).
+    - Nothing in this diff touches `tests/`, the data plane or SR translation; the run
+      directly followed the Docker jobs.
+    - Recorded as a timing flake (1 in 5 runs), not fixed. Watch for it; if it recurs,
+      look at the tolerance or the SR sampling rather than 1.8.
+  - `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                0s
+  macos          PASS  clippy                                           1s
+  macos          PASS  cargo test --workspace                         120s (1422 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            4s (20 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                3s
+  linux-arm64    PASS  clippy                                           8s
+  linux-arm64    PASS  release build                                  105s
+  linux-arm64    PASS  cargo test --workspace                         157s (1428 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           43s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     25s
+  ci-local 2026-09-28 14:07, 8b7a688 (17 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  Next: review, then commit 1.8. Then the owner's §17.9 run, exit criterion 6, and 1.9.
+- 2026-09-28, review of the last 1.8 fixes: refused publish m-lines released on every path,
+  SDK error fences confirmed in code and tests; e2e 6/6, SDK 20 passed. Known edges, not
+  fixed: a declined m-line can hold a subscription reusing its mid until the next offer;
+  peer SSRCs noted before a refusal stay recorded (bounded). The `sender_report_translation`
+  flake is a test bug: the last packet is read after the wait, up to ≈ 1 s after the SR.
+  Fix before 1.9: record the last packet when each SR arrives, assert the median error
+  ≤ 50 ms and every SR ≤ 200 ms. Code committed; the owner's §17.9 check (exit criterion 4)
+  is still pending. Next: SR test fix and exit criterion 6 sweep, owner's check, then 1.9.

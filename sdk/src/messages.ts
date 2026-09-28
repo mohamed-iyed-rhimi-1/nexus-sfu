@@ -20,6 +20,7 @@ export type SignalMessage =
   | { type: 'Unsubscribed'; track_ids: number[] }
   | { type: 'TrackPublished'; publisher_id: number; track_id: number; kind: string; content: string }
   | { type: 'TrackUnpublished'; track_id: number }
+  | { type: 'Published'; track_id: number; mid: string; kind: string }
   | { type: 'Viewport'; visible: number[]; pinned: number[] }
   | { type: 'ViewportUpdated'; visible_count: number; pinned_count: number }
   | { type: 'SetContent'; track_id: number; content: string }

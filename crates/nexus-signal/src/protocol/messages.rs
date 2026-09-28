@@ -86,6 +86,14 @@ pub enum SignalMessage {
     },
     /// Track unpublished notification.
     TrackUnpublished { track_id: u64 },
+    /// Sent only to the publisher, once per track registered from its answer:
+    /// the track's id and the publish m-line that carries it.
+    Published {
+        track_id: u64,
+        mid: String,
+        /// "audio" or "video".
+        kind: String,
+    },
 
     // ── Viewport optimization ──
     /// Update viewport (visible/pinned participants).
@@ -187,6 +195,25 @@ mod tests {
         assert_eq!(json["type"], "Offer");
         assert_eq!(json["tracks"][0]["track_id"], 7);
         assert_eq!(json["tracks"][0]["mid"], "2");
+    }
+
+    #[test]
+    fn test_published_round_trips() {
+        let msg = SignalMessage::Published {
+            track_id: 3,
+            mid: "1".to_string(),
+            kind: "video".to_string(),
+        };
+        let json = msg.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "Published");
+        assert_eq!(value["track_id"], 3);
+        assert_eq!(value["mid"], "1");
+        let parsed = SignalMessage::from_json(&json).unwrap();
+        assert!(
+            matches!(parsed, SignalMessage::Published { track_id: 3, ref mid, ref kind }
+            if mid == "1" && kind == "video")
+        );
     }
 
     #[test]

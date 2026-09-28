@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus SFU call</title>
+  <style>
+    :root { color-scheme: light dark; --gap: 12px; }
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; }
+    header, .controls { display: flex; flex-wrap: wrap; gap: var(--gap); align-items: center; }
+    button { padding: 6px 12px; }
+    #tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--gap); margin: var(--gap) 0; }
+    figure { margin: 0; }
+    video { width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: 6px; }
+    figcaption { font-size: 12px; opacity: 0.8; }
+    pre { font-size: 12px; overflow-x: auto; padding: 8px; border: 1px solid #8884; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Nexus SFU</strong>
+    <span id="where"></span>
+  </header>
+  <div class="controls">
+    <button id="start">Start</button>
+    <button id="camera" disabled>Unpublish camera</button>
+    <button id="mic" disabled>Unpublish microphone</button>
+    <button id="leave" disabled>Leave</button>
+  </div>
+  <div id="tiles"></div>
+  <h3>Status</h3>
+  <pre id="status">Not connected</pre>
+  <h3>Log</h3>
+  <pre id="log"></pre>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

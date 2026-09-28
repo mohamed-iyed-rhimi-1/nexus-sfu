@@ -13,7 +13,7 @@ export class SignalingTransport extends EventEmitter {
   private reconnectAttempt = 0;
   private maxReconnectDelay = 30000;
   private messageQueue: SignalMessage[] = [];
-  private pingInterval: number | null = null;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
   private authenticated = false;
   /** Set by close() or an auth rejection; suppresses automatic reconnects. */
   private stopped = false;
@@ -61,6 +61,8 @@ export class SignalingTransport extends EventEmitter {
       };
 
       ws.onmessage = (event) => {
+        // A socket replaced by close() + connect() must not deliver into the new one
+        if (this.ws !== ws) return;
         let msg: any;
         try {
           msg = JSON.parse(event.data);
@@ -93,9 +95,11 @@ export class SignalingTransport extends EventEmitter {
 
       ws.onclose = () => {
         clearTimeout(authTimer);
+        fail(new NexusError('CONNECTION_FAILED', 'Connection closed before authentication'));
+        // Closed by close(), or replaced since: no events, no reconnect
+        if (this.ws !== ws) return;
         this.stopPing();
         this.authenticated = false;
-        fail(new NexusError('CONNECTION_FAILED', 'Connection closed before authentication'));
         this.emit('disconnected', { reason: 'connection closed' });
         if (!this.stopped) {
           this.attemptReconnect();
@@ -112,9 +116,26 @@ export class SignalingTransport extends EventEmitter {
     }
   }
 
+  /** Drop queued (not yet sent) messages that match. */
+  dropQueued(match: (msg: SignalMessage) => boolean): void {
+    this.messageQueue = this.messageQueue.filter((m) => !match(m));
+  }
+
+  /** Authenticated and open: a message sent now goes out on this connection. */
+  isConnected(): boolean {
+    return this.authenticated && this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Close the connection and stop reconnecting. Messages already sent are still
+   * delivered (the socket drains before closing); queued ones are dropped, so they
+   * cannot reach a later connection's session.
+   */
   close(): void {
     this.stopped = true;
     this.stopPing();
+    this.authenticated = false;
+    this.messageQueue = [];
     this.ws?.close();
     this.ws = null;
   }
@@ -151,8 +172,10 @@ export class SignalingTransport extends EventEmitter {
   }
 
   private startPing(): void {
-    this.pingInterval = window.setInterval(() => {
+    this.pingInterval = setInterval(() => {
       this.send({ type: 'Ping' });
+      // The client matches each Pong to a request; this one answers no request
+      this.emit('keepalive');
     }, 30000);
   }
 
