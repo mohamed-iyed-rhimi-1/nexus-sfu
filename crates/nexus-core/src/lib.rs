@@ -23,7 +23,7 @@ pub use types::{
 // `nexus_core::error::SfuError`.
 pub use error::{
     signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
-    SfuError, SignalingError, SsrcError, TransportError, WorkerError,
+    SfuError, SignalingError, SsrcError, TransportError,
 };
 
 // Re-export config primitives and validation trait.

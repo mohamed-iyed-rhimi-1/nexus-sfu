@@ -7,7 +7,6 @@ FROM rust:1.83.0-bookworm AS builder
 # Install build dependencies explicitly (TigerStyle: no defaults)
 # liburing-dev: io_uring support for Linux
 # capnproto: Cap'n Proto schema compiler
-# protobuf-compiler: Protocol Buffers compiler (if needed)
 # pkg-config: Build configuration helper
 # Not pinned to exact Debian revisions: bookworm replaces them with security
 # updates (and capnproto 0.10.2-1 never existed in bookworm), which broke the
@@ -16,7 +15,6 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         liburing-dev \
         capnproto \
-        protobuf-compiler \
         pkg-config \
     && \
     rm -rf /var/lib/apt/lists/*
@@ -28,9 +26,8 @@ WORKDIR /build
 # examples) when loading the manifest, so those directories are needed even
 # though only the binary is built. `.cargo/` carries the target rustflags
 # that enable ARMv8 AES/PMULL for SRTP on arm64.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo/ ./.cargo/
-COPY proto/ ./proto/
 COPY src/ ./src/
 COPY crates/ ./crates/
 COPY benches/ ./benches/

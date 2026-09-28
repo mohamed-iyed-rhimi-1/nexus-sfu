@@ -80,7 +80,6 @@ The orchestrator runs a `tokio::select!` loop with 4 modules:
 
 - Rust 1.83+ (see `rust-toolchain.toml`)
 - Cap'n Proto compiler (`capnp`)
-- Protocol Buffers compiler (`protoc`)
 - Linux with `liburing-dev` for io_uring support (optional)
 
 ### Build

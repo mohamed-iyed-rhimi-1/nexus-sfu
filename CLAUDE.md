@@ -22,8 +22,9 @@ targets are not met yet.
 **Current phase: 1** (`docs/plans/phase-1.md`, from the approved design note
 `docs/design/dataplane-v1.md`). Work on the `phase-1` branch; it merges into `main` (the
 trunk) only when every exit criterion passes. Phase 0 is complete (`docs/plans/phase-0.md`). The goal is to ship v1 of the new data plane
-soon (scope in `docs/dataplane-design.md` §2); the old data plane is replaced, not fixed, so
-do not spend time on bugs in `src/worker/`, `src/forward/` or the packet loop in `src/sfu.rs`.
+soon (scope in `docs/dataplane-design.md` §2). The old data plane is being deleted (the
+plan's deletion steps); do not fix bugs in what is left of it (`nexus-webrtc`'s transport and
+session, the replaced `nexus-transport` modules, `nexus-actor`, `nexus-dst`).
 
 Working on a phase:
 1. Read the phase plan's Status section first; pick the next part that is not done.
@@ -49,8 +50,7 @@ never called. Check `architecture.md` Part 2, or trace from `src/main.rs`.
 ### Prerequisites
 
 - Rust 1.83+ (install via `rustup`); cargo lives in `~/.cargo/bin`
-- Cap'n Proto compiler: `capnp`
-- Protocol Buffers compiler: `protoc`
+- Cap'n Proto compiler: `capnp` (`nexus-signal` compiles its schemas)
 
 ### Commands
 
@@ -65,7 +65,6 @@ cargo run -- --config config/development.toml    # Development (needs certs/dev-
 # Test
 cargo test --workspace                   # All tests, including tests/e2e.rs (~10 s)
 cargo test --test e2e                    # End-to-end: in-process SFU + webrtc-rs clients
-cargo test --features sim --test pps_pipeline   # Sim-mode pipeline flood (not in the default run)
 cargo bench --bench real_path            # Real ingress/egress path cost
 cargo bench --bench srtp_backends        # SRTP protect/unprotect per backend (Phase 0.4)
 cargo bench --bench udp_floor            # Raw sendmmsg/recvmmsg cost, Linux only
@@ -79,8 +78,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cd sdk && npm run build
 ```
 
-On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto` and
-`protobuf-compiler` installed, the repo mounted, and named volumes for `target/` and the
+On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto`
+installed, the repo mounted, and named volumes for `target/` and the
 cargo registry. Many paths differ on Linux (io_uring, `recvmmsg`, core pinning,
 `panic = "abort"` in release).
 
@@ -103,24 +102,23 @@ See `architecture.md` for the full picture. The essentials:
 
 - **Startup:** `nexus_sfu::server::start` (`src/server.rs`) wires everything and returns a
   `ServerHandle` (bound addresses, `shutdown()`); `main.rs` adds config, tracing, signals.
-- **Ingress:** one busy loop on its own thread (`Sfu::run_packet_loop`, `src/sfu.rs`)
-  receives, classifies, decrypts (under a per-session mutex) and routes every packet.
-- **Workers:** pinned threads (`src/worker/pool.rs`) own tracks; per subscriber they copy,
-  rewrite, SRTP-encrypt and `sendmmsg`.
+- **Data plane:** `nexus-dataplane`, one shard thread in Phase 1 (`recvmmsg`/`sendmmsg` on
+  Linux): classify, ICE-lite, SRTP in, rewrite, fan-out, SRTP out, RTCP. Driven only by
+  commands; reports events. The old ingress loop and worker pool are deleted (Phase 1 C1+C3).
 - **Control plane:** Tokio. WebSocket signaling → `SessionOrchestrator`
-  (`src/orchestrator/`: room, negotiation, subscription, connection) which also runs DTLS
-  handshakes and ICE timers. REST API on Axum with JWT.
+  (`src/orchestrator/`: room, negotiation, subscription, connection, plane) which runs the
+  DTLS handshakes and sends commands to the shard. REST API on Axum with JWT.
 
-The redesign replaces ingress and workers outright with per-session shards in Phase 1
-(`docs/dataplane-design.md`).
+`architecture.md` still describes the old path in places; it is rewritten in Phase 1.9.
 
 ### Workspace Structure
 
 ```
-src/                 Binary crate: main.rs, server.rs (startup), sfu.rs (packet loop),
-                     orchestrator/, worker/, forward/ (SSRC router), config/, signal/, transport/
+src/                 Binary crate: main.rs, server.rs (startup), node.rs (node id, gossip),
+                     orchestrator/, config/, signal/
 crates/
   nexus-core/        Shared types, config primitives
+  nexus-dataplane/   The data plane: shards, commands/events, SRTP, rewrite, I/O
   nexus-transport/   UDP, io_uring, ICE, DTLS (OpenSSL), SRTP, arena, ring buffer
   nexus-media/       RTP/RTCP parsing, codec detection
   nexus-webrtc/      WebRTC session state machine, SDP, packet demux
@@ -134,7 +132,7 @@ crates/
   nexus-loadtest/    Load generator with webrtc-rs clients; also the e2e tests' clients
                      (per-track receive stats, loss injection in lossy.rs)
 sdk/                 TypeScript client SDK
-tests/               e2e.rs (+ e2e/harness.rs), pps_pipeline.rs (--features sim)
+tests/               e2e.rs (+ e2e/harness.rs)
 benches/             real_path, memory (+ memory/signaling.rs), srtp_backends, udp_floor
                      (trusted); packet_processing (RTCP parsing), crdt_sync
 deploy/              Docker, Grafana dashboard

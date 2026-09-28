@@ -74,13 +74,11 @@ run_macos() {
         FAILED=1
         return
     fi
-    for tool in capnp protoc; do
-        command -v "$tool" >/dev/null || {
-            echo "ci-local: $tool missing (brew install capnp protobuf)" >&2
-            FAILED=1
-            return
-        }
-    done
+    if ! command -v capnp >/dev/null; then
+        echo "ci-local: capnp missing (brew install capnp)" >&2
+        FAILED=1
+        return
+    fi
     : >"$OUT/macos.log"
     cd "$ROOT" || return
     step macos "cargo fmt --check" cargo fmt --all --check
@@ -98,7 +96,7 @@ linux_image() {
         echo "== building $image"
         docker build --platform "$platform" -t "$image" - >>"$OUT/image.log" 2>&1 <<EOF || return 1
 FROM rust:$TOOLCHAIN-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends capnproto protobuf-compiler \\
+RUN apt-get update && apt-get install -y --no-install-recommends capnproto \\
     && rm -rf /var/lib/apt/lists/*
 RUN rustup component add rustfmt clippy
 EOF

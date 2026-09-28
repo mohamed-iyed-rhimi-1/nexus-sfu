@@ -21,7 +21,7 @@
 // These are the single source of truth for error definitions.
 pub use nexus_core::error::{
     signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
-    SignalingError, SsrcError, TransportError, WorkerError,
+    SignalingError, SsrcError, TransportError,
 };
 
 // Re-export the core SfuError for crates that only need
@@ -56,10 +56,6 @@ pub enum SfuError {
     #[error("arena error: {0}")]
     Arena(#[from] ArenaError),
 
-    /// Worker pool error
-    #[error("worker error: {0}")]
-    Worker(#[from] WorkerError),
-
     /// ICE error
     #[error("ICE error: {0}")]
     Ice(#[from] nexus_transport::ice::IceError),
@@ -83,7 +79,6 @@ impl From<CoreSfuError> for SfuError {
             CoreSfuError::Parse(e) => SfuError::Parse(e),
             CoreSfuError::Room(e) => SfuError::Room(e),
             CoreSfuError::Arena(e) => SfuError::Arena(e),
-            CoreSfuError::Worker(e) => SfuError::Worker(e),
             CoreSfuError::Signaling(e) => SfuError::Signaling(e),
             CoreSfuError::Api(e) => SfuError::Api(e),
         }

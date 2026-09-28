@@ -1203,7 +1203,7 @@ session, C4 and C6 one, C5 and C7 one.
 | Step | After | Removed | Also |
 |------|-------|---------|------|
 | C2 | 1.7 | (`real_path` and `memory` were rewritten in place by 1.7, so CI's bench smoke and memory budget never lose coverage.) `benches/forwarding.rs` (measures `SsrcRouter`); `benches/packet_processing.rs` ported to the shard's classifier or deleted (it imports `quick_classify`/`PacketType` from `nexus-webrtc` `demux.rs`) | `Cargo.toml` `[[bench]]` entries |
-| C1+C3 | C2 (the old benches use the worker and router) | `Sfu` and the packet loop (`src/sfu.rs`), `SRTCP_SENT_CACHE`, `tests/pps_pipeline.rs`, root `sim` feature, `src/spin.rs`, `src/clock.rs`, `DrainState`, `DropTracker`; `src/worker/`, `src/forward/`, `src/transport/`; `src/proto.rs` and the root `build.rs` prost step (the root crate `include!`s its output only in `proto.rs`) and `check_io_uring_feature` (root `build.rs:19,31`) with the root `io_uring` feature; `lib.rs` modules and re-exports (39, 47, 50, 52, 56, 59, 134-139, 161-190); `CoreSfuError::Worker` / `WorkerError` (`nexus-core/src/error.rs:52`, `:322`) and the root `src/error.rs:24,61,85` wrappers | Merged because `worker/pool.rs` uses `SpinLoop` (`:367`, `:786`), `clock::now_us` (`:2296`) and `sfu::forget_publisher_srtcp` (`:4038`): deleting `sfu.rs` alone does not build. Root deps removed if unused after the step, each checked by a build: `prost`, `prost-build`, `capnp`, `capnpc`, `crossbeam`, `dashmap`, `memmap2`, `core_affinity`, `once_cell`, and the already unused `sysinfo`, `getrandom`, `tokio-util`, `futures-util`, `tokio-tungstenite`, `hyper`, `tower`, `tower-http`, `axum`, `rustls`, `tokio-rustls`, `rustls-pemfile`, `http`. `protoc` stays required (`nexus-signal` compiles its own schemas); CLAUDE.md unchanged on that point |
+| C1+C3 | C2 (the old benches use the worker and router) | `Sfu` and the packet loop (`src/sfu.rs`), `SRTCP_SENT_CACHE`, `tests/pps_pipeline.rs`, root `sim` feature, `src/spin.rs`, `src/clock.rs`, `DrainState`, `DropTracker`; `src/worker/`, `src/forward/`, `src/transport/`; `src/proto.rs` and the root `build.rs` prost step (the root crate `include!`s its output only in `proto.rs`) and `check_io_uring_feature` (root `build.rs:19,31`) with the root `io_uring` feature; `lib.rs` modules and re-exports (39, 47, 50, 52, 56, 59, 134-139, 161-190); `CoreSfuError::Worker` / `WorkerError` (`nexus-core/src/error.rs:52`, `:322`) and the root `src/error.rs:24,61,85` wrappers | Merged because `worker/pool.rs` uses `SpinLoop` (`:367`, `:786`), `clock::now_us` (`:2296`) and `sfu::forget_publisher_srtcp` (`:4038`): deleting `sfu.rs` alone does not build. Root deps removed if unused after the step, each checked by a build: `prost`, `prost-build`, `capnp`, `capnpc`, `crossbeam`, `dashmap`, `memmap2`, `core_affinity`, `once_cell`, and the already unused `sysinfo`, `getrandom`, `tokio-util`, `futures-util`, `tokio-tungstenite`, `hyper`, `tower`, `tower-http`, `axum`, `rustls`, `tokio-rustls`, `rustls-pemfile`, `http`. `protoc` stays required (`nexus-signal` compiles its own schemas); CLAUDE.md unchanged on that point (**wrong**, see the C1+C3 notes below: nothing needs `protoc` after this step) |
 | C4 | C1+C3 (the worker imports `nexus-actor` migration types) | `crates/nexus-actor`, `crates/nexus-dst` (it also turns on `nexus-transport/sim` for the whole workspace), workspace entries, `config/mod.rs:157-181` limits (use the orchestrator's constants), `config/tests.rs:333-338`, `lib.rs:70-75`; the `nexus_actor_*` gauges (`nexus-metrics/src/prometheus.rs:228-242`), their test, `scripts/verify_metrics.sh:51` | `nexus_actor::MAX_ROOMS` is 1,000, the orchestrator's `MAX_ROOMS` 10,000 (`room.rs:13`): validation accepts more rooms after this step; tests updated to the new limit. `nexus-core/types.rs` and `production.toml` comments that mention actors |
 | C6 | C1+C3, C2 (`Sfu` and the old benches use `WebRtcTransport` and `test-hooks`) | `nexus-webrtc`: `webrtc/transport.rs`, `webrtc/session.rs`, `webrtc/demux.rs`, `webrtc/mod.rs` constants, the `test-hooks` feature (the root dev-dependency that enabled it went in C2), `OpenSslDtlsEngine::new` (per-session certificate) | SDP stays |
 | C5 | C6 (`webrtc/session.rs:69-74` imports `DtlsSession`, `IceAgent`, `IceConfig` and more), C4 (`nexus-dst` uses the arena) | `nexus-transport`: `arena.rs`, `ring_buffer.rs`, `batch.rs`, `udp.rs`, `media_transport.rs`, `io_uring.rs`, `arena_proptest.rs`, `arena_refcount_proptest.rs`, the crate's `io_uring` and `sim` features; ICE `agent.rs`, `checklist.rs`, and `StunServer`; pure-Rust DTLS (`dtls/session.rs`, `handshake.rs`, `record.rs`, and the parts of `dtls/crypto.rs` nothing imports) | Keep `ice/stun/server.rs`'s `create_binding_request` and `generate_transaction_id` (used by `gather.rs` and the tests: move them if `server.rs` goes), `SrtpProfile` and `SrtpKeyMaterial` from `dtls/crypto.rs` (used by `openssl_backend.rs:37`), `gro.rs`, `gso.rs`, `socket_config.rs`, `stun/`, `candidate.rs`, `gather.rs` enumeration, `SrtpContext` (tests use it). `ring` stays (SRTP GCM) |
@@ -1217,6 +1217,28 @@ ingress, measured as part of `real_path`'s `ingress`, so it is not made public f
 micro-bench. Moved here from C6: the root dev-dependency `nexus-webrtc` with `test-hooks`
 (its only users were the old `real_path` and `memory`); C6 still removes the feature from
 `nexus-webrtc`. No bench imports `nexus_webrtc` now. CLAUDE.md's bench list updated.
+
+**C1+C3 done (2026-09-28):** deleted `src/sfu.rs` (with `SRTCP_SENT_CACHE`, `DrainState`,
+`DropTracker`), `src/spin.rs`, `src/clock.rs`, `src/proto.rs`, `src/worker/`, `src/forward/`,
+`src/transport/`, `tests/pps_pipeline.rs`, the root `build.rs` (capnp, prost and the io_uring
+warning) and the root `proto/` directory (only that `build.rs` read it; `nexus-signal` has
+its own); `lib.rs` modules and re-exports (the `nexus-actor` ones stay for C4, the arena/ICE
+ones for C5); `WorkerError` and the `Worker` variants in `nexus-core` and the root
+`SfuError`; root features `io_uring`, `sim` and the unused `production`; the optional
+`io-uring` dependency; build-dependencies `capnpc`, `prost-build`. Root dependencies removed
+(no user left, each checked by a grep of `src`, `tests`, `benches`, `examples` and a build):
+`prost`, `capnp`, `crossbeam`, `dashmap`, `memmap2`, `core_affinity`, `once_cell`,
+`sysinfo`, `getrandom`, `tokio-util`, `futures-util`, `tokio-tungstenite`, `hyper`, `tower`,
+`tower-http`, `axum`, `http`, `rustls`, `tokio-rustls`, `rustls-pemfile`. Kept (used):
+`notify`, `num_cpus`, `rand`, `toml`, `serde_json`, `parking_lot`, `thiserror`,
+`tracing-subscriber`, `libc`. `Cargo.lock`: 16 packages gone (prost and its build chain,
+`sysinfo`, `h2`, the second `tungstenite`/`tokio-tungstenite`, `tower-http`), nothing
+upgraded. **Correction:** "`protoc` stays required" was wrong: `nexus-signal`'s `build.rs`
+compiles Cap'n Proto only, and nothing else compiles protobuf. `protobuf-compiler` is no
+longer installed by `ci.yml`, `release.yml`, the Dockerfile or `ci-local.sh`'s image, and
+CLAUDE.md/README list only `capnp`. The Dockerfile no longer copies `build.rs` and `proto/`.
+CLAUDE.md: the "Architecture (today)" data-plane line, the workspace layout and the
+"do not fix" list describe the tree as it is now (`architecture.md` waits for 1.9).
 
 **Code notes (audited 2026-09-26):** `tests/pps_pipeline.rs` is `#![cfg(feature = "sim")]`,
 not in CI: delete, don't port. After C5, `grep -rn "arena\|io_uring\|MediaTransport" crates
@@ -1834,7 +1856,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.5b Switch (one commit) | Done | see git log (1.5b) | New path live: e2e 3/3 (both DTLS roles, AES-GCM), SSRCs rewritten. Early browser check: Chrome 153 passes (GCM, ICE-lite, media both ways) after the stable-PT fix; Firefox deferred to 1.8 (owner's decision) |
 | 1.7 Benches, memory budget, CI | Done | see git log (1.7) | 1.7a: `real_path` on the shard, 0 allocations per packet, `ENOBUFS` fallback, macOS CI job, `--locked`, timeouts, release pinned. 1.7b: `memory` on both planes, 16.9 KB per participant checked (session state), signaling ≈ 49/57 KB reported apart, budget 25 in `ci.yml`. Before C2. CI unavailable (billing lock): `scripts/ci-local.sh` stands in |
 | C2 Old benches | Done | see git log (C2) | `forwarding.rs` deleted; `packet_processing.rs` keeps RTCP parsing, demux groups dropped; root `test-hooks` dev-dependency removed (from C6) |
-| C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Not started | | |
+| C1+C3 `Sfu`, packet loop, `worker/`, `forward/`, `proto.rs` | Done | see git log (C1+C3) | ≈ 7,100 lines of old path + `sfu.rs` (2,284) gone; 20 root dependencies, `build.rs`, `proto/`, `protoc` no longer needed |
 | C4 `nexus-actor`, `nexus-dst` | Not started | | |
 | C6 `WebRtcTransport`, session, demux | Not started | | Before C5 |
 | C5 Replaced `nexus-transport` modules | Not started | | |
@@ -2256,3 +2278,28 @@ Add one line per working session: date, part, what was done, what is left.
   ci-local 2026-09-28 07:56, 964291d (5 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
   ```
   Next: review and commit C2, then C1+C3.
+- 2026-09-28: C2 committed (`7e7b689`). C1+C3 implemented (uncommitted, for review): the
+  old ingress loop, worker pool, SSRC router, root transport wrappers, sim clock, proto
+  bindings and their tests deleted; `WorkerError` gone; 20 root dependencies, the
+  build-dependencies, `build.rs`, `proto/` and the `io_uring`/`sim`/`production` features
+  removed; `protoc` no longer needed (CI, release, Dockerfile, `ci-local.sh`, CLAUDE.md,
+  README). Tests: 2,058 → 1,976 on macOS (the old path's unit tests). `ci-local.sh`
+  (default targets), summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           0s
+  macos          PASS  cargo test --workspace                         112s (1976 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                1s
+  linux-arm64    PASS  clippy                                          14s
+  linux-arm64    PASS  release build                                   55s
+  linux-arm64    PASS  cargo test --workspace                         128s (1982 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           48s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     19s
+  ci-local 2026-09-28 08:07, 7e7b689 (31 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: PASS
+  ```
+  and, since the Dockerfile changed, `ci-local.sh docker`:
+  ```
+  docker         PASS  docker build (linux/amd64)                      88s
+  ci-local 2026-09-28 08:08, 7e7b689 (31 uncommitted or untracked paths), targets: docker, budget 25 KB: PASS
+  ```
+  Next: review and commit C1+C3, then C4 (`nexus-actor`, `nexus-dst`).

@@ -47,10 +47,6 @@ pub enum SfuError {
     #[error("arena error: {0}")]
     Arena(#[from] ArenaError),
 
-    /// Worker pool error
-    #[error("worker error: {0}")]
-    Worker(#[from] WorkerError),
-
     /// WebSocket signaling error
     #[error("signaling error: {0}")]
     Signaling(#[from] SignalingError),
@@ -312,53 +308,6 @@ impl fmt::Display for ArenaError {
 }
 
 impl std::error::Error for ArenaError {}
-
-// ---------------------------------------------------------------------------
-// Worker pool errors
-// ---------------------------------------------------------------------------
-
-/// Worker pool errors.
-#[derive(Debug)]
-pub enum WorkerError {
-    /// Worker channel is full
-    ChannelFull { worker_id: u32 },
-
-    /// Worker thread panicked
-    WorkerPanicked { worker_id: u32, message: String },
-
-    /// Shutdown timed out
-    ShutdownTimeout { timeout_ms: u64 },
-
-    /// Failed to pin worker to CPU core
-    AffinityFailed { worker_id: u32, core_id: u32 },
-
-    /// Invalid worker configuration
-    InvalidConfig { message: String },
-}
-
-impl fmt::Display for WorkerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WorkerError::ChannelFull { worker_id } => {
-                write!(f, "worker {} channel full", worker_id)
-            }
-            WorkerError::WorkerPanicked { worker_id, message } => {
-                write!(f, "worker {} panicked: {}", worker_id, message)
-            }
-            WorkerError::ShutdownTimeout { timeout_ms } => {
-                write!(f, "shutdown timed out after {}ms", timeout_ms)
-            }
-            WorkerError::AffinityFailed { worker_id, core_id } => {
-                write!(f, "failed to pin worker {} to core {}", worker_id, core_id)
-            }
-            WorkerError::InvalidConfig { message } => {
-                write!(f, "invalid worker config: {}", message)
-            }
-        }
-    }
-}
-
-impl std::error::Error for WorkerError {}
 
 // ---------------------------------------------------------------------------
 // Signaling errors

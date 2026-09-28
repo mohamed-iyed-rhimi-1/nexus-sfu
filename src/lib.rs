@@ -1,27 +1,16 @@
 #![deny(warnings)]
 
-//! Nexus SFU MVP - High-performance WebRTC Selective Forwarding Unit
+//! Nexus SFU: a WebRTC Selective Forwarding Unit.
 //!
-//! This is the Minimum Viable Product implementation focusing on four key optimizations:
-//! 1. **Batch Forwarding** - sendmmsg for single-syscall multi-packet sends
-//! 2. **Worker Sharding** - Consistent hashing distributes tracks across CPU cores
-//! 3. **Hot/Cold Separation** - Optimized iteration for active subscribers
-//! 4. **Selective Forwarding** - Viewport-based filtering reduces bandwidth
+//! The binary crate wires the control plane to the data plane (`server::start`):
 //!
-//! # Architecture
+//! - **Data plane:** `nexus-dataplane` shards (receive, SRTP, rewrite, fan-out,
+//!   send), driven only through commands and events.
+//! - **Control plane:** WebSocket signaling, rooms, SDP negotiation, DTLS
+//!   handshakes and timers (`orchestrator`), on Tokio.
 //!
-//! The SFU separates control plane (can allocate, use locks) from data plane
-//! (zero allocation, lock-free):
-//!
-//! - **Control Plane**: WebSocket signaling, room management, subscription changes
-//! - **Data Plane**: Packet receive/send, RTP parsing, SSRC routing, forwarding
-//!
-//! # Performance Targets
-//!
-//! - 500-1000 participants per room
-//! - P50 latency < 20ms, P99 < 50ms
-//! - 500K+ packets/sec/core
-//! - < 500KB memory per participant
+//! See `architecture.md` for what runs today and `docs/dataplane-design.md` for the
+//! design.
 //!
 //! # Code Style
 //!
@@ -32,32 +21,19 @@
 //! - Explicit error handling
 
 // =============================================================================
-// Re-export modules (thin wrappers over library crates)
-// =============================================================================
-// The transport module re-exports from nexus_transport.
-
-pub mod transport; // → nexus_transport
-
-// =============================================================================
 // Application modules (unique to binary crate)
 // =============================================================================
 // These modules contain application-level orchestration code specific to the
 // Nexus SFU binary. They are not part of the library crates.
 
-pub mod clock;
 pub mod config;
 pub mod error;
-pub mod forward;
 pub mod node;
 pub mod orchestrator;
-pub mod proto;
 pub mod server;
-pub mod sfu;
 pub mod signal;
-pub mod spin;
 pub mod tracing;
 pub mod types;
-pub mod worker;
 
 // =============================================================================
 // Crate Re-exports
@@ -146,7 +122,7 @@ pub use nexus_media::rtcp::{ReceiverReportBlock, RtcpHeader, RtcpType, SenderRep
 pub use nexus_media::rtp::RtpHeader;
 
 // -----------------------------------------------------------------------------
-// Application modules: config, error, forward, sfu, worker, etc.
+// Application modules: config, error, tracing, types
 // -----------------------------------------------------------------------------
 pub use config::{
     ActorConfig,
@@ -164,32 +140,15 @@ pub use config::{
 };
 pub use error::{
     signaling_error_codes, ApiError, ArenaError, ParseError, RoomError, RtcpError, RtpError,
-    SfuError, SignalingError, TransportError, WorkerError,
+    SfuError, SignalingError, TransportError,
 };
-pub use forward::{SsrcError, SsrcRouter};
-pub use sfu::{DrainState, Sfu, SfuStats};
-pub use spin::SpinLoop;
 pub use tracing::{
     init_tracing, init_tracing_extended, ExtendedLoggingConfig, HotPathMetrics,
     HotPathMetricsSnapshot, LatencyGuard, LatencyKind, TracingError, HOT_PATH_METRICS,
 };
-pub use transport::{
-    BatchSender,
-    BatchSenderStats,
-    BatchSenderStatsSnapshot,
-    RecvPacket,
-    TransportConfig as UdpTransportConfig, // Low-level UDP transport config
-    TransportStats,
-    TransportStatsSnapshot,
-    UdpTransport,
-};
 pub use types::{
     BandwidthBps, ConnectionId, MediaKind, ParticipantId, RoomId, Ssrc, TimestampNs, TrackId,
 };
-pub use worker::{
-    ConsistentHash, MediaWorker, WorkerHandle, WorkerMessage, WorkerPool, WorkerStats,
-};
-
 /// Nexus SFU MVP version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
