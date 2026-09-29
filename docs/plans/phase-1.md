@@ -3342,3 +3342,26 @@ Add one line per working session: date, part, what was done, what is left.
   ms. Second machine, lip sync and the network switch waived by the owner. **Exit criterion
   4 met** with those waivers; all seven exit criteria met. Next: `ci-local.sh all` on the
   commit to merge, then fast-forward `main` (owner confirms).
+- 2026-09-29, merge check: `ci-local.sh all` on the commit to merge, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           7s
+  macos          PASS  cargo test --workspace                         104s (1469 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            4s (21 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                4s
+  linux-arm64    PASS  clippy                                          14s
+  linux-arm64    PASS  release build                                   73s
+  linux-arm64    PASS  cargo test --workspace                         194s (1475 passed, 0 failed)
+  linux-arm64    PASS  bench smoke real_path                           38s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     21s
+  linux-x86_64   PASS  cargo fmt --check                                2s
+  linux-x86_64   PASS  clippy                                          33s
+  linux-x86_64   PASS  release build                                   75s
+  linux-x86_64   PASS  cargo test --workspace                         290s (1475 passed, 0 failed)
+  linux-x86_64   PASS  bench smoke real_path                           88s
+  linux-x86_64   PASS  bench memory (budget 25 KB)                     28s
+  docker         PASS  docker build (linux/amd64)                     379s
+  --
+  ci-local 2026-09-29 09:41, 0ca7e28 (clean), targets: macos linux-arm64 linux-x86_64 docker, budget 25 KB: PASS
+  ```
+  Phase 1 merged into `main` (fast-forward) after the owner's confirmation.
