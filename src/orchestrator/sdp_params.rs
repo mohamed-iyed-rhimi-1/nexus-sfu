@@ -148,6 +148,9 @@ pub fn sub_spec(
         pt_map,
         ext_map,
         source,
+        clock_rate: track.codec.clock_rate,
+        pub_mid: track.ext.mid,
+        cname: track.cname,
     };
     assert_eq!(spec.pt_map.map(track.codec.pt), Some(sub_pt));
     Ok(Some(spec))

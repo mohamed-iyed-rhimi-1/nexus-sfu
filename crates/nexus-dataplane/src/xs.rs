@@ -18,7 +18,7 @@ pub const XS_RING: usize = 1_024;
 /// Loans a shard may have outstanding to one peer; also the capacity of each
 /// return queue, which therefore never fills.
 pub const XS_CREDIT: u32 = 1_024;
-/// Messages a shard handles from one peer per iteration (2.2).
+/// Messages a shard handles from one peer per iteration.
 pub const XS_BUDGET: usize = 256;
 
 const _: () = assert!(XS_BUDGET <= XS_RING);
@@ -150,6 +150,22 @@ impl XsPorts {
             .enumerate()
             .filter(|(_, p)| p.is_some())
             .map(|(i, _)| ShardId::new(i as u8))
+    }
+
+    /// `shard` is a peer of this shard (in the mesh and not itself).
+    pub fn is_peer(&self, shard: ShardId) -> bool {
+        self.peers
+            .get(usize::from(shard.index()))
+            .is_some_and(Option::is_some)
+    }
+
+    /// A message or a returned loan waits in a queue toward this shard
+    /// (checked before parking; ≤ 2 × 63 loads).
+    pub fn inbound_pending(&self) -> bool {
+        self.peers
+            .iter()
+            .flatten()
+            .any(|p| !p.media_rx.is_empty() || !p.return_rx.is_empty())
     }
 
     /// The media queue to `peer` has room. This shard is its only producer,
@@ -312,6 +328,36 @@ mod tests {
     fn give_back_of_an_own_loan_panics() {
         let (_pools, ports, loan) = lent_to(1);
         ports[0].give_back(loan);
+    }
+
+    #[test]
+    fn inbound_pending_sees_media_and_returns() {
+        let (mut pools, ports) = pools(3);
+        let (s0, s1) = (ShardId::new(0), ShardId::new(1));
+        assert!(ports.iter().all(|p| !p.inbound_pending()));
+        assert!(ports[0].is_peer(s1) && !ports[0].is_peer(s0));
+        assert!(!ports[0].is_peer(ShardId::new(5)));
+        let buf = pools[0].take().unwrap();
+        let loan = pools[0].lend(buf, s1);
+        let msg = XsMsg::Rtp {
+            loan,
+            len: 1,
+            track: TrackId::new(1),
+            layer: 0,
+        };
+        ports[0].send(s1, msg).unwrap();
+        assert!(ports[1].inbound_pending());
+        assert!(!ports[0].inbound_pending() && !ports[2].inbound_pending());
+        let Some(XsMsg::Rtp { loan, .. }) = ports[1].recv(s0) else {
+            panic!("no message");
+        };
+        assert!(!ports[1].inbound_pending());
+        ports[1].give_back(loan);
+        assert!(ports[0].inbound_pending(), "a return is inbound work");
+        let back = ports[0].take_return(s1).unwrap();
+        assert!(!pools[0].release(back, s1));
+        assert!(pools[0].put_if_unshared(buf));
+        assert!(ports.iter().all(|p| !p.inbound_pending()));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The shard thread's loop (note §3.2-3.3): iterate, busy-poll for
 //! `busy_poll_rounds` idle iterations, then park until the socket is
-//! readable, a command arrives, or the next timer is due.
+//! readable, a command or a peer shard's message arrives (the producer
+//! wakes the shard), or the next timer is due.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -60,7 +61,7 @@ impl<I: DatagramIo, S: EventSink> ShardThread<I, S> {
             // Any datagram taken from the socket is work, even one dropped
             // before handling: parking after an all-truncated batch would
             // pace an oversized flood to one batch per millisecond.
-            if stats.taken > 0 || stats.commands > 0 {
+            if stats.taken > 0 || stats.commands > 0 || stats.cross_shard > 0 {
                 idle_rounds = 0;
                 continue;
             }
@@ -74,7 +75,8 @@ impl<I: DatagramIo, S: EventSink> ShardThread<I, S> {
                 UNCONFIRMED_IDLE_PARK
             };
             let (shard, stop) = (&self.shard, &self.stop);
-            let pending = || shard.commands_pending() || stop.load(Ordering::SeqCst);
+            let pending =
+                || shard.commands_pending() || shard.xs_pending() || stop.load(Ordering::SeqCst);
             if self.parker.park(timeout, pending) {
                 self.shard.count_park();
             }

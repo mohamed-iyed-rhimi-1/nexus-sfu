@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::command::{ExtMap, PtMap};
 use crate::ids::{MidValue, SubscriptionId};
-use crate::session::{SessionIdx, TrackIdx};
+use crate::session::{MirrorIdx, SessionIdx, TrackIdx};
 
 /// Per-subscription rewrite state (note §11.1).
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +46,16 @@ impl RewriteState {
     }
 }
 
+/// The track a subscription follows: published on this shard, or mirrored
+/// from another (plan 2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubTrack {
+    /// A track published on this shard.
+    Local(TrackIdx),
+    /// A track published on another shard.
+    Mirror(MirrorIdx),
+}
+
 /// One subscriber's use of one track.
 pub struct Subscription {
     /// Control-plane id.
@@ -53,7 +63,7 @@ pub struct Subscription {
     /// Subscriber session.
     pub session: SessionIdx,
     /// The track.
-    pub track: TrackIdx,
+    pub track: SubTrack,
     /// Rewrite state.
     pub rewrite: RewriteState,
     /// Header extension mapping.

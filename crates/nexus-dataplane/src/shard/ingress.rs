@@ -17,6 +17,15 @@ use crate::rewrite::{commit, rewrite, RewriteError};
 use crate::session::{SessionIdx, SubIdx, TrackIdx};
 use crate::shard::io::{Datagram, DatagramIo};
 
+/// Where a forwarded packet's decrypted bytes are.
+#[derive(Clone, Copy)]
+pub(super) enum Src<'a> {
+    /// An ingress buffer of this shard.
+    Local(BufRef),
+    /// A peer's buffer, read through its loan (plan 2.2).
+    Peer(&'a [u8]),
+}
+
 /// Datagram classes by first byte (RFC 7983) and second byte (RFC 5761).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Class {
@@ -302,6 +311,9 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             return;
         };
         self.fan_out(track, d.buf, len, &header, now);
+        // Only after the local fan-out: from here on the buffer is only read.
+        self.lend_to_remotes(track, d.buf, len);
+        self.deferred_keyframe(track, now);
     }
 
     /// Note §7.2: an unknown SSRC whose `mid` element names one of the
@@ -369,13 +381,20 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         for i in 0..count {
             self.flush_if_full();
             let sidx = self.tracks.get(tidx).subscribers[i];
-            self.forward(sidx, src, len, header, now);
+            self.forward(sidx, Src::Local(src), len, header, now);
         }
     }
 
     /// Rewrite, protect and queue for one subscription; the rewrite state
     /// advances only when the packet is queued. `tx` has room.
-    fn forward(&mut self, sidx: SubIdx, src: BufRef, len: usize, header: &RtpHeader, now: Instant) {
+    pub(super) fn forward(
+        &mut self,
+        sidx: SubIdx,
+        src: Src<'_>,
+        len: usize,
+        header: &RtpHeader,
+        now: Instant,
+    ) {
         debug_assert!(!self.tx.is_full());
         let sub = self.subs.get_mut(sidx);
         let session = self.sessions.get_mut(sub.session);
@@ -386,7 +405,10 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             self.counters.drop_pool_empty += 1;
             return;
         };
-        let (input, dst) = self.pool.pair_mut(src, out);
+        let (input, dst) = match src {
+            Src::Local(buf) => self.pool.pair_mut(buf, out),
+            Src::Peer(bytes) => (bytes, self.pool.buf_mut(out)),
+        };
         let room = BUF_SIZE - outbound.tag_len() - 4;
         let written = rewrite(
             &input[..len],

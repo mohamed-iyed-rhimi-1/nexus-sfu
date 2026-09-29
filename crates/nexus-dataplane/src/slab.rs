@@ -16,6 +16,11 @@ struct Slot<T> {
     value: Option<T>,
 }
 
+/// Bytes one slot of a `Slab<T>` takes (the memory bench's report).
+pub const fn slot_size<T>() -> usize {
+    std::mem::size_of::<Slot<T>>()
+}
+
 /// `Vec` of slots plus a free list.
 pub struct Slab<T> {
     slots: Vec<Slot<T>>,

@@ -9,15 +9,16 @@ use super::Shard;
 use crate::command::{
     Command, Event, EventSink, ExtMap, IceParams, RejectReason, SrtpInstall, SubSpec, TrackSpec,
 };
-use crate::ids::{SessionId, SubscriptionId, TrackId};
+use crate::ids::{SessionId, ShardId, SubscriptionId, TrackId};
 use crate::pool::BUF_SIZE;
 use crate::session::{
     Session, SessionIdx, SubIdx, TrackIdx, MAX_OUT_SSRC_OFFSET, MAX_SUBS_PER_SESSION,
     MAX_TRACKS_PER_SESSION,
 };
 use crate::shard::io::DatagramIo;
-use crate::subscription::{RewriteState, Subscription};
-use crate::track::PublishedTrack;
+use crate::shard::xs::bit;
+use crate::subscription::{RewriteState, SubTrack, Subscription};
+use crate::track::{MirrorTrack, PublishedTrack};
 
 type Outcome = Result<(), RejectReason>;
 
@@ -55,6 +56,12 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             } => (Some(id), self.subscribe(id, sub, track, &spec, now)),
             Command::Unsubscribe { sub } => (None, self.unsubscribe(sub)),
             Command::CloseSession { id } => (Some(id), self.close_session(id)),
+            Command::AddRemoteShard { track, shard } => {
+                (None, self.add_remote_shard(track, shard, now))
+            }
+            Command::RemoveRemoteShard { track, shard } => {
+                (None, self.remove_remote_shard(track, shard))
+            }
         };
         if let Err(reason) = outcome {
             self.counters.commands_rejected += 1;
@@ -136,7 +143,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         // Bounded by MAX_SUBS_PER_SESSION; throttled per track.
         for i in 0..self.sessions.get(idx).subs.len() {
             let track = self.subs.get(self.sessions.get(idx).subs[i]).track;
-            self.request_keyframe(track, now);
+            self.keyframe_for(track, now);
         }
         Ok(())
     }
@@ -169,14 +176,50 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         Ok(())
     }
 
+    /// Removes a local track, or a mirror with its subscriptions (sent to
+    /// every shard with subscriptions to the track, plan 2.4).
     fn remove_track_cmd(&mut self, track: TrackId) -> Outcome {
-        let tidx = self
-            .track_ids
+        if let Some(&tidx) = self.track_ids.get(&track) {
+            self.remove_track(tidx);
+            return Ok(());
+        }
+        if !self.mirror_ids.contains_key(&track) {
+            return Err(RejectReason::UnknownTrack);
+        }
+        // Bounded: each pass removes one subscription; the last frees the
+        // mirror (a mirror always has one).
+        while let Some(&midx) = self.mirror_ids.get(&track) {
+            let last = self.mirrors.get(midx).subscribers.last().copied();
+            self.remove_subscription(last.expect("a mirror has subscriptions"));
+        }
+        Ok(())
+    }
+
+    /// `shard` has subscriptions to a local track: hand it every packet, and
+    /// ask for a keyframe it will receive (plan 2.2, keyframe ordering).
+    fn add_remote_shard(&mut self, track: TrackId, shard: ShardId, now: Instant) -> Outcome {
+        let tidx = self.local_track(track)?;
+        let peer = self.xs.as_ref().is_some_and(|xs| xs.is_peer(shard));
+        if shard == self.config.shard || !peer {
+            return Err(RejectReason::WrongShard);
+        }
+        self.tracks.get_mut(tidx).remote_shards |= bit(shard);
+        self.request_keyframe(tidx, now);
+        Ok(())
+    }
+
+    /// `shard` has no subscriptions to a local track any more (idempotent).
+    fn remove_remote_shard(&mut self, track: TrackId, shard: ShardId) -> Outcome {
+        let tidx = self.local_track(track)?;
+        self.tracks.get_mut(tidx).remote_shards &= !bit(shard);
+        Ok(())
+    }
+
+    fn local_track(&self, track: TrackId) -> Result<TrackIdx, RejectReason> {
+        self.track_ids
             .get(&track)
             .copied()
-            .ok_or(RejectReason::UnknownTrack)?;
-        self.remove_track(tidx);
-        Ok(())
+            .ok_or(RejectReason::UnknownTrack)
     }
 
     /// Removes a track and every subscription to it.
@@ -209,16 +252,9 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         now: Instant,
     ) -> Outcome {
         let idx = self.session_idx(id)?;
-        let tidx = self
-            .track_ids
-            .get(&track)
-            .copied()
-            .ok_or(RejectReason::UnknownTrack)?;
+        let source = self.subscription_source(track, spec)?;
         if self.sub_ids.contains_key(&sub) {
             return Err(RejectReason::DuplicateId);
-        }
-        if spec.source.shard != self.config.shard || spec.source.track != track {
-            return Err(RejectReason::WrongShard);
         }
         if !ext_map_is_valid(&spec.ext_map) {
             return Err(RejectReason::InvalidSpec);
@@ -238,26 +274,85 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
                 .map_err(|_| RejectReason::SrtpSetup)?;
         }
         session.last_out_ssrc_offset = offset;
+        // Nothing can fail from here: the mirror is created only now.
+        let source = source.unwrap_or_else(|| self.new_mirror(spec));
         let sidx = self.subs.insert(Subscription {
             id: sub,
             session: idx,
-            track: tidx,
+            track: source,
             rewrite: RewriteState::new(spec.out_ssrc),
             ext_map: spec.ext_map,
-            pub_mid: self.tracks.get(tidx).spec.ext.mid,
-            clock_rate: self.tracks.get(tidx).spec.codec.clock_rate,
+            pub_mid: spec.pub_mid,
+            clock_rate: spec.clock_rate,
             pt_map: spec.pt_map,
             mid: spec.mid,
             sent_packets: 0,
             sent_octets: 0,
         });
         self.sessions.get_mut(idx).subs.push(sidx);
-        self.tracks.get_mut(tidx).subscribers.push(sidx);
+        self.fan_out_list(source).push(sidx);
         self.sub_ids.insert(sub, sidx);
         if self.sessions.get(idx).srtp_out.is_some() {
-            self.request_keyframe(tidx, now);
+            self.keyframe_for(source, now);
         }
         Ok(())
+    }
+
+    /// The track a `Subscribe` follows: a local track (whose description must
+    /// match the spec's), an existing mirror, or `None` for a mirror to create.
+    fn subscription_source(
+        &self,
+        track: TrackId,
+        spec: &SubSpec,
+    ) -> Result<Option<SubTrack>, RejectReason> {
+        if spec.source.track != track {
+            return Err(RejectReason::WrongShard);
+        }
+        if spec.source.shard == self.config.shard {
+            let tidx = self.local_track(track)?;
+            let local = &self.tracks.get(tidx).spec;
+            let same = local.codec.clock_rate == spec.clock_rate
+                && local.ext.mid == spec.pub_mid
+                && local.cname == spec.cname;
+            if !same {
+                return Err(RejectReason::InvalidSpec);
+            }
+            return Ok(Some(SubTrack::Local(tidx)));
+        }
+        if !self
+            .xs
+            .as_ref()
+            .is_some_and(|xs| xs.is_peer(spec.source.shard))
+        {
+            return Err(RejectReason::WrongShard);
+        }
+        let Some(&midx) = self.mirror_ids.get(&track) else {
+            return Ok(None);
+        };
+        let mirror = self.mirrors.get(midx);
+        if mirror.source != spec.source.shard {
+            return Err(RejectReason::WrongShard);
+        }
+        if !mirror.matches(spec) {
+            return Err(RejectReason::InvalidSpec);
+        }
+        Ok(Some(SubTrack::Mirror(midx)))
+    }
+
+    /// A mirror of `spec.source`, still without subscriptions.
+    fn new_mirror(&mut self, spec: &SubSpec) -> SubTrack {
+        let midx = self.mirrors.insert(MirrorTrack::new(spec));
+        let previous = self.mirror_ids.insert(spec.source.track, midx);
+        assert!(previous.is_none(), "one mirror per track");
+        SubTrack::Mirror(midx)
+    }
+
+    /// The subscriptions a track's packets are forwarded to.
+    fn fan_out_list(&mut self, track: SubTrack) -> &mut Vec<SubIdx> {
+        match track {
+            SubTrack::Local(tidx) => &mut self.tracks.get_mut(tidx).subscribers,
+            SubTrack::Mirror(midx) => &mut self.mirrors.get_mut(midx).subscribers,
+        }
     }
 
     fn unsubscribe(&mut self, sub: SubscriptionId) -> Outcome {
@@ -284,7 +379,7 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             .position(|s| *s == sidx)
             .expect("listed on session");
         session.subs.remove(pos);
-        let fan_out = &mut self.tracks.get_mut(sub.track).subscribers;
+        let fan_out = self.fan_out_list(sub.track);
         let pos = fan_out
             .iter()
             .position(|s| *s == sidx)
@@ -292,6 +387,14 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         fan_out.swap_remove(pos);
         let removed = self.sub_ids.remove(&sub.id);
         assert!(removed == Some(sidx));
+        // A mirror lives as long as its subscriptions.
+        if let SubTrack::Mirror(midx) = sub.track {
+            if self.mirrors.get(midx).subscribers.is_empty() {
+                let mirror = self.mirrors.remove(midx);
+                let removed = self.mirror_ids.remove(&mirror.id);
+                assert!(removed == Some(midx));
+            }
+        }
     }
 
     fn close_session(&mut self, id: SessionId) -> Outcome {
@@ -327,6 +430,11 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         assert!(self.by_ufrag.len() == self.sessions.len());
         assert!(self.track_ids.len() == self.tracks.len());
         assert!(self.sub_ids.len() == self.subs.len());
+        assert!(self.mirror_ids.len() == self.mirrors.len());
+        assert!(
+            self.mirrors.len() <= self.subs.len(),
+            "a mirror has subscriptions"
+        );
         assert!(self.by_addr.len() <= 2 * self.sessions.len());
     }
 }

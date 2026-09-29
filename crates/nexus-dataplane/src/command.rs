@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use nexus_core::MediaKind;
 use nexus_transport::srtp::KeyMaterial;
 
-use crate::ids::{CnameValue, MidValue, SessionId, SubscriptionId, TrackId, TrackRef};
+use crate::ids::{CnameValue, MidValue, SessionId, ShardId, SubscriptionId, TrackId, TrackRef};
 
 /// Control plane → shard. Large payloads are boxed so the queue slots stay
 /// small; allocation is fine here (control path, freed on the shard).
@@ -69,6 +69,23 @@ pub enum Command {
     CloseSession {
         /// Session id.
         id: SessionId,
+    },
+    /// To the track's shard: `shard` has subscriptions to the track, so
+    /// each packet is handed to it. Also asks the publisher for a keyframe,
+    /// which the new shard receives (plan 2.2, keyframe ordering).
+    AddRemoteShard {
+        /// The published track.
+        track: TrackId,
+        /// The subscribers' shard.
+        shard: ShardId,
+    },
+    /// To the track's shard: `shard` has no subscriptions to the track any
+    /// more.
+    RemoveRemoteShard {
+        /// The published track.
+        track: TrackId,
+        /// The subscribers' shard.
+        shard: ShardId,
     },
 }
 
@@ -185,6 +202,14 @@ pub struct SubSpec {
     pub ext_map: ExtMap,
     /// The track's shard and id.
     pub source: TrackRef,
+    /// The track's RTP clock rate (the publisher's `TrackSpec`).
+    pub clock_rate: u32,
+    /// The publisher's `mid` extension id (the publisher's `TrackSpec`).
+    pub pub_mid: u8,
+    /// The track's CNAME, for translated SRs (the publisher's `TrackSpec`).
+    /// With the two fields above, all a shard needs to serve a track
+    /// published on another shard.
+    pub cname: CnameValue,
 }
 
 /// Shard → control plane.
@@ -259,7 +284,8 @@ pub enum RejectReason {
     OutSsrcNotMonotonic,
     /// Another track of the session has this SSRC.
     SsrcInUse,
-    /// The track lives on another shard (Phase 2).
+    /// The track lives on another shard than the command says, or the
+    /// shard named is not a peer of this one.
     WrongShard,
     /// An extension id in the spec does not fit the one-byte form (> 14).
     InvalidSpec,

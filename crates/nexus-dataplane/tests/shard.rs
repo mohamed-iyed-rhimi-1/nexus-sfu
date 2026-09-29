@@ -7,7 +7,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use nexus_dataplane::{
-    Command, Event, ExtIds, RejectReason, SelectReason, SubscriptionId, TrackId,
+    CnameValue, Command, Event, ExtIds, RejectReason, SelectReason, ShardId, SubSpec,
+    SubscriptionId, TrackId, TrackRef, XsMesh, XsMsg, XS_CREDIT, XS_RING,
 };
 use nexus_transport::ice::stun::StunMessage;
 use nexus_transport::srtp::ProtectionProfile;
@@ -239,6 +240,7 @@ fn call_with(profile: ProtectionProfile, subscribers: u64, extensions: bool) -> 
         if extensions {
             spec.ext_map.map[2] = 5;
             spec.ext_map.mid = 1;
+            spec.pub_mid = 1;
         }
         let sub = SubscriptionId::new(100 + n);
         command(
@@ -781,6 +783,7 @@ fn unknown_ssrc_is_learned_from_the_mid_extension() {
     let out = sub.next_out_ssrc();
     let mut sub_spec = sub_spec(out, track);
     sub_spec.ext_map.mid = 1;
+    sub_spec.pub_mid = 1;
     command(
         &mut shard,
         Command::Subscribe {
@@ -885,46 +888,59 @@ fn keyframe_requests_are_forwarded_and_throttled() {
     let mut call = call(GCM, 1);
     call.publish(1, 1, b"x");
     call.shard.io_mut().clear_outbound();
+    let start = call.now;
     let own = 0x5151_5151; // the subscriber's own RTCP SSRC
     let out = call.out_ssrcs[0];
+    let send = |call: &mut Call, plain: &[u8], ms: u64| {
+        let request = call.subscribers[0].rtcp(plain);
+        let addr = call.subscribers[0].addr;
+        call.shard.io_mut().push_inbound(addr, request);
+        run(&mut call.shard, at(start, ms));
+    };
 
     // 600 ms after the Subscribe-time PLI: forwarded, from the publisher
     // session's RTCP SSRC, for the publisher's media SSRC.
-    call.now = at(call.now, 600);
-    let request = call.subscribers[0].rtcp(&pli(own, out));
-    call.shard
-        .io_mut()
-        .push_inbound(call.subscribers[0].addr, request);
-    run(&mut call.shard, call.now);
+    send(&mut call, &pli(own, out), 600);
     assert_eq!(
         plis_to_publisher(&mut call),
         vec![(call.publisher.base, PUB_SSRC)]
     );
 
-    // 5 PLIs in the next 100 ms: none (throttled).
+    // 5 PLIs within 100 ms: one now, the other four throttled into one
+    // pending request.
     for i in 0..5 {
-        let request = call.subscribers[0].rtcp(&pli(own, out));
-        call.shard
-            .io_mut()
-            .push_inbound(call.subscribers[0].addr, request);
-        run(&mut call.shard, at(call.now, 20 * i));
+        send(&mut call, &pli(own, out), 1_200 + 20 * i);
     }
-    assert!(plis_to_publisher(&mut call).is_empty());
+    assert_eq!(plis_to_publisher(&mut call).len(), 1);
+    let c = call.shard.counters();
+    assert_eq!((c.keyframe_throttled, c.keyframe_deferred), (4, 1));
+    // The pending request goes out with the track's first packet after the
+    // window (1,200 + 500 ms), not before.
+    call.now = at(start, 1_650);
+    call.publish(2, 2, b"x");
+    assert!(plis_to_publisher(&mut call).is_empty(), "inside the window");
+    call.now = at(start, 1_700);
+    call.publish(3, 3, b"x");
+    assert_eq!(plis_to_publisher(&mut call).len(), 1, "the deferred PLI");
+    call.now = at(start, 2_100);
+    call.publish(4, 4, b"x");
+    assert!(plis_to_publisher(&mut call).is_empty(), "sent once");
 
     // A FIR after the throttle: one PLI. A PLI for an SSRC the subscriber
     // does not receive: nothing.
-    call.now = at(call.now, 600);
-    let request = call.subscribers[0].rtcp(&fir(own, out));
-    call.shard
-        .io_mut()
-        .push_inbound(call.subscribers[0].addr, request);
-    let stray = call.subscribers[0].rtcp(&pli(own, 0x1234));
-    call.shard
-        .io_mut()
-        .push_inbound(call.subscribers[0].addr, stray);
-    run(&mut call.shard, call.now);
+    send(&mut call, &fir(own, out), 2_400);
+    send(&mut call, &pli(own, 0x1234), 2_400);
     assert_eq!(plis_to_publisher(&mut call).len(), 1);
-    assert_eq!(call.shard.counters().keyframe_requests, 3);
+    // Subscribe, the forwarded PLI, the burst's first, the deferred one, the FIR.
+    let c = call.shard.counters();
+    assert_eq!(
+        (
+            c.keyframe_requests,
+            c.keyframe_throttled,
+            c.keyframe_deferred
+        ),
+        (5, 4, 1)
+    );
 }
 
 #[test]
@@ -1926,4 +1942,1212 @@ proptest! {
         }
         prop_assert!(forwarded >= 2, "the first packet reached both subscribers");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Several shards on one thread (Phase 2.2): remote fan-out, mirror tracks,
+// SRs and keyframe requests across shards, lending and returns
+// ---------------------------------------------------------------------------
+
+const XS_POOL: u32 = 512;
+
+/// A track published on shard 0 with subscribers on the given shards.
+struct Cross {
+    shards: Vec<TestShard>,
+    publisher: Peer,
+    /// (shard, peer, out SSRC, subscription id).
+    subs: Vec<(usize, Peer, u32, SubscriptionId)>,
+    track: TrackId,
+    now: Instant,
+}
+
+fn source(track: TrackId) -> TrackRef {
+    TrackRef {
+        shard: ShardId::new(0),
+        track,
+    }
+}
+
+/// `n` shards, the publisher on shard 0, one subscriber per entry of
+/// `placement` (its shard). Every shard with subscribers other than 0 gets
+/// one `AddRemoteShard`, as the orchestrator sends it (2.4).
+fn cross(n: u8, placement: &[usize]) -> Cross {
+    let now = Instant::now();
+    let mut shards = mesh(n, XS_POOL, now);
+    let publisher = Peer::new(1, "192.0.2.1:1000", GCM);
+    connect(&mut shards[0], &publisher, now);
+    let track = TrackId::new(10);
+    let spec = track_spec(Some(PUB_SSRC), b"0");
+    let add = Command::AddTrack {
+        id: publisher.id,
+        track,
+        spec,
+    };
+    command(&mut shards[0], add);
+    run_all(&mut shards, now);
+    let mut subs = Vec::new();
+    for (k, &s) in placement.iter().enumerate() {
+        let n = 2 + k as u64;
+        let mut peer = Peer::new(n, &format!("192.0.2.{n}:2000"), GCM);
+        connect(&mut shards[s], &peer, now);
+        let out = peer.next_out_ssrc();
+        let sub = SubscriptionId::new(100 + k as u64);
+        let spec = sub_spec_from(out, source(track));
+        let id = peer.id;
+        command(
+            &mut shards[s],
+            Command::Subscribe {
+                id,
+                sub,
+                track,
+                spec,
+            },
+        );
+        subs.push((s, peer, out, sub));
+    }
+    let remote: HashSet<usize> = placement.iter().copied().filter(|&s| s != 0).collect();
+    for s in remote {
+        let shard = ShardId::new(s as u8);
+        command(&mut shards[0], Command::AddRemoteShard { track, shard });
+    }
+    run_all(&mut shards, now);
+    for shard in &mut shards {
+        shard.io_mut().clear_outbound();
+        let rejected: Vec<Event> = events(shard)
+            .into_iter()
+            .filter(|e| matches!(e, Event::CommandRejected { .. }))
+            .collect();
+        assert!(rejected.is_empty(), "{rejected:?}");
+    }
+    Cross {
+        shards,
+        publisher,
+        subs,
+        track,
+        now,
+    }
+}
+
+impl Cross {
+    fn publish(&mut self, seq: u16, ts: u32, payload: &[u8]) {
+        let packet = self.publisher.rtp(PUB_SSRC, seq, ts, payload);
+        let addr = self.publisher.addr;
+        self.shards[0].io_mut().push_inbound(addr, packet);
+        run_all(&mut self.shards, self.now);
+    }
+
+    /// Datagrams each shard sent since the last call.
+    fn outbound(&mut self) -> Vec<Vec<(SocketAddr, Vec<u8>)>> {
+        self.shards
+            .iter_mut()
+            .map(|s| s.io_mut().take_outbound())
+            .collect()
+    }
+
+    /// Decrypted RTP each subscriber received since the last call (from its
+    /// own shard only).
+    fn received(&mut self) -> Vec<Vec<Vec<u8>>> {
+        let out = self.outbound();
+        self.subs
+            .iter_mut()
+            .map(|(s, peer, _, _)| {
+                let addr = peer.addr;
+                out[*s]
+                    .iter()
+                    .filter(|(a, _)| *a == addr)
+                    .map(|(_, b)| peer.open_rtp(b).expect("subscriber decrypts"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Sends the subscriber's RTCP compound to its shard.
+    fn rtcp_from(&mut self, k: usize, plain: &[u8]) {
+        let (s, peer, _, _) = &mut self.subs[k];
+        let packet = peer.rtcp(plain);
+        let addr = peer.addr;
+        self.shards[*s].io_mut().push_inbound(addr, packet);
+    }
+
+    /// PLIs the publisher received, as (sender, media).
+    fn plis_to_publisher(&mut self) -> Vec<(u32, u32)> {
+        let addr = self.publisher.addr;
+        let sent = sent_to(&mut self.shards[0], addr);
+        sent.iter()
+            .map(|b| {
+                let p = self.publisher.open_rtcp(b).expect("publisher decrypts");
+                let pli = nexus_media::rtcp::PliPacket::parse(&p).expect("a PLI");
+                (pli.sender_ssrc, pli.media_ssrc)
+            })
+            .collect()
+    }
+
+    fn assert_quiet(&self) {
+        for (i, shard) in self.shards.iter().enumerate() {
+            let snap = shard.snapshot();
+            assert_eq!(snap.pool_available, XS_POOL as usize, "shard {i} pool");
+            assert_eq!(snap.xs_in_flight, 0, "shard {i} loans");
+            assert!(!shard.xs_pending(), "shard {i} queues");
+        }
+    }
+}
+
+fn rejections(shard: &mut TestShard) -> Vec<RejectReason> {
+    events(shard)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::CommandRejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn cross_shard_subscriber_gets_what_a_local_one_gets() {
+    let mut x = cross(2, &[0, 1]);
+    assert_eq!(x.shards[1].mirror(x.track), Some((ShardId::new(0), 1)));
+    assert_eq!(x.shards[0].remote_shards(x.track), Some(0b10));
+    let before = (*x.shards[0].counters(), *x.shards[1].counters());
+    for i in 0..3u16 {
+        x.publish(i, 1000 + 960 * u32::from(i), &[i as u8; 40]);
+    }
+    let got = x.received();
+    for (k, packets) in got.iter().enumerate() {
+        assert_eq!(packets.len(), 3, "subscriber {k}");
+        for (i, p) in packets.iter().enumerate() {
+            assert_eq!(ssrc(p), x.subs[k].2);
+            assert_eq!(p[1] & 0x7F, SUB_PT);
+            assert_eq!(&p[12..], &[i as u8; 40]);
+        }
+        assert_eq!(seq(&packets[2]).wrapping_sub(seq(&packets[0])), 2);
+    }
+    let (a, b) = (x.shards[0].counters(), x.shards[1].counters());
+    assert_eq!(a.xs_tx - before.0.xs_tx, 3);
+    assert_eq!(b.xs_rx - before.1.xs_rx, 3);
+    assert_eq!(a.xs_returned - before.0.xs_returned, 3);
+    x.assert_quiet();
+}
+
+#[test]
+fn one_hand_off_per_shard_not_per_subscriber() {
+    let mut x = cross(3, &[1, 1, 1, 2, 2]);
+    let before = *x.shards[0].counters();
+    for i in 0..4u16 {
+        x.publish(i, 960 * u32::from(i), b"media");
+    }
+    assert!(x.received().iter().all(|p| p.len() == 4));
+    let after = x.shards[0].counters();
+    assert_eq!(after.xs_tx - before.xs_tx, 8, "4 packets × 2 shards");
+    assert_eq!(
+        after.tx_datagrams, before.tx_datagrams,
+        "no local subscriber"
+    );
+    x.assert_quiet();
+}
+
+#[test]
+fn sender_report_is_translated_on_the_subscribers_shard() {
+    let mut x = cross(2, &[1]);
+    for i in 0..3u16 {
+        x.publish(i, 1000 + 960 * u32::from(i), &[0u8; 50]);
+    }
+    let rtp = x.received().remove(0);
+    let ts_offset = ts(&rtp[0]).wrapping_sub(1000);
+    let ntp = 0xDEAD_BEEF_0000_0001u64;
+    let sr = x
+        .publisher
+        // The publisher's own counters differ from B's, so B's are checked.
+        .rtcp(&sender_report(PUB_SSRC, ntp, 5000, 77, 9_999));
+    let addr = x.publisher.addr;
+    x.shards[0].io_mut().push_inbound(addr, sr);
+    run_all(&mut x.shards, x.now);
+    let (_, peer, out, _) = &mut x.subs[0];
+    let sent = sent_to(&mut x.shards[1], peer.addr);
+    assert_eq!(sent.len(), 1);
+    let plain = peer.open_rtcp(&sent[0]).expect("subscriber decrypts SRTCP");
+    let sr = nexus_media::rtcp::SenderReport::parse(&plain).unwrap();
+    assert_eq!(sr.ssrc, *out);
+    assert_eq!(sr.ntp_timestamp, ntp);
+    assert_eq!(sr.rtp_timestamp, 5000u32.wrapping_add(ts_offset));
+    assert_eq!((sr.packet_count, sr.octet_count), (3, 150), "B's counters");
+    let sdes = &plain[28..];
+    assert_eq!(&sdes[10..10 + sdes[9] as usize], b"publisher-cname");
+    assert_eq!(x.shards[1].counters().sr_translated, 1);
+    assert_eq!(x.shards[0].counters().sr_translated, 0);
+}
+
+#[test]
+fn keyframe_requests_cross_shards_and_are_throttled_on_the_publisher() {
+    let mut x = cross(3, &[1, 2]);
+    x.publish(1, 1, b"x");
+    x.outbound();
+    let own = 0x5151_5151;
+    x.now = at(x.now, 600);
+    let out = x.subs[0].2;
+    x.rtcp_from(0, &pli(own, out));
+    run_all(&mut x.shards, x.now);
+    let base = x.publisher.base;
+    assert_eq!(x.plis_to_publisher(), vec![(base, PUB_SSRC)]);
+
+    // Five PLIs from B and C within 100 ms after the throttle: one now, and
+    // one when the window ends (with the track's next packet).
+    x.now = at(x.now, 600);
+    let before = *x.shards[0].counters();
+    for i in 0..5 {
+        let k = i % 2;
+        let out = x.subs[k].2;
+        x.rtcp_from(k, &pli(own, out));
+        run_all(&mut x.shards, at(x.now, 20 * i as u64));
+    }
+    assert_eq!(x.plis_to_publisher().len(), 1);
+    x.now = at(x.now, 500);
+    x.publish(2, 2, b"y");
+    assert_eq!(x.plis_to_publisher().len(), 1, "the deferred PLI");
+    let c = x.shards[0].counters();
+    assert_eq!(c.keyframe_requests - before.keyframe_requests, 2);
+    assert_eq!(c.keyframe_throttled - before.keyframe_throttled, 4);
+    assert_eq!(c.keyframe_deferred - before.keyframe_deferred, 1);
+    assert_eq!(c.xs_keyframe_ignored, 0);
+}
+
+/// Review race: `AddRemoteShard` reaches A before B's `Subscribe`, so A's
+/// keyframe arrives at B before the mirror exists (dropped), and B's own
+/// request then falls inside A's throttle window. It is deferred, not
+/// dropped: exactly one PLI when the window ends, even with no media (the
+/// sweep sends it).
+#[test]
+fn a_throttled_request_from_a_new_shard_gets_a_keyframe_after_the_window() {
+    let mut x = cross(2, &[]);
+    let t0 = x.now;
+    let (track, shard) = (x.track, ShardId::new(1));
+    command(&mut x.shards[0], Command::AddRemoteShard { track, shard });
+    run_all(&mut x.shards, t0);
+    assert_eq!(x.plis_to_publisher().len(), 1, "AddRemoteShard's PLI");
+    x.publish(1, 1, b"keyframe");
+    assert_eq!(
+        x.shards[1].counters().drop_xs_no_track,
+        1,
+        "before the mirror"
+    );
+
+    let t1 = at(t0, 100);
+    let mut peer = Peer::new(2, "192.0.2.2:2000", GCM);
+    connect(&mut x.shards[1], &peer, t1);
+    let out = peer.next_out_ssrc();
+    let sub = SubscriptionId::new(100);
+    let spec = sub_spec_from(out, source(track));
+    command(
+        &mut x.shards[1],
+        Command::Subscribe {
+            id: peer.id,
+            sub,
+            track,
+            spec,
+        },
+    );
+    run_all(&mut x.shards, t1);
+    assert!(x.plis_to_publisher().is_empty(), "inside the window");
+    let c = *x.shards[0].counters();
+    assert_eq!((c.keyframe_throttled, c.keyframe_deferred), (1, 1));
+
+    // Still inside the window: nothing. Past it (the sweep runs at 1 s, no
+    // packet needed): exactly one.
+    run_all(&mut x.shards, at(t0, 450));
+    assert!(x.plis_to_publisher().is_empty());
+    run_all(&mut x.shards, at(t0, 1_100));
+    assert_eq!(x.plis_to_publisher(), vec![(x.publisher.base, PUB_SSRC)]);
+    run_all(&mut x.shards, at(t0, 2_200));
+    assert!(x.plis_to_publisher().is_empty(), "sent once");
+    let c = x.shards[0].counters();
+    assert_eq!(c.keyframe_requests, 2);
+    assert_eq!((c.keyframe_throttled, c.keyframe_deferred), (1, 1));
+}
+
+/// Shard 0 as a `Shard` publishing one track; shard 1's ports held by the
+/// test (a scripted peer), with `AddRemoteShard` for it applied.
+struct Scripted {
+    shard: TestShard,
+    peer: nexus_dataplane::XsPorts,
+    publisher: Peer,
+    now: Instant,
+    seq: u16,
+}
+
+fn scripted(pool: u32) -> Scripted {
+    let now = Instant::now();
+    let mut shard = shard_on(ShardId::new(0), pool, now);
+    let other = nexus_dataplane::BufferPool::new(ShardId::new(1), 4);
+    let mut ports = XsMesh::build(&[shard.pool_region(), other.region()]);
+    let peer = ports.pop().unwrap();
+    shard.attach_xs(ports.pop().unwrap());
+    let publisher = Peer::new(1, "192.0.2.1:1000", GCM);
+    connect(&mut shard, &publisher, now);
+    let track = TrackId::new(10);
+    let spec = track_spec(Some(PUB_SSRC), b"0");
+    command(
+        &mut shard,
+        Command::AddTrack {
+            id: publisher.id,
+            track,
+            spec,
+        },
+    );
+    let shard_1 = ShardId::new(1);
+    command(
+        &mut shard,
+        Command::AddRemoteShard {
+            track,
+            shard: shard_1,
+        },
+    );
+    run(&mut shard, now);
+    assert!(rejections(&mut shard).is_empty());
+    shard.io_mut().clear_outbound();
+    Scripted {
+        shard,
+        peer,
+        publisher,
+        now,
+        seq: 0,
+    }
+}
+
+impl Scripted {
+    fn publish(&mut self, count: usize) {
+        for _ in 0..count {
+            self.seq = self.seq.wrapping_add(1);
+            let packet = self.publisher.rtp(PUB_SSRC, self.seq, 0, b"payload");
+            let addr = self.publisher.addr;
+            self.shard.io_mut().push_inbound(addr, packet);
+        }
+        run(&mut self.shard, self.now);
+    }
+
+    /// Takes every RTP hand-off in the queue, checking it reads as the
+    /// publisher's packet; other messages are discarded.
+    fn take(&mut self) -> Vec<nexus_dataplane::Loan> {
+        let mut loans = Vec::new();
+        while let Some(msg) = self.peer.recv(ShardId::new(0)) {
+            if let XsMsg::Rtp { loan, len, .. } = msg {
+                let bytes = self.peer.region(ShardId::new(0)).read(&loan, len.into());
+                assert_eq!(ssrc(bytes), PUB_SSRC);
+                loans.push(loan);
+            }
+        }
+        loans
+    }
+}
+
+#[test]
+fn full_peer_queue_drops_with_credit_left_and_recovers() {
+    let mut s = scripted(XS_POOL);
+    // Fill the queue with SRs (no loans): the credit stays untouched.
+    for i in 0..XS_RING as u64 {
+        let sr = s.publisher.rtcp(&sender_report(PUB_SSRC, i, 0, 0, 0));
+        let addr = s.publisher.addr;
+        s.shard.io_mut().push_inbound(addr, sr);
+    }
+    run(&mut s.shard, s.now);
+    assert_eq!(
+        s.shard.counters().xs_tx,
+        XS_RING as u64,
+        "the queue is full"
+    );
+    let before = *s.shard.counters();
+    s.publish(3);
+    let c = s.shard.counters();
+    assert_eq!(c.drop_xs_full - before.drop_xs_full, 3);
+    assert_eq!(c.drop_xs_credit, 0);
+    let snap = s.shard.snapshot();
+    assert_eq!(
+        (snap.xs_in_flight, snap.pool_available),
+        (0, XS_POOL as usize)
+    );
+
+    // The peer drains: hand-offs resume without drops.
+    assert!(s.take().is_empty(), "only SRs were queued");
+    s.publish(2);
+    let loans = s.take();
+    assert_eq!(loans.len(), 2);
+    assert_eq!(s.shard.counters().drop_xs_full - before.drop_xs_full, 3);
+    for loan in loans {
+        s.peer.give_back(loan);
+    }
+    s.shard.iterate(s.now);
+    assert_eq!(s.shard.snapshot().pool_available, XS_POOL as usize);
+}
+
+#[test]
+fn exhausted_credit_drops_and_returns_at_the_top_of_iterate_restore_it() {
+    let pool = 2 * XS_CREDIT + 256;
+    let mut s = scripted(pool);
+    let mut held = Vec::new();
+    // Hand off the whole credit while the peer keeps every loan (its queue
+    // stays empty, so only the credit can refuse).
+    while held.len() < XS_CREDIT as usize {
+        s.publish(64.min(XS_CREDIT as usize - held.len()));
+        held.extend(s.take());
+    }
+    assert_eq!(s.shard.snapshot().xs_in_flight, XS_CREDIT as usize);
+    assert_eq!(s.shard.counters().drop_xs_credit, 0);
+    s.publish(5);
+    assert_eq!(s.shard.counters().drop_xs_credit, 5);
+    assert_eq!(
+        s.shard.snapshot().xs_in_flight,
+        XS_CREDIT as usize,
+        "unchanged"
+    );
+    assert!(s.take().is_empty());
+
+    // Every loan back: the next iteration releases them before its batch,
+    // so a burst the size of the credit goes out with no credit drop.
+    for loan in held.drain(..) {
+        s.peer.give_back(loan);
+    }
+    s.publish(64);
+    assert_eq!(s.shard.counters().drop_xs_credit, 5, "no new drop");
+    assert_eq!(s.shard.snapshot().xs_in_flight, 64);
+    for loan in s.take() {
+        s.peer.give_back(loan);
+    }
+    s.shard.iterate(s.now);
+    let snap = s.shard.snapshot();
+    assert_eq!((snap.xs_in_flight, snap.pool_available), (0, pool as usize));
+}
+
+#[test]
+fn subscribe_before_add_remote_shard_gets_media_and_a_keyframe_after_it() {
+    let now = Instant::now();
+    let mut x = cross(2, &[]);
+    x.now = now;
+    let mut peer = Peer::new(2, "192.0.2.2:2000", GCM);
+    connect(&mut x.shards[1], &peer, now);
+    let out = peer.next_out_ssrc();
+    let (track, sub) = (x.track, SubscriptionId::new(100));
+    let spec = sub_spec_from(out, source(track));
+    command(
+        &mut x.shards[1],
+        Command::Subscribe {
+            id: peer.id,
+            sub,
+            track,
+            spec,
+        },
+    );
+    x.subs.push((1, peer, out, sub));
+    run_all(&mut x.shards, now);
+    // B's keyframe request arrived before B was a remote shard: ignored.
+    assert_eq!(x.shards[0].counters().xs_keyframe_ignored, 1);
+    assert!(x.plis_to_publisher().is_empty());
+    x.publish(1, 1, b"early");
+    assert!(x.received()[0].is_empty(), "not handed off yet");
+    assert_eq!(x.shards[0].counters().xs_tx, 0);
+
+    let shard = ShardId::new(1);
+    command(&mut x.shards[0], Command::AddRemoteShard { track, shard });
+    run_all(&mut x.shards, now);
+    assert_eq!(
+        x.plis_to_publisher().len(),
+        1,
+        "AddRemoteShard asks for a keyframe"
+    );
+    x.publish(2, 2, b"late");
+    assert_eq!(x.received()[0].len(), 1);
+    x.assert_quiet();
+}
+
+#[test]
+fn hand_off_before_the_mirror_exists_is_dropped_and_returned() {
+    let mut x = cross(2, &[]);
+    let (track, shard) = (x.track, ShardId::new(1));
+    command(&mut x.shards[0], Command::AddRemoteShard { track, shard });
+    run_all(&mut x.shards, x.now);
+    x.publish(1, 1, b"nobody");
+    assert_eq!(x.shards[1].counters().drop_xs_no_track, 1);
+    x.assert_quiet();
+
+    // The subscription comes later (after the throttle): keyframe, media.
+    x.now = at(x.now, 600);
+    x.plis_to_publisher();
+    let mut peer = Peer::new(2, "192.0.2.2:2000", GCM);
+    connect(&mut x.shards[1], &peer, x.now);
+    let out = peer.next_out_ssrc();
+    let sub = SubscriptionId::new(100);
+    let spec = sub_spec_from(out, source(track));
+    command(
+        &mut x.shards[1],
+        Command::Subscribe {
+            id: peer.id,
+            sub,
+            track,
+            spec,
+        },
+    );
+    x.subs.push((1, peer, out, sub));
+    run_all(&mut x.shards, x.now);
+    assert_eq!(x.plis_to_publisher().len(), 1);
+    x.publish(2, 2, b"now");
+    assert_eq!(x.received()[0].len(), 1);
+}
+
+#[test]
+fn remove_track_on_the_publishers_shard_then_on_the_mirrors() {
+    let mut x = cross(2, &[0, 1]);
+    let track = x.track;
+    command(&mut x.shards[0], Command::RemoveTrack { track });
+    run_all(&mut x.shards, x.now);
+    assert_eq!(x.shards[0].snapshot().tracks, 0);
+    assert_eq!(x.shards[0].snapshot().subscriptions, 0);
+    x.publish(1, 1, b"gone");
+    assert_eq!(x.shards[0].counters().drop_no_route, 1);
+    assert_eq!(x.shards[0].counters().xs_tx, 0);
+    // The mirror stays until its own RemoveTrack (the orchestrator sends it).
+    assert_eq!(x.shards[1].mirror(track), Some((ShardId::new(0), 1)));
+    command(&mut x.shards[1], Command::RemoveTrack { track });
+    run_all(&mut x.shards, x.now);
+    let snap = x.shards[1].snapshot();
+    assert_eq!((snap.mirrors, snap.subscriptions), (0, 0));
+    command(&mut x.shards[1], Command::RemoveTrack { track });
+    run_all(&mut x.shards, x.now);
+    assert_eq!(
+        rejections(&mut x.shards[1]),
+        vec![RejectReason::UnknownTrack]
+    );
+    x.assert_quiet();
+}
+
+#[test]
+fn publisher_close_session_leaves_the_mirror_to_remove_track() {
+    let mut x = cross(2, &[1]);
+    let track = x.track;
+    command(
+        &mut x.shards[0],
+        Command::CloseSession { id: x.publisher.id },
+    );
+    run_all(&mut x.shards, x.now);
+    assert_eq!(x.shards[0].snapshot().tracks, 0);
+    assert_eq!(x.shards[0].remote_shards(track), None);
+    command(&mut x.shards[1], Command::RemoveTrack { track });
+    run_all(&mut x.shards, x.now);
+    assert_eq!(x.shards[1].snapshot().mirrors, 0);
+    x.assert_quiet();
+}
+
+#[test]
+fn subscriber_leaves_while_hand_offs_are_in_flight() {
+    let mut x = cross(2, &[1]);
+    for i in 0..5u16 {
+        let packet = x.publisher.rtp(PUB_SSRC, i, 0, b"in flight");
+        let addr = x.publisher.addr;
+        x.shards[0].io_mut().push_inbound(addr, packet);
+    }
+    run(&mut x.shards[0], x.now);
+    assert_eq!(x.shards[0].snapshot().xs_in_flight, 5);
+    let id = x.subs[0].1.id;
+    command(&mut x.shards[1], Command::CloseSession { id });
+    run_all(&mut x.shards, x.now);
+    // Commands run before the peers' messages in an iteration.
+    assert_eq!(x.shards[1].counters().drop_xs_no_track, 5);
+    assert_eq!(x.shards[1].snapshot().mirrors, 0);
+    x.assert_quiet();
+}
+
+#[test]
+fn mirror_is_freed_with_its_last_subscription() {
+    let mut x = cross(2, &[1, 1]);
+    let track = x.track;
+    command(&mut x.shards[1], Command::Unsubscribe { sub: x.subs[0].3 });
+    run_all(&mut x.shards, x.now);
+    assert_eq!(x.shards[1].mirror(track), Some((ShardId::new(0), 1)));
+    command(&mut x.shards[1], Command::Unsubscribe { sub: x.subs[1].3 });
+    run_all(&mut x.shards, x.now);
+    assert_eq!(x.shards[1].mirror(track), None);
+    assert_eq!(x.shards[1].snapshot().mirrors, 0);
+}
+
+#[test]
+fn wrong_shard_and_mismatched_descriptions_are_rejected() {
+    let mut x = cross(2, &[1]);
+    let track = x.track;
+    let mut peer = Peer::new(9, "192.0.2.9:2000", GCM);
+    connect(&mut x.shards[1], &peer, x.now);
+    let id = peer.id;
+    let try_subscribe = |x: &mut Cross, s: usize, spec: Box<SubSpec>, n: u64| {
+        let sub = SubscriptionId::new(900 + n);
+        command(
+            &mut x.shards[s],
+            Command::Subscribe {
+                id,
+                sub,
+                track,
+                spec,
+            },
+        );
+        run_all(&mut x.shards, x.now);
+        rejections(&mut x.shards[s])
+    };
+    let not_a_peer = TrackRef {
+        shard: ShardId::new(5),
+        track,
+    };
+    let spec = sub_spec_from(peer.next_out_ssrc(), not_a_peer);
+    assert_eq!(
+        try_subscribe(&mut x, 1, spec, 1),
+        vec![RejectReason::WrongShard]
+    );
+    let other = source(TrackId::new(11));
+    let spec = sub_spec_from(peer.next_out_ssrc(), other);
+    assert_eq!(
+        try_subscribe(&mut x, 1, spec, 2),
+        vec![RejectReason::WrongShard]
+    );
+    let mut spec = sub_spec_from(peer.next_out_ssrc(), source(track));
+    spec.clock_rate = 90_000;
+    assert_eq!(
+        try_subscribe(&mut x, 1, spec, 3),
+        vec![RejectReason::InvalidSpec]
+    );
+    assert_eq!(
+        x.shards[1].mirror(track),
+        Some((ShardId::new(0), 1)),
+        "unchanged"
+    );
+
+    for (shard, reason) in [
+        (ShardId::new(0), RejectReason::WrongShard),
+        (ShardId::new(3), RejectReason::WrongShard),
+    ] {
+        command(&mut x.shards[0], Command::AddRemoteShard { track, shard });
+        run_all(&mut x.shards, x.now);
+        assert_eq!(rejections(&mut x.shards[0]), vec![reason]);
+    }
+    let unknown = TrackId::new(99);
+    let shard = ShardId::new(1);
+    command(
+        &mut x.shards[0],
+        Command::AddRemoteShard {
+            track: unknown,
+            shard,
+        },
+    );
+    command(
+        &mut x.shards[0],
+        Command::RemoveRemoteShard {
+            track: unknown,
+            shard,
+        },
+    );
+    run_all(&mut x.shards, x.now);
+    assert_eq!(
+        rejections(&mut x.shards[0]),
+        vec![RejectReason::UnknownTrack, RejectReason::UnknownTrack]
+    );
+    assert_eq!(x.shards[0].remote_shards(track), Some(0b10), "unchanged");
+}
+
+#[test]
+fn local_subscription_must_describe_the_track_as_it_was_published() {
+    let mut call = call(GCM, 0);
+    let mut peer = Peer::new(2, "192.0.2.2:2000", GCM);
+    connect(&mut call.shard, &peer, call.now);
+    let mut spec = sub_spec(peer.next_out_ssrc(), call.track);
+    spec.cname = CnameValue::new(b"someone-else").unwrap();
+    let (id, sub, track) = (peer.id, SubscriptionId::new(1), call.track);
+    command(
+        &mut call.shard,
+        Command::Subscribe {
+            id,
+            sub,
+            track,
+            spec,
+        },
+    );
+    run(&mut call.shard, call.now);
+    assert_eq!(rejections(&mut call.shard), vec![RejectReason::InvalidSpec]);
+    // Without a mesh, a track of another shard cannot be subscribed to.
+    let remote = TrackRef {
+        shard: ShardId::new(1),
+        track,
+    };
+    let spec = sub_spec_from(peer.next_out_ssrc(), remote);
+    command(
+        &mut call.shard,
+        Command::Subscribe {
+            id,
+            sub,
+            track,
+            spec,
+        },
+    );
+    run(&mut call.shard, call.now);
+    assert_eq!(rejections(&mut call.shard), vec![RejectReason::WrongShard]);
+}
+
+// ---------------------------------------------------------------------------
+// Three shards, random operations (Phase 2 exit criterion 6)
+// ---------------------------------------------------------------------------
+
+/// A participant or control-plane operation; indices pick among what exists
+/// (modulo), so every sequence is meaningful.
+#[derive(Clone, Debug)]
+enum XsOp {
+    Publish(u8),
+    Subscribe(u8, u8),
+    Unsubscribe(u8),
+    Unpublish(u8),
+    Leave(u8),
+    Rtp(u8),
+    Sr(u8),
+    Pli(u8),
+    /// Hand up to n queued commands to a shard.
+    Deliver(u8, u8),
+    /// One iteration of a shard.
+    Iterate(u8),
+}
+
+fn xs_op() -> impl Strategy<Value = XsOp> {
+    prop_oneof![
+        2 => any::<u8>().prop_map(XsOp::Publish),
+        4 => (any::<u8>(), any::<u8>()).prop_map(|(s, t)| XsOp::Subscribe(s, t)),
+        1 => any::<u8>().prop_map(XsOp::Unsubscribe),
+        1 => any::<u8>().prop_map(XsOp::Unpublish),
+        1 => any::<u8>().prop_map(XsOp::Leave),
+        4 => any::<u8>().prop_map(XsOp::Rtp),
+        1 => any::<u8>().prop_map(XsOp::Sr),
+        1 => any::<u8>().prop_map(XsOp::Pli),
+        4 => (any::<u8>(), 1..16u8).prop_map(|(s, n)| XsOp::Deliver(s, n)),
+        4 => any::<u8>().prop_map(XsOp::Iterate),
+    ]
+}
+
+const XS_SHARDS: usize = 3;
+const XS_PEOPLE: usize = 6;
+
+struct ModelTrack {
+    id: TrackId,
+    owner: usize,
+    ssrc: u32,
+    seq: u16,
+    live: bool,
+}
+
+struct ModelSub {
+    id: SubscriptionId,
+    who: usize,
+    track: usize,
+    out: u32,
+    live: bool,
+}
+
+/// The shards and a small model of the orchestrator's counting rule (plan
+/// 2.4): per (track, shard other than the track's), the live subscriptions;
+/// `AddRemoteShard` on 0 → 1, `RemoveRemoteShard` on 1 → 0, `RemoveTrack` to
+/// every counted shard on unpublish. Commands wait in one FIFO per shard and
+/// are delivered in a random interleaving.
+struct Model {
+    shards: Vec<TestShard>,
+    people: Vec<(Peer, usize, bool)>,
+    subs_ever: Vec<usize>,
+    tracks: Vec<ModelTrack>,
+    subs: Vec<ModelSub>,
+    counts: std::collections::HashMap<(usize, usize), u32>,
+    queues: Vec<std::collections::VecDeque<Command>>,
+    now: Instant,
+}
+
+impl Model {
+    fn new() -> Self {
+        let now = Instant::now();
+        let mut shards = mesh(XS_SHARDS as u8, XS_POOL, now);
+        let people = (0..XS_PEOPLE)
+            .map(|i| {
+                let n = 1 + i as u64;
+                let peer = Peer::new(n, &format!("192.0.2.{n}:1000"), GCM);
+                let shard = i % XS_SHARDS;
+                connect(&mut shards[shard], &peer, now);
+                (peer, shard, true)
+            })
+            .collect();
+        Self {
+            shards,
+            people,
+            subs_ever: vec![0; XS_PEOPLE],
+            tracks: Vec::new(),
+            subs: Vec::new(),
+            counts: Default::default(),
+            queues: (0..XS_SHARDS).map(|_| Default::default()).collect(),
+            now,
+        }
+    }
+
+    fn live_tracks(&self) -> Vec<usize> {
+        (0..self.tracks.len())
+            .filter(|&t| self.tracks[t].live)
+            .collect()
+    }
+
+    fn live_subs(&self) -> Vec<usize> {
+        (0..self.subs.len())
+            .filter(|&k| self.subs[k].live)
+            .collect()
+    }
+
+    fn pick<T: Copy>(items: &[T], i: u8) -> Option<T> {
+        (!items.is_empty()).then(|| items[usize::from(i) % items.len()])
+    }
+
+    fn apply(&mut self, op: XsOp) {
+        match op {
+            XsOp::Publish(p) => self.publish(usize::from(p) % XS_PEOPLE),
+            XsOp::Subscribe(s, t) => {
+                if let Some(t) = Self::pick(&self.live_tracks(), t) {
+                    self.subscribe(usize::from(s) % XS_PEOPLE, t);
+                }
+            }
+            XsOp::Unsubscribe(k) => {
+                if let Some(k) = Self::pick(&self.live_subs(), k) {
+                    let (who, id) = (self.subs[k].who, self.subs[k].id);
+                    self.queues[self.people[who].1].push_back(Command::Unsubscribe { sub: id });
+                    self.sub_ended(k);
+                }
+            }
+            XsOp::Unpublish(t) => {
+                if let Some(t) = Self::pick(&self.live_tracks(), t) {
+                    let owner = self.people[self.tracks[t].owner].1;
+                    let track = self.tracks[t].id;
+                    self.queues[owner].push_back(Command::RemoveTrack { track });
+                    self.track_ended(t);
+                }
+            }
+            XsOp::Leave(p) => self.leave(usize::from(p) % XS_PEOPLE),
+            XsOp::Rtp(t) => self.media(t, false),
+            XsOp::Sr(t) => self.media(t, true),
+            XsOp::Pli(k) => {
+                if let Some(k) = Self::pick(&self.live_subs(), k) {
+                    let (who, out) = (self.subs[k].who, self.subs[k].out);
+                    let (peer, shard, _) = &mut self.people[who];
+                    let packet = peer.rtcp(&pli(0x5151_5151, out));
+                    let addr = peer.addr;
+                    self.shards[*shard].io_mut().push_inbound(addr, packet);
+                }
+            }
+            XsOp::Deliver(s, n) => {
+                let s = usize::from(s) % XS_SHARDS;
+                for _ in 0..n {
+                    let Some(c) = self.queues[s].pop_front() else {
+                        break;
+                    };
+                    command(&mut self.shards[s], c);
+                }
+            }
+            XsOp::Iterate(s) => {
+                self.now = at(self.now, 7);
+                self.shards[usize::from(s) % XS_SHARDS].iterate(self.now);
+            }
+        }
+    }
+
+    fn publish(&mut self, p: usize) {
+        let mine = self
+            .tracks
+            .iter()
+            .filter(|t| t.live && t.owner == p)
+            .count();
+        if !self.people[p].2 || mine >= 3 {
+            return;
+        }
+        let n = self.tracks.len() as u64 + 1;
+        let (id, ssrc) = (TrackId::new(n), 0xC000_0000 + n as u32);
+        let spec = track_spec(Some(ssrc), format!("{n}").as_bytes());
+        let (peer, shard, _) = &self.people[p];
+        let add = Command::AddTrack {
+            id: peer.id,
+            track: id,
+            spec,
+        };
+        self.queues[*shard].push_back(add);
+        self.tracks.push(ModelTrack {
+            id,
+            owner: p,
+            ssrc,
+            seq: 0,
+            live: true,
+        });
+    }
+
+    fn subscribe(&mut self, who: usize, t: usize) {
+        let owner = self.tracks[t].owner;
+        let taken = self
+            .subs
+            .iter()
+            .any(|s| s.live && s.who == who && s.track == t);
+        if who == owner || !self.people[who].2 || taken || self.subs_ever[who] >= 20 {
+            return;
+        }
+        self.subs_ever[who] += 1;
+        let (from, track) = (self.people[owner].1, self.tracks[t].id);
+        let id = SubscriptionId::new(1_000 + self.subs.len() as u64);
+        let (peer, shard, _) = &mut self.people[who];
+        let (shard, out) = (*shard, peer.next_out_ssrc());
+        let source = TrackRef {
+            shard: ShardId::new(from as u8),
+            track,
+        };
+        let spec = sub_spec_from(out, source);
+        let sub = Command::Subscribe {
+            id: peer.id,
+            sub: id,
+            track,
+            spec,
+        };
+        self.queues[shard].push_back(sub);
+        self.subs.push(ModelSub {
+            id,
+            who,
+            track: t,
+            out,
+            live: true,
+        });
+        if shard != from {
+            let count = self.counts.entry((t, shard)).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                let shard = ShardId::new(shard as u8);
+                self.queues[from].push_back(Command::AddRemoteShard { track, shard });
+            }
+        }
+    }
+
+    /// A subscription ends (Unsubscribe or its subscriber left).
+    fn sub_ended(&mut self, k: usize) {
+        self.subs[k].live = false;
+        let (t, shard) = (self.subs[k].track, self.people[self.subs[k].who].1);
+        let from = self.people[self.tracks[t].owner].1;
+        if shard == from {
+            return;
+        }
+        let count = self.counts.get_mut(&(t, shard)).expect("counted");
+        *count -= 1;
+        if *count == 0 {
+            self.counts.remove(&(t, shard));
+            let (track, shard) = (self.tracks[t].id, ShardId::new(shard as u8));
+            self.queues[from].push_back(Command::RemoveRemoteShard { track, shard });
+        }
+    }
+
+    /// A track ends: `RemoveTrack` to every counted shard; its subscriptions
+    /// end without `Unsubscribe` (the orchestrator's `forget_tracks`).
+    fn track_ended(&mut self, t: usize) {
+        self.tracks[t].live = false;
+        for s in 0..XS_SHARDS {
+            if self.counts.remove(&(t, s)).is_some() {
+                let track = self.tracks[t].id;
+                self.queues[s].push_back(Command::RemoveTrack { track });
+            }
+        }
+        for sub in self.subs.iter_mut().filter(|s| s.track == t) {
+            sub.live = false;
+        }
+    }
+
+    /// At most two participants leave, so the others keep the case busy.
+    fn leave(&mut self, p: usize) {
+        let left = self.people.iter().filter(|(_, _, alive)| !alive).count();
+        if !self.people[p].2 || left >= 2 {
+            return;
+        }
+        for k in self.live_subs() {
+            if self.subs[k].who == p {
+                self.sub_ended(k);
+            }
+        }
+        for t in self.live_tracks() {
+            if self.tracks[t].owner == p {
+                self.track_ended(t);
+            }
+        }
+        self.people[p].2 = false;
+        let (peer, shard, _) = &self.people[p];
+        self.queues[*shard].push_back(Command::CloseSession { id: peer.id });
+    }
+
+    fn media(&mut self, t: u8, sr: bool) {
+        let Some(t) = Self::pick(&self.live_tracks(), t) else {
+            return;
+        };
+        let track = &mut self.tracks[t];
+        track.seq = track.seq.wrapping_add(1);
+        let (ssrc, seq) = (track.ssrc, track.seq);
+        let (peer, shard, _) = &mut self.people[track.owner];
+        let packet = match sr {
+            true => peer.rtcp(&sender_report(
+                ssrc,
+                u64::from(seq),
+                960 * u32::from(seq),
+                1,
+                5,
+            )),
+            false => peer.rtp(ssrc, seq, 960 * u32::from(seq), b"media"),
+        };
+        let addr = peer.addr;
+        self.shards[*shard].io_mut().push_inbound(addr, packet);
+    }
+
+    /// Delivers what is left, drains every shard, then checks: no leaked
+    /// buffer or loan, and every shard agrees with the model.
+    fn check_quiescent(&mut self) -> Result<(), TestCaseError> {
+        for s in 0..XS_SHARDS {
+            // Far below the queue's capacity (< 200 operations).
+            while let Some(c) = self.queues[s].pop_front() {
+                command(&mut self.shards[s], c);
+            }
+        }
+        run_all(&mut self.shards, self.now);
+        for (s, shard) in self.shards.iter_mut().enumerate() {
+            let snap = shard.snapshot();
+            prop_assert_eq!(snap.pool_available, XS_POOL as usize, "shard {} pool", s);
+            prop_assert_eq!(snap.xs_in_flight, 0, "shard {} loans", s);
+            // The model sends commands in the orchestrator's order per shard:
+            // an add before the track's removal on its shard, `RemoveTrack`
+            // only to shards with subscriptions (so with a mirror), cleanup
+            // only for live ids. Nothing is ever rejected.
+            let rejected = rejections(shard);
+            prop_assert!(rejected.is_empty(), "shard {}: {:?}", s, rejected);
+        }
+        for (t, track) in self.tracks.iter().enumerate() {
+            let owner = self.people[track.owner].1;
+            let mask: u64 = (0..XS_SHARDS)
+                .filter(|&s| self.counts.contains_key(&(t, s)))
+                .map(|s| 1 << s)
+                .sum();
+            let expected = track.live.then_some(mask);
+            prop_assert_eq!(
+                self.shards[owner].remote_shards(track.id),
+                expected,
+                "track {}",
+                t
+            );
+            for s in (0..XS_SHARDS).filter(|&s| s != owner) {
+                let subs = self
+                    .subs
+                    .iter()
+                    .filter(|k| k.live && k.track == t && self.people[k.who].1 == s)
+                    .count();
+                let expected = (subs > 0).then_some((ShardId::new(owner as u8), subs));
+                prop_assert_eq!(
+                    self.shards[s].mirror(track.id),
+                    expected,
+                    "track {} on {}",
+                    t,
+                    s
+                );
+            }
+        }
+        for s in 0..XS_SHARDS {
+            let subs = self
+                .subs
+                .iter()
+                .filter(|k| k.live && self.people[k.who].1 == s);
+            prop_assert_eq!(
+                self.shards[s].snapshot().subscriptions,
+                subs.count(),
+                "shard {}",
+                s
+            );
+        }
+        self.check_final_media()
+    }
+
+    /// Every live track sends one packet marked with its id: each live
+    /// subscription gets exactly its track's, with its own SSRC, whichever
+    /// shard it is on; afterwards nothing is lent or leaked.
+    fn check_final_media(&mut self) -> Result<(), TestCaseError> {
+        for shard in &mut self.shards {
+            shard.io_mut().clear_outbound();
+        }
+        for t in self.live_tracks() {
+            let track = &mut self.tracks[t];
+            track.seq = track.seq.wrapping_add(1);
+            let marker = track.id.get().to_be_bytes();
+            let (peer, shard, _) = &mut self.people[track.owner];
+            let packet = peer.rtp(track.ssrc, track.seq, 0, &marker);
+            let addr = peer.addr;
+            self.shards[*shard].io_mut().push_inbound(addr, packet);
+        }
+        run_all(&mut self.shards, self.now);
+        let out: Vec<_> = self
+            .shards
+            .iter_mut()
+            .map(|s| s.io_mut().take_outbound())
+            .collect();
+        for who in 0..XS_PEOPLE {
+            let mut expected: Vec<(u32, u64)> = self
+                .subs
+                .iter()
+                .filter(|k| k.live && k.who == who)
+                .map(|k| (k.out, self.tracks[k.track].id.get()))
+                .collect();
+            let (peer, shard, _) = &mut self.people[who];
+            let (addr, mut got) = (peer.addr, Vec::new());
+            for (_, bytes) in out[*shard].iter().filter(|(a, _)| *a == addr) {
+                if (64..=95).contains(&(bytes[1] & 0x7F)) {
+                    continue; // RTCP (SRs, PLIs)
+                }
+                let p = peer.open_rtp(bytes).expect("subscriber decrypts");
+                let marker = u64::from_be_bytes(p[12..20].try_into().unwrap());
+                got.push((ssrc(&p), marker));
+            }
+            expected.sort_unstable();
+            got.sort_unstable();
+            prop_assert_eq!(got, expected, "participant {}", who);
+        }
+        for (s, shard) in self.shards.iter().enumerate() {
+            let snap = shard.snapshot();
+            prop_assert_eq!(snap.pool_available, XS_POOL as usize, "shard {} pool", s);
+            prop_assert_eq!(snap.xs_in_flight, 0, "shard {} loans", s);
+        }
+        Ok(())
+    }
+}
+
+/// Cases the proptest runs.
+const XS_CASES: u32 = 128;
+
+/// The runner is written out (not `proptest!`) so the test can also check,
+/// after all cases, that enough of them handed packets across shards and
+/// ended with mirrors: the checks above would pass vacuously otherwise.
+#[test]
+fn three_shards_agree_with_the_orchestrator_model_and_leak_nothing() {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let (handed_off, mirrored) = (AtomicU32::new(0), AtomicU32::new(0));
+    let config = ProptestConfig {
+        cases: XS_CASES,
+        ..ProptestConfig::default()
+    };
+    let mut runner = proptest::test_runner::TestRunner::new(config);
+    let ops = prop::collection::vec(xs_op(), 1..200);
+    let result = runner.run(&ops, |ops| {
+        let mut model = Model::new();
+        for op in ops {
+            model.apply(op);
+        }
+        let xs_tx: u64 = model.shards.iter().map(|s| s.counters().xs_tx).sum();
+        model.check_quiescent()?;
+        // At quiescence, where the model check applies.
+        let mirrors: usize = model.shards.iter().map(|s| s.snapshot().mirrors).sum();
+        handed_off.fetch_add(u32::from(xs_tx > 0), Relaxed);
+        mirrored.fetch_add(u32::from(mirrors > 0), Relaxed);
+        Ok(())
+    });
+    if let Err(error) = result {
+        panic!("{error}");
+    }
+    // Measured ≈ 75% and ≈ 50-60% (random seeds); an eighth is far below.
+    let (handed_off, mirrored) = (handed_off.into_inner(), mirrored.into_inner());
+    eprintln!("{handed_off} of {XS_CASES} cases handed off, {mirrored} ended with mirrors");
+    assert!(
+        handed_off >= XS_CASES / 8,
+        "{handed_off} cases with hand-offs"
+    );
+    assert!(mirrored >= XS_CASES / 8, "{mirrored} cases with mirrors");
 }

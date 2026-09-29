@@ -27,12 +27,14 @@ pub struct PrometheusExporter {
     sfu_active_rooms: Gauge,
 
     // Shard metrics (label `shard`): one counter per `ShardCounters` field, in the
-    // order of `ShardCounters::NAMES`, and the four gauges.
+    // order of `ShardCounters::NAMES`, and the six gauges.
     shard_counters: Vec<IntCounterVec>,
     shard_sessions: IntGaugeVec,
     shard_tracks: IntGaugeVec,
     shard_subscriptions: IntGaugeVec,
     shard_rx_pps: IntGaugeVec,
+    shard_mirrors: IntGaugeVec,
+    shard_xs_in_flight: IntGaugeVec,
 
     // CRDT metrics
     crdt_gossip_sent: Counter,
@@ -133,6 +135,11 @@ impl PrometheusExporter {
         let shard_tracks = shard_gauge("tracks", "Published tracks on the shard")?;
         let shard_subscriptions = shard_gauge("subscriptions", "Subscriptions on the shard")?;
         let shard_rx_pps = shard_gauge("rx_pps", "Datagrams received per second")?;
+        let shard_mirrors = shard_gauge("mirrors", "Tracks from other shards mirrored here")?;
+        let shard_xs_in_flight = shard_gauge(
+            "xs_in_flight",
+            "Loans outstanding to other shards, per peer (a buffer lent to 3 shards counts 3)",
+        )?;
 
         // CRDT metrics
         let crdt_gossip_sent = Counter::with_opts(Opts::new(
@@ -202,6 +209,8 @@ impl PrometheusExporter {
             shard_tracks,
             shard_subscriptions,
             shard_rx_pps,
+            shard_mirrors,
+            shard_xs_in_flight,
             crdt_gossip_sent,
             crdt_gossip_received,
             crdt_state_syncs,
@@ -316,6 +325,8 @@ impl PrometheusExporter {
                 (&self.shard_tracks, stats.gauges.tracks),
                 (&self.shard_subscriptions, stats.gauges.subscriptions),
                 (&self.shard_rx_pps, stats.gauges.rx_pps),
+                (&self.shard_mirrors, stats.gauges.mirrors),
+                (&self.shard_xs_in_flight, stats.gauges.xs_in_flight),
             ];
             for (gauge, value) in gauges {
                 gauge

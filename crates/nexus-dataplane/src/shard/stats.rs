@@ -30,6 +30,8 @@ macro_rules! counters {
             tracks: AtomicU64,
             subscriptions: AtomicU64,
             rx_pps: AtomicU64,
+            mirrors: AtomicU64,
+            xs_in_flight: AtomicU64,
         }
 
         impl ShardStats {
@@ -40,6 +42,8 @@ macro_rules! counters {
                 self.tracks.store(gauges.tracks, Ordering::Relaxed);
                 self.subscriptions.store(gauges.subscriptions, Ordering::Relaxed);
                 self.rx_pps.store(gauges.rx_pps, Ordering::Relaxed);
+                self.mirrors.store(gauges.mirrors, Ordering::Relaxed);
+                self.xs_in_flight.store(gauges.xs_in_flight, Ordering::Relaxed);
             }
 
             /// The last published values.
@@ -53,6 +57,8 @@ macro_rules! counters {
                         tracks: self.tracks.load(Ordering::Relaxed),
                         subscriptions: self.subscriptions.load(Ordering::Relaxed),
                         rx_pps: self.rx_pps.load(Ordering::Relaxed),
+                        mirrors: self.mirrors.load(Ordering::Relaxed),
+                        xs_in_flight: self.xs_in_flight.load(Ordering::Relaxed),
                     },
                 }
             }
@@ -71,6 +77,13 @@ pub struct Gauges {
     pub subscriptions: u64,
     /// Datagrams received per second over the last sweep interval.
     pub rx_pps: u64,
+    /// Mirror tracks (tracks published on another shard with subscribers
+    /// here).
+    pub mirrors: u64,
+    /// Loans outstanding: this shard's buffers lent to peers and not
+    /// returned yet, counted per peer (one buffer lent to 3 peers counts 3;
+    /// the per-peer credit bounds each peer's share).
+    pub xs_in_flight: u64,
 }
 
 /// A read of `ShardStats`.
@@ -174,12 +187,33 @@ counters! {
     keyframe_requests,
     /// Keyframe requests suppressed by the 500 ms throttle.
     keyframe_throttled,
+    /// Throttle windows that ended with a request waiting: one PLI is sent
+    /// when the window ends (counted in `keyframe_requests` once sent).
+    keyframe_deferred,
     /// `ConsentLost` events.
     consent_lost,
     /// Commands handled.
     commands,
     /// Commands rejected.
     commands_rejected,
+    /// Messages sent to peer shards (RTP hand-offs, SRs, keyframe requests).
+    xs_tx,
+    /// Messages received from peer shards.
+    xs_rx,
+    /// Lent buffers given back by peer shards.
+    xs_returned,
+    /// Cross-shard messages dropped because the peer's queue was full.
+    drop_xs_full,
+    /// RTP hand-offs dropped because the peer held its whole credit.
+    drop_xs_credit,
+    /// Cross-shard messages for a track this shard neither publishes nor
+    /// mirrors (a race with removal or with `AddRemoteShard`), or a hand-off
+    /// from a shard that is not the mirror's source (a bug there).
+    drop_xs_no_track,
+    /// Handed-off RTP whose header does not parse (a bug on the sender).
+    drop_xs_malformed,
+    /// Keyframe requests from a shard not (yet) in the track's remote shards.
+    xs_keyframe_ignored,
 }
 
 #[cfg(test)]
@@ -199,6 +233,8 @@ mod tests {
             tracks: 1,
             subscriptions: 4,
             rx_pps: 250,
+            mirrors: 3,
+            xs_in_flight: 5,
         };
         stats.publish(&counters, gauges);
         assert_eq!(stats.load(), ShardStatsSnapshot { counters, gauges });

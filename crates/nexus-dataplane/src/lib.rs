@@ -69,4 +69,11 @@ pub mod sizes {
     pub const PUBLISHED_TRACK: usize = std::mem::size_of::<crate::track::PublishedTrack>();
     /// One subscription slot.
     pub const SUBSCRIPTION: usize = std::mem::size_of::<crate::subscription::Subscription>();
+    /// One mirror track (a track published on another shard).
+    pub const MIRROR_TRACK: usize = std::mem::size_of::<crate::track::MirrorTrack>();
+    /// One slot of the mirror slab (the mirror plus the slot's generation).
+    pub const MIRROR_TRACK_SLOT: usize = crate::slab::slot_size::<crate::track::MirrorTrack>();
+    /// One entry of the mirror id map.
+    pub const MIRROR_ID_ENTRY: usize =
+        std::mem::size_of::<(crate::ids::TrackId, crate::session::MirrorIdx)>();
 }

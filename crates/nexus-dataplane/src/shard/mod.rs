@@ -12,6 +12,7 @@ pub mod park;
 mod rtcp;
 pub(crate) mod runner;
 pub mod stats;
+mod xs;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -24,14 +25,16 @@ use rustc_hash::FxHashMap;
 use crate::command::{Command, Event, EventSink, Refused};
 use crate::config::{ConfigError, ShardConfig};
 use crate::ice::UFRAG_LEN;
-use crate::ids::{SessionId, SubscriptionId, TrackId};
-use crate::pool::{BufRef, BufferPool};
+use crate::ids::{SessionId, ShardId, SubscriptionId, TrackId};
+use crate::pool::{BufRef, BufferPool, PoolRegion};
 use crate::rng::Rng;
-use crate::session::{Session, SessionIdx, SubIdx, TrackIdx};
+use crate::session::{MirrorIdx, Session, SessionIdx, SubIdx, TrackIdx};
 use crate::slab::Slab;
 use crate::subscription::Subscription;
-use crate::track::PublishedTrack;
+use crate::track::{MirrorTrack, PublishedTrack};
+use crate::xs::XsPorts;
 use io::{Datagram, DatagramIo, RecvBatch, RecvResult, SendBatch};
+use park::Wake;
 use stats::{ShardCounters, ShardStats};
 
 /// Capacity of the command queue (note §5.3).
@@ -65,6 +68,8 @@ pub struct IterationStats {
     pub would_block: bool,
     /// Commands handled.
     pub commands: usize,
+    /// Cross-shard messages handled and lent buffers released.
+    pub cross_shard: usize,
 }
 
 /// Table sizes, for tests and stats.
@@ -82,6 +87,11 @@ pub struct ShardSnapshot {
     pub ufrags: usize,
     /// Free pool buffers.
     pub pool_available: usize,
+    /// Mirror tracks (tracks of other shards with subscriptions here).
+    pub mirrors: usize,
+    /// Loans outstanding to peer shards, counted per peer (one buffer lent
+    /// to 3 peers counts 3).
+    pub xs_in_flight: usize,
 }
 
 /// One shard: sessions, tracks, subscriptions and the packet path.
@@ -97,9 +107,11 @@ pub struct Shard<I: DatagramIo, S: EventSink> {
     sessions: Slab<Session>,
     tracks: Slab<PublishedTrack>,
     subs: Slab<Subscription>,
+    mirrors: Slab<MirrorTrack>,
     session_ids: FxHashMap<SessionId, SessionIdx>,
     track_ids: FxHashMap<TrackId, TrackIdx>,
     sub_ids: FxHashMap<SubscriptionId, SubIdx>,
+    mirror_ids: FxHashMap<TrackId, MirrorIdx>,
     /// Only addresses that passed STUN authentication (note §7.1).
     by_addr: FxHashMap<SocketAddr, SessionIdx>,
     by_ufrag: FxHashMap<[u8; UFRAG_LEN], SessionIdx>,
@@ -117,6 +129,14 @@ pub struct Shard<I: DatagramIo, S: EventSink> {
     last_sweep: (u64, Instant),
     /// Datagrams per second over the last sweep interval.
     rx_pps: u64,
+    /// This shard's ends of the cross-shard queues (plan 2.2); `None` until
+    /// attached, and while `drain_cross_shard` holds them.
+    xs: Option<XsPorts>,
+    /// Wakes of the peer shards, by shard index (empty on `MemIo`).
+    peer_wakes: Box<[Wake]>,
+    /// Peers to wake at the end of the iteration (bit i: shard i): pushed
+    /// media, or loans given back to them.
+    wake_mask: u64,
 }
 
 impl<I: DatagramIo, S: EventSink> Shard<I, S> {
@@ -137,9 +157,11 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             sessions: Slab::new(),
             tracks: Slab::new(),
             subs: Slab::new(),
+            mirrors: Slab::new(),
             session_ids: FxHashMap::default(),
             track_ids: FxHashMap::default(),
             sub_ids: FxHashMap::default(),
+            mirror_ids: FxHashMap::default(),
             by_addr: FxHashMap::with_capacity_and_hasher(addresses, Default::default()),
             by_ufrag: FxHashMap::default(),
             rng: Rng::new(config.rng_seed),
@@ -151,6 +173,9 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             dtls_budget: config.dtls_budget_per_sweep,
             last_sweep: (0, now),
             rx_pps: 0,
+            xs: None,
+            peer_wakes: Box::new([]),
+            wake_mask: 0,
             config,
         })
     }
@@ -165,6 +190,33 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         self.commands.push(command)
     }
 
+    /// The pool region peers read this shard's loans from (startup: the
+    /// mesh is built from every shard's region).
+    pub fn pool_region(&self) -> Arc<PoolRegion> {
+        self.pool.region()
+    }
+
+    /// Connects the shard to its peers (startup, once, before `iterate`
+    /// hands anything off).
+    pub fn attach_xs(&mut self, ports: XsPorts) {
+        assert!(ports.shard() == self.config.shard, "ports of another shard");
+        assert!(self.xs.is_none(), "cross-shard ports attached twice");
+        self.xs = Some(ports);
+    }
+
+    /// The peers' wakes, indexed by shard index (this shard's own is never
+    /// used). Startup, once, after `attach_xs`.
+    pub fn attach_peer_wakes(&mut self, wakes: Vec<Wake>) {
+        assert!(self.peer_wakes.is_empty(), "peer wakes attached twice");
+        assert!(wakes.len() <= crate::ids::MAX_SHARDS);
+        self.peer_wakes = wakes.into_boxed_slice();
+    }
+
+    /// The shard's id.
+    pub fn id(&self) -> ShardId {
+        self.config.shard
+    }
+
     /// Published counters and gauges (updated by housekeeping).
     pub fn stats(&self) -> Arc<ShardStats> {
         Arc::clone(&self.stats)
@@ -175,6 +227,8 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     /// again, retry retained events, run housekeeping when due.
     pub fn iterate(&mut self, now: Instant) -> IterationStats {
         self.counters.iterations += 1;
+        // Returns first: credit peers freed is there for this batch.
+        let returned = self.drain_returns();
         // A receive error counts as an empty batch.
         let received = match self.io.recv_batch(&mut self.rx, &mut self.pool) {
             Ok(received) => received,
@@ -189,7 +243,8 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         for i in 0..self.rx.len() {
             let datagram = self.rx.get(i);
             self.handle_datagram(datagram, now);
-            self.pool.put(datagram.buf);
+            // Lent to peers: the last return frees it.
+            self.pool.put_if_unshared(datagram.buf);
         }
         self.rx.clear();
         if !self.pending_switches.is_empty() {
@@ -197,19 +252,23 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
         }
         self.flush();
         let commands = self.drain_commands(now);
-        // Command output (DTLS records, keyframe requests) goes out now.
+        let messages = self.drain_cross_shard(now);
+        // Command and peer output (DTLS records, keyframe requests,
+        // forwarded hand-offs) goes out now.
         self.flush();
         self.push_pending();
         if now >= self.next_housekeeping {
             self.housekeeping(now);
             self.next_housekeeping = now + HOUSEKEEPING_INTERVAL;
         }
-        debug_assert!(self.tx.is_empty());
+        self.wake_peers();
+        debug_assert!(self.tx.is_empty() && self.wake_mask == 0);
         IterationStats {
             received: received.received,
             taken: received.taken(),
             would_block: received.would_block,
             commands,
+            cross_shard: returned + messages,
         }
     }
 
@@ -241,6 +300,11 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
     /// A command is waiting in the queue (checked before parking).
     pub fn commands_pending(&self) -> bool {
         !self.commands.is_empty()
+    }
+
+    /// A peer's message or returned loan is waiting (checked before parking).
+    pub fn xs_pending(&self) -> bool {
+        self.xs.as_ref().is_some_and(XsPorts::inbound_pending)
     }
 
     /// Latest time a parked shard must run again: the next housekeeping, or
@@ -277,7 +341,26 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             addresses: self.by_addr.len(),
             ufrags: self.by_ufrag.len(),
             pool_available: self.pool.available(),
+            mirrors: self.mirrors.len(),
+            xs_in_flight: self.pool.lent_total() as usize,
         }
+    }
+
+    /// The shards a local track is handed to (bit i: shard i); `None` if
+    /// the track is not published here. For tests.
+    #[doc(hidden)]
+    pub fn remote_shards(&self, track: TrackId) -> Option<u64> {
+        let tidx = *self.track_ids.get(&track)?;
+        Some(self.tracks.get(tidx).remote_shards)
+    }
+
+    /// A mirror's source shard and subscription count; `None` if the track
+    /// is not mirrored here. For tests.
+    #[doc(hidden)]
+    pub fn mirror(&self, track: TrackId) -> Option<(ShardId, usize)> {
+        let midx = *self.mirror_ids.get(&track)?;
+        let mirror = self.mirrors.get(midx);
+        Some((mirror.source, mirror.subscribers.len()))
     }
 
     /// A session's selected address.

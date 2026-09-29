@@ -467,6 +467,9 @@ impl EgressRig {
             let mut spec = sub_spec(subscriber.next_out_ssrc(), track);
             spec.ext_map.map[usize::from(AUDIO_LEVEL_EXT)] = 5;
             spec.ext_map.mid = 1;
+            // The track as published (the shard refuses any other description).
+            spec.pub_mid = MID_EXT;
+            spec.clock_rate = media.clock_rate;
             let command = Command::Subscribe {
                 id: subscriber.id,
                 sub: SubscriptionId::new(n),

@@ -11,7 +11,7 @@ use nexus_core::MediaKind;
 use nexus_dataplane::{
     CnameValue, CodecParams, Command, Event, ExtIds, ExtMap, IceParams, MemIo, MidValue, PtMap,
     SessionId, Shard, ShardConfig, ShardId, SrtpInstall, SubSpec, SubscriptionId, TrackId,
-    TrackRef, TrackSpec,
+    TrackRef, TrackSpec, XsMesh,
 };
 use nexus_transport::ice::stun::{
     create_binding_request, generate_transaction_id, sign_message, STUN_MAGIC_COOKIE,
@@ -28,12 +28,49 @@ pub const SUB_PT: u8 = 100;
 
 /// A shard on `MemIo` with test settings.
 pub fn shard(now: Instant) -> TestShard {
+    shard_on(ShardId::new(0), 512, now)
+}
+
+/// Shard `id` on `MemIo` with test settings and `pool` buffers.
+pub fn shard_on(id: ShardId, pool: u32, now: Instant) -> TestShard {
     let config = ShardConfig {
-        pool_buffers: 512,
+        shard: id,
+        pool_buffers: pool,
         max_sessions: 64,
         ..Default::default()
     };
     Shard::new(config, MemIo::new(), Vec::new(), now).expect("valid config")
+}
+
+/// `n` shards connected by a cross-shard mesh, each with `pool` buffers.
+pub fn mesh(n: u8, pool: u32, now: Instant) -> Vec<TestShard> {
+    let mut shards: Vec<TestShard> = (0..n)
+        .map(|i| shard_on(ShardId::new(i), pool, now))
+        .collect();
+    let regions: Vec<_> = shards.iter().map(TestShard::pool_region).collect();
+    for (shard, ports) in shards.iter_mut().zip(XsMesh::build(&regions)) {
+        shard.attach_xs(ports);
+    }
+    shards
+}
+
+/// Iterates every shard, in order, until none has inbound datagrams,
+/// commands or cross-shard work left.
+pub fn run_all(shards: &mut [TestShard], now: Instant) {
+    for _ in 0..1_000 {
+        let mut busy = false;
+        for shard in shards.iter_mut() {
+            let stats = shard.iterate(now);
+            busy |= stats.received > 0 || stats.commands > 0 || stats.cross_shard > 0;
+        }
+        let idle = shards
+            .iter()
+            .all(|s| s.io().inbound_len() == 0 && !s.commands_pending() && !s.xs_pending());
+        if idle && !busy {
+            return;
+        }
+    }
+    panic!("shards did not drain");
 }
 
 /// Iterates until inbound datagrams and commands are drained.
@@ -341,17 +378,28 @@ pub fn track_spec(ssrc: Option<u32>, mid: &[u8]) -> Box<TrackSpec> {
     })
 }
 
-/// A subscription spec mapping `PUB_PT` → `SUB_PT`.
+/// A subscription spec mapping `PUB_PT` → `SUB_PT` for a track of shard 0
+/// described by `track_spec` (no extensions).
 pub fn sub_spec(out_ssrc: u32, track: TrackId) -> Box<SubSpec> {
+    let source = TrackRef {
+        shard: ShardId::new(0),
+        track,
+    };
+    sub_spec_from(out_ssrc, source)
+}
+
+/// `sub_spec` for a track published on `source.shard`.
+pub fn sub_spec_from(out_ssrc: u32, source: TrackRef) -> Box<SubSpec> {
+    let track = track_spec(None, b"0");
     Box::new(SubSpec {
         out_ssrc,
         mid: MidValue::new(b"s0").expect("mid"),
         pt_map: PtMap::new(&[(PUB_PT, SUB_PT)]).expect("pt map"),
         ext_map: ExtMap::default(),
-        source: TrackRef {
-            shard: ShardId::new(0),
-            track,
-        },
+        source,
+        clock_rate: track.codec.clock_rate,
+        pub_mid: track.ext.mid,
+        cname: track.cname,
     })
 }
 

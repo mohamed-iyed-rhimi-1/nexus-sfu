@@ -35,6 +35,8 @@ pub type SessionIdx = Key;
 pub type TrackIdx = Key;
 /// Slab key of a subscription.
 pub type SubIdx = Key;
+/// Slab key of a mirror track.
+pub type MirrorIdx = Key;
 
 /// A fixed-capacity list; never allocates.
 #[derive(Clone, Copy, Debug)]

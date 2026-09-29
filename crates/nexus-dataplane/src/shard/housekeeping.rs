@@ -23,6 +23,14 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
                 self.sweep_session(idx, now);
             }
         }
+        // Bounded by the track slab's slots (≤ 10 per session). Sent before
+        // the stats are published, so they count what went out.
+        for index in 0..self.tracks.slot_count() {
+            if let Some(tidx) = self.tracks.key_at(index) {
+                self.deferred_keyframe(tidx, now);
+            }
+        }
+        self.flush();
         let (last_rx, last_at) = self.last_sweep;
         let elapsed_ms = now.saturating_duration_since(last_at).as_millis() as u64;
         let received = self.counters.rx_datagrams - last_rx;
@@ -40,6 +48,8 @@ impl<I: DatagramIo, S: EventSink> Shard<I, S> {
             tracks: self.tracks.len() as u64,
             subscriptions: self.subs.len() as u64,
             rx_pps: self.rx_pps,
+            mirrors: self.mirrors.len() as u64,
+            xs_in_flight: u64::from(self.pool.lent_total()),
         }
     }
 

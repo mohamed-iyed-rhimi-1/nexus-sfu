@@ -822,6 +822,22 @@ fn presized_entries() -> usize {
         + std::mem::size_of::<(u64, SubscriptionState)>()
 }
 
+/// A mirror's subscriber list after its first push: `Vec` allocates room
+/// for 4 `SubIdx` (8 B each).
+const MIRROR_LIST_BYTES: usize = 32;
+
+/// The most a participant can add on other shards through mirrors (Phase
+/// 2.2): each subscribed track published on another shard, with this
+/// participant its mirror's only subscriber. A mirror slab slot, its id-map
+/// entry and its subscriber list; `size_of`, not measured (this bench runs
+/// one shard).
+fn mirror_share() -> usize {
+    let per_mirror = nexus_dataplane::sizes::MIRROR_TRACK_SLOT
+        + nexus_dataplane::sizes::MIRROR_ID_ENTRY
+        + MIRROR_LIST_BYTES;
+    SUBSCRIBED_TRACKS * per_mirror
+}
+
 fn report_run(m: &Measured) {
     println!(
         "\n{} rooms of {ROOM_SIZE} ({} participants), Rust heap per participant",
@@ -877,6 +893,15 @@ fn report_structure() {
         kb(data as f64).trim()
     );
     println!(
+        "  mirrors (cross-shard, worst case): {} subscribed tracks × (slab slot {} + map entry {} + \
+         list {}) = {} (added to the checked figure)",
+        SUBSCRIBED_TRACKS,
+        nexus_dataplane::sizes::MIRROR_TRACK_SLOT,
+        nexus_dataplane::sizes::MIRROR_ID_ENTRY,
+        MIRROR_LIST_BYTES,
+        kb(mirror_share() as f64).trim()
+    );
+    println!(
         "  control plane: entries of pre-sized maps {} B (added to the checked figure); transport entry {} B",
         presized_entries(),
         std::mem::size_of::<TransportEntry>()
@@ -896,12 +921,13 @@ fn main() {
         .iter()
         .max_by(|a, b| a.total().total_cmp(&b.total()))
         .expect("at least one run");
-    let checked = worst.total() + presized_entries() as f64;
+    let checked = worst.total() + (presized_entries() + mirror_share()) as f64;
     println!(
-        "\nChecked figure: {} ({} rooms) + pre-sized entries {} B = {} per participant",
+        "\nChecked figure: {} ({} rooms) + pre-sized entries {} B + mirrors {} = {} per participant",
         kb(worst.total()).trim(),
         worst.rooms,
         presized_entries(),
+        kb(mirror_share() as f64).trim(),
         kb(checked).trim()
     );
     if let Ok(budget) = std::env::var("NEXUS_MEM_BUDGET_KB") {
@@ -912,12 +938,13 @@ fn main() {
         assert!(
             checked <= budget * 1024.0,
             "\"A+V publisher subscribed to 10 tracks\" uses {:.1} KB per participant \
-             (data plane {:.1} KB, control plane {:.1} KB, pre-sized entries {} B, {} rooms); \
-             budget {budget} KB",
+             (data plane {:.1} KB, control plane {:.1} KB, pre-sized entries {} B, \
+             mirrors {} B, {} rooms); budget {budget} KB",
             checked / 1024.0,
             data / 1024.0,
             control / 1024.0,
             presized_entries(),
+            mirror_share(),
             worst.rooms
         );
         println!(

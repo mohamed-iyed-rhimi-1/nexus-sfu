@@ -1056,7 +1056,8 @@ async fn wait_for_pli(a: &HeadlessClient, ssrc: u32, since: Instant, within: Dur
 }
 
 /// Keyframe requests (R1, note §17.6): the SFU asks A for a keyframe when B
-/// subscribes, forwards B's PLI, and forwards one of a burst (500 ms throttle).
+/// subscribes, forwards B's PLI, and forwards one of a burst at once and one
+/// when the 500 ms throttle window ends (a throttled request is deferred).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keyframe_requests() {
     let _serial = SERIAL.lock().await;
@@ -1099,13 +1100,11 @@ async fn keyframe_requests() {
     let forwarded = wait_for_pli(&a, video, sent, Duration::from_millis(500)).await;
 
     // 3. Past the throttle again (the settled stats take 1.1 s), 5 PLIs within
-    // 100 ms: exactly one reaches A in the following 400 ms, and the shard
-    // throttled the other four.
+    // 100 ms: exactly one reaches A in the following 400 ms, the shard
+    // throttled the other four into one pending request, and that one
+    // reaches A once the 500 ms window ends (Phase 2.2 review).
     let quiet = Instant::now();
-    let throttled = settled_shard_stats(&server)
-        .await
-        .counters
-        .keyframe_throttled;
+    let before = settled_shard_stats(&server).await.counters;
     assert_eq!(
         plis_since(&a, video, quiet),
         Vec::<Instant>::new(),
@@ -1123,7 +1122,7 @@ async fn keyframe_requests() {
         "burst took {:?}",
         burst.elapsed()
     );
-    tokio::time::sleep(Duration::from_millis(500).saturating_sub(burst.elapsed())).await;
+    tokio::time::sleep(Duration::from_millis(400).saturating_sub(burst.elapsed())).await;
     let arrived = plis_since(&a, video, burst);
     eprintln!(
         "keyframe_requests: on subscribe {on_subscribe:?}, forwarded {forwarded:?}, \
@@ -1134,12 +1133,40 @@ async fn keyframe_requests() {
             .map(|t| t.duration_since(burst))
             .collect::<Vec<_>>()
     );
-    assert_eq!(arrived.len(), 1, "one PLI of the burst reaches A");
+    assert_eq!(arrived.len(), 1, "one PLI of the burst reaches A at once");
+    // The deferred one: sent when the window ends (with the next video
+    // packet), so ≈ 500 ms after the first; nothing after it.
+    let first = arrived[0];
+    let deferred = wait_for_pli(&a, video, first + Duration::from_millis(1), STEP_TIMEOUT).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let all = plis_since(&a, video, burst);
+    eprintln!("keyframe_requests: deferred PLI {deferred:?} after the first");
+    assert_eq!(
+        all.len(),
+        2,
+        "the burst yields one PLI now and one deferred"
+    );
+    let gap = all[1].duration_since(all[0]);
+    assert!(
+        gap >= Duration::from_millis(400),
+        "deferred PLI {gap:?} after the first"
+    );
 
     let shard = settled_shard_stats(&server).await;
+    let c = &shard.counters;
     assert_eq!(
-        shard.counters.keyframe_throttled,
-        throttled + 4,
+        c.keyframe_throttled,
+        before.keyframe_throttled + 4,
+        "{shard:?}"
+    );
+    assert_eq!(
+        c.keyframe_deferred,
+        before.keyframe_deferred + 1,
+        "{shard:?}"
+    );
+    assert_eq!(
+        c.keyframe_requests,
+        before.keyframe_requests + 2,
         "{shard:?}"
     );
     assert_eq!(a.rtcp_log().overflow(), 0);

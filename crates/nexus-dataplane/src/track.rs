@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 
-use crate::command::TrackSpec;
-use crate::ids::TrackId;
+use crate::command::{SubSpec, TrackSpec};
+use crate::ids::{CnameValue, ShardId, TrackId};
 use crate::rtcp::SrInfo;
 use crate::session::{SessionIdx, SubIdx};
 
@@ -33,6 +33,13 @@ pub struct PublishedTrack {
     pub subscribers: Vec<SubIdx>,
     /// Last keyframe request sent to the publisher (note §12.3).
     pub last_pli: Option<Instant>,
+    /// A request arrived inside the throttle window: one PLI is sent when
+    /// the window ends, so a subscriber whose request was throttled (e.g. a
+    /// new shard's, right after `AddRemoteShard`'s) still gets a keyframe.
+    pub keyframe_pending: bool,
+    /// Shards with subscriptions to the track (bit i: shard i), each handed
+    /// every packet once (note §7.1, plan 2.2). Never this shard's bit.
+    pub remote_shards: u64,
 }
 
 impl PublishedTrack {
@@ -48,6 +55,48 @@ impl PublishedTrack {
             }],
             subscribers: Vec::new(),
             last_pli: None,
+            keyframe_pending: false,
+            remote_shards: 0,
         }
+    }
+}
+
+/// A track published on another shard, with subscriptions on this one
+/// (plan 2.2). Created by the first such `Subscribe`, freed with its last
+/// subscription or by `RemoveTrack`. What it needs of the track comes in
+/// the `SubSpec`, so it has no command of its own.
+pub struct MirrorTrack {
+    /// The track's id.
+    pub id: TrackId,
+    /// The publisher's shard.
+    pub source: ShardId,
+    /// Local subscriptions (grows on command).
+    pub subscribers: Vec<SubIdx>,
+    /// The track's RTP clock rate.
+    pub clock_rate: u32,
+    /// The publisher's `mid` extension id.
+    pub pub_mid: u8,
+    /// The track's CNAME, for translated SRs.
+    pub cname: CnameValue,
+}
+
+impl MirrorTrack {
+    /// A mirror of `spec.source` without subscriptions.
+    pub fn new(spec: &SubSpec) -> Self {
+        Self {
+            id: spec.source.track,
+            source: spec.source.shard,
+            subscribers: Vec::new(),
+            clock_rate: spec.clock_rate,
+            pub_mid: spec.pub_mid,
+            cname: spec.cname,
+        }
+    }
+
+    /// `spec` describes the track the same way.
+    pub fn matches(&self, spec: &SubSpec) -> bool {
+        self.clock_rate == spec.clock_rate
+            && self.pub_mid == spec.pub_mid
+            && self.cname == spec.cname
     }
 }

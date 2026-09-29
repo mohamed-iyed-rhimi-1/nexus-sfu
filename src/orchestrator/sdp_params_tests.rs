@@ -215,6 +215,10 @@ fn subscriber_answer_maps_pt_and_extensions() {
     );
     assert_eq!(sub.ext_map.map[1], 0, "publisher mid is never forwarded");
     assert_eq!(sub.source, source());
+    // What a shard serving the track from another shard needs (plan 2.2).
+    assert_eq!(sub.clock_rate, publisher.codec.clock_rate);
+    assert_eq!(sub.pub_mid, publisher.ext.mid);
+    assert_eq!(sub.cname, publisher.cname);
 }
 
 #[test]

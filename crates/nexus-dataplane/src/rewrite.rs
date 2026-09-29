@@ -231,6 +231,7 @@ mod tests {
     use crate::command::{ExtMap, PtMap};
     use crate::ids::{MidValue, SubscriptionId};
     use crate::slab::Key;
+    use crate::subscription::SubTrack;
 
     /// Builds an RTP packet; `ext` is (profile, block) with the block a
     /// multiple of 4 bytes.
@@ -268,7 +269,7 @@ mod tests {
         Subscription {
             id: SubscriptionId::new(1),
             session: Key::default(),
-            track: Key::default(),
+            track: SubTrack::Local(Key::default()),
             rewrite: RewriteState::new(0xABCD_0001),
             ext_map: ExtMap { map, mid: sub_mid },
             pub_mid: 1,

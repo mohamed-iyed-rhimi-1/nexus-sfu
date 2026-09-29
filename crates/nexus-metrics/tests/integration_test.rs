@@ -88,6 +88,8 @@ fn test_shard_stats_are_exported_per_shard() {
         stats.counters.rx_datagrams = 100 + shard as u64;
         stats.counters.drop_srtp_auth = 3;
         stats.gauges.sessions = 7;
+        stats.gauges.mirrors = 2;
+        stats.gauges.xs_in_flight = 9 + shard as u64;
         stats
     }));
     assert!(installed);
@@ -106,6 +108,14 @@ fn test_shard_stats_are_exported_per_shard() {
     );
     assert!(
         output.contains("nexus_shard_sessions{shard=\"0\"} 7"),
+        "{output}"
+    );
+    assert!(
+        output.contains("nexus_shard_mirrors{shard=\"1\"} 2"),
+        "{output}"
+    );
+    assert!(
+        output.contains("nexus_shard_xs_in_flight{shard=\"1\"} 10"),
         "{output}"
     );
     // A second render reports the same totals (counters are reset, then set).

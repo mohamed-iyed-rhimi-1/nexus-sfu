@@ -2,8 +2,8 @@
 
 **State: in progress** (plan written 2026-09-29, audited against `75fcdd9` the same day, revised the same day after
 the owner's review; 2.1 detailed the same day from a code analysis, with the owner's `Loan`
-decision and a process-unique region id; 2.1 implemented the same day, not committed,
-waiting for review).
+decision and a process-unique region id; 2.1 implemented and committed the same day,
+`28d9cdf`; 2.2 implemented the same day, not committed, waiting for review).
 
 **Design:** [`docs/dataplane-design.md`](../dataplane-design.md) §5, Phase 2 ("Port per shard,
 placement, cross-shard queues and buffer return"), within D1-D4 and D8, §3.1 and §3.3. Detailed
@@ -47,7 +47,7 @@ against `75fcdd9`; line numbers drift, so prefer the symbol names.
    - `ten_clients_four_shards`: `ten_clients_audio_video` with `shards = 4`, participants
      spread over every shard;
    - `unpublish_and_leave_across_shards`: after unpublish and leave, every shard's
-     `tracks` and `subscriptions` gauges and in-flight buffers return to 0;
+     `tracks` and `subscriptions` gauges and `xs_in_flight` (loans outstanding) return to 0;
    - `resubscribe_across_shards`: `resubscribe_no_srtp_index_reuse` with publisher and
      subscriber on different shards (no repeated (SSRC, index) on the wire);
    - the 9 existing tests stay green (the harness sums stats over shards).
@@ -327,10 +327,13 @@ not committed, stopped for review.
 tracks published elsewhere, driven entirely through `MemIo` with several shards iterated on
 one thread.
 
-**Files:** `crates/nexus-dataplane/src/{command.rs, track.rs, subscription.rs, lib.rs
-(sizes), shard/{mod.rs, ingress.rs, commands.rs, rtcp.rs, runner.rs, stats.rs, xs.rs
-(new)}}`, `tests/{support/mod.rs, shard.rs, alloc.rs}`, `benches/memory.rs` (new
-structure sizes reported; budget re-checked).
+**Files:** `crates/nexus-dataplane/src/{command.rs, track.rs, subscription.rs, session.rs,
+xs.rs, lib.rs (sizes), rewrite.rs (test fixture), shard/{mod.rs, ingress.rs, commands.rs,
+rtcp.rs, runner.rs, stats.rs, housekeeping.rs, xs.rs (new)}}`, `tests/{support/mod.rs,
+shard.rs, alloc.rs}`, `benches/memory.rs` (new structure sizes reported; budget re-checked),
+`benches/real_path.rs` (`SubSpec.pub_mid`). Found while implementing: `SubSpec`'s other
+constructor, `src/orchestrator/sdp_params.rs` (+ its tests), fills the three new fields, and
+the two new gauges need `crates/nexus-metrics/src/prometheus.rs` (+ its integration test).
 
 **Change:**
 - **Commands** (to the publisher's shard): `AddRemoteShard { track, shard }` and
@@ -395,9 +398,21 @@ structure sizes reported; budget re-checked).
   `AddRemoteShard` itself requests a keyframe. Otherwise a request that arrives before
   `AddRemoteShard` produces a keyframe the new shard never receives, and the throttle
   suppresses the next request.
+  **Deferral** (2.2 review): the reverse order races too. `AddRemoteShard` sends a PLI and
+  arms the throttle, the keyframe reaches the new shard before its mirror exists (dropped),
+  and the new shard's own request then falls inside the window. So a throttled request is
+  not dropped: the track keeps one `keyframe_pending`, sent as one PLI when the window
+  ends. It is checked on each of the track's packets and by housekeeping (so it goes out
+  within 1 s for a paused publisher), costs one load per packet while none is pending, and
+  is counted in `keyframe_deferred`.
 - **Counters:** `xs_tx`, `xs_rx`, `xs_returned`, `drop_xs_full`, `drop_xs_credit`,
-  `drop_xs_no_track`; gauges `mirrors`, `xs_in_flight` (sum over peers). They reach
-  Prometheus through `ShardCounters::NAMES` with no exporter change.
+  `drop_xs_no_track` (also a hand-off from a shard that is not the mirror's source), and
+  (added while implementing) `drop_xs_malformed` (a hand-off whose header does not parse,
+  a sender bug), `xs_keyframe_ignored` (the ordering rule) and `keyframe_deferred`. They
+  reach Prometheus through `ShardCounters::NAMES` with no exporter change. The gauges
+  `mirrors` and `xs_in_flight` (loans outstanding, summed over peers: one buffer lent to 3
+  peers counts 3; `BufferPool::lent_total`) are listed field by field in
+  `Gauges`/`ShardStats` and in the exporter, which gains two gauge families.
 
 **Code notes (audited 2026-09-29):**
 - `Shard::iterate` (`shard/mod.rs:176-214`): recv → `handle_datagram` + `pool.put` →
@@ -815,11 +830,15 @@ changes a decision (D1-D10, R1-R9).
 | §13.4 item 7 | Return ring capacity = media capacity + `XS_BUDGET`, so it cannot fill | Does not bound what is outstanding (the owner can keep lending while returns wait). A per-peer credit (`in_flight[j] < XS_CREDIT`) bounds it; return capacity = `XS_CREDIT` |
 | §13.4 | `Subscribe{source: TrackRef}` is all the subscriber's shard needs | It also needs the track's clock rate, publisher `mid` id and cname (read from the local track today, `commands.rs:247-248`); carried in `SubSpec`, kept in a mirror track |
 | §12.3, §13.4 | Subscriber's shard sends `KeyframeRequest`; commands unordered is safe | A request that arrives before `AddRemoteShard` yields a keyframe the new shard never gets, and the throttle suppresses the next. `AddRemoteShard` requests a keyframe; requests from shards not in `remote_shards` are ignored |
+| §12.3 | Keyframe requests inside the 500 ms window are suppressed | They are deferred: one pending request per track, sent when the window ends (a new shard's request right after `AddRemoteShard`'s PLI would otherwise wait for the client's next PLI) (2.2 review) |
 | §13.2 | `RoomAffine` decides from `ShardLoad` (stats) | Stats are published once a second; placement counts its own sessions and uses stats only for `rx_pps` |
 | §6.5 / §13.4 | Track removal: `RemoveTrack` to the publisher's shard | With mirrors, `RemoveTrack` also goes to every shard with subscriptions to the track: the orchestrator marks subscriber m-lines inactive without `Unsubscribe` (`forget_tracks`) |
 | §2 targets | Linux arm64 and x86_64 | Linux arm64 in the ≈ 10 vCPU VM (owner); x86_64 at release |
 | §2 latency | "Timestamp at receive vs `sendmmsg` return" | Receive time = the iteration's `now`, read before `recvmmsg` (an upper bound), recorded at the flush's return by the off-by-default `latency-probe` feature; cross-shard packets carry their origin iteration's `now`. No per-datagram receive timestamp (`SO_TIMESTAMP`) |
 | §6.4 / §13.4 | A full command queue fails the orchestrator operation (note §5.3) | Right for additive commands; cleanup commands (`Unsubscribe`, `RemoveRemoteShard`, `RemoveTrack` to other shards) are retried by the sweep instead, or state on another shard leaks (2.4) |
+| Plan 2.2 | Gauges reach Prometheus with no exporter change | Only counters do (`ShardCounters::NAMES`); `mirrors` and `xs_in_flight` are added to `Gauges`, `ShardStats` and `nexus-metrics`' exporter (2.2) |
+| Plan 2.2 tests | "Credit exhausted with ring room" on shards iterated on one thread | Cannot happen there: `XS_CREDIT == XS_RING` and a shard returns each loan in the drain that received it, so credit ends exactly when the ring fills. The test holds the peer's `XsPorts` itself (a scripted peer that keeps loans); "full ring with credit left" fills the ring with `SenderReport`s (2.2) |
+| Plan 2.2 | Local `Subscribe` reads clock rate and `mid` id from the track | The `SubSpec` carries them (and the cname) for every subscription; a local `Subscribe` whose description differs from the track's is refused with `InvalidSpec`, so every single-shard test and e2e run checks what the orchestrator fills in (2.2) |
 | §10.3 | Pool buffers are only touched by their shard | Peers read lent buffers, so the owner forms per-buffer references only, never one over the whole region (2.1) |
 
 ## Risks for this phase
@@ -844,8 +863,8 @@ changes a decision (D1-D10, R1-R9).
 
 | Part | State | Commits | Notes |
 |------|-------|---------|-------|
-| 2.1 Shared pool region, `XsMsg`, mesh | Done, not committed (second review) | | `Loan` with region id; freeing independent of call order (`held`); stress test and Miri clean |
-| 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Not started | | |
+| 2.1 Shared pool region, `XsMsg`, mesh | Done | `28d9cdf` | `Loan` with region id; freeing independent of call order (`held`); stress test and Miri clean |
+| 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Done, not committed (review fixes, second review) | | Mirrors, lend after local fan-out, returns at the top of `iterate`; alloc test 0 on 2 shards; 3-shard proptest agrees with the counting model |
 | 2.3 N shards on threads | Not started | | |
 | 2.4 Control plane: placement, cross-shard subscriptions | Not started | | |
 | 2.5 E2E on several shards | Not started | | |
@@ -952,3 +971,79 @@ Add one line per working session: date, part, what was done, what is left.
   (331 s). **ci-local** (`e399329` + 6 uncommitted or untracked paths, macos + linux-arm64):
   all PASS, `cargo test --workspace` 1,495 (macOS) / 1,501 (Linux), bench smoke and memory
   budget 25 KB PASS. Next: owner's review, then commit; then 2.2.
+- 2026-09-29: 2.1 committed (`28d9cdf`); Status set to Done. **2.2 implemented, not
+  committed.** `AddRemoteShard`/`RemoveRemoteShard`; `PublishedTrack.remote_shards`;
+  `MirrorTrack` (freed with its last subscription or by `RemoveTrack`) and `SubTrack`
+  (local or mirror); `SubSpec` carries `clock_rate`, `pub_mid`, `cname` (filled by
+  `sdp_params::sub_spec`), and a local `Subscribe` that describes the track differently is
+  refused with `InvalidSpec`. New `shard/xs.rs`: `drain_returns` at the top of `iterate`,
+  `lend_to_remotes` after the local fan-out (credit, then room, then lend and send; `unlend`
+  on `Err`), `drain_cross_shard` after the commands (≤ `XS_BUDGET` per peer; the ports moved
+  out for the drain so `forward` reads a peer's slice, `Src::{Local, Peer}`), SRs translated
+  on the mirror's shard, `KeyframeRequest` ignored from a shard not in `remote_shards`, and
+  `AddRemoteShard` asking for a keyframe; one wake per peer per iteration (`wake_mask`,
+  `attach_peer_wakes` for 2.3). Ingress buffers go back with `put_if_unshared`. Runner:
+  cross-shard work counts as work, `xs_pending` before parking. Counters `xs_tx`, `xs_rx`,
+  `xs_returned`, `drop_xs_full`, `drop_xs_credit`, `drop_xs_no_track`, `drop_xs_malformed`,
+  `xs_keyframe_ignored`; gauges `mirrors`, `xs_in_flight` (exporter extended; corrections
+  table). **Tests:** 14 new in `tests/shard.rs` (2-3 shards on one thread; a scripted peer
+  holding shard 1's `XsPorts` for the full-queue and exhausted-credit cases, see the
+  corrections table), among them a 3-shard proptest (128 cases, < 200 operations, ≈ 1 s):
+  an orchestrator model counts per (track, shard), delivers per-shard FIFOs in a random
+  interleaving and iterates shards in random order; at quiescence every pool is full, no
+  loan is out, `remote_shards` and mirrors match the model, and one marked packet per live
+  track reaches exactly the live subscriptions with their SSRCs. Mutation checks, each
+  caught: `RemoveRemoteShard` a no-op (proptest), returns drained after ingress (credit
+  test), `put` instead of `put_if_unshared` (10 tests panic), keyframe requests accepted
+  from any shard (ordering test), a loan not given back without a mirror (3 tests).
+  `tests/alloc.rs` runs 1 and 2 shards (5 subscribers on each, SRs and PLIs across), GCM and
+  CM: 0 allocations, output = 10 × input, 10,000 hand-offs returned per case. The new
+  `InvalidSpec` check found `benches/real_path.rs` subscribing to 90 kHz video with a 48 kHz
+  spec (fixed). **Sizes:** `PublishedTrack` 384 → 392 B, `Subscription` 120 B (unchanged,
+  padding), `MirrorTrack` 296 B. `benches/memory.rs` adds the worst-case mirror share
+  (10 subscribed tracks, one subscriber per mirror: 3.2 KB) to the checked figure: 17.3 KB
+  + 264 B + 3.2 KB = **20.8 KB ≤ 25 KB**. **`real_path`** (Linux arm64 container, HEAD vs
+  the working tree): a first 3 × 3 run on a loaded host (load ≈ 8) showed ingress +33-37% in
+  the new tree's runs 2-3 only (its run 1 matched base), so it was repeated for ingress with
+  5 alternations at load 1-2.4; medians: GCM audio 700 → 678 ns, GCM video 837 → 882, CM
+  audio 753 → 786, CM video 1,286 → 1,316 (−3% to +5%, as in 2.1). Egress from the 3 × 3
+  run: /10-/500 within ±5% (e.g. GCM video /100 109.3 → 109.7 µs), /1 +5% to +22% with base
+  itself spreading as much (GCM audio /1 base 1.84-2.31 µs); 0 allocations per packet
+  throughout. **ci-local** (`28d9cdf` + 26 uncommitted or untracked paths, macos +
+  linux-arm64): all PASS, `cargo test --workspace` 1,512 (macOS) / 1,518 (Linux), bench
+  smoke and memory budget 25 KB PASS (the 26th path was `shard.proptest-regressions`, seeds
+  from the mutation runs, reverted afterwards). Not tested yet: the wakes
+  (`attach_peer_wakes`, `wake_peers`) and the runner's park check on `xs_pending`, which need
+  threads (2.3's `tests/loopback.rs`). Next: owner's review of 2.2, then
+  commit; then 2.3.
+- 2026-09-29: 2.2 review fixes, not committed. (1) **Keyframe throttle race:** a request
+  inside the 500 ms window is deferred, not dropped (`PublishedTrack.keyframe_pending`, one
+  per track; `deferred_keyframe` on each of the track's packets and in housekeeping, which
+  now flushes before publishing the stats; counter `keyframe_deferred`). Tests: the race on
+  `MemIo` (`AddRemoteShard` before B's `Subscribe`, the keyframe dropped at B, B's request
+  deferred, exactly one PLI after the window with no media, sent by the sweep); the
+  throttle tests exact (5 within 100 ms → one now, one deferred with the first packet after
+  the window, not before; single shard: 5 requests, 4 throttled, 1 deferred); a mutation
+  that never sets the flag fails all three. e2e `keyframe_requests`: one PLI of the burst at
+  once, the deferred one 563 ms after it, counters +4 throttled, +1 deferred, +2 requests.
+  `tests/alloc.rs`: deferred PLIs sent inside the measured window, 0 allocations; its exact
+  "PLI + FIR = requests + throttled" becomes a range (+ deferrals, + one pending per track
+  from the warm-up). A first version flushed the sweep's PLIs after the stats were
+  published, and `tests/loopback.rs` `burst_larger_than_the_send_batch` saw 751 of 750
+  (a PLI counted in `keyframe_requests` but not yet in `tx_datagrams`); fixed in the shard,
+  the test unchanged. (2) **`xs_in_flight` = loans outstanding** (one buffer lent to 3
+  peers counts 3, `BufferPool::lent_total`), in the gauge docs, `ShardSnapshot`, the
+  Prometheus help and this plan. Nits: the cross-shard SR test sends publisher counters
+  (77, 9,999) so B's (3, 150) are checked; the proptest asserts no rejection at all (the
+  model's per-shard order makes none possible, comment) and is a hand-written `TestRunner`
+  that also asserts, after all cases, that ≥ 1/8 handed packets across shards and ≥ 1/8
+  ended with mirrors (measured 89-95 and 57-75 of 128); `benches/memory.rs` counts a mirror
+  as slab slot 304 + id-map entry 16 + subscriber list 32 B (`sizes::MIRROR_TRACK_SLOT`,
+  `MIRROR_ID_ENTRY`, `slab::slot_size`); `mirror_rtp` drops (`drop_xs_no_track`) a hand-off
+  from a peer that is not the mirror's source in release builds too; a keyframe request
+  names its requester by the queue it came on, `from` only checked; `drain_cross_shard`
+  says nothing in it may send to a peer. **Sizes:** `PublishedTrack` 400 B (the flag),
+  checked memory 17.3 KB + 264 B + mirrors 3.4 KB = **21.0 KB ≤ 25 KB**. **ci-local**
+  (`28d9cdf` + 27 uncommitted or untracked paths, macos + linux-arm64): all PASS,
+  `cargo test --workspace` 1,513 (macOS) / 1,519 (Linux), e2e included, bench smoke and
+  memory budget 25 KB PASS. Next: owner's review, then commit; then 2.3.
