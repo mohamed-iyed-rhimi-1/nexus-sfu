@@ -19,8 +19,8 @@ async fn main() -> ExitCode {
     // Parse CLI arguments
     let cli = Cli::parse();
     // Before logging starts: stdout carries only the token.
-    if let Command::Token { sub, ttl } = &cli.command {
-        return print_token(cli.jwt_secret.clone(), sub, *ttl);
+    if let Command::Token { sub, rooms, ttl } = &cli.command {
+        return print_token(cli.jwt_secret.clone(), sub, rooms, *ttl);
     }
 
     // Initialize logging based on verbose flag
@@ -119,12 +119,13 @@ async fn main() -> ExitCode {
 }
 
 /// `token`: print a JWT minted with `--jwt-secret`, else `NEXUS_JWT_SECRET`.
-fn print_token(secret: Option<String>, sub: &str, ttl: u64) -> ExitCode {
+fn print_token(secret: Option<String>, sub: &str, rooms: &[String], ttl: u64) -> ExitCode {
     let Some(secret) = secret.or_else(|| std::env::var("NEXUS_JWT_SECRET").ok()) else {
         eprintln!("error: no --jwt-secret given and NEXUS_JWT_SECRET is not set");
         return ExitCode::from(2);
     };
-    match nexus_loadtest::signaling::mint_token(&secret, sub, ttl) {
+    let rooms: Vec<&str> = rooms.iter().map(String::as_str).collect();
+    match nexus_loadtest::signaling::mint_token(&secret, sub, &rooms, ttl) {
         Ok(token) => {
             println!("{token}");
             ExitCode::SUCCESS

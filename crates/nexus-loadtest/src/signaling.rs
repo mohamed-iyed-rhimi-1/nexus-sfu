@@ -88,15 +88,17 @@ impl SignalingConnection {
 
     /// Connect to SFU signaling endpoint and complete the auth handshake
     ///
-    /// `subject` becomes the `sub` claim when a token is minted from `jwt_secret`.
+    /// When a token is minted from `jwt_secret`, `subject` becomes its `sub` claim and
+    /// `room` its only `rooms` entry (the SFU refuses other rooms).
     pub async fn connect(
         url: &str,
         options: &ConnectionOptions,
         subject: &str,
+        room: &str,
     ) -> Result<Self, SignalingError> {
         let transport = SignalingTransport::from_url(url)?;
         // Resolve credentials before dialing so a missing token fails fast
-        let token = resolve_token(options, subject)?;
+        let token = resolve_token(options, subject, room)?;
 
         let connection = match transport {
             SignalingTransport::WebSocket => {
@@ -194,9 +196,10 @@ impl SignalingConnection {
         url: &str,
         options: &ConnectionOptions,
         subject: &str,
+        room: &str,
         timeout: std::time::Duration,
     ) -> Result<Self, SignalingError> {
-        tokio::time::timeout(timeout, Self::connect(url, options, subject))
+        tokio::time::timeout(timeout, Self::connect(url, options, subject, room))
             .await
             .map_err(|_| SignalingError::Timeout(timeout))?
     }
@@ -314,15 +317,27 @@ impl SignalingConnection {
                     });
                 }
                 SignalMessage::Error { code, message } => {
-                    if code == "room_not_found" || code == "ROOM_NOT_FOUND" {
-                        return Err(SignalingError::RoomNotFound(message));
-                    }
-                    return Err(SignalingError::ProtocolError(format!(
-                        "Join failed: {} - {}",
-                        code, message
-                    )));
+                    return Err(room_error("Join", &code, message));
                 }
                 // Ignore other messages while waiting for join response
+                _ => continue,
+            }
+        }
+    }
+
+    /// Create a room, or get the id of the room with this name if it exists
+    ///
+    /// Sends a Create message and waits for the Created response.
+    pub async fn create_room(&mut self, room_name: &str) -> Result<u64, SignalingError> {
+        let room_name = Some(room_name.to_string());
+        self.send(SignalMessage::Create { room_name }).await?;
+        loop {
+            match self.recv().await? {
+                SignalMessage::Created { room_id, .. } => return Ok(room_id),
+                SignalMessage::Error { code, message } => {
+                    return Err(room_error("Create", &code, message));
+                }
+                // Ignore other messages while waiting for the response
                 _ => continue,
             }
         }
@@ -381,22 +396,47 @@ impl SignalingConnection {
     }
 }
 
-/// Pick the explicit token, or mint a short-lived HS256 JWT from the secret
-fn resolve_token(options: &ConnectionOptions, subject: &str) -> Result<String, SignalingError> {
+/// The error for a refused `Create` or `Join`
+fn room_error(request: &str, code: &str, message: String) -> SignalingError {
+    match code {
+        "ROOM_NOT_FOUND" | "room_not_found" => SignalingError::RoomNotFound(message),
+        "FORBIDDEN" => SignalingError::Forbidden(message),
+        _ => SignalingError::ProtocolError(format!("{request} failed: {code} - {message}")),
+    }
+}
+
+/// Pick the explicit token, or mint a short-lived HS256 JWT from the secret that
+/// grants `room`
+fn resolve_token(
+    options: &ConnectionOptions,
+    subject: &str,
+    room: &str,
+) -> Result<String, SignalingError> {
     if let Some(token) = &options.auth_token {
         return Ok(token.clone());
     }
     let secret = options.jwt_secret.as_deref().ok_or_else(|| {
         SignalingError::AuthFailed("no --token or --jwt-secret provided".to_string())
     })?;
-    mint_token(secret, subject, MINTED_TOKEN_TTL_SECS)
+    mint_token(secret, subject, &[room], MINTED_TOKEN_TTL_SECS)
 }
 
 /// The SFU refuses shorter secrets (`nexus_api::auth::MIN_SECRET_LEN`).
 pub const MIN_SECRET_LEN: usize = 32;
+/// The SFU refuses tokens naming more rooms (`nexus_api::auth::MAX_TOKEN_ROOMS`).
+pub const MAX_TOKEN_ROOMS: usize = 16;
+/// The SFU refuses longer room names (`nexus_state::MAX_ROOM_NAME_LEN`).
+pub const MAX_ROOM_NAME_LEN: usize = 256;
 
-/// An HS256 JWT with `sub`, `iat` and `exp = now + ttl_secs`, as the SFU validates it.
-pub fn mint_token(secret: &str, subject: &str, ttl_secs: u64) -> Result<String, SignalingError> {
+/// An HS256 JWT with `sub`, `iat`, `exp = now + ttl_secs` and the `rooms` claim, as
+/// the SFU validates it. `rooms` names the rooms the holder may create or join;
+/// `"*"` grants every room, and an empty list grants none.
+pub fn mint_token(
+    secret: &str,
+    subject: &str,
+    rooms: &[&str],
+    ttl_secs: u64,
+) -> Result<String, SignalingError> {
     if secret.len() < MIN_SECRET_LEN {
         return Err(SignalingError::AuthFailed(format!(
             "JWT secret must be at least {MIN_SECRET_LEN} characters (the SFU refuses shorter ones)"
@@ -407,6 +447,12 @@ pub fn mint_token(secret: &str, subject: &str, ttl_secs: u64) -> Result<String, 
             "token needs a non-empty subject and a TTL above 0".to_string(),
         ));
     }
+    let bad_room = |r: &&str| r.is_empty() || r.len() > MAX_ROOM_NAME_LEN;
+    if rooms.len() > MAX_TOKEN_ROOMS || rooms.iter().any(bad_room) {
+        return Err(SignalingError::AuthFailed(format!(
+            "token names at most {MAX_TOKEN_ROOMS} rooms of 1 to {MAX_ROOM_NAME_LEN} bytes"
+        )));
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -415,6 +461,7 @@ pub fn mint_token(secret: &str, subject: &str, ttl_secs: u64) -> Result<String, 
         "sub": subject,
         "iat": now,
         "exp": now + ttl_secs,
+        "rooms": rooms,
     });
     jsonwebtoken::encode(
         &jsonwebtoken::Header::default(),
@@ -526,6 +573,7 @@ mod tests {
             "wss://192.0.2.1:9999", // TEST-NET-1 address, should be unreachable
             &options,
             "test-client",
+            "room",
             timeout,
         )
         .await;
@@ -545,7 +593,7 @@ mod tests {
             jwt_secret: Some("dev-secret-minimum-32-characters-long".to_string()),
             insecure_tls: false,
         };
-        assert_eq!(resolve_token(&options, "client").unwrap(), "explicit");
+        assert_eq!(resolve_token(&options, "client", "r").unwrap(), "explicit");
     }
 
     #[test]
@@ -555,7 +603,7 @@ mod tests {
             jwt_secret: Some(secret.to_string()),
             ..Default::default()
         };
-        let token = resolve_token(&options, "loadtest-viewer").unwrap();
+        let token = resolve_token(&options, "loadtest-viewer", "stage").unwrap();
 
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.required_spec_claims.insert("exp".to_string());
@@ -566,12 +614,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.claims["sub"], "loadtest-viewer");
+        assert_eq!(decoded.claims["rooms"], serde_json::json!(["stage"]));
     }
 
     #[test]
     fn test_mint_token_sets_ttl_and_refuses_short_secrets() {
         let secret = "dev-secret-minimum-32-characters-long";
-        let token = mint_token(secret, "alice", 120).unwrap();
+        let token = mint_token(secret, "alice", &["demo", "*"], 120).unwrap();
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.required_spec_claims.insert("exp".to_string());
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
@@ -581,21 +630,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.claims["sub"], "alice");
+        assert_eq!(decoded.claims["rooms"], serde_json::json!(["demo", "*"]));
         let iat = decoded.claims["iat"].as_u64().unwrap();
         assert_eq!(decoded.claims["exp"].as_u64().unwrap(), iat + 120);
 
         let short = "x".repeat(MIN_SECRET_LEN - 1);
         assert!(matches!(
-            mint_token(&short, "alice", 120),
+            mint_token(&short, "alice", &["demo"], 120),
             Err(SignalingError::AuthFailed(_))
         ));
-        assert!(mint_token(secret, "", 120).is_err());
-        assert!(mint_token(secret, "alice", 0).is_err());
+        assert!(mint_token(secret, "", &["demo"], 120).is_err());
+        assert!(mint_token(secret, "alice", &["demo"], 0).is_err());
+        // The SFU's limits on the rooms claim; an empty list is a valid token
+        assert!(mint_token(secret, "alice", &[""], 120).is_err());
+        let long = "x".repeat(MAX_ROOM_NAME_LEN + 1);
+        assert!(mint_token(secret, "alice", &[&long], 120).is_err());
+        assert!(mint_token(secret, "alice", &["r"; MAX_TOKEN_ROOMS + 1], 120).is_err());
+        assert!(mint_token(secret, "alice", &["r"; MAX_TOKEN_ROOMS], 120).is_ok());
+        assert!(mint_token(secret, "alice", &[], 120).is_ok());
     }
 
     #[test]
     fn test_resolve_token_without_credentials_fails() {
-        let result = resolve_token(&ConnectionOptions::default(), "client");
+        let result = resolve_token(&ConnectionOptions::default(), "client", "r");
         assert!(matches!(result, Err(SignalingError::AuthFailed(_))));
     }
 }

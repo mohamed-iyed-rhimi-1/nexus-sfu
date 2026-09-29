@@ -27,6 +27,21 @@ pub struct RoomManager {
     created: HashMap<u64, Vec<u32>>,
 }
 
+/// The reply to a `Create` or `Join` for a room the token does not name.
+const FORBIDDEN_MESSAGE: &str = "Token does not grant this room";
+
+/// Whether the participant's token grants the room with this name (`None`: a new
+/// unnamed room). Unknown participants are granted nothing.
+fn granted(
+    sessions: &HashMap<u64, ParticipantHandle>,
+    participant_id: u64,
+    name: Option<&str>,
+) -> bool {
+    sessions
+        .get(&participant_id)
+        .is_some_and(|handle| handle.grant.allows(name))
+}
+
 impl RoomManager {
     pub fn new(distributed_state: Arc<DistributedState>) -> Self {
         Self {
@@ -43,6 +58,11 @@ impl RoomManager {
         sessions: &HashMap<u64, ParticipantHandle>,
     ) {
         if participant_id == 0 {
+            return;
+        }
+        // Before the name lookup: only tokens that name a room reach it (Phase 1.9a)
+        if !granted(sessions, participant_id, room_name.as_deref()) {
+            send_error(sessions, participant_id, "FORBIDDEN", FORBIDDEN_MESSAGE);
             return;
         }
 
@@ -149,6 +169,28 @@ impl RoomManager {
         }
     }
 
+    /// Whether the room exists and the participant's token names it; sends
+    /// `ROOM_NOT_FOUND` or `FORBIDDEN` if not.
+    fn room_granted(
+        &self,
+        participant_id: u64,
+        room_id: u32,
+        sessions: &HashMap<u64, ParticipantHandle>,
+    ) -> bool {
+        let Some(room) = self.distributed_state.get_room(room_id) else {
+            let message = "Room does not exist";
+            send_error(sessions, participant_id, "ROOM_NOT_FOUND", message);
+            return false;
+        };
+        assert_eq!(room.room_id(), room_id);
+        // Unnamed rooms have the name "": only a "*" token grants them
+        if !granted(sessions, participant_id, Some(room.name())) {
+            send_error(sessions, participant_id, "FORBIDDEN", FORBIDDEN_MESSAGE);
+            return false;
+        }
+        true
+    }
+
     pub fn handle_join(
         &mut self,
         participant_id: u64,
@@ -197,13 +239,7 @@ impl RoomManager {
             return;
         }
 
-        if !self.distributed_state.room_exists(room_id_u32) {
-            send_error(
-                sessions,
-                participant_id,
-                "ROOM_NOT_FOUND",
-                "Room does not exist",
-            );
+        if !self.room_granted(participant_id, room_id_u32, sessions) {
             return;
         }
 

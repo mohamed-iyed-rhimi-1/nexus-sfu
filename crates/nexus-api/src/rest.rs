@@ -11,12 +11,15 @@
 //! - `GET /rooms` - List rooms (JWT required)
 //! - `GET /rooms/:id` - Get room details (JWT required)
 //! - `DELETE /rooms/:id` - Delete room (JWT required)
+//!
+//! The room routes act only on rooms the token's `rooms` claim names
+//! (`RoomGrant`): others are refused with 403 and left out of the list.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Extension, Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -26,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::auth::{JwtValidator, MIN_SECRET_LEN};
+use crate::auth::{JwtValidator, RoomGrant, MIN_SECRET_LEN};
 use crate::error::ApiError;
 use nexus_metrics::MetricsCollector;
 use nexus_state::DistributedState;
@@ -350,7 +353,7 @@ impl ApiServer {
 /// Requires valid JWT token in Authorization header for all other endpoints.
 async fn jwt_auth_middleware(
     State(state): State<Arc<AppState>>,
-    request: Request<axum::body::Body>,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
     let path = request.uri().path();
@@ -380,8 +383,9 @@ async fn jwt_auth_middleware(
         }
     };
 
-    // Validate token
-    state.jwt_validator.validate(token)?;
+    // Validate token; the handlers check its room grant
+    let grant = state.jwt_validator.validate(token)?.room_grant();
+    request.extensions_mut().insert(grant);
 
     Ok(next.run(request).await)
 }
@@ -473,6 +477,7 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// Requires JWT authentication.
 async fn create_room_handler(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Extension<RoomGrant>,
     Json(request): Json<CreateRoomRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Validate request
@@ -480,6 +485,9 @@ async fn create_room_handler(
         return Err(ApiError::BadRequest {
             message: "Room name cannot be empty".to_string(),
         });
+    }
+    if !grant.allows(Some(&request.name)) {
+        return Err(forbidden(&request.name));
     }
 
     if request.name.len() > 256 {
@@ -534,17 +542,38 @@ async fn create_room_handler(
     Ok((StatusCode::CREATED, Json(room)))
 }
 
-/// GET /rooms - List all rooms
+/// The refusal for a room the token does not name.
+fn forbidden(name: &str) -> ApiError {
+    ApiError::Forbidden {
+        reason: format!("token does not grant room '{name}'"),
+    }
+}
+
+/// Refusal for a room addressed by id: the name stays hidden, so probing ids with a token
+/// that does not grant them reveals only that the id exists.
+fn forbidden_by_id() -> ApiError {
+    ApiError::Forbidden {
+        reason: "token does not grant this room".to_string(),
+    }
+}
+
+/// GET /rooms - List the rooms the token grants
 ///
 /// Requires JWT authentication.
 async fn list_rooms_handler(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Extension<RoomGrant>,
 ) -> Result<impl IntoResponse, ApiError> {
     let rooms = state.rooms.read().await;
+    let rooms: Vec<RoomResponse> = rooms
+        .iter()
+        .filter(|r| grant.allows(Some(&r.name)))
+        .cloned()
+        .collect();
 
     Ok(Json(ListRoomsResponse {
         total: rooms.len(),
-        rooms: rooms.clone(),
+        rooms,
     }))
 }
 
@@ -553,6 +582,7 @@ async fn list_rooms_handler(
 /// Requires JWT authentication.
 async fn get_room_handler(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Extension<RoomGrant>,
     Path(id): Path<u32>,
 ) -> Result<impl IntoResponse, ApiError> {
     let rooms = state.rooms.read().await;
@@ -560,6 +590,7 @@ async fn get_room_handler(
     let room = rooms.iter().find(|r| r.id == id).cloned();
 
     match room {
+        Some(r) if !grant.allows(Some(&r.name)) => Err(forbidden_by_id()),
         Some(r) => Ok(Json(r)),
         None => Err(ApiError::NotFound {
             resource: format!("room {}", id),
@@ -572,18 +603,22 @@ async fn get_room_handler(
 /// Requires JWT authentication.
 async fn delete_room_handler(
     State(state): State<Arc<AppState>>,
+    Extension(grant): Extension<RoomGrant>,
     Path(id): Path<u32>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut rooms = state.rooms.write().await;
 
-    let initial_len = rooms.len();
-    rooms.retain(|r| r.id != id);
-
-    if rooms.len() == initial_len {
+    let Some(room) = rooms.iter().find(|r| r.id == id) else {
         return Err(ApiError::NotFound {
             resource: format!("room {}", id),
         });
+    };
+    if !grant.allows(Some(&room.name)) {
+        return Err(forbidden_by_id());
     }
+    let initial_len = rooms.len();
+    rooms.retain(|r| r.id != id);
+    assert_eq!(rooms.len() + 1, initial_len, "room ids are unique");
 
     // Remove from distributed state if available
     if let Some(ref distributed_state) = state.distributed_state {
@@ -622,7 +657,8 @@ mod tests {
             name: "rest".into(),
             max_participants: 10,
         };
-        let created = create_room_handler(State(state.clone()), Json(request)).await;
+        let grant = Extension(RoomGrant::Any);
+        let created = create_room_handler(State(state.clone()), grant, Json(request)).await;
         assert!(created.is_ok());
         let rooms = state.rooms.read().await;
         assert_eq!(rooms.len(), 1);
@@ -631,6 +667,98 @@ mod tests {
         assert_eq!(distributed.get_room(1).unwrap().name(), "", "untouched");
         // And the orchestrator's next room follows
         assert_eq!(distributed.create_room_auto(String::new(), 10).unwrap(), 4);
+    }
+
+    fn bearer(rooms: &[&str]) -> axum::http::HeaderValue {
+        let claims = serde_json::json!({ "sub": "u", "exp": u64::MAX / 2, "rooms": rooms });
+        let key = jsonwebtoken::EncodingKey::from_secret(test_secret().as_bytes());
+        let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &key);
+        format!("Bearer {}", token.unwrap()).parse().unwrap()
+    }
+
+    /// Room routes act only on the rooms the token names (Phase 1.9a): a token for
+    /// "a" cannot create, read or delete "b", and the list shows only "a".
+    #[tokio::test]
+    async fn test_room_routes_follow_the_token_grant() {
+        use axum_test::TestServer;
+        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let server = TestServer::new(ApiServer::new(addr, &test_secret(), None).router).unwrap();
+        let auth = header::AUTHORIZATION;
+        let create = |token, name: &str| {
+            let body = serde_json::json!({ "name": name });
+            server
+                .post("/rooms")
+                .add_header(auth.clone(), token)
+                .json(&body)
+        };
+        assert_eq!(
+            create(bearer(&["a"]), "a").await.status_code(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            create(bearer(&["*"]), "b").await.status_code(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            create(bearer(&["a"]), "c").await.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            create(bearer(&[]), "c").await.status_code(),
+            StatusCode::FORBIDDEN
+        );
+
+        let list = server
+            .get("/rooms")
+            .add_header(auth.clone(), bearer(&["a"]))
+            .await;
+        let list: serde_json::Value = list.json();
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["rooms"][0]["name"], "a");
+        let list = server
+            .get("/rooms")
+            .add_header(auth.clone(), bearer(&["*"]))
+            .await;
+        assert_eq!(list.json::<serde_json::Value>()["total"], 2);
+
+        // "a" is room 1, "b" room 2
+        let get = |token, id: u32| {
+            server
+                .get(&format!("/rooms/{id}"))
+                .add_header(auth.clone(), token)
+        };
+        assert_eq!(get(bearer(&["a"]), 1).await.status_code(), StatusCode::OK);
+        let refused = get(bearer(&["a"]), 2).await;
+        assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+        assert!(!refused.text().contains("\"b\"") && !refused.text().contains("'b'"));
+        assert_eq!(
+            get(bearer(&["a"]), 9).await.status_code(),
+            StatusCode::NOT_FOUND
+        );
+        let delete = |token, id: u32| {
+            server
+                .delete(&format!("/rooms/{id}"))
+                .add_header(auth.clone(), token)
+        };
+        let refused = delete(bearer(&["a"]), 2).await;
+        assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+        assert!(
+            !refused.text().contains("'b'"),
+            "a refusal by id hides the name"
+        );
+        assert_eq!(
+            get(bearer(&["b"]), 2).await.status_code(),
+            StatusCode::OK,
+            "kept"
+        );
+        assert_eq!(
+            delete(bearer(&["b"]), 2).await.status_code(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            get(bearer(&["*"]), 2).await.status_code(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]

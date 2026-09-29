@@ -295,6 +295,7 @@ impl HeadlessClient {
             &self.config.sfu_url,
             &self.config.connection,
             &participant_name,
+            &self.config.room,
             self.config.connection_timeout,
         )
         .await
@@ -305,77 +306,16 @@ impl HeadlessClient {
         let signaling = Arc::new(Mutex::new(signaling));
         self.signaling = Some(signaling.clone());
 
-        // Step 2: Join the room
-        // Use room ID directly if it's numeric, otherwise hash the string
-        let mut room_id: u64 = self.config.room.parse().unwrap_or_else(|_| {
-            // Simple hash for string room names (fallback for backwards compatibility)
-            // Note: For production use, you should use the actual room ID from the API
-            let mut hash: u64 = 0;
-            for byte in self.config.room.bytes() {
-                hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
-            }
-            tracing::warn!(
-                "Room '{}' is not a numeric ID, using hash {}. For best results, use the numeric room ID from the API.",
-                self.config.room,
-                hash
-            );
-            hash
-        });
-
+        // Step 2: Create the room by name (or get its id if it exists), then join
+        // it. The minted token names only this room: the SFU refuses any other.
         let join_response = {
             let mut sig = signaling.lock().await;
-
-            // Broadcaster creates the room; viewers just join.
-            // If join fails with room_not_found, try creating first then re-join.
-            match sig.join_room(room_id, &participant_name).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    // Room doesn't exist — create it and retry join
-                    let create_msg = nexus_signal::protocol::SignalMessage::Create {
-                        room_name: Some(self.config.room.clone()),
-                    };
-                    sig.send(create_msg).await.map_err(|e| {
-                        ClientError::PeerConnectionFailed(format!("Failed to create room: {}", e))
-                    })?;
-
-                    // Wait for Created response
-                    loop {
-                        let msg = sig.recv().await.map_err(|e| {
-                            ClientError::PeerConnectionFailed(format!(
-                                "Failed to recv create response: {}",
-                                e
-                            ))
-                        })?;
-                        match msg {
-                            nexus_signal::protocol::SignalMessage::Created {
-                                room_id: created_id,
-                                ..
-                            } => {
-                                tracing::info!("Created room {}", created_id);
-                                room_id = created_id;
-                                break;
-                            }
-                            nexus_signal::protocol::SignalMessage::Error { code, message } => {
-                                return Err(ClientError::PeerConnectionFailed(format!(
-                                    "Room creation failed: {} - {}",
-                                    code, message
-                                )));
-                            }
-                            _ => continue,
-                        }
-                    }
-
-                    // Now join the created room
-                    sig.join_room(room_id, &participant_name)
-                        .await
-                        .map_err(|e2| {
-                            ClientError::PeerConnectionFailed(format!(
-                                "Failed to join room after create: {} (original: {})",
-                                e2, e
-                            ))
-                        })?
-                }
-            }
+            let room_id = sig.create_room(&self.config.room).await.map_err(|e| {
+                ClientError::PeerConnectionFailed(format!("Room creation failed: {e}"))
+            })?;
+            sig.join_room(room_id, &participant_name)
+                .await
+                .map_err(|e| ClientError::PeerConnectionFailed(format!("Join failed: {e}")))?
         };
 
         self.participant_id = Some(join_response.participant_id);

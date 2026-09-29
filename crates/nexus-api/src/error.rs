@@ -27,6 +27,10 @@ pub enum ApiError {
     #[error("unauthorized: {reason}")]
     Unauthorized { reason: String },
 
+    /// Forbidden — the token does not grant this resource
+    #[error("forbidden: {reason}")]
+    Forbidden { reason: String },
+
     /// Resource not found
     #[error("not found: {resource}")]
     NotFound { resource: String },
@@ -45,12 +49,14 @@ impl IntoResponse for ApiError {
     ///
     /// Maps error variants to appropriate HTTP status codes:
     /// - Unauthorized → 401
+    /// - Forbidden → 403
     /// - NotFound → 404
     /// - BadRequest → 400
     /// - Internal → 500
     fn into_response(self) -> Response {
         let (status, error_type) = match &self {
             ApiError::Unauthorized { .. } => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            ApiError::Forbidden { .. } => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::NotFound { .. } => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::BadRequest { .. } => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),

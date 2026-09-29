@@ -120,7 +120,8 @@ export class NexusClient extends EventEmitter {
 
   /**
    * Create a room, or get the id of the room with this name if it exists (the SFU
-   * looks rooms up by name). Does not join it.
+   * looks rooms up by name). Does not join it. The token's `rooms` claim must name
+   * the room (or be `"*"`); otherwise this and `join` reject with `FORBIDDEN`.
    */
   async createRoom(name?: string): Promise<number> {
     return new Promise((resolve, reject) => {

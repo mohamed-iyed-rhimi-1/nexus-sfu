@@ -79,7 +79,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cd sdk && npm ci && npm run build && npm test
 
 # Dev token for the SDK and the browser page (examples/web/README.md)
-NEXUS_JWT_SECRET=<32+ chars> cargo run -p nexus-loadtest -- token --sub alice
+NEXUS_JWT_SECRET=<32+ chars> cargo run -p nexus-loadtest -- token --sub alice --room demo
 ```
 
 On macOS, check Linux in Docker: a `rust:1.83.0-bookworm` container with `capnproto`

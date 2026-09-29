@@ -66,6 +66,10 @@ pub enum SignalingError {
     #[error("Room not found: {0}")]
     RoomNotFound(String),
 
+    /// The token's `rooms` claim does not name the room (`FORBIDDEN`)
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     /// Connection was closed unexpectedly
     #[error("Connection closed")]
     ConnectionClosed,

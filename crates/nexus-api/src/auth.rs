@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 /// Minimum required secret length for security (256 bits)
 pub const MIN_SECRET_LEN: usize = 32;
 
+/// Most room names one token may carry in its `rooms` claim.
+pub const MAX_TOKEN_ROOMS: usize = 16;
+
+/// The `rooms` entry that grants every room, including unnamed ones.
+pub const ROOM_WILDCARD: &str = "*";
+
 /// JWT claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -24,6 +30,67 @@ pub struct Claims {
     /// Issued at time (Unix timestamp)
     #[serde(default)]
     pub iat: u64,
+    /// Names of the rooms the holder may create, join or manage; `"*"` grants every
+    /// room. Missing or empty grants none (the token still authenticates).
+    #[serde(default)]
+    pub rooms: Vec<String>,
+}
+
+impl Claims {
+    /// The rooms these claims grant.
+    pub fn room_grant(&self) -> RoomGrant {
+        assert!(self.rooms.len() <= MAX_TOKEN_ROOMS, "validated claims");
+        if self.rooms.iter().any(|r| r == ROOM_WILDCARD) {
+            return RoomGrant::Any;
+        }
+        RoomGrant::Names(self.rooms.clone().into_boxed_slice())
+    }
+}
+
+/// The rooms a token grants, kept per connection by the orchestrator and per request
+/// by the REST API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomGrant {
+    /// Every room, named or not (`"*"`).
+    Any,
+    /// Only rooms with exactly these names.
+    Names(Box<[String]>),
+}
+
+impl RoomGrant {
+    /// Grants no room.
+    pub fn none() -> Self {
+        RoomGrant::Names(Box::new([]))
+    }
+
+    /// Whether a room with this name may be used. `None` or `""` is an unnamed room,
+    /// which only `Any` grants.
+    pub fn allows(&self, name: Option<&str>) -> bool {
+        match (self, name) {
+            (RoomGrant::Any, _) => true,
+            (RoomGrant::Names(_), None | Some("")) => false,
+            (RoomGrant::Names(names), Some(name)) => names.iter().any(|n| n == name),
+        }
+    }
+}
+
+/// Checks the `rooms` claim, which comes from the client: bounded count, each name
+/// non-empty and no longer than a room name can be.
+fn check_rooms(rooms: &[String]) -> Result<(), ApiError> {
+    let reason = if rooms.len() > MAX_TOKEN_ROOMS {
+        format!("token names more than {MAX_TOKEN_ROOMS} rooms")
+    } else if rooms.iter().any(|r| r.is_empty()) {
+        "token names an empty room".to_string()
+    } else if rooms
+        .iter()
+        .any(|r| r.len() > nexus_state::MAX_ROOM_NAME_LEN)
+    {
+        let max = nexus_state::MAX_ROOM_NAME_LEN;
+        format!("token names a room longer than {max} bytes")
+    } else {
+        return Ok(());
+    };
+    Err(ApiError::Unauthorized { reason })
 }
 
 /// JWT token validator using HS256 algorithm.
@@ -124,6 +191,7 @@ impl JwtValidator {
             !token_data.claims.sub.is_empty(),
             "Claims must have non-empty subject"
         );
+        check_rooms(&token_data.claims.rooms)?;
 
         Ok(token_data.claims)
     }
@@ -148,6 +216,7 @@ mod tests {
             sub: "test-user".to_string(),
             exp: (now as i64 + exp_offset_secs) as u64,
             iat: now,
+            rooms: vec!["demo".to_string()],
         };
 
         encode(
@@ -183,6 +252,7 @@ mod tests {
             sub: String::new(),
             exp: u64::MAX / 2,
             iat: 0,
+            rooms: Vec::new(),
         };
         let token = encode(
             &Header::default(),
@@ -212,6 +282,7 @@ mod tests {
         assert!(result.is_ok());
         let claims = result.unwrap();
         assert_eq!(claims.sub, "test-user");
+        assert_eq!(claims.rooms, vec!["demo".to_string()]);
     }
 
     #[test]
@@ -248,5 +319,82 @@ mod tests {
 
         let result = validator.validate(&token);
         assert!(result.is_err());
+    }
+
+    fn token_with_rooms(secret: &str, rooms: serde_json::Value) -> String {
+        let claims = serde_json::json!({ "sub": "u", "exp": u64::MAX / 2, "rooms": rooms });
+        let key = EncodingKey::from_secret(secret.as_bytes());
+        encode(&Header::default(), &claims, &key).unwrap()
+    }
+
+    #[test]
+    fn test_missing_rooms_claim_grants_nothing() {
+        let secret = create_test_secret();
+        let validator = JwtValidator::new(&secret);
+        let claims = serde_json::json!({ "sub": "u", "exp": u64::MAX / 2 });
+        let key = EncodingKey::from_secret(secret.as_bytes());
+        let token = encode(&Header::default(), &claims, &key).unwrap();
+        let claims = validator.validate(&token).expect("authenticates");
+        assert!(claims.rooms.is_empty());
+        assert_eq!(claims.room_grant(), RoomGrant::none());
+        assert!(!claims.room_grant().allows(Some("demo")));
+    }
+
+    #[test]
+    fn test_rooms_claim_limits_are_refused_not_panic() {
+        let secret = create_test_secret();
+        let validator = JwtValidator::new(&secret);
+        let too_many: Vec<String> = (0..=MAX_TOKEN_ROOMS).map(|i| format!("r{i}")).collect();
+        let too_long = "x".repeat(nexus_state::MAX_ROOM_NAME_LEN + 1);
+        let longest = "x".repeat(nexus_state::MAX_ROOM_NAME_LEN);
+        for rooms in [
+            serde_json::json!(too_many),
+            serde_json::json!([""]),
+            serde_json::json!([too_long]),
+            serde_json::json!("demo"),
+            serde_json::json!([1]),
+        ] {
+            let token = token_with_rooms(&secret, rooms.clone());
+            assert!(
+                matches!(
+                    validator.validate(&token),
+                    Err(ApiError::Unauthorized { .. })
+                ),
+                "{rooms} must be refused"
+            );
+        }
+        let at_limit: Vec<String> = (0..MAX_TOKEN_ROOMS).map(|i| format!("r{i}")).collect();
+        let token = token_with_rooms(&secret, serde_json::json!(at_limit));
+        assert_eq!(
+            validator.validate(&token).unwrap().rooms.len(),
+            MAX_TOKEN_ROOMS
+        );
+        let token = token_with_rooms(&secret, serde_json::json!([longest]));
+        assert!(validator.validate(&token).is_ok());
+    }
+
+    #[test]
+    fn test_room_grant_allows() {
+        let names = RoomGrant::Names(vec!["demo".to_string(), "b".to_string()].into());
+        assert!(names.allows(Some("demo")));
+        assert!(names.allows(Some("b")));
+        assert!(!names.allows(Some("Demo")));
+        assert!(!names.allows(Some("demo2")));
+        assert!(!names.allows(Some("")));
+        assert!(!names.allows(None));
+        assert!(RoomGrant::Any.allows(None));
+        assert!(RoomGrant::Any.allows(Some("")));
+        assert!(RoomGrant::Any.allows(Some("anything")));
+        assert!(!RoomGrant::none().allows(Some("demo")));
+        assert!(!RoomGrant::none().allows(None));
+    }
+
+    #[test]
+    fn test_wildcard_among_names_grants_every_room() {
+        let secret = create_test_secret();
+        let validator = JwtValidator::new(&secret);
+        let token = token_with_rooms(&secret, serde_json::json!(["demo", ROOM_WILDCARD]));
+        let grant = validator.validate(&token).unwrap().room_grant();
+        assert_eq!(grant, RoomGrant::Any);
     }
 }

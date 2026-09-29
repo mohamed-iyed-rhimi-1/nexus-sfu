@@ -26,6 +26,6 @@ pub mod auth;
 pub mod error;
 pub mod rest;
 
-pub use auth::JwtValidator;
+pub use auth::{JwtValidator, RoomGrant};
 pub use error::ApiError;
 pub use rest::{ApiServer, Readiness};

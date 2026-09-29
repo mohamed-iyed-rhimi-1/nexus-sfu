@@ -205,6 +205,20 @@ test('createRoom rejects on an SFU error', async () => {
   client.close();
 });
 
+test('createRoom and join reject with FORBIDDEN for a room the token does not name', async () => {
+  const { client, ws } = await connected();
+  const created = client.createRoom('other');
+  ws.receive({ type: 'Error', code: 'FORBIDDEN', message: 'Token does not grant this room' });
+  ws.pong();
+  await assert.rejects(created, { code: 'FORBIDDEN' });
+  const joined = client.join(1, 'alice');
+  await tick();
+  ws.receive({ type: 'Error', code: 'FORBIDDEN', message: 'Token does not grant this room' });
+  ws.pong();
+  await assert.rejects(joined, { code: 'FORBIDDEN' });
+  client.close();
+});
+
 test('subscribe and unsubscribe split into requests of at most 10 ids', async () => {
   assert.equal(MAX_TRACKS_PER_REQUEST, 10);
   const { client, ws } = await connected();

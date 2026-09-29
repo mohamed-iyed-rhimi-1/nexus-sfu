@@ -20,9 +20,11 @@ use std::time::{Duration, Instant};
 
 use harness::*;
 use nexus_loadtest::client::HeadlessClient;
+use nexus_loadtest::config::ConnectionOptions;
+use nexus_loadtest::error::SignalingError;
 use nexus_loadtest::lossy::{Direction, LossRule, LossRules, PacketClass, SrtcpLayout, TapEntry};
 use nexus_loadtest::rtcp_log::ntp_to_system_time;
-use nexus_loadtest::signaling::SignalingConnection;
+use nexus_loadtest::signaling::{mint_token, SignalingConnection};
 use nexus_loadtest::{Announced, RemoteTrack, TrackRxStats};
 use nexus_sfu::nexus_transport::dtls::DtlsRole;
 use nexus_sfu::nexus_transport::srtp::ProtectionProfile;
@@ -231,10 +233,15 @@ async fn candidate_is_announced_address() {
     assert_eq!(server.candidate_addrs(), &[expected]);
 
     let options = client_config(&server, "candidates").connection;
-    let mut sig =
-        SignalingConnection::connect_with_timeout(&ws_url(&server), &options, "cand", STEP_TIMEOUT)
-            .await
-            .expect("signaling connects");
+    let mut sig = SignalingConnection::connect_with_timeout(
+        &ws_url(&server),
+        &options,
+        "cand",
+        "candidates",
+        STEP_TIMEOUT,
+    )
+    .await
+    .expect("signaling connects");
     sig.send(SignalMessage::Create {
         room_name: Some("candidates".to_string()),
     })
@@ -277,6 +284,83 @@ async fn candidate_is_announced_address() {
 
     drop(sig);
     server.shutdown().await.expect("clean shutdown");
+}
+
+/// `step`'s result, or a panic naming it after `STEP_TIMEOUT`.
+async fn within<T>(what: &str, step: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(STEP_TIMEOUT, step)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: no reply within {STEP_TIMEOUT:?}"))
+}
+
+/// Phase 1.9a, the owner's reproduction: a token for room "alpha" cannot reach room
+/// "beta" by id or by name, a token without a `rooms` claim reaches no room, and a
+/// `"*"` token reaches every room. Signaling only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_claim_confines_create_and_join() {
+    let _serial = SERIAL.lock().await;
+    init_logging();
+    let server = start_server().await;
+    let connect = |subject: &'static str, rooms: &'static [&'static str]| {
+        let url = ws_url(&server);
+        async move {
+            let token = mint_token(JWT_SECRET, subject, rooms, 600).expect("mints");
+            let options = ConnectionOptions {
+                auth_token: Some(token),
+                ..Default::default()
+            };
+            SignalingConnection::connect_with_timeout(&url, &options, subject, "", STEP_TIMEOUT)
+                .await
+                .expect("authenticates: the rooms claim does not gate the handshake")
+        }
+    };
+    let mut a = connect("alice", &["alpha"]).await;
+    let alpha = within("Create", a.create_room("alpha"))
+        .await
+        .expect("alpha");
+    within("Join", a.join_room(alpha, "alice"))
+        .await
+        .expect("joins alpha");
+
+    let mut b = connect("bob", &["beta"]).await;
+    let by_name = within("Create", b.create_room("alpha")).await;
+    assert!(
+        matches!(by_name, Err(SignalingError::Forbidden(_))),
+        "{by_name:?}"
+    );
+    let by_id = within("Join", b.join_room(alpha, "bob")).await;
+    assert!(
+        matches!(by_id, Err(SignalingError::Forbidden(_))),
+        "{by_id:?}"
+    );
+    let beta = within("Create", b.create_room("beta")).await.expect("beta");
+    assert_ne!(beta, alpha, "a new room, not alpha under another name");
+    within("Join", b.join_room(beta, "bob"))
+        .await
+        .expect("joins beta");
+
+    let mut c = connect("carol", &[]).await;
+    let create = within("Create", c.create_room("gamma")).await;
+    assert!(
+        matches!(create, Err(SignalingError::Forbidden(_))),
+        "{create:?}"
+    );
+    let join = within("Join", c.join_room(alpha, "carol")).await;
+    assert!(
+        matches!(join, Err(SignalingError::Forbidden(_))),
+        "{join:?}"
+    );
+
+    let mut d = connect("dave", &["*"]).await;
+    let joined = within("Join", d.join_room(alpha, "dave"))
+        .await
+        .expect("any room");
+    assert_eq!(joined.room_id, alpha);
+    assert_eq!(
+        joined.participants.len(),
+        1,
+        "alice only: no ghost from bob or carol"
+    );
 }
 
 /// The client takes the DTLS server role (answer `a=setup:passive`), so the

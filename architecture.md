@@ -134,14 +134,15 @@ Key facts:
 | Rooms: create, join, leave on `DistributedState`; ≤ 10,000 rooms, 4 per creating connection, released when empty | ✅ | `room.rs` |
 | WebSocket signaling with JSON (SDK, loadtest); 256 KB message and 1 MB frame caps, rate limit | ✅ | `crates/nexus-signal/src/websocket` |
 | TLS for signaling; refuses to start if configured TLS fails | ✅ | `WebSocketServer::new` |
-| REST API with JWT, `/health`, `/ready`, `/metrics` | ✅ | `crates/nexus-api` |
+| REST API with JWT, `/health`, `/ready`, `/metrics`; room routes limited to the token's `rooms` | ✅ | `crates/nexus-api` |
+| Room authorization: the JWT's `rooms` claim (names, `"*"` for all) gates `Create`/`Join` and the REST room routes (`FORBIDDEN` / 403); no claim, no room | ✅ | `nexus_api::auth::RoomGrant`, `src/orchestrator/room.rs` |
 | Prometheus metrics: `nexus_shard_*` per shard; Grafana dashboard | ✅ | `crates/nexus-metrics`, `deploy/grafana` |
 | Config loading and validation (unknown sections and fields refused) | ✅ | `src/config/` |
 | Config hot-reload | 🟡 | Runs, but nothing reads the reloaded config (2.1) |
 | QUIC signaling | 🟡 | Not started (2.3) |
 | GCC bandwidth estimation, REMB | 🟡 | Not called (2.3) |
 | TypeScript client SDK (WebSocket + JSON), example page | ✅ | `sdk/`, `examples/web/` |
-| Dev token: `nexus-loadtest token --sub <name>` | ✅ | `crates/nexus-loadtest` |
+| Dev token: `nexus-loadtest token --sub <name> --room <room>` | ✅ | `crates/nexus-loadtest` |
 | Docker image, `deploy/docker/run.sh` | ✅ | `deploy/docker` |
 
 ### 1.4 Distributed state
@@ -197,14 +198,17 @@ Fixed in Phase 1 (by construction, one outbound SRTP context per session; tested
   never reused offset, in the session's single outbound context.
 - **SRTCP per-track contexts toward publishers and subscriber SRs.** Both now go through the
   session's single context and SRTCP index.
+- **Room authorization** (Phase 1.9a). The JWT's `rooms` claim names the rooms its holder
+  may create, join or manage over REST (`"*"`: every room, including unnamed ones); others
+  are refused with `FORBIDDEN` (REST: 403). A token without the claim authenticates but
+  reaches no room. `FORBIDDEN` on `Join` differs from `ROOM_NOT_FOUND`, so room ids can
+  still be probed for existence (owner's decision).
 - **No panic on network input** (Phase 1 exit criterion 6): every path a datagram or a
   signaling message reaches was swept, with proptests on the shard's STUN handling, the
   signaling messages and the gossip decoders (`docs/plans/phase-1.md`, "Before 1.9").
 
 Open (known, accepted for now; details in `docs/plans/phase-1.md` "Risks" and "Before 1.9"):
 
-- **No room authorization.** Tokens carry no room claim: any authenticated user can join any
-  room by its (sequential) id. In the v1 scope (`dataplane-design.md` §2).
 - **ICE-lite on-path injection.** STUN authenticates the request, not its source address; an
   on-path attacker can move a session to its own address until the peer's next nomination.
   Media stays encrypted.

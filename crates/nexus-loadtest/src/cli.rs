@@ -145,6 +145,11 @@ pub enum Command {
         #[arg(long, required = true)]
         sub: String,
 
+        /// A room the token may create or join (the `rooms` claim); repeat for more,
+        /// at most 16. `'*'` grants every room
+        #[arg(long = "room", required = true)]
+        rooms: Vec<String>,
+
         /// Lifetime in seconds
         #[arg(long, default_value = "3600")]
         ttl: u64,

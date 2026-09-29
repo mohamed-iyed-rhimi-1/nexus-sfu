@@ -118,7 +118,7 @@ async fn exchange(url: &str, orchestrator_rx: &mut mpsc::Receiver<OrchestratorEv
     let mut clients = Vec::with_capacity(CONNECTIONS);
     let mut outbound = Vec::with_capacity(CONNECTIONS);
     for i in 0..CONNECTIONS {
-        let mut client = SignalingConnection::connect(url, &options, &format!("p{i}"))
+        let mut client = SignalingConnection::connect(url, &options, &format!("p{i}"), "bench")
             .await
             .expect("client connects");
         let Some(OrchestratorEvent::Connected { outbound_tx, .. }) = orchestrator_rx.recv().await

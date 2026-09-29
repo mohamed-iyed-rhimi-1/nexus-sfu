@@ -170,15 +170,31 @@ fn send(orchestrator: &mut SessionOrchestrator, participant_id: u64, message: Si
     orchestrator.settle();
 }
 
+/// Connects with a token that grants every room (`"*"`).
 fn connect(
     orchestrator: &mut SessionOrchestrator,
     participant_id: u64,
 ) -> mpsc::Receiver<SignalMessage> {
+    connect_with(orchestrator, participant_id, &["*"])
+}
+
+/// Connects with a token whose `rooms` claim is `rooms`.
+fn connect_with(
+    orchestrator: &mut SessionOrchestrator,
+    participant_id: u64,
+    rooms: &[&str],
+) -> mpsc::Receiver<SignalMessage> {
     let (tx, rx) = mpsc::channel(1024);
+    let claims = nexus_api::auth::Claims {
+        sub: format!("p{participant_id}"),
+        exp: u64::MAX / 2,
+        iat: 0,
+        rooms: rooms.iter().map(|r| r.to_string()).collect(),
+    };
     orchestrator.dispatch_event(OrchestratorEvent::Connected {
         participant_id,
         outbound_tx: tx,
-        claims: None,
+        claims,
     });
     rx
 }
@@ -702,7 +718,8 @@ async fn created_rooms_are_limited_and_released_with_their_creator() {
         },
     );
     assert_eq!(h.errors(1), ["ROOM_LIMIT"]);
-    // A known name is not a new room: allowed
+    // A known name is not a new room: allowed (both tokens grant every room;
+    // `create_and_join_follow_the_token_rooms` covers named grants)
     h.send(
         2,
         SignalMessage::Create {
@@ -748,6 +765,99 @@ async fn created_rooms_are_limited_and_released_with_their_creator() {
     // The last member leaving releases the joined room as before
     h.send(2, SignalMessage::Leave);
     assert!(!state.room_exists(joined as u32));
+}
+
+/// The ids of the `Created` replies in `messages`.
+fn created_ids(messages: Vec<SignalMessage>) -> Vec<u64> {
+    messages
+        .into_iter()
+        .filter_map(|m| match m {
+            SignalMessage::Created { room_id, .. } => Some(room_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Phase 1.9a: `Create` and `Join` act only on rooms the token's `rooms` claim names.
+/// The owner's reproduction: a second token joined room 1 by id, and `Create` with
+/// the same name returned the same room. Refusals leave no state behind.
+#[tokio::test]
+async fn create_and_join_follow_the_token_rooms() {
+    let mut h = Harness::new();
+    for (pid, rooms) in [(1, &["alpha"][..]), (2, &["beta"][..]), (3, &["alpha"][..])] {
+        let rx = connect_with(&mut h.orchestrator, pid, rooms);
+        h.clients.insert(pid, rx);
+    }
+    let state = h.orchestrator.plane.state.clone();
+    let named = |name: &str| SignalMessage::Create {
+        room_name: Some(name.into()),
+    };
+    h.send(1, named("alpha"));
+    let alpha = created_ids(h.drain(1));
+    assert_eq!(alpha.len(), 1);
+    let alpha = alpha[0];
+    h.join_room(1, alpha);
+
+    // 2 names "beta" only: alpha is refused by name and by id, unnamed rooms too
+    h.send(2, named("alpha"));
+    h.send(2, SignalMessage::Create { room_name: None });
+    h.send(2, named(""));
+    assert_eq!(h.errors(2), ["FORBIDDEN", "FORBIDDEN", "FORBIDDEN"]);
+    let join = |room_id| SignalMessage::Join {
+        room_id,
+        participant_name: "p2".into(),
+    };
+    h.send(2, join(alpha));
+    assert_eq!(h.errors(2), ["FORBIDDEN"]);
+    // A missing room is still ROOM_NOT_FOUND (FORBIDDEN tells which ids exist:
+    // owner's decision 2026-09-28)
+    h.send(2, join(99));
+    assert_eq!(h.errors(2), ["ROOM_NOT_FOUND"]);
+    assert_eq!(state.room_count(), 1, "no room allocated by a refusal");
+    assert_eq!(state.participant_count(alpha as u32), 1, "no ghost member");
+    assert!(h.orchestrator.sessions[&2].room_id.is_none());
+
+    // Its own room works, and 3 (also "alpha") shares alpha by name and by id
+    h.send(2, named("beta"));
+    let beta = created_ids(h.drain(2));
+    assert_eq!(beta.len(), 1);
+    assert_ne!(beta[0], alpha);
+    h.send(3, named("alpha"));
+    assert_eq!(created_ids(h.drain(3)), [alpha]);
+    h.join_room(3, alpha);
+    assert_eq!(state.participant_count(alpha as u32), 2);
+}
+
+/// A token without a `rooms` claim authenticates but grants no room; a `"*"` token
+/// reaches every room, including one created without a name.
+#[tokio::test]
+async fn token_without_rooms_grants_none_and_wildcard_grants_all() {
+    let mut h = Harness::new();
+    for (pid, rooms) in [(1, &[][..]), (2, &["*"][..]), (3, &["*"][..])] {
+        let rx = connect_with(&mut h.orchestrator, pid, rooms);
+        h.clients.insert(pid, rx);
+    }
+    h.send(2, SignalMessage::Create { room_name: None });
+    let unnamed = created_ids(h.drain(2));
+    assert_eq!(unnamed.len(), 1);
+    h.send(1, SignalMessage::Create { room_name: None });
+    h.send(
+        1,
+        SignalMessage::Create {
+            room_name: Some("x".into()),
+        },
+    );
+    h.send(
+        1,
+        SignalMessage::Join {
+            room_id: unnamed[0],
+            participant_name: "p1".into(),
+        },
+    );
+    assert_eq!(h.errors(1), ["FORBIDDEN", "FORBIDDEN", "FORBIDDEN"]);
+    h.join_room(3, unnamed[0]);
+    let state = h.orchestrator.plane.state.clone();
+    assert_eq!(state.participant_count(unnamed[0] as u32), 1);
 }
 
 /// A room id the REST API created first is skipped, not overwritten.
@@ -825,7 +935,8 @@ enum Step {
     /// A well-formed answer to the participant's latest offer.
     AnswerLatest(u64, u32, bool),
     Disconnect(u64),
-    Reconnect(u64),
+    /// Reconnect with the token grant `FUZZ_GRANTS[i]`.
+    Reconnect(u64, usize),
     /// Join the fuzz room (id 1).
     JoinRoom(u64),
     /// A well-formed Publish of these kinds (true: video).
@@ -833,6 +944,9 @@ enum Step {
     /// Subscribe to up to this many tracks seen in TrackPublished/Joined.
     SubscribeSeen(u64, usize),
 }
+
+/// Token `rooms` claims a reconnecting participant may get.
+const FUZZ_GRANTS: [&[&str]; 4] = [&["*"], &["fuzz"], &["other"], &[]];
 
 fn fuzz_string() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -898,7 +1012,7 @@ fn fuzz_step() -> impl Strategy<Value = Step> {
         6 => (pid.clone(), fuzz_message()).prop_map(|(p, m)| Step::Send(p, m)),
         3 => (pid.clone(), 1_000..60_000u32, any::<bool>()).prop_map(|(p, s, d)| Step::AnswerLatest(p, s, d)),
         1 => pid.clone().prop_map(Step::Disconnect),
-        1 => pid.clone().prop_map(Step::Reconnect),
+        1 => (pid.clone(), 0..FUZZ_GRANTS.len()).prop_map(|(p, g)| Step::Reconnect(p, g)),
         3 => pid.clone().prop_map(Step::JoinRoom),
         3 => (pid.clone(), prop::collection::vec(any::<bool>(), 1..3)).prop_map(|(p, k)| Step::PublishKinds(p, k)),
         3 => (pid, 1..12usize).prop_map(|(p, n)| Step::SubscribeSeen(p, n)),
@@ -937,8 +1051,8 @@ proptest! {
                     h.orchestrator.dispatch_event(OrchestratorEvent::Disconnected { participant_id: pid });
                     h.orchestrator.settle();
                 }
-                Step::Reconnect(pid) => {
-                    let rx = connect(&mut h.orchestrator, pid);
+                Step::Reconnect(pid, grant) => {
+                    let rx = connect_with(&mut h.orchestrator, pid, FUZZ_GRANTS[grant]);
                     h.clients.insert(pid, rx);
                     offers.remove(&pid);
                 }

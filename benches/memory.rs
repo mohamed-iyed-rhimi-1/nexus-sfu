@@ -43,6 +43,7 @@ use std::time::Instant;
 use nexus_dataplane::{
     Command, CommandQueueFull, Event, MemIo, Shard, ShardConfig, ShardId, ShardLoad, SingleShard,
 };
+use nexus_sfu::nexus_api::auth::Claims;
 use nexus_sfu::orchestrator::negotiation::NegotiationState;
 use nexus_sfu::orchestrator::plane::CommandSink;
 use nexus_sfu::orchestrator::subscription::SubscriptionState;
@@ -511,7 +512,7 @@ impl Rig {
                 .handle_signal(OrchestratorEvent::Connected {
                     participant_id: admin,
                     outbound_tx: admin_tx,
-                    claims: None,
+                    claims: any_room(),
                 });
             let event = OrchestratorEvent::Message {
                 participant_id: admin,
@@ -579,7 +580,7 @@ impl Rig {
         let event = OrchestratorEvent::Connected {
             participant_id: client.id,
             outbound_tx: client.tx.take().expect("connects once"),
-            claims: None,
+            claims: any_room(),
         };
         let room_id = client.room;
         tagged(Tag::Control, || self.orchestrator.handle_signal(event));
@@ -923,5 +924,17 @@ fn main() {
             "Budget: {:.1} KB ≤ {budget} KB per participant (session state only)",
             checked / 1024.0
         );
+    }
+}
+
+/// Claims whose `rooms` claim is `"*"`: the bench's rooms are unnamed. The grant has
+/// no heap (`RoomGrant::Any`); a token naming one room would add its name per
+/// connection.
+fn any_room() -> Claims {
+    Claims {
+        sub: "bench".to_string(),
+        exp: u64::MAX / 2,
+        iat: 0,
+        rooms: vec!["*".to_string()],
     }
 }

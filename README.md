@@ -167,7 +167,8 @@ cargo bench --bench udp_floor      # Linux only
 ```
 
 A browser test page on the SDK is in [`examples/web/`](examples/web/README.md); it needs a
-token: `NEXUS_JWT_SECRET=<32+ chars> cargo run -p nexus-loadtest -- token --sub alice`.
+token: `NEXUS_JWT_SECRET=<32+ chars> cargo run -p nexus-loadtest -- token --sub alice --room demo`
+(the token may create or join only the rooms it names).
 
 ## Deployment
 

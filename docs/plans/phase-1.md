@@ -2076,7 +2076,8 @@ anything that failed.
     participant's tracks. The rejoined tab decoded both peers after 112 ms.
 - No warning or error in the SFU log.
 
-*Owner's check (§17.9 steps 1-6):* to fill in.
+*Owner's check (§17.9 steps 1-6):* to fill in. Since 1.9a each token must name the room:
+`nexus-loadtest token --sub <name> --room demo`, the same `--room` as the page's `room`.
 
 | Field | Value |
 |-------|-------|
@@ -2291,6 +2292,56 @@ anything that failed.
   - the SRTP profiles other than GCM-128 in the shard proptests;
   - no `cargo-fuzz` targets.
 
+### 1.9a Room authorization
+
+**Owner's decision (2026-09-28):** fixed before the merge. Reproduced against a release
+build: a second token joined room 1 by id, and `Create` with the same name returned the
+same room. Choices made at planning: names plus a `"*"` wildcard; REST included;
+`FORBIDDEN` for a refused `Create` and `Join` (a missing room stays `ROOM_NOT_FOUND`, so
+ids can be probed for existence: accepted).
+
+**Files:** `crates/nexus-api` (`auth.rs`, `rest.rs`, `error.rs`), `nexus-signal`
+(`OrchestratorEvent::Connected`), `src/orchestrator/` (`mod.rs`, `room.rs`, tests),
+`crates/nexus-loadtest` (`signaling.rs`, `client.rs`, `cli.rs`, `main.rs`), `tests/e2e.rs`,
+`benches/memory*.rs`, SDK test and doc comment, `examples/web/README.md`, documents.
+
+**Change:**
+- **Claim:** `Claims.rooms: Vec<String>` (serde default). `JwtValidator::validate` refuses
+  more than 16 names, an empty name, or one over `MAX_ROOM_NAME_LEN` (256). `RoomGrant`
+  (`Any` for `"*"`, else `Names`) with `allows(name)`: `Names` never grants an unnamed room
+  (`None` or `""`). Missing or empty claim: the token authenticates but grants no room.
+- **Signaling:** `Connected.claims` is `Claims`, not `Option` (the server always had them;
+  tests and benches now pass real claims instead of silently "none"). The orchestrator keeps
+  `claims.room_grant()` in `ParticipantHandle.grant`. `Create` checks the grant before the
+  name lookup; `Join` checks the room's stored name (`DistributedState::get_room`) after
+  the existence check (`RoomManager::room_granted`). Refusals leave no state.
+- **REST:** the middleware puts the grant in the request's extensions; create, get and
+  delete answer 403 (`ApiError::Forbidden`) for a room the token does not name; list is
+  filtered.
+- **Tooling:** `mint_token(secret, sub, rooms, ttl)` writes `rooms` (same limits);
+  `nexus-loadtest token --room <name>` (required, repeatable, `'*'`). `connect` takes the
+  room the minted token names. `HeadlessClient::connect` now sends `Create` by name, then
+  `Join`, instead of guessing an id from a hash of the name and creating on any error
+  (which would have hidden a refusal). New `SignalingConnection::create_room` and
+  `SignalingError::Forbidden`.
+- **SDK/page:** the SDK passes the token through unchanged; its test covers `FORBIDDEN`
+  on `createRoom` and `join`. The page README mints with `--room demo`; the "no room claim"
+  known limit is gone.
+
+**Tests:** `nexus-api` (claim limits refused without panic, grant truth table, wildcard,
+REST routes by grant through the router); orchestrator (`create_and_join_follow_the_token_rooms`,
+`token_without_rooms_grants_none_and_wildcard_grants_all`; the random-signaling proptest
+reconnects with grants `*`, `fuzz`, `other`, none); e2e `room_claim_confines_create_and_join`
+(the owner's reproduction: by id and by name; no claim; `"*"`). Negative check: with the
+`Join` grant check disabled, the orchestrator test fails (`[]` instead of `["FORBIDDEN"]`).
+
+**Checkpoint:** a token for room A cannot create, join or (REST) read or delete room B, by
+id or by name; `cargo test --workspace`, e2e 9/9, SDK tests, memory budget pass.
+
+**Left open (not 1.9a):** `Joined` lists other participants with an empty name; the
+orchestrator's name → room map is not shared with REST, so a REST room "x" and a signaling
+`Create "x"` are two rooms (a token naming "x" reaches both).
+
 ### 1.9 Documents and merge
 
 **Files:** `architecture.md`, `CLAUDE.md`, `README.md`, `docs/dataplane-design.md` (revision
@@ -2367,7 +2418,7 @@ The note's §19 risks stand; these are the ones the audit added.
 | `macos-14` refuses 8 MiB socket buffers (`ENOBUFS` on older XNU) and every server test fails | 1.7a: `bind_shard_socket` halves on `ENOBUFS` and warns |
 | Remote panics remain in code the shard does not use but the control plane does (DTLS, SDP parser) | Exit criterion 6; DTLS input guards in 1.5a; SDP errors instead of asserts in 1.4 (done: two parser panics fixed, fuzz proptests on the parser) |
 | **Known limit, aggregate DTLS pressure.** The per-session budget (32 DTLS datagrams per second, 1.2) bounds one peer, but many sessions that passed STUN and never finish DTLS can together fill the event channel all shards share, and other sessions' handshake datagrams are then dropped (peers retransmit) | 1.3 (done): a shard-wide cap on `DtlsDatagram` events per second (`dtls_budget_per_sweep`, 1,024). 1.5a/1.5b: the orchestrator's DTLS handshake timeout closes sessions that do not complete, so the pressure is bounded in time |
-| **Known limit, room authorization (v1 item).** Tokens carry no room claim: any authenticated user can join any room by id (sequential) and subscribe to its tracks. 1.5b confines subscriptions to the subscriber's own room and refuses a second `Join`, but not the first | Added to the v1 scope (`dataplane-design.md` §2, revision 2026-09-27). **Owner's decision 2026-09-28: fixed in Phase 1, part 1.9a, before the merge** (reproduced: a second token joined room 1 by id, and `Create` with the same name returned the same room). Needs a room claim in the JWT (`nexus-api`), checks in `Create`/`Join`, and the dev token of 1.8 minting it |
+| **Fixed in 1.9a: room authorization (v1 item).** Tokens carried no room claim: any authenticated user can join any room by id (sequential) and subscribe to its tracks. 1.5b confines subscriptions to the subscriber's own room and refuses a second `Join`, but not the first | Added to the v1 scope (`dataplane-design.md` §2, revision 2026-09-27). **Owner's decision 2026-09-28: fixed in Phase 1, part 1.9a, before the merge** (reproduced: a second token joined room 1 by id, and `Create` with the same name returned the same room). Done in 1.9a: `rooms` claim, `Create`/`Join` and REST checks, `token --room` |
 | **Known limit, ICE-lite on-path injection.** STUN authenticates the request, not its source address (RFC 8445). An attacker on the path can drop a fresh nomination and send it from its own address before the original arrives, or replay one older than the last 16 transaction ids, and the session moves to it. Media stays SRTP-encrypted; the real peer is cut off until its next nomination | Inherent to ICE-lite; accepted for v1. 1.2 refuses repeated transaction ids and rate-limits switches. A full fix needs proof of liveness at the new address (e.g. consent from the SFU side) and comes after v1 |
 
 ## Status
@@ -2393,8 +2444,8 @@ The note's §19 risks stand; these are the ones the audit added.
 | 1.6b E2E: address change, SR, keyframes | Done | see git log (1.6b) | `LossRules::rebind`, `RtcpLog` (publisher PLI/FIR, subscriber SR/CNAME), three tests; resume 2.1-2.3 s, SR error ≤ 5.7 ms, burst → 1 PLI; negative check fails with the silence rule disabled. Review fixes (1.6a/1.6b checks, `ci-local.sh` lock, dashboard, scripts) |
 | 1.8 SDK, browser page, manual check | Code done (see git log (1.8)); owner's check pending | | `Published` to the publisher, `nexus-loadtest token`, SDK `createRoom`/`publish`/`unpublish`/`unsubscribe`/`leave`/`getStats`, ≤ 10 ids per request, `node:test` (20) in CI, `examples/web/`, review fixes (fenced error matching, refused-publish cleanup, refused publish m-lines released on the server). Chromium 153 pre-check passes steps 2, 3, 5 (GCM, ICE-lite, late join ≈ 0.2 s). Exit criterion 4 waits for the owner's Chrome + Firefox run on two machines |
 | SR flake, exit criterion 6 sweep | Done | `fa8a6a9` | SR errors measured per SR (median ≤ 50 ms, max ≤ 200 ms). Sweep of every network input path: aborts fixed in the shard (duplicate nomination entries), signaling (`Create` name over 256 bytes, room-id wrap) and **gossip** (empty datagram, crafted updates, found in review). Gossip off unless a cluster is configured. Room limits (every room counted, per-creator cap, release, rooms no longer preallocate ≈ 440 KB). Proptests: authenticated STUN, random signaling, gossip bytes and messages. **Exit criterion 6 met** |
-| 1.9a Room authorization | Not started | | Owner's decision 2026-09-28: before the merge. Room claim in the JWT; `Create`/`Join` check it; `nexus-loadtest token --room`; SDK/page pass it; e2e: a token for room A cannot join room B by id or by name |
-| 1.9 Documents, merge | Documents done; merge waits for 1.9a and exit criterion 4 | see git log (1.9) | `architecture.md` Parts 1-5 on the new path (Phase 1 numbers, Phase 0 kept as baseline), CLAUDE.md, README, design revision 2026-09-28 (GCM first, 17.5 KB, tombstones, `Published`), note in `dataplane-v1.md`, old-path comments in `src/lib.rs`, `node.rs`, `error.rs`, `Cargo.toml`, `basic_sfu.rs`. Left: owner's §17.9 table, `ci-local.sh all` on the merge commit, fast-forward `main` |
+| 1.9a Room authorization | Done | see git log (1.9a) | `rooms` claim (≤ 16 names, `"*"`), `RoomGrant`; `Create`/`Join` refuse with `FORBIDDEN`; REST routes 403 and filtered list; `token --room`; loadtest client creates by name then joins; e2e `room_claim_confines_create_and_join` (e2e 9 tests) |
+| 1.9 Documents, merge | Documents done; merge waits for exit criterion 4 (1.9a done) | see git log (1.9) | `architecture.md` Parts 1-5 on the new path (Phase 1 numbers, Phase 0 kept as baseline), CLAUDE.md, README, design revision 2026-09-28 (GCM first, 17.5 KB, tombstones, `Published`), note in `dataplane-v1.md`, old-path comments in `src/lib.rs`, `node.rs`, `error.rs`, `Cargo.toml`, `basic_sfu.rs`. Left: owner's §17.9 table, `ci-local.sh all` on the merge commit, fast-forward `main` |
 
 Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked at 1.7, 17.5 KB after the rooms change, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers (owner's Chrome + Firefox run, table in 1.8) · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☑ no panic on input (`fa8a6a9`) · 7 ☑ documents (1.9).
 
@@ -3226,3 +3277,42 @@ Add one line per working session: date, part, what was done, what is left.
   ≈ 49 KB with an outbound offer in the bench). Also seen: `Joined` lists other
   participants with an empty name. Next: commit 1.9 documents, then 1.9a, the owner's
   §17.9 check, `ci-local.sh all`, merge.
+- 2026-09-28, 1.9a room authorization (uncommitted, for review): plan approved with the
+  owner's choices (names + `"*"`, REST included, `FORBIDDEN` for `Create` and `Join`).
+  Details under 1.9a. Negative check: the new orchestrator test fails with the `Join`
+  grant check disabled. macOS: `cargo test --workspace` 1,469 passed, e2e 9/9 (43 s),
+  SDK 21 passed. `ci-local.sh`, summary:
+  ```
+  macos          PASS  cargo fmt --check                                1s
+  macos          PASS  clippy                                           0s
+  macos          PASS  cargo test --workspace                          98s (1469 passed, 0 failed)
+  macos          PASS  sdk npm ci + npm test                            5s (21 passed, 0 failed)
+  linux-arm64    PASS  cargo fmt --check                                5s
+  linux-arm64    PASS  clippy                                          17s
+  linux-arm64    PASS  release build                                   96s
+  linux-arm64    FAIL  cargo test --workspace                        2078s (726 passed, 1 failed)  (see target/ci-local/linux-arm64.log)
+  linux-arm64    PASS  bench smoke real_path                           47s
+  linux-arm64    PASS  bench memory (budget 25 KB)                     21s
+  ci-local 2026-09-28 20:19, 33e4225 (24 uncommitted or untracked paths), targets: macos linux-arm64, budget 25 KB: FAIL
+  ```
+  The Linux failure: `two_party_audio_video` panicked "media did not start: A has [], B
+  has []" (last of the 9 e2e tests; the other 8, including `ten_clients` on the same
+  Create-then-Join client path, passed; cargo stopped there, hence 726). **Not
+  reproduced:** in the same container, `two_party` alone 5/5 and the full e2e suite 3/3
+  (9/9 each, ≈ 44 s). First time this failure is seen; cause unknown (the test step ran
+  2,078 s, a heavily loaded host). If it recurs, look at the time from `Joined` to the
+  first offer for the two clients. Memory budget passes (session state, `RoomGrant::Any`
+  has no heap). Next: review and commit 1.9a; re-run `ci-local.sh` green on the commit;
+  then the owner's §17.9 check (tokens with `--room`), `ci-local.sh all`, merge.
+- 2026-09-29, review of 1.9a: security review found no bypass (id probing, unnamed rooms,
+  Create by another's name, id reuse, grant changes after auth, a room named `"*"`,
+  cross-room subscribe; HS256 only, `exp` required, strict claim type, no claim = no rooms).
+  Fixed here: a REST refusal by id no longer names the room (`forbidden_by_id`; the test
+  fails with the old message). Known limits, not fixed: a grant outlives token expiry on an
+  open WebSocket (`exp` is checked at the handshake only); REST `DELETE` removes a room that
+  signaling members are still in; `aud`/`iss` not checked; `Joined` lists other participants
+  with an empty name. The earlier Linux `two_party_audio_video` failure (test step 2,078 s)
+  came with a 98% full disk; after freeing 58 GB `ci-local.sh` passed with the test step at
+  264 s: macOS 1,469 passed, SDK 21, Linux arm64 1,475 passed, benches pass; e2e 4/4.
+  Committed and pushed. Left for the merge: the owner's §17.9 check (tokens with `--room`),
+  `ci-local.sh all` on the merge commit, fast-forward `main`.

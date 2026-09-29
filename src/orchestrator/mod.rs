@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nexus_api::RoomGrant;
 use nexus_dataplane::{Command, Event, Placement, TrackId as DpTrackId};
 use nexus_state::DistributedState;
 use nexus_transport::dtls::DtlsCertificate;
@@ -47,6 +48,8 @@ const EVENT_BATCH: usize = 256;
 /// Shared per-participant state visible to all managers.
 pub struct ParticipantHandle {
     pub outbound_tx: mpsc::Sender<SignalMessage>,
+    /// The rooms the participant's token grants (`Create`/`Join` check it).
+    pub grant: RoomGrant,
     pub room_id: Option<u32>,
     pub published_tracks: Vec<TrackId>,
 }
@@ -178,8 +181,8 @@ impl SessionOrchestrator {
             OrchestratorEvent::Connected {
                 participant_id,
                 outbound_tx,
-                ..
-            } => self.handle_connected(participant_id, outbound_tx),
+                claims,
+            } => self.handle_connected(participant_id, outbound_tx, claims.room_grant()),
             OrchestratorEvent::Message {
                 participant_id,
                 message,
@@ -190,7 +193,12 @@ impl SessionOrchestrator {
         }
     }
 
-    fn handle_connected(&mut self, participant_id: u64, outbound_tx: mpsc::Sender<SignalMessage>) {
+    fn handle_connected(
+        &mut self,
+        participant_id: u64,
+        outbound_tx: mpsc::Sender<SignalMessage>,
+        grant: RoomGrant,
+    ) {
         if participant_id == 0 {
             return;
         }
@@ -198,6 +206,7 @@ impl SessionOrchestrator {
             participant_id,
             ParticipantHandle {
                 outbound_tx,
+                grant,
                 room_id: None,
                 published_tracks: Vec::with_capacity(10),
             },

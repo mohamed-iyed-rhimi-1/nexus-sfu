@@ -40,10 +40,12 @@ The SFU does not serve the page. Any static server does.
    - Pass the secret in `NEXUS_JWT_SECRET`, the variable the SFU reads, so it stays out of
      your shell history and process list.
    - `--jwt-secret` also works, but puts the secret on the command line.
+   - `--room` names a room the token may create or join (its `rooms` claim; repeat for
+     more, `--room '*'` for every room). The SFU refuses any other room with `FORBIDDEN`.
 
    ```bash
    export NEXUS_JWT_SECRET=dev-secret-minimum-32-characters-long
-   cargo run -p nexus-loadtest -- token --sub alice
+   cargo run -p nexus-loadtest -- token --sub alice --room demo
    ```
 
 4. Serve the **repository root**, so that `../../sdk/dist/index.js` resolves, and open the
@@ -63,7 +65,7 @@ The SFU does not serve the page. Any static server does.
 |-----------|---------|---------|
 | `token` | (required) | JWT from `nexus-loadtest token` |
 | `url` | `ws(s)://<page host>:8080` | Signaling URL |
-| `room` | `demo` | Room name; the same name joins the same room |
+| `room` | `demo` | Room name; the same name joins the same room. The token must name it (`--room`) |
 | `name` | `guest-<n>` | Display name in the log |
 | `fake` | off | `fake=1`: a canvas and an oscillator instead of camera and microphone (headless runs) |
 
@@ -126,4 +128,3 @@ The SFU needs UDP port 10000 and TCP 8080 reachable from both machines, and
 - **No ICE restart.** When a laptop switches between Wi-Fi and wired, browsers usually
   restart ICE, and the call does not recover. Pure NAT rebinding does recover (e2e
   `address_change_mid_call`).
-- **Tokens carry no room claim.** Any valid token can join any room.

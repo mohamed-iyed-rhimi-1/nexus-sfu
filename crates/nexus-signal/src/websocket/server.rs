@@ -77,8 +77,9 @@ pub enum OrchestratorEvent {
     Connected {
         participant_id: u64,
         outbound_tx: mpsc::Sender<SignalMessage>,
-        /// JWT claims from the authenticated participant.
-        claims: Option<nexus_api::auth::Claims>,
+        /// JWT claims from the authenticated participant; their `rooms` claim
+        /// bounds the rooms it may create or join.
+        claims: nexus_api::auth::Claims,
     },
     /// Participant sent a signaling message.
     Message {
@@ -442,7 +443,7 @@ where
         .send(OrchestratorEvent::Connected {
             participant_id,
             outbound_tx: outbound_tx.clone(),
-            claims: Some(participant_claims),
+            claims: participant_claims,
         })
         .await
         .is_err()
@@ -672,6 +673,7 @@ mod tests {
             sub: "size-test".to_string(),
             exp: u64::MAX / 2,
             iat: 0,
+            rooms: vec!["*".to_string()],
         };
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
