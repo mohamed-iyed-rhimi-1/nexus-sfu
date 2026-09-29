@@ -32,6 +32,7 @@ pub mod shard;
 mod slab;
 mod subscription;
 mod track;
+pub mod xs;
 
 pub use command::{
     CodecParams, Command, Event, EventSink, ExtIds, ExtMap, IceParams, PtMap, Refused,
@@ -46,7 +47,7 @@ pub use ids::{
     CnameValue, MidValue, SessionId, ShardId, SubscriptionId, TrackId, TrackRef, MAX_SHARDS,
 };
 pub use placement::{Placement, ShardLoad, SingleShard};
-pub use pool::{BufRef, BufferPool, BUF_SIZE};
+pub use pool::{BufRef, BufferPool, Loan, PoolRegion, BUF_SIZE};
 pub use session::{MAX_SUBS_PER_SESSION, MAX_TRACKS_PER_SESSION};
 #[cfg(target_os = "linux")]
 pub use shard::io::{udp_gro_enabled, LinuxIo};
@@ -56,6 +57,7 @@ pub use shard::io::{
 };
 pub use shard::stats::{ShardCounters, ShardStats, ShardStatsSnapshot};
 pub use shard::{IterationStats, Shard, ShardSnapshot};
+pub use xs::{XsMesh, XsMsg, XsPorts, XS_BUDGET, XS_CREDIT, XS_RING};
 
 /// In-memory sizes of the shard's per-session, per-track and per-subscription
 /// entries, for the memory bench's structural report (`benches/memory.rs`).

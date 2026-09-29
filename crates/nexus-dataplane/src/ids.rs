@@ -38,7 +38,7 @@ nonzero_id!(
 );
 
 /// Index of a shard in the process, `< MAX_SHARDS`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ShardId(u8);
 
 impl ShardId {

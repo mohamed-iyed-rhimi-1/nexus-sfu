@@ -1,7 +1,9 @@
 # Phase 2 — Multiple shards
 
-**State: not started** (plan written 2026-09-29, audited against `75fcdd9` the same day, revised the same day after
-the owner's review; waiting for the next review).
+**State: in progress** (plan written 2026-09-29, audited against `75fcdd9` the same day, revised the same day after
+the owner's review; 2.1 detailed the same day from a code analysis, with the owner's `Loan`
+decision and a process-unique region id; 2.1 implemented the same day, not committed,
+waiting for review).
 
 **Design:** [`docs/dataplane-design.md`](../dataplane-design.md) §5, Phase 2 ("Port per shard,
 placement, cross-shard queues and buffer return"), within D1-D4 and D8, §3.1 and §3.3. Detailed
@@ -29,6 +31,7 @@ against `75fcdd9`; line numbers drift, so prefer the symbol names.
 |-------|----------|-------------------|
 | Cross-shard rings | `crossbeam_queue::ArrayQueue<XsMsg>` per ordered shard pair, used single-producer / single-consumer. Already a dependency (the command queues), no `unsafe`. A custom SPSC ring replaces it only if `benches/dataplane.rs` shows the queue is a measurable share of the per-packet cost | A generic SPSC ring from the deleted `src/worker/spsc.rs` (note §13.4) |
 | Verifying the shared pool | A multi-thread stress test with canary bytes, plus Miri (nightly, local) on a small two-thread hand-off test | A `loom` model of one pair (note §13.4 item 6). `loom` is not in `Cargo.lock` and cannot model crossbeam's internals without cfg changes |
+| Peer access to a lent buffer | `lend` returns a move-only `Loan` (12 B: index, process-unique region id, owner, peer; private fields, not `Copy`/`Clone`); a peer reads through `&Loan` and returns it by moving it into the return ring, so reading after the return does not compile. `XsMsg` carries the `Loan` and is not `Copy` | `XsMsg: Copy` with a `BufRef` and a safe `slice(buf, len)` any code could call on any handle, including one already returned (note §13.4) |
 | Where the targets are measured | Linux arm64 in the Docker Desktop VM raised to ≈ 10 vCPU (M2 Pro host), recorded as a VM result. x86_64 on real hardware stays open (release item) | Linux arm64 and x86_64 (design §2) |
 
 ## Exit criteria
@@ -114,84 +117,207 @@ Realistic size: ≈ 8-10 sessions.
 
 **Goal:** the pieces for handing a buffer to another shard and getting it back, tested alone
 before the shard uses them: a pool region peers can read, owner-local refcounts with a
-per-peer credit, the message type and the ring mesh.
+per-peer credit, a move-only `Loan` for each lent buffer, the message type and the ring mesh.
 
 **Files:** `crates/nexus-dataplane/src/{pool.rs, xs.rs (new), ids.rs, lib.rs}`,
-`crates/nexus-dataplane/tests/pool_handoff.rs` (new).
+`crates/nexus-dataplane/tests/pool_handoff.rs` (new). No manifest change (`crossbeam-queue`
+is already a dependency; crate `tests/` files are auto-discovered) and **no caller change**:
+`take`, `put`, `buf`, `buf_mut`, `pair_mut`, `available` and `capacity` keep their signatures.
 
-**Change:**
-- **`PoolRegion`:** the pool's bytes in one allocation behind an `Arc`, one
-  `UnsafeCell<[u8; BUF_SIZE]>` per buffer, `Sync` by an `unsafe impl` with the ownership
-  argument. Peers hold a clone of every other shard's region and read
-  `slice(buf, len) -> &[u8]`.
-- **No reference ever spans the whole region.** Today `pair_mut` splits all of `memory`
-  (`pool.rs:102-108`), which would alias a peer's shared read of a lent buffer. In the new
-  pool, `buf_mut(buf)` and `pair_mut(read, write)` build **per-buffer** references from the
-  buffers' own cells, and only for buffers the owner holds (free, being received into, or
-  its own send buffers). `LinuxIo` keeps `buf_mut` pointers in its iovecs (`linux.rs:97`,
-  `:116`); those buffers are receive slots and send buffers, never lent, so the rule holds.
-- **Lend only after local fan-out:** the ingress buffer is lent after the local subscribers
-  are served, and from then on the owner does not touch it until `release` brings its
-  `refs` to 0. Nothing writes to a lent buffer (the plaintext is final after unprotect).
-- **`BufferPool`** keeps its free stack and gains:
-  - `refs: Box<[u16]>`, one per buffer, read and written only by the owner (note §13.4 item 2);
-  - `in_flight: [u32; MAX_SHARDS]`, buffers currently lent to each peer (owner-local);
-  - `can_lend(peer)` (`in_flight[peer] < XS_CREDIT`), `lend(buf, peer)`, `unlend(buf, peer)`
-    (undo, for the push-failure path of 2.2), `release(buf, peer)` (a returned handle:
-    `refs -= 1`, `in_flight -= 1`, `put` at 0), and `put_if_unshared(buf)` for the ingress
-    path.
-  - `put` and `take` keep their current checks; `put` on a buffer with `refs > 0` is a bug
-    (`assert!`).
-- **Credit, not ring capacity, bounds what is lent** (correction to note §13.4 item 7): the
-  owner lends to peer j only while `in_flight[j] < XS_CREDIT`, and the return ring j→owner
-  has capacity `XS_CREDIT`, so it can never be full. A full return ring is an `assert!`
-  (it would leak a buffer). Starting values: media ring 1,024, `XS_CREDIT` 1,024,
-  `XS_BUDGET` 256 messages per peer per iteration; 2.6 tunes them.
-- **`XsMsg`** (`Copy`, a `const` assert of ≤ 24 bytes on the default build):
-  `Rtp { buf: BufRef, len: u16, track: TrackId, layer: u8 }`,
+**Change — `pool.rs`:**
+- **`PoolRegion { id: u32, shard: ShardId, cells: Box<[UnsafeCell<[u8; BUF_SIZE]>]> }`**:
+  one allocation at startup (`iter::repeat_with(..).take(count).collect()`; the pages are
+  touched eagerly, 2 MB at the default), shared as `Arc<PoolRegion>`. `Sync` by an `unsafe
+  impl` with the safety argument below. **`id` is process-unique**, taken from a global
+  `AtomicU32` (`assert!` that it does not wrap): a `ShardId` does not identify a region,
+  because several pools in one process share `ShardId(0)` (each e2e test's in-process server,
+  unit tests), so a `Loan` from one would otherwise pass the checks of another — a read of a
+  cell its owner writes, or an early free, from safe `pub` code. Methods: `id()`, `shard()`,
+  `len()`, and `read<'a>(&'a self, loan: &'a Loan, len: usize) -> &'a [u8]`, which
+  `assert!`s `loan.region == self.id` and `len <= BUF_SIZE` (soundness guards, so hard
+  asserts). The slice borrows the `Loan`, so it cannot outlive the loan's return.
+- **`Loan { index: u32, region: u32, owner: ShardId, peer: ShardId }`** (12 B, align 4):
+  `#[must_use]`, `Debug` only,
+  no `Clone`, `Copy` or `Drop`, private fields; only `BufferPool::lend` makes one. Accessors
+  `buf() -> BufRef`, `owner()`, `peer()`. A `Loan` dropped without being returned leaks its buffer (a bug
+  the pool-full checks catch), never undefined behaviour.
+- **`BufferPool`** becomes `{ shard, region: Arc<PoolRegion>, free: Vec<u32>, state: Box<[u16]>,
+  in_flight: [u32; MAX_SHARDS], lent: u32 }`, where each buffer's `state` holds `refs` (the loan
+  count, low 15 bits) and `held` (top bit). `state` and `in_flight` are read and written only
+  by the owner (note §13.4 item 2). One word per buffer keeps `take` and `put` to one load,
+  compare and store: `LinuxIo::recv_batch` takes 64 buffers and puts back the unused ones every
+  iteration, so these two run ≈ 128 times per iteration (a separate `held: Box<[bool]>` cost
+  ≈ 180 ns per ingress iteration, see the session log).
+  - **Freeing does not depend on call order** (review, 2026-09-29): `held` says a local holder
+    (ingress, a send buffer) has the buffer, from `take` to `put`/`put_if_unshared`. A buffer
+    goes back on the free stack when it is neither held nor lent, by whichever of the holder
+    or the last `release` comes last (`free_if_done`). Without it, a return handled between
+    `lend` and `put_if_unshared` would free the buffer at `refs == 0` and the holder would
+    push the index a second time (one buffer handed out twice). `held` replaces the debug-only
+    `taken` and makes the double-free check a hard `assert!`.
+  - `take`: `assert!(state == 0)` (hard, so a corrupt free stack fails near the cause), sets
+    `held`. `put`: one compare `state == HELD`, else a cold panic naming the case ("put of a
+    lent buffer" or "buffer returned twice"), then `state = 0` and push.
+  - `buf(&self, buf) -> &[u8]`: a shared reference to one cell (the owner may read a lent
+    buffer).
+  - `buf_mut(&mut self, buf) -> &mut [u8]`: `assert!(refs[i] == 0, "write to a lent buffer")`,
+    then a reference to that cell only.
+  - `pair_mut(read, write)`: two references built from two different cells (`assert!(read !=
+    write)`), the write side with the same `refs == 0` assert; the read side may be lent. **No
+    reference ever spans the whole region** (today's `split_at_mut` over `memory`,
+    `pool.rs:98-117`, goes).
+  - `can_lend(peer)`: `in_flight[peer] < XS_CREDIT`.
+  - `lend(&mut self, buf, peer) -> Loan`: `assert!(peer != self.shard)`,
+    `assert!(can_lend(peer))` (the credit is what keeps the return ring from filling) and
+    `assert!(held)` (only the holder lends), then `refs += 1`, `in_flight[peer] += 1`.
+  - `unlend(&mut self, loan)`: undoes `lend` for a push that failed (2.2). `assert!(loan.region
+    == region.id)`. The holder still has the buffer, so it is not freed here
+    (`debug_assert!`); the holder's `put_if_unshared` frees it.
+  - `release(&mut self, loan, from: ShardId) -> bool`: a returned loan. `assert!(loan.region ==
+    region.id)`, `debug_assert!(loan.peer == from)` (return from the wrong peer), `refs -= 1`,
+    `in_flight -= 1`, freed if neither lent nor held; returns whether it freed the buffer.
+  - `put_if_unshared(buf) -> bool`: ends the hold (`assert!(held)`, "buffer returned twice");
+    frees the buffer if it is not lent, otherwise the last `release` does.
+  - `in_flight(peer)`, `lent_total()` (2.2's `xs_in_flight` gauge), `region() -> Arc<PoolRegion>`
+    (startup clone for the mesh).
+- **`unsafe` stays local:** `#[allow(unsafe_code)]` only on the `unsafe impl Sync` and on the
+  few fns that call `UnsafeCell::get` (`buf`, `buf_mut`, `pair_mut`, `PoolRegion::read`), each
+  block with a `// SAFETY:` comment. The crate root keeps `#![deny(unsafe_code)]`.
+- `BufRef`'s doc ("Phase 2 adds the owner-local refcount") says where the refcount lives and
+  that cross-shard handles are `Loan`s.
+- **Safety argument** (written at the top of `pool.rs`):
+  1. Only the owner forms `&mut` into its region, one cell at a time, and only for a cell with
+     `refs == 0` (asserted); `&mut self` on `BufferPool` rules out two local `&mut` to one cell.
+  2. Peers form `&[u8]` only through `read(&Loan)`. A `Loan` exists only between `lend` and
+     `release`/`unlend`, so `refs > 0` while any peer can read. A `Loan` names its region by
+     the process-unique `id`, and `read`, `release` and `unlend` assert it, so a loan from
+     another pool (even one with the same `ShardId`) can neither read this region nor change
+     its counts.
+  3. Owner writes → `lend` → `ArrayQueue::push` (Release) → peer `pop` (Acquire) → reads; the
+     reads end with the borrow of the `Loan` → return `push` (Release) → owner `pop` (Acquire)
+     → `release` → `put` → next writes. Every write is ordered after every peer read of the
+     previous use.
+  4. `in_flight[j]` counts every loan of the owner's that j holds, has queued or is returning,
+     and the return ring j→owner has capacity `XS_CREDIT`, so it cannot fill. The count is per
+     `loan.peer`, so `give_back` asserts `loan.peer == self.shard` (a loan given back by
+     another shard would go into a queue its credit does not bound) and `assert!`s the push
+     (a full return ring would leak a buffer).
+- **Lend only after local fan-out** (the rule 2.2 follows): the ingress buffer is lent after
+  the local subscribers are served; from then on the owner only reads it until `release`
+  brings `refs` to 0. Nothing writes to a lent buffer (the plaintext is final after unprotect).
+
+**Change — `xs.rs` (new, `pub mod xs`):**
+- **`XsMsg`** (`Debug`, not `Copy`: it carries a `Loan`):
+  `Rtp { loan: Loan, len: u16, track: TrackId, layer: u8 }`,
   `SenderReport { track: TrackId, layer: u8, ntp: u64, rtp: u32 }`,
   `KeyframeRequest { track: TrackId, layer: u8, from: ShardId }`.
-- **`XsMesh::new(n)`** builds, for every ordered pair (i, j), a media ring i→j and a return
-  ring j→i (`ArrayQueue`), and hands each shard its `XsPorts`: producer ends to every peer,
-  consumer ends from every peer, the peers' regions, and (2.3) the peers' `Wake`s.
-  `ShardId` gets `Ord`; `MAX_SHARDS` stays 64 (a `ShardMask` is a `u64`).
+  `const _: () = assert!(size_of::<XsMsg>() <= 24)` on the default build (layout: tag, layer,
+  len in 4 B, `Loan` at 4..16, `TrackId` at 16; 2.6's `latency-probe` field is exempt).
+  `give_back` routes a `Loan` by its `owner` (a mesh holds one region per shard).
+- **Constants:** `XS_RING = 1_024` (media ring), `XS_CREDIT = 1_024` (per-peer credit and
+  return-ring capacity), `XS_BUDGET = 256` (messages per peer per iteration, 2.2). `const`
+  asserts `XS_BUDGET <= XS_RING`; `refs` stays `u16` (`lend` asserts it does not overflow;
+  the protocol lends a buffer at most once per peer, ≤ 63). 2.6 tunes the values.
+- **`XsMesh::build(regions: &[Arc<PoolRegion>]) -> Vec<XsPorts>`**: asserts `1 <= n <=
+  MAX_SHARDS` and `regions[i].shard() == i`; for every ordered pair i ≠ j one media
+  `ArrayQueue<XsMsg>` i→j (`XS_RING`) and one return `ArrayQueue<Loan>` j→i (`XS_CREDIT`).
+- **`XsPorts { shard, peers: Box<[Option<PeerPorts>]> }`**, indexed by shard index, `None`
+  for itself; `PeerPorts` holds `media_tx`, `media_rx`, `return_tx`, `return_rx` (`Arc`s) and
+  the peer's `Arc<PoolRegion>`. Methods: `shard()`, `peer_ids()`, `has_room(peer)` (this shard
+  is the ring's only producer, so room seen stays room until its push),
+  `send(peer, msg) -> Result<(), XsMsg>` (the message comes back so the caller can `unlend`),
+  `recv(peer) -> Option<XsMsg>`, `region(peer) -> &PoolRegion`, `give_back(loan)` (routed by
+  `loan.owner`; asserts it is not an own loan and that `loan.peer` is this shard), `take_return(peer) -> Option<Loan>`. The peers' `Wake`s and an
+  `inbound_pending()` for the runner come with 2.2/2.3.
+- `ids.rs`: `ShardId` derives `PartialOrd, Ord`; `MAX_SHARDS` stays 64 (a `ShardMask` is a
+  `u64`). `lib.rs`: `pub mod xs;`, re-exports `Loan`, `PoolRegion`, `XsMsg`, `XsMesh`,
+  `XsPorts` and the `XS_*` constants.
 
 **Code notes (audited 2026-09-29):**
 - `BufferPool` today (`pool.rs:20-27`) is `{ shard, memory: Vec<u8>, free: Vec<u32>, taken
   (debug) }`: one `Vec<u8>` of `count × BUF_SIZE`, LIFO free stack, no refcount, no `unsafe`.
   `take` `:57`, `put` `:71` (debug asserts owner and double free; hard `assert!` on stack
   overflow), `buf` `:85`, `buf_mut` `:91`, `pair_mut` `:98` (safe `split_at_mut`).
-  `BufRef { shard, index }` (`:11-17`) says "Phase 2 adds the owner-local refcount".
+- **Callers, unchanged by 2.1:** `shard/ingress.rs` (`buf` for classify/parse, `buf_mut` for
+  unprotect in place `:282`, `:342`, `pair_mut` for the rewrite `:79`, `:389`), `shard/rtcp.rs`
+  and `shard/commands.rs` (take + `buf_mut` + put), `shard/mod.rs:192` (`put` after
+  `handle_datagram`, still right because nothing lends until 2.2, which switches it to
+  `put_if_unshared`), the three `DatagramIo` backends (`io/{portable,linux}.rs`, `MemIo` in
+  `io.rs`), `io/conformance.rs`, `runner.rs` tests, `benches/real_path.rs` (`BenchIo`).
+- `LinuxIo` keeps raw pointers from `buf_mut` in its iovecs (`arm_rx` `linux.rs:97`, `arm_tx`
+  `:116`); those are receive slots and send buffers, never lent, so the `refs == 0` assert
+  holds and the kernel's writes never touch a lent cell.
+- The new `refs` asserts in `buf_mut`/`pair_mut`/`put` are on the per-packet path (one
+  owner-local compare each): `real_path` is measured before and after (PR checklist).
 - The deleted `src/worker/spsc.rs` (last at `372cbcd^`, 481 lines) was `SpscChannel<N>` over
   `UnsafeCell<[Option<PacketSlot>; N]>`, head/tail `AtomicU32` without padding or cached
-  indices, not generic, 8 single-thread tests: no proptest, no loom, no stress test. Not used
-  (owner's decision).
-- `crossbeam-queue = "0.3"` is already a `nexus-dataplane` dependency (`Cargo.toml`), used for
-  the command `ArrayQueue` (`shard/mod.rs:38`, capacity 4,096). Its push/pop pair gives the
-  Release/Acquire ordering the safety argument needs (owner write → peer read; peer read →
-  owner reuse, through the return ring).
+  indices, not generic, 8 single-thread tests. Not used (owner's decision).
+- `crossbeam-queue = "0.3"` (lock: 0.3.12, `crossbeam-utils` 0.8.21) is already a dependency,
+  used for the command `ArrayQueue` (`shard/mod.rs:38`, capacity 4,096). Its push/pop give
+  the Release/Acquire ordering of the safety argument; crossbeam runs under Miri.
+  `ArrayQueue` slots carry a stamp: ≈ 32 B per `XsMsg`, 24 B per `Loan`, so ≈ 56 KB per
+  ordered pair at the starting capacities (see 2.3 on growth with n).
 - `#![deny(unsafe_code)]` is at `lib.rs:16`; the only `#[allow(unsafe_code)]` is
   `shard/io.rs:19` (`mod linux`).
-- `lib.rs` `sizes::{SESSION, PUBLISHED_TRACK, SUBSCRIPTION}` (`:63-70`) feed the memory
-  bench; 2.1 does not change them (2.2 does).
+- `lib.rs` `sizes` (`:63-70`) feed the memory bench; 2.1 does not change them (2.2 does).
 - `TrackId` is a monotonic `u64` from the orchestrator's counter, never 0 and never reused
   (`src/orchestrator/ids.rs:40`, `bump` `:48-53`), so a late message naming a removed track
   can never be taken for a new one.
+- **Miri:** `rustup toolchain install nightly --component miri` (done 2026-09-29, nightly
+  `c1070d693 2026-09-28`). `+nightly` overrides `rust-toolchain.toml`. Nightly deprecates
+  `AtomicU32::fetch_update` (renamed `try_update`), which trips `#![deny(warnings)]`, so
+  every Miri run uses `RUSTFLAGS=--cap-lints=warn`; the pinned 1.83 build keeps
+  `fetch_update`.
 
 **Tests:**
-- Unit: `can_lend` false at `XS_CREDIT`; `unlend` restores `refs` and `in_flight`;
-  `release` frees at 0 and not before; `put` of a lent buffer panics; return of a handle from
-  the wrong peer is caught (`debug_assert`); `pair_mut` of two buffers while a third is lent
-  and read elsewhere (the stress test covers the concurrent case).
-- `XsMsg` size (≤ 24 B) and `Copy`; `XsMesh` wiring for n = 1..4 (no self rings).
-- `tests/pool_handoff.rs`: owner thread writes a canary (buffer index, generation) and lends;
-  2-3 reader threads check the canary, return; the owner reuses only returned buffers. 10⁶
-  hand-offs, no mismatch, pools full at the end.
-- **Miri** on a reduced hand-off test (two threads, ≈ 100 hand-offs, `cfg(miri)` sizes):
-  `cargo +nightly miri test -p nexus-dataplane --test pool_handoff`. Local only; the command
-  and result go in the session log.
+- Unit, `pool.rs`:
+  - lend → release cycle: `refs`, `in_flight`, `available`;
+  - `can_lend` false at `XS_CREDIT` (pool of `XS_CREDIT + 1`, one loan per buffer);
+  - `unlend` restores `refs` and `in_flight` and does not free;
+  - a buffer lent to two peers is freed at the second `release`, not the first;
+  - `put_if_unshared` true when unshared, false when lent (then `release` frees it);
+  - order independence: lend → release → `put_if_unshared` and lend → `put_if_unshared` →
+    release each free the buffer exactly once (all buffers then taken, none twice); `lend`
+    after the holder put the buffer back panics;
+  - `put`, `buf_mut` and the write side of `pair_mut` on a lent buffer panic; `pair_mut`
+    whose read side is lent works; `lend` to its own shard panics;
+  - `release` from the wrong peer is caught (`cfg(debug_assertions)`);
+  - a `Loan` from another pool **with the same `ShardId`** panics in `read`, `release` and
+    `unlend` (region id);
+  - aliasing on one thread: a `read(&loan)` slice held while `pair_mut` writes two other
+    buffers (Miri checks it).
+- Unit, `xs.rs`: `XsMsg` ≤ 24 B; mesh wiring for n = 1..4 (every ordered pair delivers media
+  and returns, no self ports, n = 1 has no peers); a full media ring hands the message back
+  and `unlend` leaves the counters as before; `give_back` lands in the owner's return ring;
+  `give_back` of an own loan, and of a loan lent to another shard, panic.
+- **`tests/pool_handoff.rs`** (on `XsMesh::build`, owner shard 0, reader shards 1..=3):
+  - owner thread: drain every return ring (`release`) → `take` (none: go round) → write a
+    canary (buffer index, generation, length, a fill derived from the generation, random
+    length) → lend to a random subset of readers where `can_lend && has_room` → `send` (an
+    `Err` is `unlend`ed and counted) → `put_if_unshared`. Stops after `HANDOFFS` loans and all
+    returns;
+  - reader threads: `recv` → `read` → check header and body (the body compared with `==`
+    against a static pattern, i.e. memcmp, so the debug build stays fast) → `give_back`.
+    Readers that hold loans (per 8, per 64, up to the credit) keep each loan's generation and
+    length, yield now and then while holding, and check the canary **again** before
+    `give_back`, so an owner that reuses a buffer early is caught outside Miri too. The
+    no-credit and empty-pool paths run;
+  - a reader's panic sets an abort flag the owner checks every round, and the owner's end
+    (or panic) sets `done`, so a failure stops both sides at once;
+  - end: 0 mismatches, the owner's pool full, every `in_flight` 0, loans sent = received =
+    returned. Every loop has an iteration cap and a deadline `assert!`, so a bug fails the
+    test instead of hanging it;
+  - `HANDOFFS` = 10⁶, pool 64 buffers; under `cfg(miri)` 100 hand-offs, one reader, pool 8.
+    Target ≤ 10 s in a debug `cargo test`.
+- **Miri** (nightly, local; command, nightly version, duration and result in the session log):
+  `cargo +nightly miri test -p nexus-dataplane --test pool_handoff` and
+  `cargo +nightly miri test -p nexus-dataplane --lib -- pool:: xs::`. If time allows, the
+  hand-off test again with `MIRIFLAGS=-Zmiri-many-seeds=0..16` (more schedules).
 
-**Checkpoint:** `cargo test -p nexus-dataplane` green; Miri clean; Linux container run.
+**Checkpoint:** `cargo test -p nexus-dataplane` green and the workspace green (fmt, clippy
+`-D warnings`); Miri clean; `real_path` before/after in the Linux container, in the session
+log; `scripts/ci-local.sh` summary in the session log; Status table and session log updated;
+not committed, stopped for review.
 
 ---
 
@@ -352,7 +478,14 @@ accepts `shards > 1`.
   (`:160-173`, already N-aware).
 - **Pool size:** validated ≥ `RECV_BATCH + SEND_BATCH + (shards − 1) × XS_CREDIT`, so lent
   buffers can never starve a receive batch; the default follows the shard count (≈ 2 MB per
-  shard at 1 shard, ≈ 8 MB at 4 with the starting constants). 2.6 revisits the constants.
+  shard at 1 shard, ≈ 7 MB at 4 with the starting constants). 2.6 revisits the constants.
+- **Fixed memory grows with n²** (found while detailing 2.1): the pool minimum is
+  `(n − 1) × XS_CREDIT` buffers per shard and the mesh has n(n − 1) pairs of rings (≈ 56 KB
+  per pair). At 4 shards that is ≈ 7 MB of pool per shard and ≈ 0.7 MB of rings; at
+  `MAX_SHARDS` = 64 it would be ≈ 126 MB of pool per shard (≈ 8 GB in total) and ≈ 225 MB of
+  rings. So `shards` is validated against a practical bound (e.g. the core count, with a
+  clear error), or `XS_CREDIT` is scaled down with n; `Dataplane::start` logs the fixed
+  memory it allocates.
 - **Pinning:** shard i stays on `core_affinity::get_core_ids()[i]` (`sched.rs:7-25`); the
   warning at `config.rs:137-149` ("shard 0 on core 0") is reworded for N shards, and the
   config docs say which cores the shards take.
@@ -456,8 +589,17 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
   - `RemoveTrack` needs no such rule (track ids are never reused), nor does `Unsubscribe`
     (subscription ids are never reused).
   - A full retry list logs an error and leaks, as `pending_close` does today.
+  - **Per-shard order** (review note, 2026-09-29): before any push to shard s, additive or
+    cleanup, `Plane` first sends s's queued cleanup commands, oldest first (the retry list
+    absorbs `pending_close`, so `CloseSession` follows the same rule). If one still does not
+    fit, the new command is never sent ahead of it: a cleanup command joins the list behind
+    it, an additive command closes its participant as today. The list is FIFO per shard and
+    the 1 s sweep keeps that order.
 - A rejected `AddRemoteShard`/`RemoveRemoteShard`/`RemoveTrack` for an unknown track is
-  ignored (race with removal). `WrongShard` stays an internal error
+  ignored (race with removal), and so is a rejected `Unsubscribe` for an unknown subscription
+  (it may be retried after `CloseSession` or `RemoveTrack` removed the subscription). Both
+  already hold: `connection.rs:120-127` returns early for `UnknownSession`, `UnknownTrack`
+  and `UnknownSubscription`; keep it. `WrongShard` stays an internal error
   (`connection.rs:132-139`).
 - `ServerHandle::candidate_addrs` (shard 0's, `server.rs:69-72, 219`) is documented as
   such or becomes per shard for the tests.
@@ -493,6 +635,10 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
 - Full queue: a cleanup command waits in the retry list and is sent by the sweep, the
   participant is not closed; an additive command still closes it. Remove pending, then a new
   subscriber on the same shard → the pending remove is cancelled and no add is sent.
+- Per-shard order: a cleanup command queued for B, then a `Subscribe` to B → the recorded
+  stream has the cleanup first; with B's queue still full, the `Subscribe` closes its
+  participant and the cleanup stays queued ahead. A late `Unsubscribe` rejected with
+  `UnknownSubscription` closes no one.
 - Randomised sequence (subscribe, unsubscribe, unpublish, leave, full queues on/off): the
   recorded stream per (track, shard) is balanced: adds and removes alternate, and at the end
   every pair with a count has had one more add than remove.
@@ -664,6 +810,7 @@ changes a decision (D1-D10, R1-R9).
 |------|------|------|
 | §7.1 | `PublishedTrack::remote_shards: ShardMask`, "always empty in Phase 1" | Not in the code (`track.rs:23-36`); added in 2.2 |
 | §13.4 | SPSC ring from `src/worker/spsc.rs` | `ArrayQueue` per ordered pair (owner); `spsc.rs` was not generic, unpadded, single-thread tested only |
+| §13.4 | `XsMsg` `Copy`, ≤ 32 bytes, carrying a `BufRef`; peers read `region.slice(buf, len)` | A safe read by `BufRef` cannot stop a peer reading a buffer it already returned (a data race). `lend` returns a move-only 12-byte `Loan` naming its region by a process-unique id (a `ShardId` repeats across pools in one process), peers read through `&Loan` and return it by move; `XsMsg` is not `Copy`, ≤ 24 bytes (owner, 2.1) |
 | §13.4 item 6 | `loom` model of one pair | Multi-thread stress test + Miri (owner); `loom` is not in the lock file |
 | §13.4 item 7 | Return ring capacity = media capacity + `XS_BUDGET`, so it cannot fill | Does not bound what is outstanding (the owner can keep lending while returns wait). A per-peer credit (`in_flight[j] < XS_CREDIT`) bounds it; return capacity = `XS_CREDIT` |
 | §13.4 | `Subscribe{source: TrackRef}` is all the subscriber's shard needs | It also needs the track's clock rate, publisher `mid` id and cname (read from the local track today, `commands.rs:247-248`); carried in `SubSpec`, kept in a mirror track |
@@ -689,13 +836,15 @@ changes a decision (D1-D10, R1-R9).
 | Lent buffers starve a shard's receive batch | Pool size validated against `(shards − 1) × XS_CREDIT` (2.3); `drop_pool_empty` counted |
 | A hot room (one publisher, many viewers) keeps all decrypts on one shard | Accepted by design §7 |
 | Port range awkward behind Docker/Kubernetes/firewalls | Documented range (2.7); single-port mode stays after v1 (design §7) |
-| Miri needs nightly and may not support every crate used by the test | The hand-off test uses only `pool.rs` and `ArrayQueue`; run locally, recorded in the session log |
+| Miri needs nightly and may not support every crate used by the test | The hand-off test uses only `pool.rs`, `xs.rs` and `ArrayQueue`; run locally, recorded in the session log. Nightly and the `miri` component are not installed yet; `RUSTFLAGS=--cap-lints=warn` for the Miri run if a nightly-only lint trips `deny(warnings)` |
+| Fixed memory (pools, rings) grows with n² | 2.3 bounds `shards` or scales `XS_CREDIT` with n and logs the fixed memory; 2.6 reports it for 4 shards |
+| The `refs == 0` asserts added to `buf_mut`/`pair_mut`/`put` cost on the per-packet path | One owner-local compare each; `real_path` before and after in 2.1 |
 
 ## Status
 
 | Part | State | Commits | Notes |
 |------|-------|---------|-------|
-| 2.1 Shared pool region, `XsMsg`, mesh | Not started | | |
+| 2.1 Shared pool region, `XsMsg`, mesh | Done, not committed (second review) | | `Loan` with region id; freeing independent of call order (`held`); stress test and Miri clean |
 | 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Not started | | |
 | 2.3 N shards on threads | Not started | | |
 | 2.4 Control plane: placement, cross-shard subscriptions | Not started | | |
@@ -729,3 +878,77 @@ Add one line per working session: date, part, what was done, what is left.
   creates, spill rules (room cap 50, shard `max_sessions`), `recvmmsg` sinks, criteria 2/3
   scenarios, x86_64 emulated, criterion 6 agreement check, `FakeSink` recording shards.
   Waiting for review. Next: 2.1.
+- 2026-09-29: 2.1 detailed from a code analysis (every pool caller, the Linux iovecs, the
+  soundness of peer reads). Owner's decision: a move-only `Loan` instead of a `Copy`
+  `XsMsg` with a `BufRef`. Added: `refs == 0` asserts on `buf_mut`/`pair_mut`/`put` (a
+  `real_path` check), per-buffer cells and the safety argument, the `XsPorts` API, the
+  stress-test design and the Miri commands (nightly not installed yet); 2.3 note on fixed
+  memory growing with n²; review note carried into 2.4 (per-shard order: queued cleanup
+  before any push; a rejected `Unsubscribe` for an unknown subscription is ignored, already
+  so in `connection.rs`). Not committed. Next: implement 2.1.
+- 2026-09-29: plan fix before 2.1 (owner's review): a `ShardId` does not identify a region
+  (every in-process server and unit test has a `ShardId(0)` pool), so `PoolRegion` gets a
+  process-unique `id` (global `AtomicU32`, no wrap) and `Loan` carries it (12 B);
+  `read`/`release`/`unlend` assert it. **2.1 implemented, not committed:** `pool.rs`
+  (`PoolRegion` with one `UnsafeCell` per buffer, `Loan`, `refs`/`in_flight`/credit,
+  `can_lend`/`lend`/`unlend`/`release`/`put_if_unshared`, `refs == 0` asserts on
+  `put`/`buf_mut`/`pair_mut`, safety argument; `#[allow(unsafe_code)]` on the `Sync` impl and
+  four fns), `xs.rs` (`XsMsg` ≤ 24 B, const-asserted; `XS_RING`/`XS_CREDIT`/`XS_BUDGET`;
+  `XsMesh::build`, `XsPorts`), `ShardId: Ord`, re-exports. No caller changed. Also added:
+  `PoolRegion::is_empty` (clippy). Tests: 18 unit tests in `pool.rs` (among them a same-`ShardId`
+  loan from another pool panicking in `read`, `release` and `unlend`), 4 in `xs.rs`;
+  `tests/pool_handoff.rs`: 10⁶ hand-offs to 3 readers (return at once, per 8, per 64) and
+  2 × 10⁵ with the credit exhausted (140,576 lends refused for credit), 0 mismatches, pool
+  full; 0.6-0.8 s in debug. Readers stop if the owner panics (a drop guard), so a failure
+  does not wait out the 120 s deadline. Mutation check: an early free (refs set to 0 in
+  `release`) fails the test at once through the pool's own asserts, also with the `refs`
+  asserts removed (free-stack bound). **Miri** (nightly 2026-09-28, `RUSTFLAGS=--cap-lints=warn`):
+  `cargo +nightly miri test -p nexus-dataplane --test pool_handoff` clean (100 hand-offs,
+  one reader, 16 s; the credit variant is ignored under Miri); `--lib -- pool:: xs::` 20 passed,
+  2 ignored (2 MB pools), 33 s; `MIRIFLAGS=-Zmiri-many-seeds=0..16` on the hand-off test:
+  16 seeds clean, 324 s. **`real_path`** (Linux arm64 container, HEAD vs the working tree,
+  medians): pool paths −31% to +6% (e.g. GCM video with 100 subscribers 104.5 → 102.9 µs,
+  ingress GCM video 800 → 819 ns, CM video with 1 subscriber 3.12 → 3.31 µs). Benches that do
+  not touch the pool moved by as much (SRTP unprotect GCM audio +19%), so the change is within
+  run-to-run noise; 0 allocations per packet in every case. **ci-local** (`e399329` + 6
+  uncommitted or untracked paths, macos + linux-arm64): all PASS, `cargo test --workspace`
+  1,490 (macOS) / 1,496 (Linux) passed, bench smoke and memory budget 25 KB PASS. Next:
+  owner's review of 2.1, then commit; then 2.2.
+- 2026-09-29: 2.1 review fixes, not committed. (1) **Freeing independent of call order:**
+  each buffer's `state: u16` holds its loan count and a `HELD` bit (a local holder has it,
+  `take` to `put`/`put_if_unshared`; replaces the debug-only `taken`), and a buffer goes back
+  on the free stack when its state is 0, by whichever of the holder or the last `release`
+  comes last. Before, a return handled between `lend` and `put_if_unshared` freed at
+  `refs == 0` and the holder pushed the index again. `lend` asserts `HELD`; `unlend` cannot
+  free (debug-asserted); a double put is a hard `assert!`. Tests: lend → release →
+  `put_if_unshared` and lend → `put_if_unshared` → release each free once (every buffer then
+  taken, none twice); `lend` after the holder's put panics. (2) `XsPorts::give_back` asserts
+  `loan.peer() == self.shard` (the return-queue bound counts credit per peer); tests for a
+  loan lent elsewhere and an own loan. (3) `pool_handoff.rs`: holding readers keep each loan's
+  generation and length, yield every 4 receipts while holding, and re-check the canary
+  before `give_back`. Mutation check with the pool's asserts removed and `release` freeing
+  early: the canaries alone report 854,038 mismatches. Nits: `take` hard-asserts
+  `state == 0`; a reader's panic sets an abort flag the owner checks every round; the plan
+  lists `owner()` among `Loan`'s accessors; safety point 4 and the plan text updated.
+  **Hot-path cost:** a first version with a separate `held: Box<[bool]>` cost ≈ +16% on
+  `ingress/gcm/video` (medians of 3 alternating runs, 1,149 → 1,334 ns) because
+  `LinuxIo::recv_batch` takes 64 buffers and puts the unused ones back every iteration
+  (≈ 128 pool operations per one-datagram iteration). Folding `HELD` into the loan-count word
+  (one load, compare and store in `take` and `put`, the failed `put` check in a `#[cold]` fn)
+  brought it to +2-6%: `real_path` in the Linux arm64 container, base and new alternating, 3
+  runs each on a loaded host (load ≈ 8), medians: ingress GCM video 1,159 → 1,185 ns, GCM
+  audio 925 → 970, CM video 1,760 → 1,818, CM audio 1,020 → 1,081; egress GCM video /1
+  3,015 → 3,182, /10 16,241 → 18,172, /100 145,750 → 144,460, /500 627,220 → 657,440 (base
+  itself varies 15.9-17.8 µs at /10 across its 3 runs); SRTP control 405 → 407 ns. A full
+  run earlier in the session was ≈ 40% slower on every bench, SRTP included (host load), and
+  is discarded. 0 allocations per packet throughout. **Proposal (2.6, not done):**
+  `LinuxIo` could keep its armed receive buffers across iterations instead of taking and
+  putting back 63 per call, which removes most of that per-iteration pool cost (before and
+  after this change). Results on the final tree: `cargo test -p nexus-dataplane` green (lib
+  80, `pool_handoff` 2 in 0.6 s: 10⁶ hand-offs, 0 mismatches; credit variant ≈ 170,000 lends
+  refused for credit); clippy and fmt clean. **Miri** (nightly 2026-09-28,
+  `RUSTFLAGS=--cap-lints=warn`): `--test pool_handoff` clean (14 s); `--lib -- pool:: xs::`
+  25 passed, 2 ignored (39 s); `MIRIFLAGS=-Zmiri-many-seeds=0..16` 16 seeds tried, 16 `ok`
+  (331 s). **ci-local** (`e399329` + 6 uncommitted or untracked paths, macos + linux-arm64):
+  all PASS, `cargo test --workspace` 1,495 (macOS) / 1,501 (Linux), bench smoke and memory
+  budget 25 KB PASS. Next: owner's review, then commit; then 2.2.
