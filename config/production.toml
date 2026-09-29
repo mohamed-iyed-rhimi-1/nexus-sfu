@@ -82,12 +82,17 @@ seed_peers = []
 [dataplane]
 # The data plane (nexus-dataplane): one thread and one media socket per shard.
 # Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
-shards = 1                              # Must be 1 in Phase 1
+# shards: 1..=16; shard i uses media port + i and, with cpu_affinity, core i. Until Phase
+# 2.4 every session goes to shard 0, capped at transport.max_webrtc_sessions / shards.
+shards = 1
 busy_poll_rounds = 256                  # Spin before parking (lower latency, more CPU)
-pool_buffers = 1024                     # 2 KB packet buffers per shard
+# 2 KB packet buffers per shard. Default: 1024 + (shards - 1) × 1024 (2 MB per shard
+# at 1 shard, 8 MB at 4, 32 MB at 16: ≈ 512 MB in all); minimum: 320 + (shards - 1) × 1024
+# (a credit of loans per peer).
+# pool_buffers = 1024
 consent_timeout_ms = 30000              # Close a session after 30 s without authenticated traffic
 rebind_silence_ms = 2000                # Accept a new client address after 2 s of silence
-cpu_affinity = true                     # Pin shard i to core i
+cpu_affinity = true                     # Pin shard i to core i (cores 0..shards-1)
 # SCHED_FIFO stays off: with busy polling and pinning, shard 0 would spin as a
 # real-time thread on core 0 and could starve interrupts and the control plane there.
 realtime_priority = false

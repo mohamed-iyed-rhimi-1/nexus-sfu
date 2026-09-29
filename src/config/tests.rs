@@ -135,7 +135,20 @@ fn test_env_var_overrides() {
     assert!(ConfigLoader::merge_from_env(NexusConfig::default()).is_err());
     env::set_var("NEXUS_SHARDS", "2");
     let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
-    assert!(config.validate().is_err(), "Phase 1 runs one shard");
+    // `validate_dataplane` alone: the unspecified announced IP above is still set.
+    assert!(config.validate_dataplane().is_ok(), "several shards run");
+    let dp = config.to_dataplane_config().unwrap();
+    assert_eq!(
+        dp.shard.pool_buffers, 2_048,
+        "the default pool follows the shards"
+    );
+    assert_eq!(
+        dp.shard.max_sessions,
+        config.transport.max_webrtc_sessions.div_ceil(2)
+    );
+    env::set_var("NEXUS_SHARDS", "17");
+    let config = ConfigLoader::merge_from_env(NexusConfig::default()).unwrap();
+    assert!(config.validate_dataplane().is_err(), "above the shard cap");
     env::remove_var("NEXUS_SHARDS");
 
     // Test 6: the old data plane's variables are refused, not ignored
@@ -174,7 +187,7 @@ fn test_hot_reload_ignores_dataplane_config() {
     let original = config.dataplane.pool_buffers;
     let new_config = NexusConfig {
         dataplane: DataplaneSettings {
-            pool_buffers: original * 2,
+            pool_buffers: Some(4_096),
             ..Default::default()
         },
         ..Default::default()
@@ -368,7 +381,7 @@ fn test_dataplane_config_mapping() {
     config.api.bind_addr = "127.0.0.1:8081".to_string();
     config.metrics.bind_addr = "127.0.0.1:9090".to_string();
     config.dataplane.busy_poll_rounds = 7;
-    config.dataplane.pool_buffers = 4096;
+    config.dataplane.pool_buffers = Some(4096);
     config.dataplane.consent_timeout_ms = 20_000;
     config.dataplane.rebind_silence_ms = 1_500;
     config.dataplane.cpu_affinity = true;
@@ -426,6 +439,28 @@ fn test_dataplane_reserved_ports() {
 }
 
 #[test]
+fn test_dataplane_accepts_several_shards() {
+    for shards in 2..=4u16 {
+        let mut config = NexusConfig::default();
+        config.dataplane.shards = shards;
+        config.validate().expect("valid");
+        let dp = config.to_dataplane_config().unwrap();
+        assert_eq!(dp.shards, shards);
+        assert_eq!(
+            dp.shard.pool_buffers,
+            nexus_dataplane::default_pool_buffers(shards)
+        );
+        config.dataplane.pool_buffers = Some(nexus_dataplane::min_pool_buffers(shards));
+        config.validate().expect("the minimum is enough");
+    }
+    let mut config = NexusConfig::default();
+    config.dataplane.shards = nexus_dataplane::MAX_SHARDS_SUPPORTED + 1;
+    let err = config.validate().expect_err("above the cap").to_string();
+    let range = format!("1..={}", nexus_dataplane::MAX_SHARDS_SUPPORTED);
+    assert!(err.contains(&range), "{err}");
+}
+
+#[test]
 fn test_dataplane_rejects_invalid_settings() {
     let refused = |f: &dyn Fn(&mut NexusConfig)| {
         let mut config = NexusConfig::default();
@@ -434,8 +469,20 @@ fn test_dataplane_rejects_invalid_settings() {
         assert!(err.to_string().contains("dataplane"), "{err}");
     };
     refused(&|c| c.dataplane.shards = 0);
-    refused(&|c| c.dataplane.shards = 2);
-    refused(&|c| c.dataplane.pool_buffers = 1);
+    refused(&|c| c.dataplane.shards = 17);
+    refused(&|c| c.dataplane.shards = 65);
+    refused(&|c| c.dataplane.pool_buffers = Some(1));
+    // Two shards need a credit of loans on top of the batches.
+    refused(&|c| {
+        c.dataplane.shards = 2;
+        c.dataplane.pool_buffers = Some(1_343);
+    });
+    // Shard 2's port would be the signaling port.
+    refused(&|c| {
+        c.dataplane.shards = 4;
+        c.transport.media_bind_addr = "0.0.0.0:8078".parse().unwrap();
+        c.transport.signaling_bind_addr = "0.0.0.0:8080".parse().unwrap();
+    });
     refused(&|c| c.dataplane.rebind_silence_ms = c.dataplane.consent_timeout_ms);
     // The media port must not be the signaling, API or metrics port.
     refused(&|c| {

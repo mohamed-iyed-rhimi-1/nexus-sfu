@@ -179,7 +179,7 @@ Key facts:
 | **RR and TWCC toward publishers** | Not sent, so browsers keep their start bitrate | Phase 3 |
 | **Simulcast** | `MAX_LAYERS` = 1; `a=ssrc-group:SIM` refused in the answer | After v1 |
 | **Bandwidth estimation** | Not called (`nexus-bwe`, 2.3); `[bwe]` config is not read | After v1 |
-| **Multiple shards** | `dataplane.shards` > 1 is refused at startup (`DataplaneConfig::MAX_SHARDS_PHASE_1`); only `SingleShard` placement exists, and only the first shard's candidates are advertised | Phase 2 (`Placement` is the hook) |
+| **Multiple shards** | `dataplane.shards` 1..=16 starts one thread per shard, connected by the cross-shard mesh (Phase 2.3); only `SingleShard` placement exists, so every session is on shard 0, capped at `max_webrtc_sessions / shards` while the other shards idle (a startup warning says so), and only its candidates are advertised | Phase 2.4 (`Placement` is the hook) |
 | **ICE restart / network switch** | No ICE restart; a changed address is followed only by the rebind rule (2 s silence), so a client whose new path needs a new candidate pair loses the call | After v1 |
 | **Codecs** | VP8 and Opus only | After v1 |
 | **QUIC signaling** | Not started (2.3) | Non-goal |
@@ -240,7 +240,7 @@ Open (known, accepted for now; details in `docs/plans/phase-1.md` "Risks" and "B
 
 | Item | Status | What exists today |
 |------|--------|-------------------|
-| Multiple shards on multiple cores, port per shard, cross-shard queues | ⬜ | Phase 2. One shard; `Placement`, `TrackRef` and `WrongShard` are the interfaces it builds on |
+| Multiple shards on multiple cores, port per shard, cross-shard queues | 🟡 | Phase 2. Shards start on their own threads and ports, connected by the cross-shard queues (2.3); placement is still `SingleShard` (2.4), so sessions all go to shard 0, capped at `max_webrtc_sessions / shards` |
 | Throughput and scaling bench (`benches/dataplane.rs`) | ⬜ | Phase 2. `real_path` measures ingress and per-subscriber egress separately |
 | NACK, RR, TWCC feedback | ⬜ | Phase 3 (`docs/design/loss-recovery.md`, to be written) |
 | Simulcast, bandwidth estimation, single-port mode, RTX | ⬜ | After v1 |

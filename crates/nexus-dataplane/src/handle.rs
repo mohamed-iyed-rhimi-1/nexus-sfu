@@ -1,7 +1,9 @@
 //! Starting the data plane and talking to it (note §3.1, §3.6, §5.3).
 //!
-//! `Dataplane::start` binds one socket per shard and spawns one thread per
-//! shard. The control plane then uses only `DataplaneHandle`: commands in
+//! `Dataplane::start` binds one socket per shard and builds every shard,
+//! connects them with the cross-shard mesh and each other's wakes, and only
+//! then spawns one thread per shard, so a setup error leaves no thread
+//! behind. The control plane then uses only `DataplaneHandle`: commands in
 //! (one `ArrayQueue` per shard, waking a parked shard), events out (one
 //! tokio channel all shards share, filled with `try_send`), stats, and
 //! shutdown.
@@ -28,6 +30,7 @@ use crate::shard::park::{Parker, Wake};
 use crate::shard::runner::ShardThread;
 use crate::shard::stats::{ShardStats, ShardStatsSnapshot};
 use crate::shard::Shard;
+use crate::xs::XsMesh;
 
 /// Capacity of the event channel all shards share (note §5.3).
 pub const EVENT_CHANNEL_CAPACITY: usize = 8_192;
@@ -171,30 +174,106 @@ fn fit_buffer_sizes(
 pub struct Dataplane;
 
 impl Dataplane {
-    /// Binds a socket and spawns a thread per shard. On any failure the
-    /// shards already started are stopped and joined.
+    /// Binds a socket and builds a shard for every shard index, connects
+    /// the shards (mesh and peer wakes, when there are several), then spawns
+    /// a thread per shard. A bind or setup error returns before any thread
+    /// exists; on a failed spawn the shards already started are stopped and
+    /// joined.
     pub fn start(
         config: DataplaneConfig,
     ) -> Result<(DataplaneHandle, Vec<ShardInfo>), DataplaneError> {
         config.validate().map_err(DataplaneError::Config)?;
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let mut handle = DataplaneHandle {
-            shards: Vec::with_capacity(usize::from(config.shards)),
-            events: Mutex::new(Some(events_rx)),
-            threads: Mutex::new(Vec::with_capacity(usize::from(config.shards))),
-        };
         let seed = process_seed();
-        let mut infos = Vec::with_capacity(usize::from(config.shards));
+        let count = usize::from(config.shards);
+        let mut prepared = Vec::with_capacity(count);
         for index in 0..config.shards {
-            // shards ≤ MAX_SHARDS_PHASE_1, validated.
+            // shards ≤ MAX_SHARDS_SUPPORTED, validated.
             let index = u8::try_from(index).expect("validated shard count");
-            let info = handle.spawn_shard(&config, index, seed, events_tx.clone())?;
-            infos.push(info);
+            prepared.push(prepare_shard(&config, index, seed, events_tx.clone())?);
         }
-        assert!(infos.len() == usize::from(config.shards));
+        if count > 1 {
+            connect(&mut prepared);
+        }
+        log_fixed_memory(&config);
+        let infos: Vec<ShardInfo> = prepared.iter().map(|p| p.info).collect();
+        let mut handle = DataplaneHandle {
+            shards: Vec::with_capacity(count),
+            events: Mutex::new(Some(events_rx)),
+            threads: Mutex::new(Vec::with_capacity(count)),
+        };
+        for shard in prepared {
+            handle.spawn_shard(&config, shard)?;
+        }
+        assert!(infos.len() == count);
         assert!(handle.shards.len() == infos.len());
         Ok((handle, infos))
     }
+}
+
+/// A shard built and bound, not yet running.
+struct Prepared {
+    shard: Shard<PlatformIo, mpsc::Sender<Event>>,
+    parker: Parker,
+    wake: Wake,
+    info: ShardInfo,
+}
+
+/// Binds shard `index` and builds it on this thread, so setup errors
+/// surface before any spawn.
+fn prepare_shard(
+    config: &DataplaneConfig,
+    index: u8,
+    seed: u64,
+    events: mpsc::Sender<Event>,
+) -> Result<Prepared, DataplaneError> {
+    let mut addr = config.bind_addr;
+    if addr.port() != 0 {
+        addr.set_port(addr.port() + u16::from(index));
+    }
+    let socket_error = |source| DataplaneError::Socket { addr, source };
+    let socket = bind_shard_socket(addr, config).map_err(socket_error)?;
+    let local_addr = socket.local_addr().map_err(socket_error)?;
+    let (parker, wake) = Parker::new(socket.as_raw_fd()).map_err(DataplaneError::Thread)?;
+    let io = PlatformIo::new(socket).map_err(socket_error)?;
+    let shard_config = config.shard_config(index, seed);
+    let shard =
+        Shard::new(shard_config, io, events, Instant::now()).map_err(DataplaneError::Config)?;
+    let id = ShardId::new(index);
+    assert!(shard.id() == id);
+    Ok(Prepared {
+        shard,
+        parker,
+        wake,
+        info: ShardInfo { id, local_addr },
+    })
+}
+
+/// Gives every shard its ends of the cross-shard mesh (built over every
+/// shard's pool region) and every shard's wake, indexed by shard.
+fn connect(prepared: &mut [Prepared]) {
+    assert!(prepared.len() > 1);
+    let regions: Vec<_> = prepared.iter().map(|p| p.shard.pool_region()).collect();
+    let ports = XsMesh::build(&regions);
+    assert!(ports.len() == prepared.len());
+    let wakes: Vec<Wake> = prepared.iter().map(|p| p.wake.clone()).collect();
+    for (shard, ports) in prepared.iter_mut().zip(ports) {
+        shard.shard.attach_xs(ports);
+        shard.shard.attach_peer_wakes(wakes.clone());
+    }
+}
+
+/// Logs the memory the shards allocate at start (pools, rings).
+fn log_fixed_memory(config: &DataplaneConfig) {
+    let memory = config.fixed_memory();
+    tracing::info!(
+        shards = config.shards,
+        pool_buffers = config.shard.pool_buffers,
+        pool_bytes_per_shard = memory.pool_bytes_per_shard,
+        ring_bytes = memory.ring_bytes,
+        total_bytes = memory.total(config.shards),
+        "data plane fixed memory"
+    );
 }
 
 /// A random seed per process for the shards' rewrite offsets (no clock,
@@ -221,27 +300,22 @@ pub struct DataplaneHandle {
 }
 
 impl DataplaneHandle {
-    /// Binds shard `index`, builds it on this thread (so setup errors
-    /// surface before any spawn) and starts its thread.
+    /// Starts a prepared shard's thread.
     fn spawn_shard(
         &mut self,
         config: &DataplaneConfig,
-        index: u8,
-        seed: u64,
-        events: mpsc::Sender<Event>,
-    ) -> Result<ShardInfo, DataplaneError> {
-        let mut addr = config.bind_addr;
-        if addr.port() != 0 {
-            addr.set_port(addr.port() + u16::from(index));
-        }
-        let socket_error = |source| DataplaneError::Socket { addr, source };
-        let socket = bind_shard_socket(addr, config).map_err(socket_error)?;
-        let local_addr = socket.local_addr().map_err(socket_error)?;
-        let (parker, wake) = Parker::new(socket.as_raw_fd()).map_err(DataplaneError::Thread)?;
-        let io = PlatformIo::new(socket).map_err(socket_error)?;
-        let shard_config = config.shard_config(index, seed);
-        let shard =
-            Shard::new(shard_config, io, events, Instant::now()).map_err(DataplaneError::Config)?;
+        prepared: Prepared,
+    ) -> Result<(), DataplaneError> {
+        let Prepared {
+            shard,
+            parker,
+            wake,
+            info,
+        } = prepared;
+        assert!(
+            usize::from(info.id.index()) == self.shards.len(),
+            "spawned in order"
+        );
         let handle = ShardHandle {
             commands: shard.command_queue(),
             wake,
@@ -258,15 +332,15 @@ impl DataplaneHandle {
             cpu_affinity: config.cpu_affinity,
             realtime_priority: config.realtime_priority,
         };
-        let id = ShardId::new(index);
+        let id = info.id;
         let join = std::thread::Builder::new()
-            .name(format!("nexus-shard-{index}"))
+            .name(format!("nexus-shard-{}", id.index()))
             .stack_size(SHARD_STACK_SIZE)
             .spawn(move || thread.run(id))
             .map_err(DataplaneError::Thread)?;
         self.shards.push(handle);
         self.threads.lock().expect("threads lock").push(join);
-        Ok(ShardInfo { id, local_addr })
+        Ok(())
     }
 
     /// Number of shards.

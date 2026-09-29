@@ -14,12 +14,15 @@ use super::{ConfigError, NexusConfig};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DataplaneSettings {
-    /// Number of shards (one thread and one media port each). 1 in Phase 1.
+    /// Number of shards (one thread and one media port each),
+    /// 1..=`nexus_dataplane::MAX_SHARDS_SUPPORTED` (16).
     pub shards: u16,
     /// Idle iterations before a shard parks; 0 parks as soon as it is idle.
     pub busy_poll_rounds: u32,
-    /// Packet buffers per shard (2,048 bytes each).
-    pub pool_buffers: u32,
+    /// Packet buffers per shard (2,048 bytes each). Unset: 1,024 plus a
+    /// cross-shard credit per peer (`nexus_dataplane::default_pool_buffers`);
+    /// set, it must be at least `min_pool_buffers(shards)`.
+    pub pool_buffers: Option<u32>,
     /// No authenticated traffic for this long closes the session.
     pub consent_timeout_ms: u32,
     /// Silence of the selected address before a rebind is accepted.
@@ -37,7 +40,7 @@ impl Default for DataplaneSettings {
         Self {
             shards: 1,
             busy_poll_rounds: 0,
-            pool_buffers: 1_024,
+            pool_buffers: None,
             consent_timeout_ms: 30_000,
             rebind_silence_ms: 2_000,
             cpu_affinity: false,
@@ -53,8 +56,14 @@ impl NexusConfig {
     /// API and metrics ports reserved.
     pub fn to_dataplane_config(&self) -> Result<nexus_dataplane::DataplaneConfig, ConfigError> {
         let settings = &self.dataplane;
-        if settings.shards == 0 {
-            return Err(ConfigError::invalid("dataplane.shards", "must be >= 1"));
+        let max_shards = nexus_dataplane::MAX_SHARDS_SUPPORTED;
+        if !(1..=max_shards).contains(&settings.shards) {
+            return Err(ConfigError::invalid(
+                "dataplane.shards",
+                &format!(
+                    "must be in 1..={max_shards} (pools and cross-shard rings grow with shards²)"
+                ),
+            ));
         }
         let realtime_priority = if settings.realtime_priority {
             let level = u8::try_from(settings.realtime_priority_level).map_err(|_| {
@@ -81,7 +90,9 @@ impl NexusConfig {
             rng_seed: None,
             ..Default::default()
         };
-        config.shard.pool_buffers = settings.pool_buffers;
+        config.shard.pool_buffers = settings
+            .pool_buffers
+            .unwrap_or_else(|| nexus_dataplane::default_pool_buffers(settings.shards));
         config.shard.max_sessions = max_sessions;
         config.shard.consent_timeout = Duration::from_millis(settings.consent_timeout_ms.into());
         config.shard.rebind_silence = Duration::from_millis(settings.rebind_silence_ms.into());

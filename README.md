@@ -30,12 +30,12 @@ The goal is an SFU that forwards 500K+ packets/sec/core in userspace with P99 la
 ## Features
 
 - **Zero-alloc hot path** — the shard forwards with no heap allocation, lock or clock read per packet (checked in CI)
-- **Sharded data plane** — one thread and one socket per shard, `recvmmsg`/`sendmmsg`; one shard in Phase 1
+- **Sharded data plane** — one thread and one socket per shard, `recvmmsg`/`sendmmsg`; several shards start (`dataplane.shards`), but every session is placed on shard 0 until Phase 2.4
 - **In-process state** — CRDTs, no Redis, no Postgres; single node (gossip is off and not yet authenticated)
 - **WebSocket signaling** — JSON messages, WSS with TLS
 - **Keyframes and lip sync** — PLI on subscribe, PLI/FIR forwarding with throttling, Sender Report translation
 
-Not yet: NACK and TWCC feedback (Phase 3), multiple shards (Phase 2), simulcast and bandwidth estimation (after v1). `nexus-bwe` exists but is not wired in.
+Not yet: placing sessions on several shards (Phase 2.4; until then all go to shard 0, capped at `max_webrtc_sessions / shards`), NACK and TWCC feedback (Phase 3), simulcast and bandwidth estimation (after v1). `nexus-bwe` exists but is not wired in.
 
 ## Architecture
 
@@ -116,7 +116,7 @@ signaling_bind_addr = "0.0.0.0:8080"  # WebSocket signaling
 announced_ips = ["203.0.113.7"]       # ICE host candidates; see below
 
 [dataplane]
-shards = 1              # one thread and one media port per shard (1 in Phase 1)
+shards = 1              # one thread and one media port per shard (1..=16)
 busy_poll_rounds = 0    # idle iterations before a shard parks (256 in production)
 cpu_affinity = false    # pin shard i to core i
 

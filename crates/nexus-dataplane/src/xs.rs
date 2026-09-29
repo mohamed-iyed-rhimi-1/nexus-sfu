@@ -76,6 +76,23 @@ struct PeerPorts {
     region: Arc<PoolRegion>,
 }
 
+/// Bytes of one `ArrayQueue` slot holding a `T`: the value plus crossbeam's
+/// 8-byte stamp, rounded up to 8 (an estimate of its private layout).
+const fn slot_bytes(value: usize) -> u64 {
+    ((value + 8).div_ceil(8) * 8) as u64
+}
+
+/// Estimated memory of the rings of a mesh of `shards` shards: per ordered
+/// pair, a media ring of `XS_RING` messages and a return ring of
+/// `XS_CREDIT` loans (≈ 56 KB). Grows with `shards²`.
+pub fn mesh_bytes(shards: u16) -> u64 {
+    assert!(usize::from(shards) <= MAX_SHARDS);
+    let n = u64::from(shards);
+    let pair = XS_RING as u64 * slot_bytes(std::mem::size_of::<XsMsg>())
+        + u64::from(XS_CREDIT) * slot_bytes(std::mem::size_of::<Loan>());
+    n * n.saturating_sub(1) * pair
+}
+
 /// A shard's ends of the mesh, one entry per peer.
 pub struct XsPorts {
     shard: ShardId,
@@ -228,6 +245,17 @@ mod tests {
         let regions: Vec<_> = pools.iter().map(BufferPool::region).collect();
         let ports = XsMesh::build(&regions);
         (pools, ports)
+    }
+
+    #[test]
+    fn mesh_memory_grows_with_ordered_pairs() {
+        assert_eq!(mesh_bytes(0), 0);
+        assert_eq!(mesh_bytes(1), 0, "one shard has no rings");
+        let pair = mesh_bytes(2) / 2;
+        // A 24-byte message and a 12-byte loan, each with an 8-byte stamp.
+        assert_eq!(pair, 1_024 * 32 + 1_024 * 24);
+        assert_eq!(mesh_bytes(4), 12 * pair);
+        assert_eq!(mesh_bytes(16), 240 * pair);
     }
 
     #[test]

@@ -3,7 +3,8 @@
 **State: in progress** (plan written 2026-09-29, audited against `75fcdd9` the same day, revised the same day after
 the owner's review; 2.1 detailed the same day from a code analysis, with the owner's `Loan`
 decision and a process-unique region id; 2.1 implemented and committed the same day,
-`28d9cdf`; 2.2 implemented the same day, not committed, waiting for review).
+`28d9cdf`; 2.2 committed the same day, `8210c7b`; 2.3 detailed and implemented the same day,
+not committed, waiting for review).
 
 **Design:** [`docs/dataplane-design.md`](../dataplane-design.md) §5, Phase 2 ("Port per shard,
 placement, cross-shard queues and buffer return"), within D1-D4 and D8, §3.1 and §3.3. Detailed
@@ -480,51 +481,82 @@ workspace green; Linux container run.
 **Goal:** `Dataplane::start` runs N shard threads connected by the mesh, and the config
 accepts `shards > 1`.
 
-**Files:** `crates/nexus-dataplane/src/{handle.rs, config.rs, sched.rs, shard/runner.rs}`,
-`tests/loopback.rs`, `src/config/{dataplane.rs, tests.rs}`, `config/*.toml` (comments).
+**Files:** `crates/nexus-dataplane/src/{handle.rs, config.rs, sched.rs, xs.rs, lib.rs,
+shard/runner.rs}`, `tests/loopback.rs`, `examples/basic_sfu.rs`, `src/config/{dataplane.rs,
+tests.rs}`, `config/*.toml` (comments), and one-line facts in `CLAUDE.md`, `README.md`,
+`architecture.md` (the full pass stays in 2.7).
+
+**Owner's decisions (2026-09-29, detailing 2.3):**
+- **Shard cap 16** (`DataplaneConfig::MAX_SHARDS_SUPPORTED`): more is an error naming the
+  fixed memory; `shards` above the core count is a warning; `Dataplane::start` logs the pool
+  and ring bytes. 2.6 may retune `XS_CREDIT` and raise the cap.
+- **`dataplane.pool_buffers` is optional:** unset means `1,024 + (shards − 1) × XS_CREDIT`;
+  set is validated against the minimum.
 
 **Change:**
-- **Two-phase start:** bind every socket, build every `Shard` and `Parker`, build the
-  `XsMesh` and give each shard its ports and its peers' `Wake`s, then spawn. Today
-  `Dataplane::start` (`handle.rs:176-198`) calls `spawn_shard` (`handle.rs:226-271`), which
-  builds and spawns one shard at a time.
-- **Limit:** `MAX_SHARDS_PHASE_1` (`config.rs:134`, checked at `:157` with "shards must be 1
-  in Phase 1") goes; `shards` is checked against `ids::MAX_SHARDS` (64) and the port range
-  (`:160-173`, already N-aware).
-- **Pool size:** validated ≥ `RECV_BATCH + SEND_BATCH + (shards − 1) × XS_CREDIT`, so lent
-  buffers can never starve a receive batch; the default follows the shard count (≈ 2 MB per
-  shard at 1 shard, ≈ 7 MB at 4 with the starting constants). 2.6 revisits the constants.
-- **Fixed memory grows with n²** (found while detailing 2.1): the pool minimum is
-  `(n − 1) × XS_CREDIT` buffers per shard and the mesh has n(n − 1) pairs of rings (≈ 56 KB
-  per pair). At 4 shards that is ≈ 7 MB of pool per shard and ≈ 0.7 MB of rings; at
-  `MAX_SHARDS` = 64 it would be ≈ 126 MB of pool per shard (≈ 8 GB in total) and ≈ 225 MB of
-  rings. So `shards` is validated against a practical bound (e.g. the core count, with a
-  clear error), or `XS_CREDIT` is scaled down with n; `Dataplane::start` logs the fixed
-  memory it allocates.
-- **Pinning:** shard i stays on `core_affinity::get_core_ids()[i]` (`sched.rs:7-25`); the
-  warning at `config.rs:137-149` ("shard 0 on core 0") is reworded for N shards, and the
-  config docs say which cores the shards take.
-- `src/config/dataplane.rs:17` doc and the TOML comments (`shards = 1 # Must be 1 in Phase
-  1`) updated; defaults stay `shards = 1` everywhere until 2.7 decides production's value.
+- **Two-phase start** (`handle.rs`): `prepare_shard` (today's `spawn_shard` without the
+  spawn: bind `port + i`, `Parker`/`Wake`, `PlatformIo`, `Shard::new`) for every shard
+  first, so a failure drops every socket and no thread exists; then, **only when n > 1** (the
+  single-shard path stays exactly as in Phase 1), `XsMesh::build` over every shard's
+  `pool_region()`, `attach_xs` and `attach_peer_wakes` (every shard's `Wake`, by index);
+  then log the fixed memory; then spawn. A failed spawn returns the error and the handle's
+  `Drop` stops and joins the shards already spawned.
+- **Limit:** `MAX_SHARDS_PHASE_1` goes; `1 ≤ shards ≤ MAX_SHARDS_SUPPORTED` (16, const-asserted
+  `≤ ids::MAX_SHARDS`). The port-range checks were already N-aware.
+- **Pool size:** `min_pool_buffers(n) = RECV_BATCH + SEND_BATCH + (n − 1) × XS_CREDIT`
+  (320 + (n − 1) × 1,024), so lent buffers can never starve a receive batch;
+  `default_pool_buffers(n) = 1,024 + (n − 1) × XS_CREDIT` (2 MB per shard at 1 shard, 8 MB at
+  4, 32 MB at 16).
+- **Fixed memory grows with n²** (found while detailing 2.1): pools n × default, rings
+  n(n − 1) × (`XS_RING` × slot(`XsMsg`) + `XS_CREDIT` × slot(`Loan`)) ≈ 56 KB per ordered
+  pair (`xs::mesh_bytes`, an estimate of crossbeam's slot layout). At 4 shards ≈ 32 MB of
+  pools and ≈ 0.7 MB of rings; at 16 ≈ 512 MB and ≈ 13 MB; at 64 it would be ≈ 8 GB, hence
+  the cap. `DataplaneConfig::fixed_memory()` is logged at start and reused by 2.6.
+- **Pinning:** shard i stays on `core_affinity::get_core_ids()[i]` (`sched.rs`); the
+  SCHED_FIFO warning is reworded for N shards (shard i busy-polls on core i, shard 0 on core
+  0); a new warning for `shards` above the core count, and one more when those shards are
+  SCHED_FIFO busy-pollers (unpinned on shared cores, they can starve every other thread). `warnings_for(cores)` is testable.
+- Binary: `DataplaneSettings.pool_buffers: Option<u32>`; `to_dataplane_config` checks
+  `shards` in `1..=16` before computing the default (the message formats the range from
+  `MAX_SHARDS_SUPPORTED`). **Interim warning:** with `shards > 1`, `server::start` warns
+  that placement is `SingleShard` until 2.4 (sessions all on shard 0, capped at
+  `max_webrtc_sessions / shards`, the other shards idle); the TOML `shards` comments,
+  CLAUDE.md, README and architecture.md say the same. TOML comments: `shards` 1..=16, port
+  + i, core i; `pool_buffers` commented out with the formula. Defaults stay `shards = 1`
+  everywhere until 2.7 decides production's value.
 
-**Code notes (audited 2026-09-29):**
-- `Dataplane::start` already creates one event channel for every shard (`handle.rs:180`),
-  binds `port + index` (`:233-236`, ephemeral per shard when the port is 0), and returns
-  `Vec<ShardInfo>`; `DataplaneHandle::send(shard, cmd)` (`:285-295`), `stats(shard)`,
-  `loads()` (`:309-317`) and `shutdown()` (`:326-344`) are per shard already.
-- `src/config/dataplane.rs` already splits `max_webrtc_sessions` with `div_ceil(shards)`
-  (`:67-70`) and passes the reserved ports (`:99-110`).
-- Tests that assume one shard: `config.rs:260-263` (`shards: 2` refused),
-  `src/config/tests.rs:136-138, 436-437`.
-- Shutdown: a shard that stops while peers still hold its buffers is fine (the region is an
-  `Arc`); messages still in rings at shutdown are dropped with the process.
+**Code notes (audited 2026-09-29, at `8210c7b`):**
+- `Dataplane::start` (`handle.rs:176-198`) built and spawned one shard at a time
+  (`spawn_shard`, `:226-270`); it already made one event channel for every shard, bound
+  `port + index` (ephemeral per shard at port 0) and returned `Vec<ShardInfo>`;
+  `DataplaneHandle::send/stats/loads/shutdown` are per shard already.
+- `Shard::attach_xs`, `attach_peer_wakes`, `wake_peers` (`shard/xs.rs`) and the runner's
+  `xs_pending()` park check (`runner.rs:78`) came with 2.2 and were not exercised on threads
+  until this part.
+- `src/config/dataplane.rs` splits `max_webrtc_sessions` with `div_ceil(shards)`. **Interim
+  until 2.4:** `SingleShard` still places every session on shard 0, so a binary with
+  `shards > 1` has 1/n of its session capacity on the shard that gets them all. Defaults
+  stay 1, so nothing changes in practice.
+- Shutdown is unchanged: every shard is stopped and woken, then joined. A shard that stops
+  while peers hold its buffers is fine (regions are `Arc`s held by the peers' ports; `Loan`
+  has no `Drop`); messages still in rings go with the process.
 
 **Tests:**
-- `tests/loopback.rs`: 2 shards, publisher on shard 0 and subscriber on shard 1 through real
-  sockets (media, SR, PLI across); 4 shards all parked, a message to a parked peer is handled
-  within 10 ms (wake works); shutdown joins every shard within 100 ms.
-- Config: `shards = 2..4` accepted, `shards = 65` refused, the range overlapping a reserved
-  port refused, pool below the minimum refused.
+- `config.rs`: `shards` 2..=4 with the default pool accepted; 0, 17, 65 refused; pool 1,343
+  at 2 shards refused, 1,344 accepted, the default valid for every n in 1..=16; a range
+  overlapping a reserved port refused (10,003 of 10,000 + 4), 10,004 accepted; 65,535 + 2
+  shards refused; `warnings_for`; `fixed_memory`.
+- `src/config/tests.rs`: `NEXUS_SHARDS=2` valid with pool 2,048 and split sessions;
+  `shards` 17 and 65, pool below the minimum, and a media range into the signaling port
+  refused.
+- `tests/loopback.rs` (the helpers take a `ShardId`): 2 shards, publisher on 0 and
+  subscriber on 1 through real sockets (media, SR with the subscriber's counters and SDES,
+  PLI across, loans all returned); 4 shards all parked, publisher on 0 and one subscriber
+  on each of 1-3, 20 packets 50 ms apart: median ≤ 10 ms and max ≤ 500 ms (below the 1 s
+  park timeout, so a loaded CI host does not fail it) to every subscriber (only
+  `wake_peers` wakes them); shutdown joins 4 shards within 1 s (sub-millisecond when idle); a failed bind of shard 1 starts no thread and releases
+  shard 0's port. Mutation checks: `wake_peers` a no-op; `xs_pending` removed from the park
+  check (a narrow race: recorded whether caught).
 
 **Checkpoint:** workspace green, Linux container run (threads, pinning, `LinuxIo`).
 
@@ -864,8 +896,8 @@ changes a decision (D1-D10, R1-R9).
 | Part | State | Commits | Notes |
 |------|-------|---------|-------|
 | 2.1 Shared pool region, `XsMsg`, mesh | Done | `28d9cdf` | `Loan` with region id; freeing independent of call order (`held`); stress test and Miri clean |
-| 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Done, not committed (review fixes, second review) | | Mirrors, lend after local fan-out, returns at the top of `iterate`; alloc test 0 on 2 shards; 3-shard proptest agrees with the counting model |
-| 2.3 N shards on threads | Not started | | |
+| 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Done | `8210c7b` | Mirrors, lend after local fan-out, returns at the top of `iterate`; alloc test 0 on 2 shards; 3-shard proptest agrees with the counting model |
+| 2.3 N shards on threads | Done, not committed | | Two-phase start, mesh and peer wakes (n > 1 only); cap 16; optional pool with a per-shard-count default; loopback tests on 2 and 4 shards |
 | 2.4 Control plane: placement, cross-shard subscriptions | Not started | | |
 | 2.5 E2E on several shards | Not started | | |
 | 2.6 `benches/dataplane.rs`, measurements, tuning | Not started | | |
@@ -1047,3 +1079,52 @@ Add one line per working session: date, part, what was done, what is left.
   (`28d9cdf` + 27 uncommitted or untracked paths, macos + linux-arm64): all PASS,
   `cargo test --workspace` 1,513 (macOS) / 1,519 (Linux), e2e included, bench smoke and
   memory budget 25 KB PASS. Next: owner's review, then commit; then 2.3.
+- 2026-09-29: 2.2 committed (`8210c7b`); Status set to Done. 2.3 detailed from a code
+  analysis (owner's decisions: shard cap 16, `pool_buffers` optional with a default that
+  follows the shard count) and **implemented, not committed.** `Dataplane::start` prepares
+  every shard (bind, `Parker`, `Shard::new`) before spawning any, then, for n > 1,
+  `XsMesh::build` + `attach_xs` + `attach_peer_wakes`, logs the fixed memory, and spawns.
+  `DataplaneConfig`: `MAX_SHARDS_PHASE_1` gone, `MAX_SHARDS_SUPPORTED = 16`,
+  `min_pool_buffers`/`default_pool_buffers`, pool checked against the minimum,
+  `warnings_for(cores)` (SCHED_FIFO warning reworded, new warning for shards above the core
+  count), `fixed_memory()` with `xs::mesh_bytes` (56 KB per ordered pair). Binary:
+  `dataplane.pool_buffers: Option<u32>`, `shards` checked in 1..=16; TOML comments; one-line
+  facts in CLAUDE.md, README, architecture.md. The runner's park check moved into
+  `work_pending` (no behaviour change) so it can be unit-tested. **Tests:** config (2-4
+  accepted, 0/17/65 refused, pool 1,343/1,344 at 2 shards, port range, warnings, fixed
+  memory), binary config (`NEXUS_SHARDS=2` valid with pool 2,048, 17 refused, pool below
+  minimum and a range into the signaling port refused); `tests/loopback.rs` (helpers take a
+  `ShardId`): `cross_shard_call_over_real_sockets` (media, SR with shard 1's counters and
+  SDES, PLI across within 100 ms, 50 loans returned), `parked_shards_wake_for_a_peer` (4
+  shards, macOS: median 0.45 ms, max 1.3 ms over 20 rounds),
+  `shutdown_joins_every_shard` (0.5 ms), `a_failed_bind_starts_no_thread`; runner unit test
+  `a_queued_peer_message_is_pending_work`. **Mutation checks:** `wake_peers` a no-op → both
+  loopback tests fail (29 of 50 packets; "woken in time"); `xs_pending` removed from the park
+  check → the loopback tests still pass in 5 of 5 runs (the race window is too narrow), the
+  new runner unit test fails. **Smoke:** `NEXUS_SHARDS=4` with `development.toml` binds
+  10000-10003, logs 34.2 MB fixed (8 MB pool per shard, 0.69 MB rings), stops cleanly;
+  `NEXUS_SHARDS=17` refused. **ci-local** (`8210c7b` + 18 uncommitted or untracked paths,
+  macos + linux-arm64): all PASS, `cargo test --workspace` 1,525 (macOS) / 1,531 (Linux),
+  bench smoke and memory budget 25 KB PASS. Interim until 2.4: `SingleShard` places every
+  session on shard 0 while `max_sessions` is split by the shard count. Next: owner's review
+  of 2.3, then commit; then 2.4.
+- 2026-09-29: 2.3 review fixes, not committed. (1) **Interim capacity:** `server::start`
+  warns when `shards > 1` ("placement is SingleShard until Phase 2.4: sessions all on shard
+  0, capped at max_webrtc_sessions / shards; the other shards idle", with the per-shard
+  cap); the TOML `shards` comments, the CLAUDE.md `[dataplane]` line and the architecture.md
+  rows say the same. Stale lines fixed: CLAUDE.md data-plane bullet (one thread per shard),
+  README features and "Not yet" (shards start, placement is 2.4), architecture.md Part 5 row
+  (🟡). (2) **Timing bounds:** `parked_shards_wake_for_a_peer` keeps median ≤ 10 ms, max and
+  per-receive timeout 500 ms (below the 1 s park timeout); `shutdown_joins_every_shard` ≤ 1
+  s. Nits: the binary's shard-cap message formats `1..=MAX_SHARDS_SUPPORTED` (tested); the
+  data plane's `ConfigError` holds a static string, so it names `MAX_SHARDS_SUPPORTED`
+  instead of repeating 16; a separate warning for SCHED_FIFO busy-polling shards above the
+  core count (tested with and without busy polling); TOML pool comment gives 16 shards
+  (≈ 512 MB). **Timings:** macOS median 0.38 ms, max 1.0 ms, shutdown 0.36 ms; Linux arm64
+  container, 3 runs: median 0.44 / 0.49 / 0.47 ms, max 1.4 / 1.1 / 4.3 ms, shutdown 1.9 /
+  0.29 / 0.33 ms. Smoke: `NEXUS_SHARDS=2` logs the placement warning (50 sessions per
+  shard in `development.toml`); `NEXUS_SHARDS=17` refused with "must be in 1..=16".
+  Loopback (14 passed, 1 ignored) and config and runner unit tests (dataplane 13, binary 39) green.
+  **ci-local** (`8210c7b` + 19 uncommitted or untracked paths, macos + linux-arm64): all
+  PASS, `cargo test --workspace` 1,525 (macOS) / 1,531 (Linux), bench smoke and memory
+  budget 25 KB PASS. Next: owner's review, then commit; then 2.4.

@@ -75,14 +75,20 @@ impl<I: DatagramIo, S: EventSink> ShardThread<I, S> {
                 UNCONFIRMED_IDLE_PARK
             };
             let (shard, stop) = (&self.shard, &self.stop);
-            let pending =
-                || shard.commands_pending() || shard.xs_pending() || stop.load(Ordering::SeqCst);
-            if self.parker.park(timeout, pending) {
+            if self.parker.park(timeout, || work_pending(shard, stop)) {
                 self.shard.count_park();
             }
         }
         self.shard.publish_stats();
     }
+}
+
+/// Work that arrived since the last iteration and that no socket readiness
+/// reports: a command, a peer's message or returned loan, or `stop`.
+/// Checked after the parked flag is set, so a producer that pushed before
+/// it (and saw no parked flag, so did not wake) is not missed.
+fn work_pending<I: DatagramIo, S: EventSink>(shard: &Shard<I, S>, stop: &AtomicBool) -> bool {
+    shard.commands_pending() || shard.xs_pending() || stop.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -130,6 +136,39 @@ mod tests {
             tx.clear();
             Sent::default()
         }
+    }
+
+    /// A peer's message queued before the shard parks keeps it from parking
+    /// (the producer saw no parked flag, so it did not wake the shard).
+    #[test]
+    fn a_queued_peer_message_is_pending_work() {
+        use crate::ids::TrackId;
+        use crate::shard::io::MemIo;
+        use crate::xs::{XsMesh, XsMsg};
+        let now = Instant::now();
+        let config = ShardConfig {
+            shard: ShardId::new(1),
+            pool_buffers: crate::config::min_pool_buffers(2),
+            ..ShardConfig::default()
+        };
+        let mut shard = Shard::new(config, MemIo::new(), Vec::<Event>::new(), now).unwrap();
+        let peer = BufferPool::new(ShardId::new(0), 4);
+        let mut ports = XsMesh::build(&[peer.region(), shard.pool_region()]);
+        shard.attach_xs(ports.pop().unwrap());
+        let stop = AtomicBool::new(false);
+        assert!(!work_pending(&shard, &stop));
+        let sr = XsMsg::SenderReport {
+            track: TrackId::new(7),
+            layer: 0,
+            ntp: 1,
+            rtp: 2,
+        };
+        assert!(ports[0].send(ShardId::new(1), sr).is_ok());
+        assert!(work_pending(&shard, &stop), "a queued message is work");
+        assert!(shard.iterate(now).cross_shard > 0);
+        assert!(!work_pending(&shard, &stop), "drained");
+        stop.store(true, Ordering::SeqCst);
+        assert!(work_pending(&shard, &stop));
     }
 
     #[test]

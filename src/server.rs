@@ -139,6 +139,20 @@ impl Drop for ServerHandle {
     }
 }
 
+/// Until Phase 2.4 placement is `SingleShard`: with several shards every
+/// session goes to shard 0, whose limit is the configured total split by the
+/// shard count, while the other shards idle. Warns once at startup.
+fn warn_single_shard_placement(shards: u16, max_sessions_per_shard: u32) {
+    if shards > 1 {
+        warn!(
+            shards,
+            max_sessions_per_shard,
+            "placement is SingleShard until Phase 2.4: sessions all on shard 0, capped at \
+             max_webrtc_sessions / shards; the other shards idle"
+        );
+    }
+}
+
 /// Start the SFU. Must be called inside a multi-threaded tokio runtime.
 pub async fn start(config: NexusConfig) -> Result<ServerHandle, String> {
     config
@@ -152,6 +166,7 @@ pub async fn start(config: NexusConfig) -> Result<ServerHandle, String> {
     let dataplane_config = config
         .to_dataplane_config()
         .map_err(|e| format!("invalid config: {e}"))?;
+    warn_single_shard_placement(dataplane_config.shards, dataplane_config.shard.max_sessions);
     let (dataplane, shards) =
         Dataplane::start(dataplane_config).map_err(|e| format!("data plane: {e}"))?;
     let dataplane = Arc::new(dataplane);

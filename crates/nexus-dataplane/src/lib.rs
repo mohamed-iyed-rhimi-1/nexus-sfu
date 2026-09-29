@@ -38,7 +38,10 @@ pub use command::{
     CodecParams, Command, Event, EventSink, ExtIds, ExtMap, IceParams, PtMap, Refused,
     RejectReason, SelectReason, SrtpInstall, SubSpec, TrackSpec,
 };
-pub use config::{ConfigError, DataplaneConfig, ShardConfig};
+pub use config::{
+    default_pool_buffers, min_pool_buffers, ConfigError, DataplaneConfig, FixedMemory, ShardConfig,
+    MAX_SHARDS_SUPPORTED,
+};
 pub use handle::{
     bind_shard_socket, CommandQueueFull, Dataplane, DataplaneError, DataplaneHandle, ShardInfo,
     EVENT_CHANNEL_CAPACITY, SHARD_STACK_SIZE,
@@ -57,7 +60,7 @@ pub use shard::io::{
 };
 pub use shard::stats::{ShardCounters, ShardStats, ShardStatsSnapshot};
 pub use shard::{IterationStats, Shard, ShardSnapshot};
-pub use xs::{XsMesh, XsMsg, XsPorts, XS_BUDGET, XS_CREDIT, XS_RING};
+pub use xs::{mesh_bytes, XsMesh, XsMsg, XsPorts, XS_BUDGET, XS_CREDIT, XS_RING};
 
 /// In-memory sizes of the shard's per-session, per-track and per-subscription
 /// entries, for the memory bench's structural report (`benches/memory.rs`).

@@ -34,7 +34,11 @@ fn main() {
     println!("Data-plane shards: {}", config.dataplane.shards);
     println!(
         "Packet buffers per shard: {}",
-        config.dataplane.pool_buffers
+        config
+            .dataplane
+            .pool_buffers
+            .map_or("default (follows the shard count)".to_string(), |n| n
+                .to_string())
     );
     println!(
         "Consent timeout: {} ms",

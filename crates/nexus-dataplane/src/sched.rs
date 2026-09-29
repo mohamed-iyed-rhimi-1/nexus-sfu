@@ -3,7 +3,8 @@
 
 use crate::ids::ShardId;
 
-/// Pins the calling thread to core `shard` of the machine's core list.
+/// Pins the calling thread to core `shard` of the machine's core list: N
+/// shards take cores 0..N−1, in order; a shard beyond the list runs unpinned.
 pub(crate) fn pin_current(shard: ShardId) {
     let index = usize::from(shard.index());
     let cores = core_affinity::get_core_ids().unwrap_or_default();

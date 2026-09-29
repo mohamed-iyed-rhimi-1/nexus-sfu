@@ -107,8 +107,8 @@ See `architecture.md` for the full picture. The essentials:
 
 - **Startup:** `nexus_sfu::server::start` (`src/server.rs`) wires everything and returns a
   `ServerHandle` (bound addresses, `shutdown()`); `main.rs` adds config, tracing, signals.
-- **Data plane:** `nexus-dataplane`, one shard thread in Phase 1 (`recvmmsg`/`sendmmsg` on
-  Linux): classify, ICE-lite, SRTP in, rewrite, fan-out, SRTP out, RTCP. Driven only by
+- **Data plane:** `nexus-dataplane`, one thread per shard (`dataplane.shards`, 1 by default;
+  `recvmmsg`/`sendmmsg` on Linux), connected by cross-shard queues: classify, ICE-lite, SRTP in, rewrite, fan-out, SRTP out, RTCP. Driven only by
   commands; reports events. The old ingress loop and worker pool are deleted (Phase 1 C1+C3).
 - **Control plane:** Tokio. WebSocket signaling → `SessionOrchestrator`
   (`src/orchestrator/`: room, negotiation, subscription, connection, plane) which runs the
@@ -175,8 +175,10 @@ Config files in `config/` (TOML). Precedence: CLI args > env vars (`NEXUS_*`) > 
 - `config/production.toml` - one shard with busy polling and CPU pinning; needs `NEXUS_JWT_SECRET` and TLS files at `/etc/nexus/tls/`
 - `config/loadtest.toml` - tuned for load testing
 
-`[dataplane]`: `shards` (must be 1 in Phase 1; `NEXUS_SHARDS`), `busy_poll_rounds` (idle
-iterations before a shard parks), `cpu_affinity`, `realtime_priority`. `[cluster]`:
+`[dataplane]`: `shards` (1..=16, one thread and media port `+ i` each; `NEXUS_SHARDS`; until
+Phase 2.4 every session is on shard 0, capped at `max_webrtc_sessions / shards`, with a
+startup warning), `pool_buffers` (unset: 1,024 + (shards − 1) × 1,024), `busy_poll_rounds` (idle iterations
+before a shard parks), `cpu_affinity`, `realtime_priority`. `[cluster]`:
 `gossip_enabled` (default false) needs a specific `gossip_bind_addr`, never 0.0.0.0.
 
 Unknown sections and unknown `[transport]` fields are errors (the old `[worker]`,
