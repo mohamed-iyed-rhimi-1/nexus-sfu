@@ -20,11 +20,12 @@ multi-core targets are not measured yet (`architecture.md` Part 5). v1 is not re
 | `docs/design/*.md` | Detailed designs, written before the phase that needs them |
 | `docs/architecture-vision.md` | The original design, for reference only; much of it is not implemented or cannot work |
 
-**Current phase: 1, closing** (`docs/plans/phase-1.md`, from the approved design note
-`docs/design/dataplane-v1.md`). All parts are done; step 1.9 (documents, merge) waits for the
-owner's Chrome + Firefox check (exit criterion 4), then `phase-1` is merged into `main` (the
-trunk). Work on the `phase-1` branch until then. Phase 0 is complete
-(`docs/plans/phase-0.md`). Next is Phase 2 (multiple shards; `docs/dataplane-design.md` §5).
+**Current phase: 2** (multiple shards; `docs/dataplane-design.md` §5). Phase 1 is complete
+and merged into `main` (the trunk): every exit criterion is met (`docs/plans/phase-1.md`,
+Status). Phase 2 has no plan yet: the first session writes `docs/plans/phase-2.md` from design
+§5 and the cross-shard parts of `docs/design/dataplane-v1.md`, on a `phase-2` branch that
+merges into `main` when its exit criteria pass. Phases 0 and 1 are complete
+(`docs/plans/phase-0.md`, `docs/plans/phase-1.md`).
 The goal is to ship v1 of the new data plane soon (scope in `docs/dataplane-design.md` §2).
 
 Working on a phase:

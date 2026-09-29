@@ -2076,23 +2076,44 @@ anything that failed.
     participant's tracks. The rejoined tab decoded both peers after 112 ms.
 - No warning or error in the SFU log.
 
-*Owner's check (§17.9 steps 1-6):* to fill in. Since 1.9a each token must name the room:
-`nexus-loadtest token --sub <name> --room demo`, the same `--room` as the page's `room`.
+*Chromium re-check with room claims (automated), 2026-09-29, on `a89196e`:*
+- Setup: Chromium through Playwright, four tabs on one Mac, `fake=1` media; release SFU
+  from `a89196e`, plain WS, `NEXUS_ANNOUNCED_IPS=192.168.100.88`; tokens from
+  `nexus-loadtest token --room demo` (a fourth with `--room other`); page from `localhost`.
+- Steps 1-2: alice and bob receive each other's audio and video, 0 packets lost; offer
+  has `a=ice-lite`; Chrome is DTLS client; `srtpCipher` `SRTP_AEAD_AES_128_GCM` in every
+  tab (the SFU logs `AeadAes128Gcm` for all 8 sessions); remote candidate
+  `host 192.168.100.88:10000`.
+- Step 3: carol joins late; video decoding within one 2 s status refresh.
+- Step 5: carol leave then rejoin: both remote videos render a frame 116 and 128 ms after
+  Rejoin (new participant id, full reconnect); alice unpublish then republish of the
+  camera: bob gets `TrackUnpublished`, then track 9 on the reused m-line (mid 2, new
+  rewritten SSRC), decoding with 0 lost.
+- Room claim: the `--room other` token joining "demo" gets `FORBIDDEN Token does not grant
+  this room`; no participant-joined notice reaches the room.
+- SFU log: only the expected "TLS not configured" warning. Page nit: after Leave, the
+  Leave button stays enabled next to Rejoin.
+- Not covered here (owner's check): two machines, Firefox, real camera/microphone, lip
+  sync (step 4), network switch (step 6).
+
+*Owner's check (§17.9 steps 1-6), 2026-09-29, on `a89196e`:* one machine; the owner chose
+to skip the second machine, the network switch (step 6), and the audible-audio and lip-sync
+judgements (step 4). Read from the owner's screenshots and the SFU log.
 
 | Field | Value |
 |-------|-------|
-| Date | |
-| Machine A: OS, browser + version, network | |
-| Machine B: OS, browser + version, network | |
-| SFU host, `NEXUS_ANNOUNCED_IPS`, signaling (ws/wss) | |
-| Negotiated SRTP cipher (Chrome / Firefox) | |
-| ICE-lite remote shown (`webrtc-internals` / `about:webrtc`) | |
-| 1-2. Both see and hear each other | |
-| 3. Third tab late, video within ≈ 1 s | |
-| 4. Lip sync | |
-| 5. Unpublish/republish, leave/rejoin | |
-| 6. Wi-Fi ↔ wired switch (recovers, or ICE restart = known limit) | |
-| Anything that failed | |
+| Date | 2026-09-29 |
+| Machine A: OS, browser + version, network | macOS 26.5 (Apple Silicon), Chrome 154.0.8037.58 (alice, bob, carol) and Firefox 156.0.1 (dave), same machine, Wi-Fi LAN |
+| Machine B: OS, browser + version, network | not done (owner's decision) |
+| SFU host, `NEXUS_ANNOUNCED_IPS`, signaling (ws/wss) | same Mac, release build of `a89196e`, `192.168.100.88`, plain `ws://localhost:8080`, tokens `--room demo` |
+| Negotiated SRTP cipher (Chrome / Firefox) | `SRTP_AEAD_AES_128_GCM` / `SRTP_AEAD_AES_128_GCM` (page status from `getStats`; the SFU logs `AeadAes128Gcm` for every session) |
+| ICE-lite remote shown (`webrtc-internals` / `about:webrtc`) | page status `ice-lite offer: true` in all four tabs; remote candidate `host 192.168.100.88:10000`; every browser DTLS client |
+| 1-2. Both see and hear each other | See: yes, four-way (each tab shows the other three with real camera video). Audio: RTP received from every peer with 0 lost; whether it is audible was not judged |
+| 3. Third tab late, video within ≈ 1 s | carol joined with 2 tracks in the room and received both 17 ms after `Joined`; dave (Firefox) joined with 6 tracks and received all within ≈ 30 ms; decoding confirmed in the next status refresh |
+| 4. Lip sync | not judged (owner's decision) |
+| 5. Unpublish/republish, leave/rejoin | covered by the automated Chromium re-check the same day (rejoin: remote video 116 / 128 ms after Rejoin; republish on the reused m-line); not repeated by hand |
+| 6. Wi-Fi ↔ wired switch (recovers, or ICE restart = known limit) | not done (owner's decision); known limit: no ICE restart in v1 |
+| Anything that failed | long links pasted from the chat were cut inside the token (`AUTH_FAILED`); short redirect links fixed it. No packet loss, no SFU warning or error |
 
 ---
 
@@ -2442,12 +2463,12 @@ The note's §19 risks stand; these are the ones the audit added.
 | C7 Config, README, example | Done | see git log (C7) | Old config sections/fields/env vars removed and refused (fail fast); shard stats on `/metrics`; README, example, TOMLs, dashboard |
 | 1.6a E2E: harness, ten clients, resubscribe | Done | see git log (1.6a) | Signaling task + events, `subscribe_confirmed`/`unsubscribe`, announced history + CNAME, inbound tap; `ten_clients` 9.7 s, suite 27.1 s; negative check fails on SRTCP index reuse |
 | 1.6b E2E: address change, SR, keyframes | Done | see git log (1.6b) | `LossRules::rebind`, `RtcpLog` (publisher PLI/FIR, subscriber SR/CNAME), three tests; resume 2.1-2.3 s, SR error ≤ 5.7 ms, burst → 1 PLI; negative check fails with the silence rule disabled. Review fixes (1.6a/1.6b checks, `ci-local.sh` lock, dashboard, scripts) |
-| 1.8 SDK, browser page, manual check | Code done (see git log (1.8)); owner's check pending | | `Published` to the publisher, `nexus-loadtest token`, SDK `createRoom`/`publish`/`unpublish`/`unsubscribe`/`leave`/`getStats`, ≤ 10 ids per request, `node:test` (20) in CI, `examples/web/`, review fixes (fenced error matching, refused-publish cleanup, refused publish m-lines released on the server). Chromium 153 pre-check passes steps 2, 3, 5 (GCM, ICE-lite, late join ≈ 0.2 s). Exit criterion 4 waits for the owner's Chrome + Firefox run on two machines |
+| 1.8 SDK, browser page, manual check | Done | see git log (1.8) | `Published` to the publisher, `nexus-loadtest token`, SDK `createRoom`/`publish`/`unpublish`/`unsubscribe`/`leave`/`getStats`, ≤ 10 ids per request, `node:test` (20) in CI, `examples/web/`, review fixes (fenced error matching, refused-publish cleanup, refused publish m-lines released on the server). Chromium 153 pre-check passes steps 2, 3, 5 (GCM, ICE-lite, late join ≈ 0.2 s). Exit criterion 4 waits for the owner's Chrome + Firefox run on two machines |
 | SR flake, exit criterion 6 sweep | Done | `fa8a6a9` | SR errors measured per SR (median ≤ 50 ms, max ≤ 200 ms). Sweep of every network input path: aborts fixed in the shard (duplicate nomination entries), signaling (`Create` name over 256 bytes, room-id wrap) and **gossip** (empty datagram, crafted updates, found in review). Gossip off unless a cluster is configured. Room limits (every room counted, per-creator cap, release, rooms no longer preallocate ≈ 440 KB). Proptests: authenticated STUN, random signaling, gossip bytes and messages. **Exit criterion 6 met** |
 | 1.9a Room authorization | Done | see git log (1.9a) | `rooms` claim (≤ 16 names, `"*"`), `RoomGrant`; `Create`/`Join` refuse with `FORBIDDEN`; REST routes 403 and filtered list; `token --room`; loadtest client creates by name then joins; e2e `room_claim_confines_create_and_join` (e2e 9 tests) |
 | 1.9 Documents, merge | Documents done; merge waits for exit criterion 4 (1.9a done) | see git log (1.9) | `architecture.md` Parts 1-5 on the new path (Phase 1 numbers, Phase 0 kept as baseline), CLAUDE.md, README, design revision 2026-09-28 (GCM first, 17.5 KB, tombstones, `Published`), note in `dataplane-v1.md`, old-path comments in `src/lib.rs`, `node.rs`, `error.rs`, `Cargo.toml`, `basic_sfu.rs`. Left: owner's §17.9 table, `ci-local.sh all` on the merge commit, fast-forward `main` |
 
-Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked at 1.7, 17.5 KB after the rooms change, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☐ browsers (owner's Chrome + Firefox run, table in 1.8) · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☑ no panic on input (`fa8a6a9`) · 7 ☑ documents (1.9).
+Exit criteria: 1 ☑ e2e (8 tests; `ci-local.sh all` on `b0a5ec5` + the 1.6b tree, 2026-09-28; re-run on the 1.6b commit) · 2 ☑ 0 allocations · 3 ☑ 25 KB budget (16.9 KB checked at 1.7, 17.5 KB after the rooms change, session state only; `ci-local.sh all` on `964291d`, 2026-09-28) · 4 ☑ browsers (Chrome 154 + Firefox 156 four-way call with AES-GCM on one machine, 2026-09-29; the owner waived the second machine, lip sync and the network switch; table in 1.8) · 5 ☑ old path deleted (C1-C7, benches ported; 2026-09-28) · 6 ☑ no panic on input (`fa8a6a9`) · 7 ☑ documents (1.9).
 
 ### Session log
 
@@ -3316,3 +3337,8 @@ Add one line per working session: date, part, what was done, what is left.
   264 s: macOS 1,469 passed, SDK 21, Linux arm64 1,475 passed, benches pass; e2e 4/4.
   Committed and pushed. Left for the merge: the owner's §17.9 check (tokens with `--room`),
   `ci-local.sh all` on the merge commit, fast-forward `main`.
+- 2026-09-29: owner's §17.9 check on one machine (table in 1.8): Chrome 154 and Firefox 156,
+  four participants, AES-GCM everywhere, 0 packets lost, late joiners served within tens of
+  ms. Second machine, lip sync and the network switch waived by the owner. **Exit criterion
+  4 met** with those waivers; all seven exit criteria met. Next: `ci-local.sh all` on the
+  commit to merge, then fast-forward `main` (owner confirms).
