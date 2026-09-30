@@ -15,7 +15,7 @@
 //! the track's shard when another shard gets its first or loses its last
 //! (`AddRemoteShard` / `RemoveRemoteShard`).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -165,6 +165,8 @@ pub struct Plane {
     pub state: Arc<DistributedState>,
     /// Participants to close, and why (drained by the orchestrator after each step).
     closing: Vec<(u64, DisconnectReason)>,
+    /// The participants in `closing`, for an O(1) duplicate check.
+    closing_ids: HashSet<u64>,
     /// Cleanup commands that did not fit, per shard, oldest first.
     pending: Vec<VecDeque<Cleanup>>,
     /// Entries in `pending`, over all shards: (`CloseSession`, other).
@@ -198,6 +200,7 @@ impl Plane {
             ids: IdAllocator::new(),
             state,
             closing: Vec::new(),
+            closing_ids: HashSet::new(),
             pending: vec![VecDeque::new(); shards],
             pending_len: (0, 0),
             budget: CleanupBudget::DEFAULT,
@@ -421,18 +424,22 @@ impl Plane {
 
     /// Close `participant` after the current step (once, whatever the reason count).
     pub fn close_participant(&mut self, participant: u64, reason: DisconnectReason) {
-        if self.closing.iter().any(|(p, _)| *p == participant) {
+        debug_assert_eq!(self.closing.len(), self.closing_ids.len());
+        if self.closing_ids.contains(&participant) {
             return;
         }
         assert!(
             self.closing.len() < MAX_CLOSING,
             "more participants closing than can be connected"
         );
+        self.closing_ids.insert(participant);
         self.closing.push((participant, reason));
     }
 
     /// The participants to close, in order.
     pub fn take_closing(&mut self) -> Vec<(u64, DisconnectReason)> {
+        debug_assert_eq!(self.closing.len(), self.closing_ids.len());
+        self.closing_ids.clear();
         std::mem::take(&mut self.closing)
     }
 

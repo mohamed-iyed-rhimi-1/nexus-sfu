@@ -20,6 +20,11 @@ macro_rules! counters {
             pub fn values(&self) -> [u64; Self::NAMES.len()] {
                 [$(self.$name,)*]
             }
+
+            /// Adds `other` field by field (saturating), e.g. to total the shards.
+            pub fn add(&mut self, other: &Self) {
+                $(self.$name = self.$name.saturating_add(other.$name);)*
+            }
         }
 
         /// Published counters and gauges, written once per second.
@@ -86,6 +91,27 @@ pub struct Gauges {
     pub xs_in_flight: u64,
 }
 
+impl Gauges {
+    /// Adds `other` field by field (saturating), e.g. to total the shards.
+    pub fn add(&mut self, other: &Self) {
+        // Destructured: a new gauge does not compile until it is added here.
+        let Self {
+            sessions,
+            tracks,
+            subscriptions,
+            rx_pps,
+            mirrors,
+            xs_in_flight,
+        } = *other;
+        self.sessions = self.sessions.saturating_add(sessions);
+        self.tracks = self.tracks.saturating_add(tracks);
+        self.subscriptions = self.subscriptions.saturating_add(subscriptions);
+        self.rx_pps = self.rx_pps.saturating_add(rx_pps);
+        self.mirrors = self.mirrors.saturating_add(mirrors);
+        self.xs_in_flight = self.xs_in_flight.saturating_add(xs_in_flight);
+    }
+}
+
 /// A read of `ShardStats`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShardStatsSnapshot {
@@ -93,6 +119,14 @@ pub struct ShardStatsSnapshot {
     pub counters: ShardCounters,
     /// Gauges.
     pub gauges: Gauges,
+}
+
+impl ShardStatsSnapshot {
+    /// Adds `other`'s counters and gauges (the process total over shards).
+    pub fn add(&mut self, other: &Self) {
+        self.counters.add(&other.counters);
+        self.gauges.add(&other.gauges);
+    }
 }
 
 counters! {
@@ -238,6 +272,48 @@ mod tests {
         };
         stats.publish(&counters, gauges);
         assert_eq!(stats.load(), ShardStatsSnapshot { counters, gauges });
+    }
+
+    #[test]
+    fn snapshots_add_field_by_field() {
+        let one = |n: u64| ShardStatsSnapshot {
+            counters: ShardCounters {
+                rx_datagrams: n,
+                xs_keyframe_ignored: 2 * n,
+                ..Default::default()
+            },
+            gauges: Gauges {
+                sessions: n,
+                tracks: n + 1,
+                subscriptions: n + 2,
+                rx_pps: n + 3,
+                mirrors: n + 4,
+                xs_in_flight: n + 5,
+            },
+        };
+        let mut total = one(1);
+        total.add(&one(10));
+        assert_eq!(total.counters.rx_datagrams, 11);
+        assert_eq!(total.counters.xs_keyframe_ignored, 22);
+        assert_eq!(total.counters.tx_datagrams, 0);
+        let expected = Gauges {
+            sessions: 11,
+            tracks: 13,
+            subscriptions: 15,
+            rx_pps: 17,
+            mirrors: 19,
+            xs_in_flight: 21,
+        };
+        assert_eq!(total.gauges, expected);
+        let mut max = ShardCounters {
+            iterations: u64::MAX,
+            ..Default::default()
+        };
+        max.add(&ShardCounters {
+            iterations: 1,
+            ..Default::default()
+        });
+        assert_eq!(max.iterations, u64::MAX, "saturates");
     }
 
     #[test]

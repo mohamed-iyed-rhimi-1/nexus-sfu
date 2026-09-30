@@ -1363,6 +1363,27 @@ async fn second_join_is_refused_and_leaves_no_ghost() {
 }
 
 #[tokio::test]
+async fn a_participant_is_closed_once_per_step() {
+    let mut h = Harness::new();
+    let plane = &mut h.orchestrator.plane;
+    plane.close_participant(1, DisconnectReason::Overloaded);
+    plane.close_participant(2, DisconnectReason::IceFailed);
+    plane.close_participant(1, DisconnectReason::Internal);
+    assert_eq!(
+        plane.take_closing(),
+        [
+            (1, DisconnectReason::Overloaded),
+            (2, DisconnectReason::IceFailed)
+        ],
+        "the first reason, in order, once"
+    );
+    assert!(plane.take_closing().is_empty());
+    // Taken: the same participant can be recorded again.
+    plane.close_participant(1, DisconnectReason::DtlsFailed);
+    assert_eq!(plane.take_closing(), [(1, DisconnectReason::DtlsFailed)]);
+}
+
+#[tokio::test]
 async fn consent_lost_and_shard_refusals_close_the_participant() {
     let mut h = Harness::new();
     for p in 1..=4 {

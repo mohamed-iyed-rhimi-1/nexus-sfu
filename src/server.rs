@@ -67,7 +67,9 @@ impl ServerHandle {
     }
 
     /// Shard 0's ICE host candidates. Each session is offered its own shard's
-    /// candidates (port + shard index); with one shard these are all of them.
+    /// candidates, on that shard's port (`media_addrs()[shard]`: the configured
+    /// port + shard index, or one ephemeral port per shard when it is 0); with
+    /// one shard these are all of them.
     pub fn candidate_addrs(&self) -> &[SocketAddr] {
         &self.candidate_addrs
     }

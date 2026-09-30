@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Most tracks recorded per client; later tracks are ignored.
 pub const MAX_TRACKS: usize = 64;
@@ -56,8 +56,16 @@ pub struct TrackRxStats {
     pub marker_mismatches: u64,
     /// Markers whose frame counter went backwards.
     pub marker_regressions: u64,
-    /// Frame counter of the last marker.
-    last_marker_frame: u32,
+    /// Frame counter of the first marker (0 until one arrives).
+    pub first_marker_frame: u32,
+    /// Frame counter of the last marker (0 until one arrives): the publisher
+    /// numbers its frames (one per 1/15 s on each track), so its advance over
+    /// a window is what the publisher produced, and the markers received over
+    /// it what arrived.
+    pub last_marker_frame: u32,
+    /// Longest time between two consecutive packets since the first packet
+    /// or the last `TrackStatsMap::start_window`.
+    pub longest_gap: Duration,
 }
 
 impl TrackRxStats {
@@ -84,13 +92,18 @@ impl TrackRxStats {
             markers: 0,
             marker_mismatches: 0,
             marker_regressions: 0,
+            first_marker_frame: 0,
             last_marker_frame: 0,
+            longest_gap: Duration::ZERO,
         }
     }
 
     fn record_marker(&mut self, ssrc: u32, frame: u32) {
         match self.marker_ssrc {
-            None => self.marker_ssrc = Some(ssrc),
+            None => {
+                self.marker_ssrc = Some(ssrc);
+                self.first_marker_frame = frame;
+            }
             Some(first) if first != ssrc => self.marker_mismatches += 1,
             Some(_) => {
                 if frame < self.last_marker_frame {
@@ -115,7 +128,11 @@ impl TrackRxStats {
 
     fn record(&mut self, seq: u16, timestamp: u32) {
         self.packets += 1;
-        self.last_arrival = Instant::now();
+        let now = Instant::now();
+        self.longest_gap = self
+            .longest_gap
+            .max(now.saturating_duration_since(self.last_arrival));
+        self.last_arrival = now;
         self.last_arrival_wall = SystemTime::now();
         // Extend the 16-bit sequence number relative to the highest seen.
         let highest = self.highest_ext_seq;
@@ -186,6 +203,15 @@ impl TrackStatsMap {
         }
     }
 
+    /// Start a measurement window: every track's `longest_gap` restarts from
+    /// its last arrival, so it covers only gaps that end after this call.
+    pub fn start_window(&self) {
+        let mut map = self.inner.lock().expect("track stats lock");
+        for stats in map.values_mut() {
+            stats.longest_gap = Duration::ZERO;
+        }
+    }
+
     /// The newest in-order packet on `ssrc`: its RTP timestamp and arrival.
     pub fn last_packet(&self, ssrc: u32) -> Option<LastPacket> {
         let map = self.inner.lock().expect("track stats lock");
@@ -237,6 +263,21 @@ mod tests {
     }
 
     #[test]
+    fn test_longest_gap_restarts_with_the_window() {
+        let map = TrackStatsMap::default();
+        map.record(5, "audio", "audio/opus", 1, 0);
+        std::thread::sleep(Duration::from_millis(30));
+        map.record(5, "audio", "audio/opus", 2, 960);
+        let gap = map.snapshot()[0].longest_gap;
+        assert!(gap >= Duration::from_millis(30), "{gap:?}");
+        map.start_window();
+        assert_eq!(map.snapshot()[0].longest_gap, Duration::ZERO);
+        map.record(5, "audio", "audio/opus", 3, 1920);
+        let gap = map.snapshot()[0].longest_gap;
+        assert!(gap < Duration::from_millis(30), "{gap:?}");
+    }
+
+    #[test]
     fn test_markers() {
         let map = TrackStatsMap::default();
         map.record(3, "video", "video/VP8", 1, 0);
@@ -248,6 +289,7 @@ mod tests {
         let t = &map.snapshot()[0];
         assert_eq!(t.marker_ssrc, Some(77));
         assert_eq!(t.markers, 4);
+        assert_eq!((t.first_marker_frame, t.last_marker_frame), (1, 3));
         assert_eq!((t.marker_mismatches, t.marker_regressions), (1, 1));
         assert_eq!(map.snapshot().len(), 1);
     }

@@ -44,7 +44,9 @@ against `75fcdd9`; line numbers drift, so prefer the symbol names.
    x86_64 emulated as `linux/amd64` under `ci-local.sh all`, so a correctness check only):
    - `cross_shard_call`: two participants on different shards, A+V both ways, payload
      markers from the right publisher, SR translation (CNAME, timestamp consistency) and
-     keyframe requests (PLI on subscribe, forwarded PLI, throttle) across shards;
+     keyframe requests (PLI on subscribe, forwarded PLI, throttle) across shards (2.5:
+     `cross_shard_call` is the two-party body on 2 shards; SR and PLI are
+     `sender_report_translation_across_shards` and `keyframe_requests_across_shards`);
    - `ten_clients_four_shards`: `ten_clients_audio_video` with `shards = 4`, participants
      spread over every shard;
    - `unpublish_and_leave_across_shards`: after unpublish and leave, every shard's
@@ -710,7 +712,9 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
 
 **Goal:** exit criterion 1 with real webrtc-rs clients.
 
-**Files:** `tests/e2e.rs`, `tests/e2e/harness.rs`.
+**Files:** `tests/e2e.rs`, `tests/e2e/harness.rs`; also `nexus-dataplane`
+`shard/stats.rs` (`ShardStatsSnapshot::add`), `nexus-loadtest` `client.rs`
+(`HeadlessClient::unpublish`), `src/orchestrator/plane.rs` (2.4 review nit).
 
 **Change:**
 - `test_config_shards(n)`; `start_server` no longer asserts one shard (`harness.rs:65`).
@@ -724,7 +728,10 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
   apart really are on different shards (per-shard `sessions` gauges).
 - The existing suite runs with `shards = 1` as today; `two_party_audio_video`,
   `sender_report_translation` and `keyframe_requests` also run with `shards = 2` and spread
-  placement (shared bodies, two test functions).
+  placement (shared bodies, two test functions). Owner's decision (2026-09-30): the
+  two-party run on 2 shards **is** `cross_shard_call`; with
+  `sender_report_translation_across_shards` and `keyframe_requests_across_shards` it covers
+  criterion 1's `cross_shard_call` (no separate duplicate test).
 - Candidates: each client already receives its own shard's candidates (signaling), so
   `candidate_is_announced_address` checks the port of the shard its session is on.
 
@@ -909,8 +916,8 @@ changes a decision (D1-D10, R1-R9).
 | 2.1 Shared pool region, `XsMsg`, mesh | Done | `28d9cdf` | `Loan` with region id; freeing independent of call order (`held`); stress test and Miri clean |
 | 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Done | `8210c7b` | Mirrors, lend after local fan-out, returns at the top of `iterate`; alloc test 0 on 2 shards; 3-shard proptest agrees with the counting model |
 | 2.3 N shards on threads | Done | `3216f32` | Two-phase start, mesh and peer wakes (n > 1 only); cap 16; optional pool with a per-shard-count default; loopback tests on 2 and 4 shards |
-| 2.4 Control plane: placement, cross-shard subscriptions | Done, not committed | | `RoomAffine` (own counts, room cap 50, pps off); counts per (track, shard) with an `announced` bit; per-shard cleanup FIFO (absorbs `pending_close`) with cancel on re-add; randomised stream test agrees with shard models |
-| 2.5 E2E on several shards | Not started | | |
+| 2.4 Control plane: placement, cross-shard subscriptions | Done | `c949dcf` | `RoomAffine` (own counts, room cap 50, pps off); counts per (track, shard) with an `announced` bit; per-shard cleanup FIFO (absorbs `pending_close`) with cancel on re-add; randomised stream test agrees with shard models |
+| 2.5 E2E on several shards | Done, not committed | | 7 multi-shard tests (placement spreads the room, gauges prove it); SFU judged by markers vs frames, failures collected with shard drop deltas; suite ≈ 83 s (macOS ×5, Linux arm64 ×3, all green) |
 | 2.6 `benches/dataplane.rs`, measurements, tuning | Not started | | |
 | 2.7 Deploy, documents, browser check, merge | Not started | | |
 
@@ -1223,3 +1230,73 @@ Add one line per working session: date, part, what was done, what is left.
   preference (pps test). **ci-local** (`3216f32` + 22 uncommitted or untracked paths,
   macos + linux-arm64): all PASS, `cargo test --workspace` 1,549 (macOS) / 1,555 (Linux),
   e2e 9/9, bench smoke and memory budget 25 KB PASS. Next: owner's review, then commit; then 2.5.
+- 2026-09-30: 2.4 Status set to Done (`c949dcf`). **2.5 implemented, not committed; one Linux
+  failure open.** Owner's decision: `cross_shard_call` is the two-party body on 2 shards;
+  with `sender_report_translation_across_shards` and `keyframe_requests_across_shards` it
+  covers criterion 1's `cross_shard_call` (text above updated). **Harness:**
+  `test_config_shards(n)` (`room_shard_max_sessions = 1`), `start_server_with` (one distinct
+  non-zero port per shard), `shard_stats` (per shard), `total_stats` /
+  `settled_total_stats` (sum through the new `ShardStatsSnapshot::add`, saturating, unit
+  test), `wait_for_shards` / `wait_for_sessions` / `wait_for_views` (exact per-shard
+  sessions, tracks, subscriptions, mirrors; 5 s deadline), `assert_no_xs_drops` (full,
+  credit, malformed; not `drop_xs_no_track`, a documented race). **Tests** (shared bodies,
+  the 9 existing ones unchanged on 1 shard): `cross_shard_call` (per shard 1/2/2/2, `xs_tx`,
+  `xs_rx`, `xs_returned` > 0), `sender_report_translation_across_shards` (only B's shard
+  translates), `keyframe_requests_across_shards` (throttle counters move on A's shard only,
+  B's shard forwards ≥ 5), `ten_clients_four_shards` (3/3/2/2; per shard tracks 2k, subs
+  18k, mirrors 2(10 − k)), `resubscribe_across_shards` (mirror added and removed each round;
+  no (SSRC, index) reuse), `candidates_follow_the_session_shard` (the shard whose gauge
+  rose names the candidate port), `unpublish_and_leave_across_shards` (cap 2: A, B on 0, C
+  on 1; B leaves → shared mirror stays; C unpublishes → `RemoveTrack` on both; C leaves as
+  last subscriber → shard 0 stops handing off; A leaves → all 0 and `xs_in_flight` 0, still
+  0 a publish later). `HeadlessClient::unpublish` added. Multi-shard media window 3 s (5 s
+  on 1 shard) to stay near 90 s. **Finding for review:** across shards a new subscriber gets
+  its first usable keyframe ≈ 540 ms after `AddRemoteShard`'s PLI (measured 205 → 740 ms
+  after subscribe; one shard ≈ 210-420 ms): `AddRemoteShard`'s PLI goes out before the
+  subscriber has SRTP, and its own request once keys are installed is deferred by the
+  500 ms throttle. As designed (2.2); the test asserts that sequence. **Nit:**
+  `Plane::close_participant` duplicate check O(1) (`closing_ids` set beside the ordered
+  Vec), test `a_participant_is_closed_once_per_step`. **Mutation checks**, each caught: no
+  `RemoveTrack` to counted shards (unpublish test), no uncount on subscriber leave
+  (unpublish test, after reordering it: the first order missed it), every session on shard
+  0 (all 7 multi-shard tests). **macOS:** fmt, clippy clean, `cargo test --workspace` 1,558
+  passed; e2e 16/16 in 5 of 5 runs, 88.9 / 89.2 / 89.4 / 90.3 / 90.4 s (target < 90 s:
+  at the limit). **ci-local** (`c949dcf` + 8 modified paths, macos + linux-arm64; stopped
+  by Claude Code during the memory bench because the host ran low on memory): macos all
+  PASS (1,558); linux-arm64 fmt, clippy, release build, bench smoke PASS, `cargo test
+  --workspace` **FAIL** 815 passed, 1 failed: `ten_clients_four_shards` "client 0: audio
+  track: 22 packets in 3s, want >= 30" (e2e 15/16, 93.6 s); memory bench not recorded.
+  Cause not determined (the SFU, or the 10 clients stalling in the container while the host
+  was short of memory; the 3 s window makes the rate check more sensitive). Next: rerun the
+  Linux job, find the cause, then owner's review and commit; then 2.6.
+- 2026-09-30: 2.5 review changes, not committed. The Linux failure did not reproduce in the
+  owner's container runs; the checks now tell the SFU from a stalled client. (1)
+  **Diagnostics:** `check_received` takes every receiver of a test and collects failures
+  before panicking; the report groups them by publisher SSRC and by receiver, lists every
+  received track's window (packets, markers of frames, seq advance and missing, longest
+  inter-arrival gap) and each shard's counter deltas (`drop_report`: rx, tx, xs and every
+  `drop_*` that grew) between the first publish in the window (`next_stats`) and the last.
+  Loadtest: `TrackRxStats::longest_gap` (restarted by `start_window`, test) and
+  `first_marker_frame` / `last_marker_frame` exposed. (2) **SFU-isolating rate:** markers
+  received ≥ 90 % of the frames the publisher's marker advanced over the window (one marker
+  per frame on each track); absolute floor ≥ 5 packets/s only. A first version counted
+  frames from 0 when no marker had arrived before the window (a video track that had only
+  mid-frame packets): one false failure on macOS ("75 markers of 117 frames", 0 missing);
+  frames now count from the first marker then. (3) **Suite time:** `settled_total_stats`
+  waits for every shard's next publish (a larger `iterations`; a parked shard wakes for it)
+  instead of 1.1 s; `wait_for_no_handoff` uses it; resubscribe rounds hold 500 ms; the
+  signaling-only tests (`room_claim_confines_create_and_join`, both candidates tests) do not
+  take `SERIAL`; the multi-shard media window is back to 5 s. That broke
+  `keyframe_requests*` (4 of 5 macOS runs: step 3 relied on the 1.1 s sleep to leave the
+  forwarded PLI's 500 ms throttle window, so the burst was all throttled): the burst now
+  starts ≥ 600 ms after the forwarded PLI, explicitly (5/5 after). Nits:
+  `Gauges::add` destructures; `drop_xs_no_track` delta 0 over the window in the two-party
+  and ten-client bodies; `wait_for_no_handoff` also checks the shard's `rx_datagrams` grew;
+  the keyframe test's `xs_tx`/`xs_rx` ≥ 5 checks removed. **Runs** (host 32-38 % memory
+  free throughout): e2e macOS 16/16 ×5, 83.2 / 83.2 / 83.5 / 83.2 / 83.0 s; Linux arm64
+  container 16/16 ×3, 84.2 / 83.9 / 83.5 s. A forced failure (`MARKER_SHARE` 101) printed
+  the report as intended. **ci-local** (`c949dcf` + 9 uncommitted or untracked paths, macos
+  + linux-arm64): all PASS, `cargo test --workspace` 1,559 (macOS) / 1,565 (Linux), e2e
+  83.7 s (macOS) / 82.8 s (Linux), bench smoke and memory budget 25 KB PASS (21.3 KB).
+  Criterion 1 is checked off with `ci-local.sh all` (x86_64 emulated) at 2.7. Next: owner's
+  review, then commit; then 2.6.

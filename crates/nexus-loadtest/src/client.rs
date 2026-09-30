@@ -881,6 +881,13 @@ impl HeadlessClient {
         self.track_stats.snapshot()
     }
 
+    /// `track_stats` now, and from now on `longest_gap` covers only this
+    /// window (`TrackStatsMap::start_window`).
+    pub fn start_window(&self) -> Vec<TrackRxStats> {
+        self.track_stats.start_window();
+        self.track_stats.snapshot()
+    }
+
     pub fn participant_id(&self) -> Option<ParticipantId> {
         self.participant_id
     }
@@ -935,6 +942,18 @@ impl HeadlessClient {
             .await
             .map(|_| ())
             .map_err(|e| ClientError::MediaError(format!("write_rtcp: {e}")))
+    }
+
+    /// Ask the SFU to remove our published `track_ids` (at most
+    /// `MAX_SUBSCRIBE_BATCH`). The SFU sends the publisher no confirmation: its
+    /// peers get `TrackUnpublished` and an offer without the tracks. The media
+    /// task keeps sending; the SFU drops what no longer routes.
+    pub async fn unpublish(&self, track_ids: &[TrackId]) -> Result<(), ClientError> {
+        assert!(!track_ids.is_empty() && track_ids.len() <= MAX_SUBSCRIBE_BATCH);
+        self.send_signal(SignalMessage::Unpublish {
+            track_ids: track_ids.to_vec(),
+        })
+        .await
     }
 
     /// Remote tracks announced so far (`Joined` and `TrackPublished`), by id.
