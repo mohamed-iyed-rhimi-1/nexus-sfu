@@ -82,8 +82,8 @@ seed_peers = []
 [dataplane]
 # The data plane (nexus-dataplane): one thread and one media socket per shard.
 # Media sockets: transport.media_bind_addr is shard 0's port, shard i uses port + i.
-# shards: 1..=16; shard i uses media port + i and, with cpu_affinity, core i. Until Phase
-# 2.4 every session goes to shard 0, capped at transport.max_webrtc_sessions / shards.
+# shards: 1..=16; shard i uses media port + i and, with cpu_affinity, core i. Each shard
+# takes at most transport.max_webrtc_sessions / shards sessions (rounded up).
 shards = 1
 busy_poll_rounds = 256                  # Spin before parking (lower latency, more CPU)
 # 2 KB packet buffers per shard. Default: 1024 + (shards - 1) × 1024 (2 MB per shard
@@ -97,6 +97,11 @@ cpu_affinity = true                     # Pin shard i to core i (cores 0..shards
 # real-time thread on core 0 and could starve interrupts and the control plane there.
 realtime_priority = false
 realtime_priority_level = 80
+# Placement: a room's sessions go to one shard until it holds room_shard_max_sessions
+# of them (or the shard is full, or above room_shard_max_pps received datagrams/s; 0 =
+# off); then the least-loaded shard takes the room's next sessions. Tuned in Phase 2.6.
+# room_shard_max_sessions = 50
+# room_shard_max_pps = 0
 
 [cluster]
 # Unique node ID. Set to 0 for auto-generation from hostname+pid+time.

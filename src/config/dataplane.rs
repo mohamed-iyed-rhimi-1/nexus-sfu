@@ -33,6 +33,13 @@ pub struct DataplaneSettings {
     pub realtime_priority: bool,
     /// SCHED_FIFO priority when `realtime_priority` is set (1..=99).
     pub realtime_priority_level: u32,
+    /// Sessions of one room on a shard before the room's next sessions go to the
+    /// least-loaded shard (≥ 1). Starting value 50, so a large room spreads its
+    /// fan-out over cores; tuned in Phase 2.6.
+    pub room_shard_max_sessions: u32,
+    /// Received datagrams per second above which a room's shard takes no more of
+    /// its sessions; 0 = off (until Phase 2.6 measures a value).
+    pub room_shard_max_pps: u32,
 }
 
 impl Default for DataplaneSettings {
@@ -46,6 +53,8 @@ impl Default for DataplaneSettings {
             cpu_affinity: false,
             realtime_priority: false,
             realtime_priority_level: 80,
+            room_shard_max_sessions: 50,
+            room_shard_max_pps: 0,
         }
     }
 }
@@ -120,11 +129,40 @@ impl NexusConfig {
         Ok(ports)
     }
 
-    /// Checks the `[dataplane]` section through the data plane's own rules.
+    /// The orchestrator's placement: `RoomAffine` over the configured shards, each
+    /// limited to its share of `transport.max_webrtc_sessions`.
+    pub fn to_placement(&self) -> Result<nexus_dataplane::RoomAffine, ConfigError> {
+        let settings = &self.dataplane;
+        if settings.room_shard_max_sessions == 0 {
+            return Err(ConfigError::invalid(
+                "dataplane.room_shard_max_sessions",
+                "must be at least 1",
+            ));
+        }
+        let dataplane = self.to_dataplane_config()?;
+        if dataplane.shard.max_sessions == 0 {
+            return Err(ConfigError::invalid(
+                "transport.max_webrtc_sessions",
+                "must be at least 1",
+            ));
+        }
+        Ok(nexus_dataplane::RoomAffine::new(
+            nexus_dataplane::RoomAffineLimits {
+                shards: dataplane.shards,
+                max_sessions: dataplane.shard.max_sessions,
+                room_shard_max_sessions: settings.room_shard_max_sessions,
+                room_shard_max_pps: settings.room_shard_max_pps,
+            },
+        ))
+    }
+
+    /// Checks the `[dataplane]` section through the data plane's own rules and the
+    /// placement's.
     pub(super) fn validate_dataplane(&self) -> Result<(), ConfigError> {
         self.to_dataplane_config()?
             .validate()
-            .map_err(|e| ConfigError::invalid("dataplane", e.0))
+            .map_err(|e| ConfigError::invalid("dataplane", e.0))?;
+        self.to_placement().map(|_| ())
     }
 }
 

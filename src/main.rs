@@ -306,6 +306,10 @@ async fn main() -> ExitCode {
         config.transport.signaling_bind_addr
     );
     info!("  Shards: {}", config.dataplane.shards);
+    info!(
+        "  Placement: a room's sessions per shard {}, shard rx limit {} pps (0 = off)",
+        config.dataplane.room_shard_max_sessions, config.dataplane.room_shard_max_pps
+    );
     info!("  Drain timeout: {}ms", config.drain_timeout_ms);
 
     // ========================================================================

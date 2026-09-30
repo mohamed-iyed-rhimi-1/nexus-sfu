@@ -172,6 +172,9 @@ pub struct TransportEntry {
     pub participant: u64,
     /// The shard the session lives on.
     pub shard: ShardId,
+    /// The room the session was placed for (`Placement::place`); handed back to
+    /// `Placement::session_closed` when the session closes.
+    pub room: Option<u32>,
     /// Local ICE credentials (sent in `CreateSession` and the offers).
     pub ice: IceParams,
     /// The DTLS handshake.
@@ -197,6 +200,7 @@ impl TransportEntry {
         Self {
             participant,
             shard,
+            room: None,
             ice: random_ice_params(),
             dtls: DtlsHandshake::new(certificate),
             ssrcs: SsrcAllocator::random(),

@@ -27,7 +27,7 @@ use crate::signal::{OfferTrack, SignalMessage};
 use crate::types::TrackId;
 
 use super::events::DisconnectReason;
-use super::plane::Plane;
+use super::plane::{Cleanup, Plane};
 use super::sdp_params::{sub_spec, track_spec};
 use super::tracks::TrackInfo;
 use super::ParticipantHandle;
@@ -569,14 +569,8 @@ impl NegotiationManager {
             return false;
         }
         let audio = spec.kind == nexus_core::MediaKind::Audio;
-        let info = TrackInfo {
-            publisher: participant_id,
-            session: id,
-            shard,
-            room,
-            spec,
-            content_type: if audio { 2 } else { 0 },
-        };
+        let content_type = if audio { 2 } else { 0 };
+        let info = TrackInfo::new(participant_id, id, shard, room, spec, content_type);
         assert!(plane.tracks.insert(track, info), "track ids are fresh");
         let state_info = StateTrackInfo {
             track_type: u8::from(!audio),
@@ -612,7 +606,9 @@ impl NegotiationManager {
     }
 
     /// `Subscribe` for every accepted subscribe m-line not yet on the shard, in
-    /// increasing out-SSRC offset (the shard's monotonic rule). Returns their tracks.
+    /// increasing out-SSRC offset (the shard's monotonic rule), each counted for its
+    /// track (`AddRemoteShard` for a first subscriber on another shard than the
+    /// track's). Returns their tracks.
     fn register_subscriptions(
         &mut self,
         participant_id: u64,
@@ -678,6 +674,11 @@ impl NegotiationManager {
                 ..slot
             });
             activated.push(slot.track);
+            // Counted on the slot's state change: the close of a participant whose
+            // announcement did not fit uncounts it.
+            if !plane.count_subscription(track, shard, participant_id) {
+                break;
+            }
         }
         activated
     }
@@ -777,7 +778,8 @@ impl NegotiationManager {
     }
 
     /// Subscribe m-lines whose track is not in `keep` turn inactive; the shard's
-    /// subscription is removed (`Unsubscribe`) if it had one.
+    /// subscription is removed (`Unsubscribe`, retried if the queue is full) and
+    /// uncounted if it had one.
     fn drop_subscriptions_except(
         &mut self,
         participant_id: u64,
@@ -802,7 +804,8 @@ impl NegotiationManager {
             }
             slot.role = MlineRole::Inactive;
             if sub.on_shard {
-                let _ = plane.push(shard, Command::Unsubscribe { sub: sub.sub }, participant_id);
+                plane.push_cleanup(shard, Cleanup::Unsubscribe(sub.sub));
+                plane.uncount_subscription(DpTrackId::new(sub.track), shard);
             }
         }
     }
@@ -969,25 +972,44 @@ impl NegotiationManager {
 
     /// Close the participant's session and remove its tracks. Returns the removed
     /// tracks (their subscribers renegotiate).
-    pub fn cleanup_participant(
-        &mut self,
-        participant_id: u64,
-        room: Option<u32>,
-        plane: &mut Plane,
-    ) -> Vec<TrackId> {
+    ///
+    /// Its on-shard subscriptions are uncounted first (the last on a shard sends
+    /// `RemoveRemoteShard`; `CloseSession` removes them on the session's shard, so no
+    /// `Unsubscribe`). Its tracks are removed from every other shard subscribed to them
+    /// (`RemoveTrack`); `CloseSession` removes them on its own.
+    pub fn cleanup_participant(&mut self, participant_id: u64, plane: &mut Plane) -> Vec<TrackId> {
         let state = self.states.remove(&participant_id);
+        let session = state.as_ref().and_then(|s| s.session);
+        let shard = session
+            .and_then(|id| plane.transports.get(id))
+            .map(|e| e.shard);
+        // Only `close_session`, called below, removes a live session's transport entry.
+        debug_assert!(
+            session.is_none() || shard.is_some(),
+            "session without transport"
+        );
+        if let (Some(state), Some(shard)) = (&state, shard) {
+            for slot in &state.mlines {
+                if let MlineRole::Subscribe(sub) = slot.role {
+                    if sub.on_shard {
+                        plane.uncount_subscription(DpTrackId::new(sub.track), shard);
+                    }
+                }
+            }
+        }
         let removed: Vec<TrackId> = plane
             .tracks
-            .remove_publisher(participant_id)
+            .by_publisher(participant_id)
             .into_iter()
             .map(|t| t.get())
             .collect();
         for &track in &removed {
+            plane.remove_track(DpTrackId::new(track), false);
             plane.state.remove_track(track);
         }
-        // CloseSession removes the session's tracks and subscriptions on the shard.
-        if let Some(id) = state.and_then(|s| s.session) {
-            plane.close_session(id, room);
+        debug_assert!(plane.tracks.by_publisher(participant_id).is_empty());
+        if let Some(id) = session {
+            plane.close_session(id);
         }
         removed
     }

@@ -110,7 +110,7 @@ Key facts:
   one per 500 ms per track.
 - **Interface to the control plane** (`command.rs`, `handle.rs`): commands (`CreateSession`,
   `SendDatagram`, `InstallSrtp`, `AddTrack`, `RemoveTrack`, `Subscribe`, `Unsubscribe`,
-  `CloseSession`) through a bounded `ArrayQueue` per shard (4,096; a full queue is an error to
+  `CloseSession`, `AddRemoteShard`, `RemoveRemoteShard`) through a bounded `ArrayQueue` per shard (4,096; a full queue is an error to
   the sender, never a silent drop); events (`DtlsDatagram`, `AddressSelected`,
   `PeerSrtpVerified`, `ConsentLost`, `CommandRejected`) through one `tokio::mpsc` (8,192),
   sent with `try_send`. When it is full, events are retained (up to 256) except
@@ -125,7 +125,9 @@ Key facts:
 | Component | Status | Location |
 |-----------|--------|----------|
 | Session orchestrator: one `select!` loop over signaling, data-plane events (≤ 256 at a time), the DTLS timer (200 ms) and the sweep (1 s) | ✅ | `src/orchestrator/mod.rs` |
-| Commands, sessions, SRTP install, closing (`Plane`); a full command queue closes that participant with `Overloaded` | ✅ | `plane.rs` |
+| Commands, sessions, SRTP install, closing (`Plane`). A full queue closes the participant (`Overloaded`) for an additive command; cleanup commands (`CloseSession`, `Unsubscribe`, `RemoveTrack`, `RemoveRemoteShard`) wait in a per-shard FIFO retried by the 1 s sweep and never close anyone; a shard's waiting cleanup is sent before any other command to it | ✅ | `plane.rs` |
+| Placement: `RoomAffine` keeps a room on one shard up to `dataplane.room_shard_max_sessions` (50) of its sessions, then moves the room's next sessions to the least-loaded shard (own session counts, then `rx_pps`); never a shard at its `max_webrtc_sessions / shards`; optional `room_shard_max_pps` (0 = off); no migration | ✅ | `crates/nexus-dataplane/src/placement.rs` |
+| Cross-shard subscriptions: on-shard subscriptions counted per (track, subscriber shard); the first on another shard sends `AddRemoteShard` to the track's shard (or cancels a waiting `RemoveRemoteShard`), the last `RemoveRemoteShard`; unpublish and publisher leave send `RemoveTrack` to every counted shard | ✅ | `plane.rs`, `tracks.rs`, `negotiation.rs` |
 | Data-plane events: DTLS input, `AddressSelected` (may start the handshake as client), `PeerSrtpVerified` (frees the OpenSSL `SSL`), `ConsentLost`; ICE (30 s) and DTLS (10 s) timeouts | ✅ | `connection.rs`, `transports.rs` |
 | DTLS via OpenSSL, one certificate for the process; role fixed by whichever comes first, a ClientHello or the answer's `a=setup`; output split into ≤ 1,200-byte datagrams; peer fingerprint (SHA-256) checked against the SDP; `SRTP_AEAD_AES_128_GCM` offered first, then `SRTP_AES128_CM_SHA1_80` | ✅ | `dtls.rs`, `crates/nexus-transport/src/dtls/openssl_backend.rs` |
 | ICE-lite: random credentials per session, host candidates from `transport.announced_ips` (or the bind IP / interfaces) with the bound port; the SFU starts no checks and sends no consent requests (consent is the shard's 30 s receive timeout); remote candidates are ignored | ✅ | `transports.rs`, `candidates.rs`, `negotiation.rs` |
@@ -179,7 +181,7 @@ Key facts:
 | **RR and TWCC toward publishers** | Not sent, so browsers keep their start bitrate | Phase 3 |
 | **Simulcast** | `MAX_LAYERS` = 1; `a=ssrc-group:SIM` refused in the answer | After v1 |
 | **Bandwidth estimation** | Not called (`nexus-bwe`, 2.3); `[bwe]` config is not read | After v1 |
-| **Multiple shards** | `dataplane.shards` 1..=16 starts one thread per shard, connected by the cross-shard mesh (Phase 2.3); only `SingleShard` placement exists, so every session is on shard 0, capped at `max_webrtc_sessions / shards` while the other shards idle (a startup warning says so), and only its candidates are advertised | Phase 2.4 (`Placement` is the hook) |
+| **Multiple shards** | `dataplane.shards` 1..=16 runs one thread per shard, connected by the cross-shard mesh, and `RoomAffine` places sessions on them (Phase 2.4); tested with a recording command sink and on the data plane alone, not yet end to end with real clients on several shards; throughput and scaling not measured | Phase 2.5 (e2e), 2.6 (bench) |
 | **ICE restart / network switch** | No ICE restart; a changed address is followed only by the rebind rule (2 s silence), so a client whose new path needs a new candidate pair loses the call | After v1 |
 | **Codecs** | VP8 and Opus only | After v1 |
 | **QUIC signaling** | Not started (2.3) | Non-goal |
@@ -240,7 +242,7 @@ Open (known, accepted for now; details in `docs/plans/phase-1.md` "Risks" and "B
 
 | Item | Status | What exists today |
 |------|--------|-------------------|
-| Multiple shards on multiple cores, port per shard, cross-shard queues | 🟡 | Phase 2. Shards start on their own threads and ports, connected by the cross-shard queues (2.3); placement is still `SingleShard` (2.4), so sessions all go to shard 0, capped at `max_webrtc_sessions / shards` |
+| Multiple shards on multiple cores, port per shard, cross-shard queues | 🟡 | Phase 2. Shards run on their own threads and ports, connected by the cross-shard queues (2.3); sessions are placed by room (`RoomAffine`, 2.4). Multi-shard e2e (2.5) and measurements (2.6) not done |
 | Throughput and scaling bench (`benches/dataplane.rs`) | ⬜ | Phase 2. `real_path` measures ingress and per-subscriber egress separately |
 | NACK, RR, TWCC feedback | ⬜ | Phase 3 (`docs/design/loss-recovery.md`, to be written) |
 | Simulcast, bandwidth estimation, single-port mode, RTX | ⬜ | After v1 |

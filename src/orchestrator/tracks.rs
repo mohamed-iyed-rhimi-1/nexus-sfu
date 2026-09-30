@@ -7,11 +7,16 @@
 use std::collections::HashMap;
 
 use nexus_core::MediaKind;
-use nexus_dataplane::{CnameValue, ExtIds, MidValue, SessionId, ShardId, TrackId, TrackSpec};
+use nexus_dataplane::{
+    CnameValue, ExtIds, MidValue, SessionId, ShardId, TrackId, TrackSpec, MAX_SHARDS_SUPPORTED,
+};
 
 /// Most tracks the registry holds (every participant of every room). Bounds the map;
 /// `insert` refuses beyond it.
 pub const MAX_TRACKS: usize = 1 << 20;
+/// Shards a track can have subscribers on (the per-shard counts are fixed arrays).
+pub const TRACK_SHARDS: usize = MAX_SHARDS_SUPPORTED as usize;
+const _: () = assert!(TRACK_SHARDS <= 32, "announced is a u32 mask");
 
 /// One published track.
 #[derive(Clone, Debug)]
@@ -30,9 +35,50 @@ pub struct TrackInfo {
     pub spec: TrackSpec,
     /// Content type from `SetContent` (no data-plane effect in v1).
     pub content_type: u8,
+    /// On-shard subscriptions to the track, by the subscriber's shard (plan 2.4):
+    /// +1 when a subscribe m-line goes onto its shard, −1 when it leaves that state.
+    pub subscribers: [u32; TRACK_SHARDS],
+    /// Shards other than `shard` the track's shard was told about: bit `i` is set
+    /// while an `AddRemoteShard` for shard `i` was accepted and no
+    /// `RemoveRemoteShard` for it has been sent or queued since.
+    pub announced: u32,
 }
 
 impl TrackInfo {
+    /// A track with no subscribers.
+    pub fn new(
+        publisher: u64,
+        session: SessionId,
+        shard: ShardId,
+        room: u32,
+        spec: TrackSpec,
+        content_type: u8,
+    ) -> Self {
+        Self {
+            publisher,
+            session,
+            shard,
+            room,
+            spec,
+            content_type,
+            subscribers: [0; TRACK_SHARDS],
+            announced: 0,
+        }
+    }
+
+    /// On-shard subscriptions on `shard`.
+    pub fn subscribers_on(&self, shard: ShardId) -> u32 {
+        self.subscribers[usize::from(shard.index())]
+    }
+
+    /// Shards other than the track's with subscriptions, in index order.
+    pub fn remote_shards(&self) -> impl Iterator<Item = ShardId> + '_ {
+        (0..TRACK_SHARDS)
+            .filter(|&i| self.subscribers[i] > 0)
+            .map(|i| ShardId::new(i as u8))
+            .filter(|&s| s != self.shard)
+    }
+
     /// Audio or video.
     pub fn kind(&self) -> MediaKind {
         self.spec.kind
@@ -93,6 +139,25 @@ impl TrackRegistry {
         self.tracks.get_mut(&id)
     }
 
+    /// One more on-shard subscription on `shard`: whether it is the first there.
+    /// `None` for an unknown track.
+    pub fn add_subscriber(&mut self, id: TrackId, shard: ShardId) -> Option<bool> {
+        let info = self.tracks.get_mut(&id)?;
+        let count = &mut info.subscribers[usize::from(shard.index())];
+        *count += 1;
+        Some(*count == 1)
+    }
+
+    /// One on-shard subscription on `shard` fewer: whether it was the last there.
+    /// `None` for an unknown (removed) track: its counts went with it.
+    pub fn remove_subscriber(&mut self, id: TrackId, shard: ShardId) -> Option<bool> {
+        let info = self.tracks.get_mut(&id)?;
+        let count = &mut info.subscribers[usize::from(shard.index())];
+        assert!(*count > 0, "subscription counted off a shard with none");
+        *count -= 1;
+        Some(*count == 0)
+    }
+
     /// The tracks a participant publishes, in id order.
     pub fn by_publisher(&self, publisher: u64) -> Vec<TrackId> {
         let mut ids: Vec<TrackId> = self
@@ -105,14 +170,9 @@ impl TrackRegistry {
         ids
     }
 
-    /// Removes every track of a participant and returns their ids, in id order.
-    pub fn remove_publisher(&mut self, publisher: u64) -> Vec<TrackId> {
-        let ids = self.by_publisher(publisher);
-        for id in &ids {
-            self.tracks.remove(id);
-        }
-        debug_assert!(self.by_publisher(publisher).is_empty());
-        ids
+    /// Every track, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (TrackId, &TrackInfo)> {
+        self.tracks.iter().map(|(id, info)| (*id, info))
     }
 
     /// Number of tracks.
@@ -132,12 +192,12 @@ mod tests {
     use nexus_dataplane::CodecParams;
 
     fn info(publisher: u64, kind: MediaKind) -> TrackInfo {
-        TrackInfo {
+        TrackInfo::new(
             publisher,
-            session: SessionId::new(publisher),
-            shard: ShardId::new(0),
-            room: 1,
-            spec: TrackSpec {
+            SessionId::new(publisher),
+            ShardId::new(0),
+            1,
+            TrackSpec {
                 kind,
                 mid: MidValue::new(b"0").unwrap(),
                 ssrc: Some(1234),
@@ -148,8 +208,8 @@ mod tests {
                 ext: ExtIds::default(),
                 cname: CnameValue::new(b"c").unwrap(),
             },
-            content_type: 0,
-        }
+            0,
+        )
     }
 
     #[test]
@@ -164,9 +224,34 @@ mod tests {
             registry.by_publisher(7),
             vec![TrackId::new(2), TrackId::new(3)]
         );
-        assert_eq!(registry.remove_publisher(7).len(), 2);
+        for id in registry.by_publisher(7) {
+            assert!(registry.remove(id).is_some());
+        }
+        assert!(registry.by_publisher(7).is_empty());
         assert_eq!(registry.len(), 1);
         assert!(registry.remove(TrackId::new(5)).is_some());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn subscribers_are_counted_per_shard() {
+        let mut registry = TrackRegistry::new();
+        let (track, a, b) = (TrackId::new(3), ShardId::new(0), ShardId::new(2));
+        assert!(registry.insert(track, info(7, MediaKind::Video)));
+        assert_eq!(registry.add_subscriber(track, b), Some(true));
+        assert_eq!(registry.add_subscriber(track, b), Some(false));
+        assert_eq!(registry.add_subscriber(track, a), Some(true));
+        let remote: Vec<ShardId> = registry.get(track).unwrap().remote_shards().collect();
+        assert_eq!(remote, [b], "the track's own shard is not remote");
+        assert_eq!(registry.remove_subscriber(track, b), Some(false));
+        assert_eq!(registry.remove_subscriber(track, b), Some(true));
+        assert_eq!(registry.get(track).unwrap().subscribers_on(b), 0);
+        registry.remove(track);
+        assert_eq!(
+            registry.add_subscriber(track, b),
+            None,
+            "gone with the track"
+        );
+        assert_eq!(registry.remove_subscriber(track, b), None);
     }
 }

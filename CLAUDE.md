@@ -5,9 +5,10 @@
 Nexus SFU is a WebRTC Selective Forwarding Unit written in Rust. It forwards media packets
 between participants in real-time video/audio sessions.
 
-**Status:** v0.1.0 — incomplete. The new data plane runs with one shard (Phase 1): 0
-allocations per packet and ≤ 25 KB of session state per participant are met; throughput and
-multi-core targets are not measured yet (`architecture.md` Part 5). v1 is not released.
+**Status:** v0.1.0 — incomplete. The new data plane runs on one or several shards (Phase 2):
+0 allocations per packet and ≤ 25 KB of session state per participant are met; multi-shard
+e2e tests (2.5) and the throughput and scaling measurements (2.6) are pending
+(`architecture.md` Part 5). v1 is not released.
 **License:** AGPL-3.0-only (binary), Apache-2.0 (library crates)
 
 ## Start here
@@ -109,7 +110,8 @@ See `architecture.md` for the full picture. The essentials:
   `ServerHandle` (bound addresses, `shutdown()`); `main.rs` adds config, tracing, signals.
 - **Data plane:** `nexus-dataplane`, one thread per shard (`dataplane.shards`, 1 by default;
   `recvmmsg`/`sendmmsg` on Linux), connected by cross-shard queues: classify, ICE-lite, SRTP in, rewrite, fan-out, SRTP out, RTCP. Driven only by
-  commands; reports events. The old ingress loop and worker pool are deleted (Phase 1 C1+C3).
+  commands; reports events. Sessions are placed by room (`RoomAffine`); a track with
+  subscribers on other shards is handed to them by buffer. The old ingress loop and worker pool are deleted (Phase 1 C1+C3).
 - **Control plane:** Tokio. WebSocket signaling → `SessionOrchestrator`
   (`src/orchestrator/`: room, negotiation, subscription, connection, plane) which runs the
   DTLS handshakes and sends commands to the shard. REST API on Axum with JWT.
@@ -175,9 +177,10 @@ Config files in `config/` (TOML). Precedence: CLI args > env vars (`NEXUS_*`) > 
 - `config/production.toml` - one shard with busy polling and CPU pinning; needs `NEXUS_JWT_SECRET` and TLS files at `/etc/nexus/tls/`
 - `config/loadtest.toml` - tuned for load testing
 
-`[dataplane]`: `shards` (1..=16, one thread and media port `+ i` each; `NEXUS_SHARDS`; until
-Phase 2.4 every session is on shard 0, capped at `max_webrtc_sessions / shards`, with a
-startup warning), `pool_buffers` (unset: 1,024 + (shards − 1) × 1,024), `busy_poll_rounds` (idle iterations
+`[dataplane]`: `shards` (1..=16, one thread and media port `+ i` each; `NEXUS_SHARDS`; each
+shard takes at most `max_webrtc_sessions / shards`), `room_shard_max_sessions` (50: a room's
+sessions on one shard before its next ones go to the least-loaded shard),
+`room_shard_max_pps` (0 = off), `pool_buffers` (unset: 1,024 + (shards − 1) × 1,024), `busy_poll_rounds` (idle iterations
 before a shard parks), `cpu_affinity`, `realtime_priority`. `[cluster]`:
 `gossip_enabled` (default false) needs a specific `gossip_bind_addr`, never 0.0.0.0.
 

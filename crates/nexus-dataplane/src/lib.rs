@@ -49,7 +49,7 @@ pub use handle::{
 pub use ids::{
     CnameValue, MidValue, SessionId, ShardId, SubscriptionId, TrackId, TrackRef, MAX_SHARDS,
 };
-pub use placement::{Placement, ShardLoad, SingleShard};
+pub use placement::{Placement, RoomAffine, RoomAffineLimits, ShardLoad, SingleShard};
 pub use pool::{BufRef, BufferPool, Loan, PoolRegion, BUF_SIZE};
 pub use session::{MAX_SUBS_PER_SESSION, MAX_TRACKS_PER_SESSION};
 #[cfg(target_os = "linux")]

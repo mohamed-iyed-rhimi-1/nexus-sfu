@@ -17,7 +17,7 @@ use super::transports::Expired;
 
 /// DTLS retransmission timer period.
 pub const DTLS_TICK: Duration = Duration::from_millis(200);
-/// Timeout sweep period (ICE connect, DTLS handshake, pending closes).
+/// Timeout sweep period (ICE connect, DTLS handshake, waiting cleanup).
 pub const SWEEP_TICK: Duration = Duration::from_secs(1);
 
 /// The orchestrator's timers.
@@ -110,12 +110,18 @@ fn apply_progress(id: SessionId, result: Result<Progress, HandshakeError>, plane
     }
 }
 
-/// A refused command. Unknown ids are expected after removals (a `RemoveTrack` takes
-/// the subscriptions to the track with it). Anything else closes the participant: the
-/// orchestrator checks the limits and specs before it sends, so a refusal means the
-/// shard is full (`Overloaded`) or the two disagree (`Internal`). The event names the
-/// session, not the track or subscription, so the registration cannot be undone
-/// selectively; a session whose tables disagree with the shard's is not kept.
+/// A refused command. Unknown ids are expected after removals: a `RemoveTrack` takes
+/// the subscriptions to the track with it; an `AddRemoteShard`, `RemoveRemoteShard` or
+/// `RemoveTrack` can meet a track already removed; a retried `Unsubscribe` can meet a
+/// subscription that a `CloseSession` or `RemoveTrack` already removed.
+///
+/// Anything else closes the participant: the orchestrator checks the limits and specs
+/// before it sends, so a refusal means the shard is full (`Overloaded`) or the two
+/// disagree (`Internal`). The event names the session, not the track or subscription,
+/// so the registration cannot be undone selectively; a session whose tables disagree
+/// with the shard's is not kept. A refused command that names no session
+/// (`RemoveTrack`, `Unsubscribe`, `AddRemoteShard`, `RemoveRemoteShard`; e.g.
+/// `WrongShard`) closes no one and is an orchestrator bug, logged as an error.
 fn on_rejected(id: Option<SessionId>, reason: RejectReason, plane: &mut Plane) {
     let participant = id.and_then(|id| plane.transports.participant_of(id));
     let close = match reason {
@@ -123,6 +129,13 @@ fn on_rejected(id: Option<SessionId>, reason: RejectReason, plane: &mut Plane) {
         | RejectReason::UnknownTrack
         | RejectReason::UnknownSubscription => {
             debug!(?participant, ?reason, "command for a removed object");
+            return;
+        }
+        _ if id.is_none() => {
+            error!(
+                ?reason,
+                "shard refused a command naming no session: orchestrator bug"
+            );
             return;
         }
         RejectReason::SessionLimit | RejectReason::TrackLimit | RejectReason::SubscriptionLimit => {
@@ -140,7 +153,7 @@ fn on_rejected(id: Option<SessionId>, reason: RejectReason, plane: &mut Plane) {
     };
     match participant {
         Some(p) => plane.close_participant(p, close),
-        None => warn!(?id, ?reason, "refused command for an unknown session"),
+        None => warn!(?id, ?reason, "refused command for a session already closed"),
     }
 }
 
@@ -158,7 +171,7 @@ pub fn poll_dtls(plane: &mut Plane) {
     }
 }
 
-/// Close sessions whose ICE-connect or DTLS timeout expired; retry pending closes.
+/// Close sessions whose ICE-connect or DTLS timeout expired; retry waiting cleanup.
 pub fn sweep(plane: &mut Plane, now: Instant) {
     for (id, expired) in plane.transports.sweep(now) {
         let Some(participant) = plane.transports.participant_of(id) else {
@@ -171,5 +184,5 @@ pub fn sweep(plane: &mut Plane, now: Instant) {
         info!(participant, ?expired, "session timed out");
         plane.close_participant(participant, reason);
     }
-    plane.retry_pending_closes();
+    plane.retry_pending_cleanup();
 }

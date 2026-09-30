@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_api::RoomGrant;
-use nexus_dataplane::{Command, Event, Placement, TrackId as DpTrackId};
+use nexus_dataplane::{Event, Placement, TrackId as DpTrackId};
 use nexus_state::DistributedState;
 use nexus_transport::dtls::DtlsCertificate;
 use tokio::sync::mpsc;
@@ -319,8 +319,10 @@ impl SessionOrchestrator {
         }
     }
 
-    /// Remove the participant's own tracks: `RemoveTrack` (which also drops the
-    /// subscriptions to them), the registries, and a renegotiation for subscribers.
+    /// Remove the participant's own tracks: `RemoveTrack` to the track's shard and to
+    /// every shard subscribed to it (which drops the subscriptions and mirrors there;
+    /// retried if a queue is full), the registries, and a renegotiation for
+    /// subscribers.
     fn handle_unpublish(&mut self, participant_id: u64, track_ids: &[u64]) {
         let mut removed = Vec::with_capacity(track_ids.len());
         for &track_id in track_ids.iter().take(nexus_webrtc::sdp::MAX_MEDIA_SECTIONS) {
@@ -341,13 +343,8 @@ impl SessionOrchestrator {
                 continue;
             }
             let track = track.expect("checked");
-            if !self
-                .plane
-                .push(shard, Command::RemoveTrack { track }, participant_id)
-            {
-                break;
-            }
-            if let Some(info) = self.plane.tracks.remove(track) {
+            if let Some(info) = self.plane.remove_track(track, true) {
+                debug_assert_eq!(info.shard, shard);
                 self.negotiation
                     .release_publish(participant_id, track_id, info.mid().as_bytes());
             }
@@ -424,12 +421,11 @@ impl SessionOrchestrator {
             .map(|h| h.published_tracks.clone())
             .unwrap_or_default();
         self.notify_unpublished(participant_id, &published);
-        let room = self.sessions.get(&participant_id).and_then(|h| h.room_id);
         self.subscription
             .cleanup_participant(participant_id, &self.plane);
         let removed = self
             .negotiation
-            .cleanup_participant(participant_id, room, &mut self.plane);
+            .cleanup_participant(participant_id, &mut self.plane);
         self.sessions.remove(&participant_id);
         self.on_tracks_removed(&removed);
         info!("Participant {} fully cleaned up", participant_id);

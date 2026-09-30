@@ -3,8 +3,8 @@
 **State: in progress** (plan written 2026-09-29, audited against `75fcdd9` the same day, revised the same day after
 the owner's review; 2.1 detailed the same day from a code analysis, with the owner's `Loan`
 decision and a process-unique region id; 2.1 implemented and committed the same day,
-`28d9cdf`; 2.2 committed the same day, `8210c7b`; 2.3 detailed and implemented the same day,
-not committed, waiting for review).
+`28d9cdf`; 2.2 committed the same day, `8210c7b`; 2.3 committed the same day, `3216f32`; 2.4
+implemented the same day, not committed, waiting for review).
 
 **Design:** [`docs/dataplane-design.md`](../dataplane-design.md) §5, Phase 2 ("Port per shard,
 placement, cross-shard queues and buffer return"), within D1-D4 and D8, §3.1 and §3.3. Detailed
@@ -581,7 +581,9 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
     (`ceil(max_webrtc_sessions / shards)`, `src/config/dataplane.rs:67-85`) and under
     `room_shard_max_pps` (`ShardLoad::rx_pps`, the only stats input). Otherwise the
     least-loaded shard (placed sessions, then `rx_pps`) that is under its `max_sessions`
-    becomes the room's current shard. A new room goes to the least-loaded shard. A shard at
+    becomes the room's current shard; when `room_shard_max_pps` is set, shards under it are
+    preferred among those, and only if none is does the rule without it apply (2.4
+    review). A new room goes to the least-loaded shard. A shard at
     its `max_sessions` is never chosen; if all are, placement returns the least-loaded one
     and the shard's own limit refuses the session (`CommandRejected`, as today).
   - Earlier participants stay where they are; there is no migration.
@@ -601,7 +603,10 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
   to `TrackInfo.shard`). **Counted on the slot's state change, not on push success:**
   - +1 when a slot becomes an on-shard subscription (`register_subscriptions`,
     `negotiation.rs:616-684`, push at `:664-671`); the first on a shard other than the
-    track's → `AddRemoteShard` to the track's shard.
+    track's → `AddRemoteShard` to the track's shard. More precisely (2.4 review): any
+    subscription on such a shard while the shard is not announced (`TrackInfo.announced`
+    bit clear) → `AddRemoteShard`, so when an earlier announcement did not fit (its
+    subscriber is being closed, maybe after this step) the next subscriber retries it.
   - −1 when an on-shard slot leaves that state: `drop_subscriptions_except`
     (`:781-810`) marks the slot `Inactive` before pushing `Unsubscribe` and ignores a failed
     push (`:803-805`), so the count follows the slot, and the `Unsubscribe` goes through the
@@ -612,7 +617,10 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
     done there, from the removed state's on-shard slots, before `close_session`. No
     `Unsubscribe` is needed: `CloseSession` removes the subscriptions (and so the mirror's
     last subscriber) on the subscriber's shard.
-  - The last one on a shard → `RemoveRemoteShard` to the track's shard.
+  - The last one on a shard → `RemoveRemoteShard` to the track's shard, only if that shard
+    was announced.
+  - A participant to close is never dropped (`Plane::closing` is bounded by
+    `MAX_TRANSPORTS`, above any possible count of connected participants, and asserted).
 - **Track removal reaches every shard** (gap found in the audit): `handle_unpublish`
   (`mod.rs:324-367`) sends `RemoveTrack` to the publisher's shard only, and
   `forget_tracks` (`negotiation.rs:864`, `subscription.rs:190-207`) then marks the
@@ -635,7 +643,10 @@ negotiation.rs, subscription.rs, mod.rs, tracks.rs}`, `src/server.rs`,
     retried remove could arrive after the new add and cut the new subscriber off.
   - `RemoveTrack` needs no such rule (track ids are never reused), nor does `Unsubscribe`
     (subscription ids are never reused).
-  - A full retry list logs an error and leaks, as `pending_close` does today.
+  - A full retry list logs an error and leaks, as `pending_close` does today. `CloseSession`
+    has its own budget (`CleanupBudget`, `MAX_TRANSPORTS` each), so other cleanup cannot
+    crowd one out: a lost `CloseSession` leaks a whole session, a lost
+    `RemoveRemoteShard` only forwarding (2.4 review).
   - **Per-shard order** (review note, 2026-09-29): before any push to shard s, additive or
     cleanup, `Plane` first sends s's queued cleanup commands, oldest first (the retry list
     absorbs `pending_close`, so `CloseSession` follows the same rule). If one still does not
@@ -897,8 +908,8 @@ changes a decision (D1-D10, R1-R9).
 |------|-------|---------|-------|
 | 2.1 Shared pool region, `XsMsg`, mesh | Done | `28d9cdf` | `Loan` with region id; freeing independent of call order (`held`); stress test and Miri clean |
 | 2.2 Shard: remote fan-out, mirrors, cross-shard RTCP | Done | `8210c7b` | Mirrors, lend after local fan-out, returns at the top of `iterate`; alloc test 0 on 2 shards; 3-shard proptest agrees with the counting model |
-| 2.3 N shards on threads | Done, not committed | | Two-phase start, mesh and peer wakes (n > 1 only); cap 16; optional pool with a per-shard-count default; loopback tests on 2 and 4 shards |
-| 2.4 Control plane: placement, cross-shard subscriptions | Not started | | |
+| 2.3 N shards on threads | Done | `3216f32` | Two-phase start, mesh and peer wakes (n > 1 only); cap 16; optional pool with a per-shard-count default; loopback tests on 2 and 4 shards |
+| 2.4 Control plane: placement, cross-shard subscriptions | Done, not committed | | `RoomAffine` (own counts, room cap 50, pps off); counts per (track, shard) with an `announced` bit; per-shard cleanup FIFO (absorbs `pending_close`) with cancel on re-add; randomised stream test agrees with shard models |
 | 2.5 E2E on several shards | Not started | | |
 | 2.6 `benches/dataplane.rs`, measurements, tuning | Not started | | |
 | 2.7 Deploy, documents, browser check, merge | Not started | | |
@@ -1128,3 +1139,87 @@ Add one line per working session: date, part, what was done, what is left.
   **ci-local** (`8210c7b` + 19 uncommitted or untracked paths, macos + linux-arm64): all
   PASS, `cargo test --workspace` 1,525 (macOS) / 1,531 (Linux), bench smoke and memory
   budget 25 KB PASS. Next: owner's review, then commit; then 2.4.
+- 2026-09-29: 2.3 Status set to Done (`3216f32`). **2.4 implemented, not committed.**
+  `RoomAffine` in `placement.rs` (`RoomAffineLimits`: shards, per-shard `max_sessions`,
+  `room_shard_max_sessions`, `room_shard_max_pps`): own counts per shard and per (room,
+  shard) with the room's current shard, least-loaded by (placed, `rx_pps`, index) among
+  shards under `max_sessions` (all at it: least-loaded overall, the shard refuses); room
+  entries freed at 0; `ShardLoad::sessions` no longer read. Config
+  `dataplane.room_shard_max_sessions` (50, ≥ 1) and `room_shard_max_pps` (0 = off),
+  `NexusConfig::to_placement` (also run by `validate`), commented lines in the four TOML
+  files; `server.rs` builds `RoomAffine`, the 2.3 `SingleShard` warning is gone; `main.rs`
+  logs both settings. **`Plane`:** `Cleanup` (`CloseSession`, `Unsubscribe`, `RemoveTrack`,
+  `RemoveRemoteShard`) and `push_cleanup` with a per-shard FIFO (bound `MAX_TRANSPORTS`,
+  absorbs `pending_close`; `retry_pending_cleanup` from the sweep); `push` and
+  `push_cleanup` first flush the shard's FIFO, and an additive command that cannot follow it
+  closes its participant. `create_session` releases the placement on both failure paths;
+  the placed room is kept on `TransportEntry.room`, so `close_session(id)` hands the same
+  room back (no room argument any more). **Counts:** `TrackInfo.subscribers[16]` and
+  `announced` (u32 mask: `AddRemoteShard` accepted, no remove sent or queued since);
+  `count_subscription` (+1 in `register_subscriptions` after the slot goes on-shard; first
+  on another shard → cancel a waiting `RemoveRemoteShard` or push `AddRemoteShard`),
+  `uncount_subscription` (−1 in `drop_subscriptions_except` with a retried `Unsubscribe`,
+  and in `cleanup_participant` from the removed state before `CloseSession`; last on an
+  announced shard → `RemoveRemoteShard` via the FIFO), `remove_track` (unpublish:
+  `RemoveTrack` to the track's shard and every counted shard; publisher leave: counted
+  shards only, `CloseSession` covers its own). Design choices beyond the text above: the
+  `announced` bit keeps the stream alternating when an `AddRemoteShard` push failed (the
+  closed subscriber's uncount then sends nothing); `RemoveTrack` to the publisher's shard is
+  a cleanup too, so a full queue no longer stops an unpublish or closes the publisher.
+  Rejections for unknown objects stay ignored (`connection.rs`, comment extended).
+  **Tests:** 8 `RoomAffine` unit tests (cap then move, ties, `max_sessions` skipped and all
+  full, pps only when set, mass join of 100 → 50/50 and 25 × 4, entries freed, one shard,
+  loads length); config 2; `TrackRegistry` counts 1; new `cross_shard_tests.rs` on a
+  `FakeSink` with N shards recording `(shard, command)` and per-shard room (unlimited, k,
+  full), `Scripted` and shared-`RoomAffine` placements: 9 tests (announce once, unpublish
+  and leave everywhere, subscriber leave, full queue waits / additive closes, cancel on
+  re-add, per-shard order incl. room for one of two, late rejections, failed create
+  releases placement, room spread through the orchestrator) and a randomised runner (96
+  cases, ≤ 40 ops on 3 shards, queues full / limited / free): the stream alternates per
+  (track, shard), and replayed on shard models it agrees with the orchestrator's sessions,
+  slots, counts, mirrors and `remote_shards` at quiescence and after everyone leaves
+  (coverage asserted: `AddRemoteShard` in 53/96 cases, `RemoveRemoteShard` 26, cleanup
+  waited 35, a full queue closed someone 49). The existing full-queue test uses the new
+  sink. **Mutation checks**, each caught: no cancel (cancel test), no uncount on leave
+  (subscriber-leave and random), `push` not flushing first (order test), `push_cleanup` not
+  flushing first (full-queue test), no `RemoveTrack` to counted shards (unpublish and
+  random), no `announced` check (announce test and random). `cargo test --workspace` 1,546
+  passed (macOS), e2e 9/9 with one shard. Memory bench: 17.6 KB + 264 B + mirrors 3.4 KB =
+  **21.3 KB ≤ 25 KB** (was 21.0). Smoke: `NEXUS_SHARDS=2` with `development.toml` binds
+  10000-10001 with no placement warning. **ci-local** (`3216f32` + 22 uncommitted or
+  untracked paths, macos + linux-arm64): all PASS, `cargo test --workspace` 1,546 (macOS) /
+  1,552 (Linux), bench smoke and memory budget 25 KB PASS. Next: owner's review of 2.4, then commit;
+  then 2.5 (e2e on several shards; `room_shard_max_sessions = 1` spreads a room).
+- 2026-09-30: 2.4 review fixes, not committed. (1) **Stuck (track, shard):** a failed
+  `AddRemoteShard` left the count at 1 with the shard unannounced and relied on closing the
+  subscriber, whose close `close_participant` dropped past 4,096 waiting. Now
+  `count_subscription` announces whenever the shard is counted and not announced (not only
+  on 0 → 1), so the next subscriber there retries; `Plane::closing` is bounded by
+  `MAX_TRANSPORTS` and asserted (entries are distinct connected participants, ≤
+  `max_webrtc_sessions` ≤ 100,000), never dropped. Test
+  `a_failed_announcement_is_retried_by_the_next_subscriber` (answers held and handled in one
+  step: the first subscriber's add does not fit, the second's is sent, the first's close
+  sends no remove). (2) **Cleanup budget:** `CleanupBudget { closes, other }`
+  (`MAX_TRANSPORTS` each), dropped commands logged at `error!`; test
+  `close_session_has_its_own_cleanup_budget` (budget 1 + 1: the `RemoveRemoteShard` behind
+  an `Unsubscribe` is dropped, the `CloseSession` still waits and is sent). (3)
+  **`room_shard_max_pps`:** when set, `least_loaded` prefers shards under it (among those
+  under `max_sessions`), then the old rule; `the_pps_limit_moves_a_room_only_when_set`
+  rewritten (3 shards: the room moves to the shard under the limit, not to the one with
+  fewest sessions; all above → fewest sessions; off → stays); plan text updated. (4) The
+  randomised runner uses a fixed seed (`TestRng::deterministic_rng`; covered: adds in 51 of
+  96 cases, removes 24, cleanup waited 36, closes 39); new scripted
+  `a_rejected_subscribe_removes_the_remote_shard_only_if_announced` (`SubscriptionLimit` on
+  an announced shard → close + `RemoveRemoteShard`; on the track's shard → close only; after
+  a failed add, rejected before its close → close only). Nits: `remove_publisher` deleted;
+  `cleanup_participant` debug-asserts a live session has its transport entry;
+  `on_rejected` logs one `error!` for a refused command naming no session (`RemoveTrack`,
+  `Unsubscribe`, `AddRemoteShard`, `RemoveRemoteShard`, e.g. `WrongShard`) and closes no one;
+  its doc comment wrapped; `session_closed` decrements a room's total only with its shard
+  count; documented that a room's current shard stays when its count there reaches 0 and
+  that `ShardLoad::sessions` is informational; CLAUDE.md status line and data-plane bullet,
+  README warning (several shards; multi-shard e2e and bench pending). **Mutation checks**,
+  each caught: announce only on 0 → 1 (retry test), one shared budget (budget test), no pps
+  preference (pps test). **ci-local** (`3216f32` + 22 uncommitted or untracked paths,
+  macos + linux-arm64): all PASS, `cargo test --workspace` 1,549 (macOS) / 1,555 (Linux),
+  e2e 9/9, bench smoke and memory budget 25 KB PASS. Next: owner's review, then commit; then 2.5.

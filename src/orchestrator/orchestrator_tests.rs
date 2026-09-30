@@ -8,12 +8,12 @@
 //! emptied.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use nexus_dataplane::{
     Command, CommandQueueFull, Dataplane, DataplaneConfig, DataplaneHandle, Event, RejectReason,
-    SessionId, ShardId, ShardLoad, ShardStatsSnapshot, SingleShard, MAX_TRACKS_PER_SESSION,
+    SessionId, ShardId, ShardLoad, ShardStatsSnapshot, SingleShard, SubscriptionId,
+    MAX_TRACKS_PER_SESSION,
 };
 use nexus_state::DistributedStateConfig;
 use parking_lot::Mutex;
@@ -1414,36 +1414,131 @@ async fn consent_lost_and_shard_refusals_close_the_participant() {
     assert_eq!((stats.gauges.sessions, stats.gauges.tracks), (0, 0));
 }
 
-/// A command sink with a switchable full queue, recording what it accepts.
-#[derive(Default)]
+/// A command as `FakeSink` records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rec {
+    Create(SessionId),
+    AddTrack(SessionId, DpTrackId),
+    Subscribe {
+        id: SessionId,
+        sub: SubscriptionId,
+        track: DpTrackId,
+        source: ShardId,
+    },
+    Unsubscribe(SubscriptionId),
+    RemoveTrack(DpTrackId),
+    Close(SessionId),
+    AddRemote(DpTrackId, ShardId),
+    RemoveRemote(DpTrackId, ShardId),
+    /// DTLS datagrams, SRTP keys.
+    Other,
+}
+
+impl Rec {
+    fn of(command: &Command) -> Self {
+        match command {
+            Command::CreateSession { id, .. } => Rec::Create(*id),
+            Command::AddTrack { id, track, .. } => Rec::AddTrack(*id, *track),
+            Command::Subscribe {
+                id,
+                sub,
+                track,
+                spec,
+            } => Rec::Subscribe {
+                id: *id,
+                sub: *sub,
+                track: *track,
+                source: spec.source.shard,
+            },
+            Command::Unsubscribe { sub } => Rec::Unsubscribe(*sub),
+            Command::RemoveTrack { track } => Rec::RemoveTrack(*track),
+            Command::CloseSession { id } => Rec::Close(*id),
+            Command::AddRemoteShard { track, shard } => Rec::AddRemote(*track, *shard),
+            Command::RemoveRemoteShard { track, shard } => Rec::RemoveRemote(*track, *shard),
+            _ => Rec::Other,
+        }
+    }
+}
+
+/// A command sink with `n` shards, recording `(shard, command)` for what it accepts.
+/// Each shard's queue is unlimited (`None`), takes `k` more commands (`Some(k)`), or
+/// is full (`Some(0)`).
 struct FakeSink {
-    full: AtomicBool,
-    accepted: Mutex<Vec<Command>>,
+    room: Mutex<Vec<Option<usize>>>,
+    accepted: Mutex<Vec<(ShardId, Rec)>>,
+}
+
+impl FakeSink {
+    fn new(shards: usize) -> Self {
+        assert!((1..=16).contains(&shards));
+        Self {
+            room: Mutex::new(vec![None; shards]),
+            accepted: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_room(&self, shard: u8, room: Option<usize>) {
+        self.room.lock()[usize::from(shard)] = room;
+    }
+
+    fn set_full(&self, shard: u8, full: bool) {
+        self.set_room(shard, full.then_some(0));
+    }
+
+    /// Everything accepted since the last call, in order.
+    fn take(&self) -> Vec<(ShardId, Rec)> {
+        std::mem::take(&mut *self.accepted.lock())
+    }
 }
 
 impl CommandSink for FakeSink {
-    fn send(&self, _shard: ShardId, command: Command) -> Result<(), CommandQueueFull> {
-        if self.full.load(Ordering::SeqCst) {
-            return Err(CommandQueueFull);
+    fn send(&self, shard: ShardId, command: Command) -> Result<(), CommandQueueFull> {
+        let mut room = self.room.lock();
+        match &mut room[usize::from(shard.index())] {
+            Some(0) => return Err(CommandQueueFull),
+            Some(k) => *k -= 1,
+            None => {}
         }
-        self.accepted.lock().push(command);
+        self.accepted.lock().push((shard, Rec::of(&command)));
         Ok(())
     }
 
     fn loads(&self) -> Vec<ShardLoad> {
-        vec![ShardLoad::default()]
+        vec![ShardLoad::default(); self.shard_count()]
     }
 
     fn shard_count(&self) -> usize {
-        1
+        self.room.lock().len()
     }
 }
 
+/// An orchestrator on `sink`'s shards (candidates 127.0.0.1:10000 + i) with `placement`.
+fn orchestrator_with(sink: &Arc<FakeSink>, placement: Box<dyn Placement>) -> SessionOrchestrator {
+    let state = Arc::new(DistributedState::new(DistributedStateConfig::new(1)));
+    let candidates = (0..sink.shard_count())
+        .map(|i| {
+            vec![std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                10_000 + i as u16,
+            ))]
+        })
+        .collect();
+    SessionOrchestrator::new(
+        Arc::clone(sink) as Arc<dyn CommandSink>,
+        candidates,
+        placement,
+        DtlsCertificate::generate().unwrap(),
+        state,
+    )
+}
+
+#[path = "cross_shard_tests.rs"]
+mod cross_shard;
+
 #[tokio::test]
 async fn full_command_queue_closes_the_participant_and_retries_the_close() {
-    let sink = Arc::new(FakeSink::default());
-    let media = "127.0.0.1:10000".parse().unwrap();
-    let mut o = orchestrator_on(Arc::clone(&sink) as Arc<dyn CommandSink>, media);
+    let sink = Arc::new(FakeSink::new(1));
+    let mut o = orchestrator_with(&sink, Box::new(SingleShard));
     let mut rx1 = connect(&mut o, 1);
     let mut rx2 = connect(&mut o, 2);
     send(&mut o, 1, SignalMessage::Create { room_name: None });
@@ -1458,7 +1553,7 @@ async fn full_command_queue_closes_the_participant_and_retries_the_close() {
     let session = o.negotiation.session(1).expect("session created");
 
     // A command that does not fit fails the operation and closes the participant.
-    sink.full.store(true, Ordering::SeqCst);
+    sink.set_full(0, true);
     send(&mut o, 2, publish_msg(&["audio"]));
     assert!(error_codes(drain(&mut rx2)).contains(&"OVERLOADED".to_string()));
     assert!(!o.sessions.contains_key(&2));
@@ -1469,14 +1564,17 @@ async fn full_command_queue_closes_the_participant_and_retries_the_close() {
     o.settle();
     drain(&mut rx1);
     assert!(o.plane.transports.is_empty());
-    assert_eq!(o.plane.pending_closes(), 1);
+    assert_eq!(o.plane.pending_cleanup(), 1);
     connection::sweep(&mut o.plane, std::time::Instant::now());
-    assert_eq!(o.plane.pending_closes(), 1, "queue still full");
+    assert_eq!(o.plane.pending_cleanup(), 1, "queue still full");
 
     // Room in the queue: the next sweep sends it.
-    sink.full.store(false, Ordering::SeqCst);
+    sink.set_full(0, false);
     connection::sweep(&mut o.plane, std::time::Instant::now());
-    assert_eq!(o.plane.pending_closes(), 0);
-    let accepted = sink.accepted.lock();
-    assert!(matches!(accepted.last(), Some(Command::CloseSession { id }) if *id == session));
+    assert_eq!(o.plane.pending_cleanup(), 0);
+    let accepted = sink.take();
+    assert_eq!(
+        accepted.last(),
+        Some(&(ShardId::new(0), Rec::Close(session)))
+    );
 }

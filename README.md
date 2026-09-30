@@ -15,7 +15,7 @@
 
 ---
 
-> **⚠️ This project is incomplete and under active development.** The new data plane runs with one shard; throughput and multi-core targets are not measured yet (see `architecture.md` Part 5 for what is). Use at your own risk.
+> **⚠️ This project is incomplete and under active development.** The new data plane runs on one or several shards; multi-shard end-to-end tests and the throughput and scaling measurements are pending (see `architecture.md` Part 5 for what is). Use at your own risk.
 
 ## Why Nexus?
 
@@ -30,12 +30,12 @@ The goal is an SFU that forwards 500K+ packets/sec/core in userspace with P99 la
 ## Features
 
 - **Zero-alloc hot path** — the shard forwards with no heap allocation, lock or clock read per packet (checked in CI)
-- **Sharded data plane** — one thread and one socket per shard, `recvmmsg`/`sendmmsg`; several shards start (`dataplane.shards`), but every session is placed on shard 0 until Phase 2.4
+- **Sharded data plane** — one thread and one socket per shard, `recvmmsg`/`sendmmsg`; several shards (`dataplane.shards`), sessions placed by room (a room stays on one shard up to `dataplane.room_shard_max_sessions`, then spills to the least-loaded), a track with subscribers on other shards decrypted once and handed over by buffer
 - **In-process state** — CRDTs, no Redis, no Postgres; single node (gossip is off and not yet authenticated)
 - **WebSocket signaling** — JSON messages, WSS with TLS
 - **Keyframes and lip sync** — PLI on subscribe, PLI/FIR forwarding with throttling, Sender Report translation
 
-Not yet: placing sessions on several shards (Phase 2.4; until then all go to shard 0, capped at `max_webrtc_sessions / shards`), NACK and TWCC feedback (Phase 3), simulcast and bandwidth estimation (after v1). `nexus-bwe` exists but is not wired in.
+Not yet: end-to-end tests and measurements on several shards (Phase 2.5-2.6), NACK and TWCC feedback (Phase 3), simulcast and bandwidth estimation (after v1). `nexus-bwe` exists but is not wired in.
 
 ## Architecture
 

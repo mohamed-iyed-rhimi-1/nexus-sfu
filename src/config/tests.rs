@@ -494,3 +494,55 @@ fn test_dataplane_rejects_invalid_settings() {
         c.metrics.bind_addr = "127.0.0.1:9090".to_string();
     });
 }
+
+#[test]
+fn test_placement_settings() {
+    let mut config = NexusConfig::default();
+    assert_eq!(config.dataplane.room_shard_max_sessions, 50);
+    assert_eq!(config.dataplane.room_shard_max_pps, 0, "off by default");
+    config.dataplane.shards = 4;
+    config.transport.max_webrtc_sessions = 1_001;
+    let placement = config.to_placement().unwrap();
+    assert_eq!(placement.rooms_tracked(), 0);
+    assert!(config.validate_dataplane().is_ok());
+
+    // Each shard's limit is its share of the total, rounded up: 251 × 4 ≥ 1,001.
+    let mut placement = placement;
+    let loads = vec![nexus_dataplane::ShardLoad::default(); 4];
+    for room in 0..1_004 {
+        nexus_dataplane::Placement::place(&mut placement, Some(room), &loads);
+    }
+    for i in 0..4 {
+        assert_eq!(placement.placed(nexus_dataplane::ShardId::new(i)), 251);
+    }
+
+    config.dataplane.room_shard_max_sessions = 0;
+    assert!(config.to_placement().is_err());
+    assert!(config.validate_dataplane().is_err(), "a room cap of 0");
+}
+
+#[test]
+fn test_placement_settings_from_toml() {
+    let mut config = NexusConfig::default();
+    config.dataplane.shards = 2;
+    config.dataplane.room_shard_max_sessions = 1;
+    config.dataplane.room_shard_max_pps = 90_000;
+    let text = toml::to_string(&config).unwrap();
+    assert!(text.contains("room_shard_max_sessions = 1\n"), "{text}");
+    assert!(text.contains("room_shard_max_pps = 90000\n"), "{text}");
+    let parsed: NexusConfig = toml::from_str(&text).unwrap();
+    assert_eq!(parsed.dataplane, config.dataplane);
+    let mut placement = parsed.to_placement().unwrap();
+    let loads = vec![nexus_dataplane::ShardLoad::default(); 2];
+    let shards: Vec<u8> = (0..4)
+        .map(|_| nexus_dataplane::Placement::place(&mut placement, Some(7), &loads).index())
+        .collect();
+    assert_eq!(shards, [0, 1, 0, 1], "a cap of 1 spreads one room");
+
+    // The shipped files leave both at their defaults (commented out).
+    for file in ["default", "development", "production", "loadtest"] {
+        let config = ConfigLoader::from_file(format!("config/{file}.toml")).unwrap();
+        assert_eq!(config.dataplane.room_shard_max_sessions, 50, "{file}");
+        assert_eq!(config.dataplane.room_shard_max_pps, 0, "{file}");
+    }
+}
